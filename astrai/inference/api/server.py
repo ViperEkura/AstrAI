@@ -3,6 +3,9 @@ OpenAI / Anthropic-compatible chat completion server backed by continuous-batchi
 
 Protocol-specific formatting is delegated to ``astrai.inference.protocol``.
 This module owns the FastAPI app, request/response schemas, and dependency wiring.
+
+``app`` is lazily constructed — importing this module does NOT create a FastAPI instance.
+Use :func:`get_app` to access the singleton.
 """
 
 import logging
@@ -12,7 +15,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from astrai.inference.api.anthropic import AnthropicResponseBuilder
@@ -24,7 +27,7 @@ from astrai.tokenize import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-_project_root = Path(__file__).parent.parent.parent
+_app_instance: Optional[FastAPI] = None
 
 
 class ChatMessage(BaseModel):
@@ -84,17 +87,15 @@ async def lifespan(app: FastAPI):
         logger.info("Inference engine shutdown complete")
 
 
-app = FastAPI(title="AstrAI Inference Server", version="0.2.0", lifespan=lifespan)
+router = APIRouter()
 
 
 def _create_engine(
-    param_path: Optional[Path] = None,
+    param_path: Path,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     max_batch_size: int = 16,
 ) -> InferenceEngine:
-    if param_path is None:
-        param_path = _project_root / "params"
     if not param_path.exists():
         raise FileNotFoundError(f"Parameter directory not found: {param_path}")
 
@@ -112,34 +113,50 @@ def _create_engine(
     return engine
 
 
+def get_app() -> FastAPI:
+    """Return the singleton FastAPI instance (lazily created on first call)."""
+    global _app_instance
+    if _app_instance is None:
+        _app_instance = FastAPI(
+            title="AstrAI Inference Server",
+            version="0.2.0",
+            lifespan=lifespan,
+        )
+        _app_instance.include_router(router)
+        _app_instance.state.server_config = {}
+        _app_instance.state.engine = None
+    return _app_instance
+
+
 def _get_engine() -> InferenceEngine:
-    engine = app.state.engine
+    engine = get_app().state.engine
     if engine is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
     return engine
 
 
-@app.get("/health")
+@router.get("/health")
 async def health():
+    app = get_app()
     return {
         "status": "ok",
         "model_loaded": app.state.engine is not None,
     }
 
 
-@app.get("/stats")
+@router.get("/stats")
 async def get_stats():
     return _get_engine().get_stats()
 
 
-@app.post("/v1/chat/completions")
+@router.post("/v1/chat/completions")
 async def chat_completion(request: ChatCompletionRequest):
     engine = _get_engine()
     handler = ProtocolHandler(request, engine, OpenAIResponseBuilder())
     return await handler.handle()
 
 
-@app.post("/v1/messages")
+@router.post("/v1/messages")
 async def create_message(request: MessagesRequest):
     engine = _get_engine()
     handler = ProtocolHandler(request, engine, AnthropicResponseBuilder())
@@ -147,14 +164,15 @@ async def create_message(request: MessagesRequest):
 
 
 def run_server(
+    param_path: Path,
     host: str = "0.0.0.0",
     port: int = 8000,
     reload: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
-    param_path: Optional[Path] = None,
     max_batch_size: int = 16,
 ):
+    app = get_app()
     app.state.server_config = {
         "device": device,
         "dtype": dtype,

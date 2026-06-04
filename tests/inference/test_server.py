@@ -2,12 +2,12 @@
 
 import pytest
 
-from astrai.inference import app
+from astrai.inference import get_app
 
 
 def test_health_no_model(client):
     """GET /health should return 200 even when engine not loaded."""
-    app.state.engine = None
+    get_app().state.engine = None
     response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
@@ -30,7 +30,7 @@ def test_chat_completions_non_stream(client, loaded_model):
     async def async_gen():
         yield "Assistant reply"
 
-    app.state.engine = loaded_model
+    get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
     response = client.post(
         "/v1/chat/completions",
@@ -56,7 +56,7 @@ def test_chat_completions_stream(client, loaded_model):
         yield "cumulative1"
         yield "cumulative2"
 
-    app.state.engine = loaded_model
+    get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
     response = client.post(
         "/v1/chat/completions",
@@ -83,7 +83,7 @@ def test_messages_non_stream(client, loaded_model):
     async def async_gen():
         yield "Assistant reply"
 
-    app.state.engine = loaded_model
+    get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
     response = client.post(
         "/v1/messages",
@@ -111,7 +111,7 @@ def test_messages_stream(client, loaded_model):
         yield "cumulative1"
         yield "cumulative2"
 
-    app.state.engine = loaded_model
+    get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
     response = client.post(
         "/v1/messages",
@@ -141,7 +141,7 @@ def test_messages_with_system(client, loaded_model):
     async def async_gen():
         yield "Reply"
 
-    app.state.engine = loaded_model
+    get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
     response = client.post(
         "/v1/messages",
@@ -165,7 +165,7 @@ def test_chat_completions_stop_sequence(client, loaded_model):
         yield "X"
         yield "world"
 
-    app.state.engine = loaded_model
+    get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
     response = client.post(
         "/v1/chat/completions",
@@ -191,7 +191,7 @@ def test_chat_completions_stop_sequence_stream(client, loaded_model):
         yield "X"
         yield "world"
 
-    app.state.engine = loaded_model
+    get_app().state.engine = loaded_model
     loaded_model.generate_async.return_value = async_gen()
     response = client.post(
         "/v1/chat/completions",

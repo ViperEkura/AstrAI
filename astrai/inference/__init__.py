@@ -17,7 +17,7 @@ from astrai.inference.api import (
     MessagesRequest,
     ProtocolHandler,
     StopChecker,
-    app,
+    get_app,
     run_server,
 )
 from astrai.inference.api.anthropic import AnthropicResponseBuilder
@@ -80,6 +80,6 @@ __all__ = [
     "ChatCompletionRequest",
     "AnthropicMessage",
     "MessagesRequest",
-    "app",
+    "get_app",
     "run_server",
 ]

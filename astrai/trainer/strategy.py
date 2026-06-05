@@ -68,6 +68,22 @@ def get_logprobs(
         return token_logprobs * shifted_mask
 
 
+def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
+    S = position_ids.size(1)
+    device = position_ids.device
+    boundaries = position_ids[:, 1:] <= position_ids[:, :-1]
+    doc_ids = torch.cat(
+        [
+            torch.zeros(position_ids.size(0), 1, dtype=torch.long, device=device),
+            boundaries.long().cumsum(dim=1),
+        ],
+        dim=1,
+    )
+    same_doc = doc_ids.unsqueeze(-1) == doc_ids.unsqueeze(-2)
+    causal = torch.tril(torch.ones(S, S, dtype=torch.bool, device=device))
+    return (same_doc & causal).unsqueeze(1)
+
+
 class BaseStrategy(ABC):
     """Abstract base class for training strategies."""
 
@@ -188,8 +204,11 @@ class SFTStrategy(BaseStrategy):
         )
 
         ignore_index = -100
-        logits = self.model(input_ids=input_ids, position_ids=position_ids)["logits"]
+        input_mask = make_doc_boundary_mask(position_ids)
         target_ids = target_ids.masked_fill(loss_mask == 0, ignore_index)
+        logits = self.model(
+            input_ids=input_ids, position_ids=position_ids, input_mask=input_mask
+        )["logits"]
 
         loss = F.cross_entropy(
             input=logits.flatten(0, 1).float(),

@@ -26,24 +26,21 @@ def process_attention_mask(
         return input_mask
 
     device = input_tensor.device
-    dtype = input_tensor.dtype
-    B, S = input_tensor.size()[:2]
+    B = input_tensor.size(0)
     T = position_ids.max().item() + 1
 
     if input_mask is None:
         if position_ids.min().item() == 0 and is_causal:
             return None
-        pad = torch.ones(B, T, dtype=torch.bool, device=device)
+        attend = torch.ones(B, 1, T, dtype=torch.bool, device=device)
     else:
-        pad = input_mask[:, :T].to(device=device, dtype=torch.bool)
+        attend = input_mask[:, :T].to(device=device, dtype=torch.bool).unsqueeze(1)
 
-    attend = pad.view(B, 1, T).expand(B, S, T).clone()
     if is_causal:
-        attend &= position_ids.unsqueeze(-1) >= torch.arange(T, device=device)
+        causal = position_ids.unsqueeze(-1) >= torch.arange(T, device=device)
+        attend = attend & causal
 
-    return torch.full(
-        (B, 1, S, T), -torch.finfo(dtype).max / 2, dtype=dtype, device=device
-    ).masked_fill_(attend.unsqueeze(1), 0.0)
+    return attend.unsqueeze(1)
 
 
 @AutoModel.register("autoregressive_lm")

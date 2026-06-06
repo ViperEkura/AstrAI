@@ -2,6 +2,9 @@
 
 Patterned after vLLM's ToolParser abstraction. Each parser knows how to
 detect and incrementally extract tool calls from raw generated text.
+
+Subclasses may optionally consume ``token_ids`` for token-level parsing
+(e.g. Harmony / VLM-style parsers).
 """
 
 import re
@@ -17,6 +20,14 @@ class BaseToolParser(ABC):
 
     Maintains streaming state internally so that each call to :meth:`feed`
     can diff against previously emitted content.
+
+    Parameters
+    ----------
+    tools : list of dict, optional
+        Tool definitions from the request.
+    tool_choice : str
+        ``"auto"`` / ``"required"`` / ``"none"`` or a named tool choice
+        dict.
     """
 
     def __init__(self, tools: Optional[List[Dict]] = None, tool_choice: str = "auto"):
@@ -24,7 +35,12 @@ class BaseToolParser(ABC):
         self.tool_choice = tool_choice
 
     @abstractmethod
-    def feed(self, body: str) -> List[Dict]:
+    def feed(
+        self,
+        body: str,
+        current_token_ids: Optional[List[int]] = None,
+        delta_token_ids: Optional[List[int]] = None,
+    ) -> List[Dict]:
         """Feed the *full* accumulated text each step.
 
         Returns a list of delta dicts to emit. Each delta is one of:
@@ -33,6 +49,15 @@ class BaseToolParser(ABC):
         - ``{"tool_calls": [...]}``    — tool-call delta (OpenAI format)
 
         Returns an empty list when nothing new should be emitted.
+
+        Parameters
+        ----------
+        body : str
+            The complete accumulated generated text so far.
+        current_token_ids : list of int, optional
+            All token IDs decoded into *body* (cumulative).
+        delta_token_ids : list of int, optional
+            Only the token IDs for this chunk.
         """
 
     @abstractmethod
@@ -199,7 +224,12 @@ class SimpleJsonToolParser(BaseToolParser):
 
     # -------------------------------------------------------------- feed
 
-    def feed(self, body: str) -> List[Dict]:
+    def feed(
+        self,
+        body: str,
+        current_token_ids: Optional[List[int]] = None,
+        delta_token_ids: Optional[List[int]] = None,
+    ) -> List[Dict]:
         deltas: List[Dict] = []
 
         completed = _find_tool_calls(body)

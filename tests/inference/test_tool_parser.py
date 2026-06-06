@@ -643,3 +643,49 @@ def test_factory_create_with_tools_only():
     parser = ToolParserFactory.create("simple_json", tools=tools)
     assert parser.tools == tools
     assert parser.tool_choice == "auto"
+
+
+def test_feed_accepts_token_ids_and_ignores_them():
+    parser = SimpleJsonToolParser()
+    text = '{"name": "get_weather", "arguments": {"city": "Beijing"}}'
+    deltas_with = parser.feed(text, current_token_ids=[123, 456], delta_token_ids=[456])
+    assert len(deltas_with) > 0
+
+
+def test_feed_token_ids_do_not_affect_parsing():
+    parser_no_ids = SimpleJsonToolParser()
+    parser_with_ids = SimpleJsonToolParser()
+    text = '{"name": "get_weather", "arguments": {"city": "Beijing"}}'
+    result_no = parser_no_ids.feed(text)
+    result_with = parser_with_ids.feed(
+        text, current_token_ids=[1, 2, 3], delta_token_ids=[3]
+    )
+    assert len(result_no) == len(result_with)
+    assert len(result_no) > 0
+    assert (
+        result_no[0]["tool_calls"][0]["function"]["name"]
+        == result_with[0]["tool_calls"][0]["function"]["name"]
+    )
+
+
+def test_parser_uses_token_ids_for_detection():
+    class TokenIdParser(BaseToolParser):
+        def __init__(self, tools=None, tool_choice="auto"):
+            super().__init__(tools, tool_choice)
+            self._detections = 0
+
+        def feed(self, body, current_token_ids=None, delta_token_ids=None):
+            if current_token_ids and 999 in current_token_ids:
+                self._detections += 1
+            return []
+
+        def parse_complete(self, body):
+            return None
+
+        @property
+        def has_tool_calls(self):
+            return self._detections > 0
+
+    parser = TokenIdParser()
+    parser.feed("hello", current_token_ids=[1, 999, 3])
+    assert parser.has_tool_calls

@@ -113,9 +113,10 @@ class OpenAIResponseBuilder(ResponseBuilder):
             )
         ]
 
-    def format_chunk(self, token: str, body: str) -> List[str]:
+    def format_chunk(self, token: str, **kwargs) -> List[str]:
+        body = kwargs.get("body", "")
         if self._parser is not None:
-            return self._format_tool_chunk(body)
+            return self._format_tool_chunk(body, **kwargs)
 
         return [
             sse_event(
@@ -135,8 +136,12 @@ class OpenAIResponseBuilder(ResponseBuilder):
             )
         ]
 
-    def _format_tool_chunk(self, body: str) -> List[str]:
-        deltas = self._parser.feed(body)
+    def _format_tool_chunk(self, body: str, **kwargs) -> List[str]:
+        deltas = self._parser.feed(
+            body,
+            current_token_ids=kwargs.get("current_token_ids"),
+            delta_token_ids=kwargs.get("delta_token_ids"),
+        )
         events: List[str] = []
         for d in deltas:
             if "content" in d:

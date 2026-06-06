@@ -78,11 +78,13 @@ class ResponseBuilder(ABC):
         """SSE events that open the stream."""
 
     @abstractmethod
-    def format_chunk(self, token: str, body: str) -> List[str]:
+    def format_chunk(self, token: str, **kwargs) -> List[str]:
         """SSE events for a single generated token.
 
-        Receives the current token and the full accumulated *body* so
-        that tool-call parsers can re-parse the complete text each step.
+        ``body`` (the full accumulated text so far) is always provided
+        as a keyword argument. Additional keyword arguments such as
+        ``current_token_ids`` and ``delta_token_ids`` may be included
+        for tool parsers that need token-level information.
         Returns a list of SSE event strings (may be empty).
         """
 
@@ -142,15 +144,24 @@ class ProtocolHandler:
             body = ""
             yielded = ""
             matched = None
+            token_ids: List[int] = []
             async for token in agen:
                 body += token
+
+                new_ids = self.engine.tokenizer.encode(token)
+                token_ids.extend(new_ids)
 
                 matched = checker.check(body)
                 if matched:
                     break
 
                 ctx.completion_tokens += 1
-                for event in self.builder.format_chunk(token, body):
+                for event in self.builder.format_chunk(
+                    token,
+                    body=body,
+                    current_token_ids=token_ids,
+                    delta_token_ids=new_ids,
+                ):
                     yield event
                 yielded += token
 

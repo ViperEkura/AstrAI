@@ -73,7 +73,7 @@ class AnthropicResponseBuilder(ResponseBuilder):
             ),
         ]
 
-    def format_chunk(self, token: str, body: str) -> List[str]:
+    def format_chunk(self, token: str, **kwargs) -> List[str]:
         return [
             sse_event(
                 {

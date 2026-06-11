@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--label_smoothing",
         type=float,
-        default=0.05,
+        default=0.0,
         help="cross_entropy function label smoothing parameter",
     )
     parser.add_argument(
@@ -214,6 +214,12 @@ def parse_args() -> argparse.Namespace:
         choices=["spawn", "fork", "forkserver"],
         help="Multiprocessing start method.",
     )
+    parser.add_argument(
+        "--neftune_alpha",
+        type=float,
+        default=0.0,
+        help="NEFTune noise alpha (0=disabled, typical: 5.0).",
+    )
 
     args = parser.parse_args()
 
@@ -293,6 +299,7 @@ def train(
     master_addr: str,
     master_port: str,
     start_method: str,
+    neftune_alpha: float,
 ):
     assert train_type in ["seq", "sft", "dpo", "grpo"]
     assert os.path.exists(param_path)
@@ -385,6 +392,7 @@ def train(
         gradient_checkpointing_modules=grad_ckpt_modules,
         executor_kwargs=executor_kwargs,
         extra_kwargs=strategy_kwargs,
+        neftune_alpha=neftune_alpha,
     )
 
     trainer = Trainer(train_config)

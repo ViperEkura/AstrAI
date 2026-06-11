@@ -63,6 +63,7 @@ class TrainContextBuilder:
 
         model = cfg.model_fn()
         model = model.to(device=device)
+        model.embed_tokens.neftune_noise_alpha = cfg.neftune_alpha
 
         model_config = {}
         if self._resume_dir:

@@ -128,6 +128,10 @@ class TrainConfig(BaseConfig):
         default=1000,
         metadata={"help": "Number of optimizer steps between validation runs."},
     )
+    neftune_alpha: float = field(
+        default=0.0,
+        metadata={"help": "NEFTune noise alpha (0=disabled, typical: 5.0)."},
+    )
 
     executor_kwargs: dict = field(
         default_factory=dict,

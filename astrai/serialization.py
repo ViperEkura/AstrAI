@@ -3,7 +3,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
 import safetensors.torch as st
 import torch
@@ -180,3 +180,22 @@ class Checkpoint:
             extra=extra,
             config=config,
         )
+
+    @classmethod
+    def load_any(cls, save_dir: str, broadcast: bool = False) -> Optional["Checkpoint"]:
+        save_path = Path(save_dir)
+        meta_path = save_path / _META_FILE
+        weights_path = save_path / _WEIGHTS_FILE
+
+        if meta_path.exists():
+            return cls.load(save_dir, broadcast=broadcast)
+
+        if weights_path.exists():
+            state_dict = load_state_dict(weights_path, broadcast=broadcast)
+            config = {}
+            config_path = save_path / _CONFIG_FILE
+            if config_path.exists():
+                config = load_json(config_path, broadcast)
+            return cls(state_dict=state_dict, config=config)
+
+        return None

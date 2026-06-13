@@ -12,7 +12,7 @@ from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import BaseExecutor, ExecutorFactory
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
-from astrai.serialization import Checkpoint, load_json, load_model_weights
+from astrai.serialization import Checkpoint, load_json
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 
 
@@ -83,21 +83,15 @@ class TrainContextBuilder:
             executor=executor,
         )
 
-        if self._resume_dir is not None:
-            resume_path = Path(self._resume_dir)
-            if (resume_path / "meta.json").exists():
-                checkpoint = Checkpoint.load(self._resume_dir)
-                state_dict = checkpoint.state_dict
+        if self._resume_dir:
+            checkpoint = Checkpoint.load_any(self._resume_dir)
+            if checkpoint is not None:
+                model.load_state_dict(checkpoint.state_dict, strict=False)
                 if checkpoint.config:
                     context.model_config = checkpoint.config
-            else:
-                checkpoint = None
-                state_dict = load_model_weights(self._resume_dir)
-            model.load_state_dict(state_dict, strict=False)
-            if checkpoint is not None:
-                context.epoch = cfg.start_epoch
-                context.iteration = cfg.start_batch
-            context.checkpoint = checkpoint
+                context.epoch = checkpoint.epoch or cfg.start_epoch
+                context.iteration = checkpoint.iteration or cfg.start_batch
+                context.checkpoint = checkpoint
 
         if cfg.lora is not None:
             inject_lora(

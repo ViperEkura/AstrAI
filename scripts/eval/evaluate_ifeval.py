@@ -343,14 +343,20 @@ def verify_response(response: str, instruction_id: str, kwargs: dict) -> Optiona
 
 def generate_one(
     engine: InferenceEngine,
+    tokenizer: AutoTokenizer,
     prompt: str,
     max_tokens: int,
     temperature: float,
     top_p: float,
     top_k: int,
 ) -> str:
+    formatted = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     output = engine.generate(
-        prompt=prompt,
+        prompt=formatted,
         stream=False,
         max_tokens=max_tokens,
         temperature=temperature,
@@ -364,6 +370,7 @@ def generate_one(
 
 def evaluate(
     engine: InferenceEngine,
+    tokenizer: AutoTokenizer,
     problems: List[dict],
     max_tokens: int,
     temperature: float,
@@ -385,7 +392,7 @@ def evaluate(
         samples = []
         for _ in range(num_samples):
             response = generate_one(
-                engine, prompt, max_tokens, temperature, top_p, top_k
+                engine, tokenizer, prompt, max_tokens, temperature, top_p, top_k
             )
             samples.append(response)
 
@@ -536,6 +543,7 @@ def main():
     model = AutoModel.from_pretrained(args.param_path)
     tokenizer = AutoTokenizer.from_pretrained(args.param_path)
     model.to(device="cuda", dtype=torch.bfloat16)
+    model.eval()
 
     engine = InferenceEngine(
         model=model,
@@ -545,6 +553,7 @@ def main():
 
     results = evaluate(
         engine=engine,
+        tokenizer=tokenizer,
         problems=problems,
         max_tokens=args.max_tokens,
         temperature=args.temperature,

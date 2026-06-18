@@ -6,8 +6,7 @@ pipeline later flattens the result into contiguous tensors.
 """
 
 from abc import ABC, abstractmethod
-from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from astrai.factory import BaseFactory
 
@@ -53,6 +52,15 @@ class SimplePacking(PackingStrategy):
 
 @PackingStrategyFactory.register("bfd")
 class BFDPacking(PackingStrategy):
+    """Best-Fit Decreasing bin packing.
+
+    Assigns sequences to bins using a best-fit heuristic (sorted by
+    decreasing length) and concatenates sequences within each bin into
+    a single packed sequence.  Packed sequences are truncated to
+    *max_packed_len* so that each packed bin fits within one context
+    window during training.
+    """
+
     def apply(
         self,
         keys: Dict[str, List[List[int]]],
@@ -62,24 +70,40 @@ class BFDPacking(PackingStrategy):
         sequences = keys.get("sequence", [])
         if not sequences:
             return keys
-        plan = self._plan(sequences, max_packed_len)
-        reordered: dict = defaultdict(list)
-        for orig_idx, _ in plan:
-            for k, vals in keys.items():
-                reordered[k].append(
-                    _truncate(vals[orig_idx], max_packed_len, truncation_mode)
+        bins = self._plan(sequences, max_packed_len, truncation_mode)
+
+        packed: Dict[str, List[List[int]]] = {}
+        for k, vals in keys.items():
+            packed[k] = [
+                _truncate(
+                    self._concat_bin(vals, bin_indices),
+                    max_packed_len,
+                    truncation_mode,
                 )
-        return dict(reordered)
+                for bin_indices in bins
+            ]
+        return packed
 
     @staticmethod
-    def _plan(sequences: List[List[int]], max_packed_len: int) -> List[Tuple[int, int]]:
+    def _concat_bin(vals: List[List[int]], indices: List[int]) -> List[int]:
+        result: List[int] = []
+        for i in indices:
+            result.extend(vals[i])
+        return result
+
+    @staticmethod
+    def _plan(
+        sequences: List[List[int]], max_packed_len: int, truncation_mode: str
+    ) -> List[List[int]]:
         n = len(sequences)
         order = sorted(range(n), key=lambda i: len(sequences[i]), reverse=True)
         bins: List[List[int]] = []
         bin_lengths: List[int] = []
 
         for orig_idx in order:
-            seq_len = min(len(sequences[orig_idx]), max_packed_len)
+            seq_len = len(
+                _truncate(sequences[orig_idx], max_packed_len, truncation_mode)
+            )
             best_bin = None
             best_remain = max_packed_len + 1
             for i, bl in enumerate(bin_lengths):
@@ -94,8 +118,4 @@ class BFDPacking(PackingStrategy):
                 bins.append([orig_idx])
                 bin_lengths.append(seq_len)
 
-        plan: List[Tuple[int, int]] = []
-        for bin_indices in bins:
-            for orig_idx in bin_indices:
-                plan.append((orig_idx, min(len(sequences[orig_idx]), max_packed_len)))
-        return plan
+        return bins

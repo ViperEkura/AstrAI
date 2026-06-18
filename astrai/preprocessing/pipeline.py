@@ -7,6 +7,7 @@ dispatched by configuration keys.
 """
 
 import json
+import logging
 import os
 from collections import defaultdict
 from itertools import chain
@@ -21,6 +22,8 @@ from astrai.preprocessing.packing import PackingStrategyFactory
 from astrai.preprocessing.position_id import PositionIdStrategyFactory
 from astrai.preprocessing.writer import StoreWriterFactory
 from astrai.tokenize import AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 _STR_TO_DTYPE: dict[str, torch.dtype] = {
     "bool": torch.bool,
@@ -88,7 +91,13 @@ class Pipeline:
             if pp.max_items and count >= pp.max_items:
                 break
 
-            result = self.transform(item)
+            try:
+                result = self.transform(item)
+            except Exception:
+                logger.warning(
+                    "Failed to process item #%d, skipping", count + 1, exc_info=True
+                )
+                continue
             if result is None:
                 continue
 
@@ -105,7 +114,7 @@ class Pipeline:
                 continue
 
             bucket = domains[domain]
-            self._align_bucket(bucket, result, ids, is_multi)
+            self._align_bucket(bucket, result, ids)
             for key, val in result.items():
                 bucket[key].append(val)
 
@@ -130,16 +139,12 @@ class Pipeline:
         return []
 
     @staticmethod
-    def _align_bucket(bucket: dict, result: dict, ids: list, is_multi: bool):
+    def _align_bucket(bucket: dict, result: dict, ids: list):
         """Pad previously-accumulated keys that are missing from *result*."""
         for key in list(bucket.keys()):
             if key in result:
                 continue
-            if is_multi:
-                pad = bucket[key][-1] if bucket[key] else [1] * len(ids)
-                bucket[key].append(pad)
-            else:
-                bucket[key].append([1] * len(ids))
+            bucket[key].append([1] * len(ids))
 
     def _iter_items(self):
         for path in self.paths:

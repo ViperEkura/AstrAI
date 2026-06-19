@@ -15,28 +15,34 @@ from astrai.dataset.storage import (
 )
 
 
+def _rand_seq(length, vocab=1000):
+    return torch.randint(0, vocab, (length,), dtype=torch.int64)
+
+
+def _make_seq_dataset(
+    test_dir, name="data", seq_length=200, train_type="seq", data=None, **load_kwargs
+):
+    if data is None:
+        data = {"sequence": [_rand_seq(seq_length)]}
+    save_h5(test_dir, name, data)
+    return DatasetFactory.load(
+        train_type,
+        test_dir,
+        window_size=load_kwargs.pop("window_size", 64),
+        **load_kwargs,
+    )
+
+
 def test_dataset_loader_random_paths(base_test_env):
     """Test dataset loader with multiple random paths"""
     test_dir = base_test_env["test_dir"]
 
-    # Create multiple mmap dataset directories with random data
     num_files = np.random.randint(2, 5)
-
     for i in range(num_files):
         seq_length = np.random.randint(200, 400)
-        dummy_data = {
-            "sequence": [
-                torch.randint(0, 1000, (seq_length,), dtype=torch.int64)
-                for _ in range(10)
-            ],
-        }
-        save_h5(test_dir, f"data_{i}", dummy_data)
-
-        # Test loading with multiple paths
-        loaded_dataset = DatasetFactory.load(
-            train_type="seq",
-            load_path=test_dir,
-            window_size=64,
+        dummy_data = {"sequence": [_rand_seq(seq_length) for _ in range(10)]}
+        loaded_dataset = _make_seq_dataset(
+            test_dir, f"data_{i}", seq_length, data=dummy_data
         )
         assert loaded_dataset is not None
         assert len(loaded_dataset) > 0
@@ -54,23 +60,15 @@ def test_dpo_strategy_with_random_data(base_test_env):
     """Test DPO strategy with randomized preference data"""
     test_dir = base_test_env["test_dir"]
 
-    # Create DPO-style data with memory mapping format
     seq_length = np.random.randint(100, 200)
-
     dummy_data = {
-        "chosen": [torch.randint(0, 1000, (seq_length,), dtype=torch.int64)],
-        "rejected": [torch.randint(0, 1000, (seq_length,), dtype=torch.int64)],
+        "chosen": [_rand_seq(seq_length)],
+        "rejected": [_rand_seq(seq_length)],
         "chosen_mask": [torch.ones(seq_length, dtype=torch.bool)],
         "rejected_mask": [torch.ones(seq_length, dtype=torch.bool)],
     }
-
-    save_h5(test_dir, "dpo_data", dummy_data)
-
-    # Load DPO dataset
-    dpo_dataset = DatasetFactory.load(
-        train_type="dpo",
-        load_path=test_dir,
-        window_size=64,
+    dpo_dataset = _make_seq_dataset(
+        test_dir, "dpo_data", seq_length, train_type="dpo", data=dummy_data
     )
 
     assert dpo_dataset is not None
@@ -92,22 +90,14 @@ def test_sft_dataset_with_random_data(base_test_env):
     """Test SFT dataset with random data"""
     test_dir = base_test_env["test_dir"]
 
-    # Create SFT-style data with memory mapping format
     seq_length = np.random.randint(100, 200)
-
     dummy_data = {
-        "sequence": [torch.randint(0, 1000, (seq_length,), dtype=torch.int64)],
+        "sequence": [_rand_seq(seq_length)],
         "loss_mask": [torch.ones(seq_length, dtype=torch.bool)],
         "position_ids": [torch.arange(seq_length, dtype=torch.int32)],
     }
-
-    save_h5(test_dir, "sft_data", dummy_data)
-
-    # Load SFT dataset
-    sft_dataset = DatasetFactory.load(
-        train_type="sft",
-        load_path=test_dir,
-        window_size=64,
+    sft_dataset = _make_seq_dataset(
+        test_dir, "sft_data", seq_length, train_type="sft", data=dummy_data
     )
 
     assert sft_dataset is not None
@@ -128,25 +118,11 @@ def test_dataset_with_custom_stride(base_test_env):
     """Test dataset with custom stride parameter"""
     test_dir = base_test_env["test_dir"]
 
-    # Create test data
-    seq_length = 200
-    dummy_data = {
-        "sequence": [torch.randint(0, 1000, (seq_length,), dtype=torch.int64)],
-    }
-
-    save_h5(test_dir, "stride_test_data", dummy_data)
-
-    # Test with custom stride
     custom_stride = 32
-    dataset = DatasetFactory.load(
-        train_type="seq", load_path=test_dir, window_size=64, stride=custom_stride
-    )
-
+    dataset = _make_seq_dataset(test_dir, "stride_test_data", stride=custom_stride)
     assert dataset is not None
     assert len(dataset) > 0
 
-    # With stride 32 and window 64 on 200 length data, we should get more samples
-    # than with default stride (which equals window size)
     default_stride_dataset = DatasetFactory.load(
         train_type="seq",
         load_path=test_dir,
@@ -157,25 +133,11 @@ def test_dataset_with_custom_stride(base_test_env):
 
 
 def test_dataset_count_property(base_test_env):
-    """Test the count property returns correct raw token count"""
     test_dir = base_test_env["test_dir"]
-
-    seq_length = 200
-    dummy_data = {
-        "sequence": [torch.randint(0, 1000, (seq_length,), dtype=torch.int64)],
-    }
-
-    save_h5(test_dir, "count_test_data", dummy_data)
-
-    dataset = DatasetFactory.load(
-        train_type="seq",
-        load_path=test_dir,
-        window_size=64,
-    )
-
-    assert dataset.count == seq_length
-    assert dataset.count > len(dataset)  # raw tokens > windows
-    assert len(dataset) == (seq_length - 1 - 64) // 64 + 1
+    dataset = _make_seq_dataset(test_dir, "count_test_data")
+    assert dataset.count == 200
+    assert dataset.count > len(dataset)
+    assert len(dataset) == (200 - 1 - 64) // 64 + 1
 
 
 def test_empty_dataset_count():
@@ -186,17 +148,10 @@ def test_empty_dataset_count():
 
 
 def test_dataset_too_short_for_window(base_test_env):
-    """Dataset shorter than window_size returns __len__ == 0"""
     test_dir = base_test_env["test_dir"]
-    seq_length = 30
-    save_h5(
-        test_dir,
-        "short",
-        {"sequence": [torch.randint(0, 1000, (seq_length,), dtype=torch.int64)]},
-    )
-    dataset = DatasetFactory.load("seq", test_dir, window_size=64)
+    dataset = _make_seq_dataset(test_dir, "short", seq_length=30)
     assert len(dataset) == 0
-    assert dataset.count == seq_length
+    assert dataset.count == 30
 
 
 def test_unloaded_dataset_getitem_raises():
@@ -220,12 +175,8 @@ def test_store_unloaded_len():
 
 
 def test_store_fetch_begin_equals_end(base_test_env):
-    """Store.fetch with begin == end returns empty tensor"""
     test_dir = base_test_env["test_dir"]
-    dummy = {"sequence": [torch.randint(0, 1000, (100,), dtype=torch.int64)]}
-    save_h5(test_dir, "empty_fetch", dummy)
-
-    dataset = DatasetFactory.load("seq", test_dir, window_size=32)
+    dataset = _make_seq_dataset(test_dir, "empty_fetch", seq_length=100, window_size=32)
     result = dataset.storage.fetch(10, 10, "sequence")
     assert result.numel() == 0
 
@@ -299,12 +250,8 @@ def test_save_load_bin_roundtrip(base_test_env):
 
 
 def test_mmap_store_load_and_fetch(base_test_env):
-    """MmapStore loads bin data and fetches correctly"""
     test_dir = base_test_env["test_dir"]
-
-    data = {
-        "sequence": [torch.randint(0, 1000, (200,), dtype=torch.int64)],
-    }
+    data = {"sequence": [_rand_seq(200)]}
     save_bin(test_dir, data)
 
     store = StoreFactory.create("bin")
@@ -317,14 +264,9 @@ def test_mmap_store_load_and_fetch(base_test_env):
 
 
 def test_mmap_dataset_load(base_test_env):
-    """DatasetFactory.load auto-detects bin format"""
     test_dir = base_test_env["test_dir"]
-
-    data = {
-        "sequence": [torch.randint(0, 1000, (200,), dtype=torch.int64)],
-    }
+    data = {"sequence": [_rand_seq(200)]}
     save_bin(test_dir, data)
-
     dataset = DatasetFactory.load("seq", test_dir, window_size=64)
     assert len(dataset) > 0
     assert dataset.count == 200
@@ -348,19 +290,16 @@ def test_normalize_mixed_empty_key():
 
 
 def test_grpo_dataset_dtype(base_test_env):
-    """GRPODataset returns correct dtypes"""
     test_dir = base_test_env["test_dir"]
-
-    seq_len = 100
-    data = {
-        "prompts": [torch.randint(0, 100, (seq_len,), dtype=torch.int32)],
-        "responses": [torch.randint(0, 100, (seq_len,), dtype=torch.int32)],
-        "masks": [torch.ones(seq_len, dtype=torch.int32)],
-        "rewards": [torch.ones(seq_len, dtype=torch.float32)],
+    dummy_data = {
+        "prompts": [torch.randint(0, 100, (100,), dtype=torch.int32)],
+        "responses": [torch.randint(0, 100, (100,), dtype=torch.int32)],
+        "masks": [torch.ones(100, dtype=torch.int32)],
+        "rewards": [torch.ones(100, dtype=torch.float32)],
     }
-    save_h5(test_dir, "grpo_dtype", data)
-
-    dataset = DatasetFactory.load("grpo", test_dir, window_size=32)
+    dataset = _make_seq_dataset(
+        test_dir, "grpo_dtype", train_type="grpo", data=dummy_data, window_size=32
+    )
     item = dataset[0]
 
     assert item["prompts"].dtype == torch.long
@@ -370,18 +309,16 @@ def test_grpo_dataset_dtype(base_test_env):
 
 
 def test_grpo_dataset_load(base_test_env):
-    """GRPODataset loads and returns correct keys"""
     test_dir = base_test_env["test_dir"]
-    seq_len = 200
-    data = {
-        "prompts": [torch.randint(0, 1000, (seq_len,), dtype=torch.int64)],
-        "responses": [torch.randint(0, 1000, (seq_len,), dtype=torch.int64)],
-        "masks": [torch.ones(seq_len, dtype=torch.int64)],
-        "rewards": [torch.rand(seq_len, dtype=torch.float32)],
+    dummy_data = {
+        "prompts": [_rand_seq(200)],
+        "responses": [_rand_seq(200)],
+        "masks": [torch.ones(200, dtype=torch.int64)],
+        "rewards": [torch.rand(200, dtype=torch.float32)],
     }
-    save_h5(test_dir, "grpo_test", data)
-
-    dataset = DatasetFactory.load("grpo", test_dir, window_size=64)
+    dataset = _make_seq_dataset(
+        test_dir, "grpo_test", train_type="grpo", data=dummy_data
+    )
     assert len(dataset) > 0
     item = dataset[0]
     assert "prompts" in item
@@ -400,7 +337,6 @@ def test_detect_format_bin_dir(base_test_env):
 
 
 def test_store_fetch_multi_key(base_test_env):
-    """Store.fetch with List[str] returns Dict[str, Tensor]"""
     test_dir = base_test_env["test_dir"]
     save_h5(
         test_dir,
@@ -410,7 +346,6 @@ def test_store_fetch_multi_key(base_test_env):
             "loss_mask": [torch.ones(100, dtype=torch.int64)],
         },
     )
-
     store = StoreFactory.create("h5")
     store.load(test_dir)
     result = store.fetch(10, 20, ["sequence", "loss_mask"])
@@ -420,10 +355,8 @@ def test_store_fetch_multi_key(base_test_env):
 
 
 def test_store_fetch_out_of_bounds(base_test_env):
-    """Store.fetch raises ValueError for out-of-bounds indices"""
     test_dir = base_test_env["test_dir"]
     save_h5(test_dir, "bounds", {"sequence": [torch.randint(0, 100, (50,))]})
-
     store = StoreFactory.create("h5")
     store.load(test_dir)
     with pytest.raises(ValueError, match="out of bounds"):
@@ -435,10 +368,7 @@ def test_store_fetch_out_of_bounds(base_test_env):
 
 
 def test_dataset_load_explicit_storage_type(base_test_env):
-    """DatasetFactory.load with explicit storage_type bypasses auto-detect"""
     test_dir = base_test_env["test_dir"]
-    save_h5(test_dir, "explicit", {"sequence": [torch.randint(0, 100, (200,))]})
-
-    dataset = DatasetFactory.load("seq", test_dir, window_size=64, storage_type="h5")
+    dataset = _make_seq_dataset(test_dir, "explicit", storage_type="h5")
     assert len(dataset) > 0
     assert dataset.count == 200

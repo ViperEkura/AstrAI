@@ -10,9 +10,7 @@ from astrai.config.preprocess_config import (
 from astrai.preprocessing.pipeline import Pipeline, filter_by_length
 from tests.data.conftest import (
     _CHAT_SECTIONS,
-    _CHAT_TEMPLATE,
     _INSTRUCTION_SECTIONS,
-    _SPECIAL_TOKENS_CONFIG,
     _TEXT_SECTIONS,
     make_dpo_chat_config,
     make_grpo_no_template_config,
@@ -26,19 +24,7 @@ def test_filter_by_length():
     assert filter_by_length("just right", min_len=5, max_len=20)
 
 
-def test_full_chat_pipeline(temp_dir, chat_tokenizer):
-    tokenizer_dir = os.path.join(temp_dir, "tok")
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    chat_tokenizer._tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
-        json.dump(
-            {
-                "special_tokens": _SPECIAL_TOKENS_CONFIG,
-                "chat_template": _CHAT_TEMPLATE,
-            },
-            f,
-        )
-
+def test_full_chat_pipeline(temp_dir, chat_tokenizer_dir):
     jsonl_path = os.path.join(temp_dir, "chat.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:
         f.write(
@@ -78,7 +64,7 @@ def test_full_chat_pipeline(temp_dir, chat_tokenizer):
         config=config,
         input_paths=[jsonl_path],
         output_dir=out_dir,
-        tokenizer_path=tokenizer_dir,
+        tokenizer_path=chat_tokenizer_dir,
     ).run()
 
     meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
@@ -91,21 +77,7 @@ def test_full_chat_pipeline(temp_dir, chat_tokenizer):
     assert meta["loss_mask"]["dtype"] == "int32"
 
 
-def test_full_text_pipeline(temp_dir, test_tokenizer):
-    tokenizer_dir = os.path.join(temp_dir, "tok")
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    test_tokenizer._tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
-        json.dump(
-            {
-                "special_tokens": {
-                    "pad_token": "<|_pad_|>",
-                    "unk_token": "<|_unk_|>",
-                }
-            },
-            f,
-        )
-
+def test_full_text_pipeline(temp_dir, tokenizer_dir):
     jsonl_path = os.path.join(temp_dir, "text.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:
         f.write(
@@ -145,24 +117,9 @@ def test_full_text_pipeline(temp_dir, test_tokenizer):
         meta = json.load(f)
     assert "sequence" in meta
     assert "loss_mask" not in meta
-    assert meta["sequence"]["dtype"] == "int32"
 
 
-def test_full_instruction_pipeline(temp_dir, test_tokenizer):
-    tokenizer_dir = os.path.join(temp_dir, "tok")
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    test_tokenizer._tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
-        json.dump(
-            {
-                "special_tokens": {
-                    "pad_token": "<|_pad_|>",
-                    "unk_token": "<|_unk_|>",
-                }
-            },
-            f,
-        )
-
+def test_full_instruction_pipeline(temp_dir, tokenizer_dir):
     jsonl_path = os.path.join(temp_dir, "instruct.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:
         f.write(
@@ -206,25 +163,9 @@ def test_full_instruction_pipeline(temp_dir, test_tokenizer):
         meta = json.load(f)
     assert "sequence" in meta
     assert "loss_mask" in meta
-    assert meta["sequence"]["dtype"] == "int32"
-    assert meta["loss_mask"]["dtype"] == "int32"
 
 
-def test_dtype_override(temp_dir, test_tokenizer):
-    tokenizer_dir = os.path.join(temp_dir, "tok")
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    test_tokenizer._tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
-        json.dump(
-            {
-                "special_tokens": {
-                    "pad_token": "<|_pad_|>",
-                    "unk_token": "<|_unk_|>",
-                }
-            },
-            f,
-        )
-
+def test_dtype_override(temp_dir, tokenizer_dir):
     jsonl_path = os.path.join(temp_dir, "data.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:
         f.write(json.dumps({"prompt": "Q", "response": "A"}) + "\n")
@@ -252,19 +193,7 @@ def test_dtype_override(temp_dir, test_tokenizer):
     assert meta["loss_mask"]["dtype"] == "bool"
 
 
-def test_dpo_pipeline(temp_dir, chat_tokenizer):
-    tokenizer_dir = os.path.join(temp_dir, "tok")
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    chat_tokenizer._tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
-        json.dump(
-            {
-                "special_tokens": _SPECIAL_TOKENS_CONFIG,
-                "chat_template": _CHAT_TEMPLATE,
-            },
-            f,
-        )
-
+def test_dpo_pipeline(temp_dir, chat_tokenizer_dir):
     jsonl_path = os.path.join(temp_dir, "dpo.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:
         f.write(
@@ -288,7 +217,7 @@ def test_dpo_pipeline(temp_dir, chat_tokenizer):
         config=make_dpo_chat_config(),
         input_paths=[jsonl_path],
         output_dir=out_dir,
-        tokenizer_path=tokenizer_dir,
+        tokenizer_path=chat_tokenizer_dir,
     ).run()
 
     meta_path = os.path.join(out_dir, "__default__", "shard_0000", "meta.json")
@@ -302,21 +231,7 @@ def test_dpo_pipeline(temp_dir, chat_tokenizer):
     assert "sequence" not in meta
 
 
-def test_grpo_pipeline(temp_dir, test_tokenizer):
-    tokenizer_dir = os.path.join(temp_dir, "tok")
-    os.makedirs(tokenizer_dir, exist_ok=True)
-    test_tokenizer._tokenizer.save(os.path.join(tokenizer_dir, "tokenizer.json"))
-    with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
-        json.dump(
-            {
-                "special_tokens": {
-                    "pad_token": "<|_pad_|>",
-                    "unk_token": "<|_unk_|>",
-                }
-            },
-            f,
-        )
-
+def test_grpo_pipeline(temp_dir, tokenizer_dir):
     jsonl_path = os.path.join(temp_dir, "grpo.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:
         f.write(

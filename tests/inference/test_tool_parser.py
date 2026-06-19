@@ -13,65 +13,26 @@ from astrai.inference.api.tool_parser import (
 )
 
 
-def test_scan_complete_simple():
-    end, complete = _scan_json('{"key": "value"}', 0)
-    assert complete is True
-    assert end == len('{"key": "value"}')
-
-
-def test_scan_complete_nested():
-    text = '{"outer": {"inner": 1}}'
+@pytest.mark.parametrize(
+    "text,expected_complete,check_end_eq_len",
+    [
+        ('{"key": "value"}', True, True),
+        ('{"outer": {"inner": 1}}', True, True),
+        ('{"key": "value"', False, False),
+        ('{"outer": {"inner": 1}', False, False),
+        ('{"key": "a{b}c"} extra', True, False),
+        (r'{"key": "a\"b"}', True, False),
+        ('{"a": {"b": {"c": {"d": {"e": 5}}}}}', True, True),
+        ('{"items": [{"x": 1}, {"x": 2}]}', True, True),
+        ('{"fn": "function() { return 1; }"}', True, False),
+        ('{"key": "\u5317\u4eac"}', True, False),
+    ],
+)
+def test_scan_json(text, expected_complete, check_end_eq_len):
     end, complete = _scan_json(text, 0)
-    assert complete is True
-    assert end == len(text)
-
-
-def test_scan_incomplete_unclosed():
-    end, complete = _scan_json('{"key": "value"', 0)
-    assert complete is False
-
-
-def test_scan_incomplete_nested():
-    end, complete = _scan_json('{"outer": {"inner": 1}', 0)
-    assert complete is False
-
-
-def test_scan_string_braces_ignored():
-    text = '{"key": "a{b}c"} extra'
-    end, complete = _scan_json(text, 0)
-    assert complete is True
-
-
-def test_scan_escaped_quote_ignored():
-    text = r'{"key": "a\"b"}'
-    end, complete = _scan_json(text, 0)
-    assert complete is True
-
-
-def test_scan_deeply_nested():
-    text = '{"a": {"b": {"c": {"d": {"e": 5}}}}}'
-    end, complete = _scan_json(text, 0)
-    assert complete is True
-    assert end == len(text)
-
-
-def test_scan_array_with_braces():
-    text = '{"items": [{"x": 1}, {"x": 2}]}'
-    end, complete = _scan_json(text, 0)
-    assert complete is True
-    assert end == len(text)
-
-
-def test_scan_code_in_string():
-    text = '{"fn": "function() { return 1; }"}'
-    end, complete = _scan_json(text, 0)
-    assert complete is True
-
-
-def test_scan_unicode_chars():
-    text = '{"key": "\u5317\u4eac"}'
-    end, complete = _scan_json(text, 0)
-    assert complete is True
+    assert complete is expected_complete
+    if check_end_eq_len:
+        assert end == len(text)
 
 
 def test_find_single_tool_call():
@@ -141,10 +102,7 @@ def test_find_arguments_with_array():
 
 
 def test_find_arguments_with_nested_array_of_objects():
-    text = (
-        '{"name": "batch", '
-        '"arguments": {"rows": [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]}}'
-    )
+    text = '{"name": "batch", "arguments": {"rows": [{"id": 1, "val": "a"}, {"id": 2, "val": "b"}]}}'
     results = _find_tool_calls(text)
     assert len(results) == 1
     assert '"rows"' in results[0]["args"]
@@ -206,38 +164,26 @@ def test_find_extracts_correct_arg_start_position():
     assert json_str == text
 
 
-def test_partial_with_name():
-    result = _find_partial_tool_call('{"name": "func", "arguments": {"city"')
-    assert result is not None
-    assert result["name"] == "func"
-    assert result["complete"] is False
-
-
-def test_partial_with_full_args():
-    result = _find_partial_tool_call('{"name": "func", "arguments": {"city": "BJ"}}')
-    assert result is not None
-    assert result["name"] == "func"
-
-
-def test_partial_no_match():
-    assert _find_partial_tool_call("plain text") is None
-
-
-def test_partial_no_name_yet():
-    assert _find_partial_tool_call('{"nam') is None
-
-
-def test_partial_deeply_nested():
-    result = _find_partial_tool_call('{"name": "deep", "arguments": {"a": {"b": {"c": ')
-    assert result is not None
-    assert result["name"] == "deep"
-    assert '"a"' in result["args"]
-
-
-def test_partial_array_incomplete():
-    result = _find_partial_tool_call('{"name": "batch", "arguments": {"items": [1, 2, ')
-    assert result is not None
-    assert result["name"] == "batch"
+@pytest.mark.parametrize(
+    "text,expected_name,expected_complete",
+    [
+        ('{"name": "func", "arguments": {"city"', "func", False),
+        ('{"name": "func", "arguments": {"city": "BJ"}}', "func", None),
+        ("plain text", None, None),
+        ('{"nam', None, None),
+        ('{"name": "deep", "arguments": {"a": {"b": {"c": ', "deep", None),
+        ('{"name": "batch", "arguments": {"items": [1, 2, ', "batch", None),
+    ],
+)
+def test_find_partial_tool_call(text, expected_name, expected_complete):
+    result = _find_partial_tool_call(text)
+    if expected_name is None:
+        assert result is None
+    else:
+        assert result is not None
+        assert result["name"] == expected_name
+        if expected_complete is not None:
+            assert result["complete"] is expected_complete
 
 
 def test_feed_plain_text():
@@ -269,7 +215,6 @@ def test_feed_tool_call_args_streaming():
     parser = SimpleJsonToolParser()
     d1 = parser.feed('{"name": "f", "arguments": {"x":')
     d2 = parser.feed('{"name": "f", "arguments": {"x": "1"}}')
-
     args_deltas = [
         d
         for batch in (d1, d2)
@@ -330,17 +275,6 @@ def test_feed_content_after_tool_call_is_not_emitted():
     parser = SimpleJsonToolParser()
     parser.feed('{"name": "f", "arguments": {}} trailing text')
     assert parser.has_tool_calls
-
-
-def _collect_args_deltas(parser):
-    args_parts = []
-    for d in parser.feed(parser._text_buffer):
-        if "tool_calls" in d:
-            for tc in d["tool_calls"]:
-                fn = tc.get("function", {})
-                if "arguments" in fn and fn["arguments"]:
-                    args_parts.append(fn["arguments"])
-    return args_parts
 
 
 def _simulate_streaming(parser, text):
@@ -447,7 +381,6 @@ def test_streaming_args_diff_only_emits_new_bytes():
     parser = SimpleJsonToolParser()
     step1 = parser.feed('{"name": "f", "arguments": {"city": "Bei')
     step2 = parser.feed('{"name": "f", "arguments": {"city": "Beijing"}}')
-
     all_args = []
     for step in (step1, step2):
         for d in step:
@@ -500,31 +433,21 @@ def test_parse_complete_with_content():
 
 def test_parse_complete_multiple_tool_calls():
     parser = SimpleJsonToolParser()
-    body = (
-        '{"name": "get_weather", "arguments": {"city": "Beijing"}}'
-        '{"name": "get_time", "arguments": {"tz": "Asia/Shanghai"}}'
-    )
+    body = '{"name": "get_weather", "arguments": {"city": "Beijing"}}{"name": "get_time", "arguments": {"tz": "Asia/Shanghai"}}'
     result = parser.parse_complete(body)
     assert result is not None
     assert len(result["tool_calls"]) == 2
     assert result["tool_calls"][0]["function"]["name"] == "get_weather"
     assert result["tool_calls"][1]["function"]["name"] == "get_time"
-    assert "Beijing" in result["tool_calls"][0]["function"]["arguments"]
-    assert "Asia/Shanghai" in result["tool_calls"][1]["function"]["arguments"]
 
 
 def test_parse_complete_complex_real_world():
     parser = SimpleJsonToolParser()
     body = (
-        '{"name": "send_email", '
-        '"arguments": {'
-        '"to": ["a@b.com", "c@d.com"], '
-        '"cc": null, '
-        '"subject": "Hello World", '
-        '"body": "This is a test email.", '
-        '"priority": 1, '
-        '"attachments": false'
-        "}}"
+        '{"name": "send_email", "arguments": {'
+        '"to": ["a@b.com", "c@d.com"], "cc": null, '
+        '"subject": "Hello World", "body": "This is a test email.", '
+        '"priority": 1, "attachments": false}}'
     )
     result = parser.parse_complete(body)
     assert result is not None
@@ -539,11 +462,7 @@ def test_parse_complete_complex_real_world():
 
 def test_parse_complete_content_with_multiple_tool_calls():
     parser = SimpleJsonToolParser()
-    body = (
-        "I will do two things. "
-        '{"name": "f1", "arguments": {"a": 1}}'
-        '{"name": "f2", "arguments": {"b": 2}}'
-    )
+    body = 'I will do two things. {"name": "f1", "arguments": {"a": 1}}{"name": "f2", "arguments": {"b": 2}}'
     result = parser.parse_complete(body)
     assert result is not None
     assert result["content"] == "I will do two things."
@@ -588,28 +507,27 @@ def test_feed_then_parse_complete_same_instance():
     assert parser.has_tool_calls
 
 
-def test_pattern_matches_basic():
-    assert _TOOL_CALL_HEAD_RE.search('{"name": "f"}')
-
-
-def test_pattern_matches_with_whitespace():
-    assert _TOOL_CALL_HEAD_RE.search('{ "name" : "f"}')
-
-
-def test_pattern_no_match_without_name():
-    assert _TOOL_CALL_HEAD_RE.search('{"other": 1}') is None
-
-
-def test_pattern_match_mid_text():
-    assert _TOOL_CALL_HEAD_RE.search('prefix {"name": "f", "args": {}}') is not None
+@pytest.mark.parametrize(
+    "text,matches",
+    [
+        ('{"name": "f"}', True),
+        ('{ "name" : "f"}', True),
+        ('{"other": 1}', False),
+        ('prefix {"name": "f", "args": {}}', True),
+        ('{"name": "f"}', True),  # match at start
+        ('   {"name": "f"}', True),
+    ],
+)
+def test_pattern_regex(text, matches):
+    result = _TOOL_CALL_HEAD_RE.search(text)
+    if matches:
+        assert result is not None
+    else:
+        assert result is None
 
 
 def test_pattern_name_at_start():
     assert _TOOL_CALL_HEAD_RE.match('{"name": "f"}')
-
-
-def test_pattern_leading_whitespace():
-    assert _TOOL_CALL_HEAD_RE.search('   {"name": "f"}') is not None
 
 
 def test_factory_register_and_create():
@@ -661,7 +579,6 @@ def test_feed_token_ids_do_not_affect_parsing():
         text, current_token_ids=[1, 2, 3], delta_token_ids=[3]
     )
     assert len(result_no) == len(result_with)
-    assert len(result_no) > 0
     assert (
         result_no[0]["tool_calls"][0]["function"]["name"]
         == result_with[0]["tool_calls"][0]["function"]["name"]

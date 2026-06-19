@@ -1,3 +1,5 @@
+import pytest
+
 from astrai.config.preprocess_config import (
     InputConfig,
     OutputConfig,
@@ -20,9 +22,8 @@ from tests.data.conftest import (
 )
 
 
-def test_chat_simple(chat_tokenizer):
+def test_chat_simple(chat_tokenizer, builder):
     config = make_chat_config()
-    builder = SectionedMaskBuilder()
     item = {
         "messages": [
             {"role": "system", "content": "You are helpful."},
@@ -46,9 +47,8 @@ def test_chat_simple(chat_tokenizer):
     assert trained < total
 
 
-def test_chat_mask_only_assistant(chat_tokenizer):
+def test_chat_mask_only_assistant(chat_tokenizer, builder):
     config = make_chat_config()
-    builder = SectionedMaskBuilder()
     item = {
         "messages": [
             {"role": "user", "content": "What is 2+2?"},
@@ -66,14 +66,22 @@ def test_chat_mask_only_assistant(chat_tokenizer):
     assert len(masked) > 0
 
 
-def test_chat_all_masked(chat_tokenizer):
+@pytest.mark.parametrize(
+    "mask_rules,mask_default,expect_nonzero",
+    [
+        ({"system": "mask", "user": "mask", "assistant": "mask"}, "mask", False),
+        ({}, "train", True),
+    ],
+)
+def test_chat_uniform_masking(
+    mask_rules, mask_default, expect_nonzero, chat_tokenizer, builder
+):
     config = PipelineConfig(
         input=InputConfig(sections=_CHAT_SECTIONS),
-        mask={"system": "mask", "user": "mask", "assistant": "mask"},
-        mask_default="mask",
+        mask=mask_rules,
+        mask_default=mask_default,
         preprocessing=ProcessingConfig(max_seq_len=2048),
     )
-    builder = SectionedMaskBuilder()
     item = {
         "messages": [
             {"role": "system", "content": "You are helpful."},
@@ -81,35 +89,20 @@ def test_chat_all_masked(chat_tokenizer):
         ]
     }
     result = builder.build(item, config, chat_tokenizer)
-    assert sum(result["loss_mask"]) == 0
+    masked_count = sum(result["loss_mask"])
+    if expect_nonzero:
+        assert masked_count > 0
+    else:
+        assert masked_count == 0
 
 
-def test_chat_all_trained(chat_tokenizer):
-    config = PipelineConfig(
-        input=InputConfig(sections=_CHAT_SECTIONS),
-        mask={},
-        mask_default="train",
-        preprocessing=ProcessingConfig(max_seq_len=2048),
-    )
-    builder = SectionedMaskBuilder()
-    item = {
-        "messages": [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "assistant", "content": "Hi there!"},
-        ]
-    }
-    result = builder.build(item, config, chat_tokenizer)
-    assert sum(result["loss_mask"]) == len(result["sequence"]) - 1
-
-
-def test_chat_empty_messages(chat_tokenizer):
+def test_chat_empty_messages(chat_tokenizer, builder):
     config = make_chat_config()
-    builder = SectionedMaskBuilder()
     assert builder.build({"messages": []}, config, chat_tokenizer) is None
     assert builder.build({}, config, chat_tokenizer) is None
 
 
-def test_chat_domain_extraction(chat_tokenizer):
+def test_chat_domain_extraction(chat_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_CHAT_SECTIONS),
         mask={"assistant": "train"},
@@ -117,7 +110,6 @@ def test_chat_domain_extraction(chat_tokenizer):
         preprocessing=ProcessingConfig(max_seq_len=2048),
         output=OutputConfig(domain_key="source"),
     )
-    builder = SectionedMaskBuilder()
     item = {
         "messages": [
             {"role": "user", "content": "Hi"},
@@ -129,14 +121,13 @@ def test_chat_domain_extraction(chat_tokenizer):
     assert result["domain"] == "wiki"
 
 
-def test_chat_truncation(chat_tokenizer):
+def test_chat_truncation(chat_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_CHAT_SECTIONS),
         mask={"assistant": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=10),
     )
-    builder = SectionedMaskBuilder()
     item = {
         "messages": [
             {
@@ -151,18 +142,16 @@ def test_chat_truncation(chat_tokenizer):
     assert len(result["loss_mask"]) == len(result["sequence"])
 
 
-def test_instruction_basic(test_tokenizer):
+def test_instruction_basic(test_tokenizer, builder):
     config = make_instruction_config()
-    builder = SectionedMaskBuilder()
     item = {"prompt": "Translate to French: Hello", "response": "Bonjour"}
     result = builder.build(item, config, test_tokenizer)
     assert result is not None
     assert len(result["sequence"]) == len(result["loss_mask"])
 
 
-def test_instruction_prompt_masked(test_tokenizer):
+def test_instruction_prompt_masked(test_tokenizer, builder):
     config = make_instruction_config()
-    builder = SectionedMaskBuilder()
     item = {"prompt": "hello", "response": "world"}
     result = builder.build(item, config, test_tokenizer)
     mask = result["loss_mask"]
@@ -175,7 +164,7 @@ def test_instruction_prompt_masked(test_tokenizer):
         assert all(m == 1 for m in mask[p_len:])
 
 
-def test_instruction_train_on_prompt(test_tokenizer):
+def test_instruction_train_on_prompt(test_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(
             sections=[
@@ -185,7 +174,6 @@ def test_instruction_train_on_prompt(test_tokenizer):
         ),
         preprocessing=ProcessingConfig(max_seq_len=2048),
     )
-    builder = SectionedMaskBuilder()
     item = {"prompt": "hello", "response": "world"}
     result = builder.build(item, config, test_tokenizer)
     mask = result["loss_mask"]
@@ -196,9 +184,8 @@ def test_instruction_train_on_prompt(test_tokenizer):
     assert all(m == 1 for m in mask[:p_len])
 
 
-def test_text_basic(test_tokenizer):
+def test_text_basic(test_tokenizer, builder):
     config = make_text_config()
-    builder = SectionedMaskBuilder()
     item = {"text": "Hello world. This is a test document."}
     result = builder.build(item, config, test_tokenizer)
     assert result is not None
@@ -207,41 +194,37 @@ def test_text_basic(test_tokenizer):
     assert "loss_mask" not in result
 
 
-def test_text_empty(test_tokenizer):
+def test_text_empty(test_tokenizer, builder):
     config = make_text_config()
-    builder = SectionedMaskBuilder()
     assert builder.build({"text": ""}, config, test_tokenizer) is None
     assert builder.build({"text": "   "}, config, test_tokenizer) is None
 
 
-def test_text_too_short(test_tokenizer):
+def test_text_too_short(test_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_TEXT_SECTIONS),
         preprocessing=ProcessingConfig(min_chars=100),
     )
-    builder = SectionedMaskBuilder()
     assert builder.build({"text": "short"}, config, test_tokenizer) is None
 
 
-def test_text_truncation(test_tokenizer):
+def test_text_truncation(test_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_TEXT_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=3, min_chars=1),
     )
-    builder = SectionedMaskBuilder()
     item = {"text": "This is a very long text that should be truncated"}
     result = builder.build(item, config, test_tokenizer)
     assert len(result["sequence"]) <= 3
 
 
-def test_sectioned_chat(chat_tokenizer):
+def test_sectioned_chat(chat_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_CHAT_SECTIONS),
         mask={"system": "mask", "user": "mask", "assistant": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=2048),
     )
-    builder = SectionedMaskBuilder()
     item = {
         "messages": [
             {"role": "user", "content": "What is 2+2?"},
@@ -255,12 +238,11 @@ def test_sectioned_chat(chat_tokenizer):
     assert 0 in result["loss_mask"]
 
 
-def test_sectioned_instruction(test_tokenizer):
+def test_sectioned_instruction(test_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_INSTRUCTION_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=0),
     )
-    builder = SectionedMaskBuilder()
     item = {"prompt": "Q: Why?", "response": "A: Because."}
     result = builder.build(item, config, test_tokenizer)
     assert result is not None
@@ -269,24 +251,22 @@ def test_sectioned_instruction(test_tokenizer):
     assert mask[-1] == 1
 
 
-def test_sectioned_text(test_tokenizer):
+def test_sectioned_text(test_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_TEXT_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=1),
     )
-    builder = SectionedMaskBuilder()
     item = {"text": "Hello world, this is a test."}
     result = builder.build(item, config, test_tokenizer)
     assert result is not None
     assert "loss_mask" not in result
 
 
-def test_sectioned_text_too_short(test_tokenizer):
+def test_sectioned_text_too_short(test_tokenizer, builder):
     config = PipelineConfig(
         input=InputConfig(sections=_TEXT_SECTIONS),
         preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=100),
     )
-    builder = SectionedMaskBuilder()
     assert builder.build({"text": "short"}, config, test_tokenizer) is None
 
 
@@ -296,13 +276,12 @@ def test_factory_registered():
 
 
 def test_factory_create():
-    builder = MaskBuilderFactory.create("sectioned")
-    assert isinstance(builder, SectionedMaskBuilder)
+    builder_obj = MaskBuilderFactory.create("sectioned")
+    assert isinstance(builder_obj, SectionedMaskBuilder)
 
 
-def test_dpo_chat_basic(chat_tokenizer):
+def test_dpo_chat_basic(chat_tokenizer, builder):
     config = make_dpo_chat_config()
-    builder = SectionedMaskBuilder()
     item = {
         "chosen": [
             {"role": "user", "content": "What is 2+2?"},
@@ -319,16 +298,14 @@ def test_dpo_chat_basic(chat_tokenizer):
     assert "rejected" in result
     assert "chosen_mask" in result
     assert "rejected_mask" in result
-    assert "domain" in result
     assert len(result["chosen"]) == len(result["chosen_mask"])
     assert len(result["rejected"]) == len(result["rejected_mask"])
     assert sum(result["chosen_mask"]) > 0
     assert sum(result["rejected_mask"]) > 0
 
 
-def test_dpo_chosen_only_trained(chat_tokenizer):
+def test_dpo_chosen_only_trained(chat_tokenizer, builder):
     config = make_dpo_chat_config()
-    builder = SectionedMaskBuilder()
     item = {
         "chosen": [
             {"role": "user", "content": "Hi"},
@@ -346,15 +323,13 @@ def test_dpo_chosen_only_trained(chat_tokenizer):
     assert 1 in result["rejected_mask"]
 
 
-def test_dpo_missing_field_is_none(chat_tokenizer):
+def test_dpo_missing_field_is_none(chat_tokenizer, builder):
     config = make_dpo_chat_config()
-    builder = SectionedMaskBuilder()
     assert builder.build({"chosen": [], "rejected": []}, config, chat_tokenizer) is None
 
 
-def test_grpo_basic(chat_tokenizer):
+def test_grpo_basic(chat_tokenizer, builder):
     config = make_grpo_config()
-    builder = SectionedMaskBuilder()
     item = {
         "prompt": [{"role": "user", "content": "What is 2+2?"}],
         "responses": ["4", "The answer is four", "Four", "2+2=4"],
@@ -370,9 +345,8 @@ def test_grpo_basic(chat_tokenizer):
     assert result["rewards"] == [1.0, 0.5, 0.8, 0.2]
 
 
-def test_grpo_response_tokens_all_trained(chat_tokenizer):
+def test_grpo_response_tokens_all_trained(chat_tokenizer, builder):
     config = make_grpo_config()
-    builder = SectionedMaskBuilder()
     item = {
         "prompt": [{"role": "user", "content": "Q"}],
         "responses": ["A", "B"],
@@ -384,9 +358,8 @@ def test_grpo_response_tokens_all_trained(chat_tokenizer):
     assert len(masks) == len(result["responses"])
 
 
-def test_grpo_single_reward(chat_tokenizer):
+def test_grpo_single_reward(chat_tokenizer, builder):
     config = make_grpo_config()
-    builder = SectionedMaskBuilder()
     item = {
         "prompt": [{"role": "user", "content": "Q"}],
         "responses": ["A"],

@@ -1,3 +1,5 @@
+import json
+import os
 import tempfile
 
 import pytest
@@ -8,6 +10,7 @@ from astrai.config.preprocess_config import (
     PipelineConfig,
     ProcessingConfig,
 )
+from astrai.preprocessing.builder import SectionedMaskBuilder
 from astrai.tokenize import AutoTokenizer
 
 _SPECIAL_TOKENS_CONFIG = {
@@ -200,3 +203,33 @@ def make_grpo_no_template_config():
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=2048),
     )
+
+
+@pytest.fixture
+def builder():
+    return SectionedMaskBuilder()
+
+
+@pytest.fixture
+def tokenizer_dir(temp_dir, test_tokenizer):
+    d = os.path.join(temp_dir, "tok")
+    os.makedirs(d, exist_ok=True)
+    test_tokenizer._tokenizer.save(os.path.join(d, "tokenizer.json"))
+    with open(os.path.join(d, "tokenizer_config.json"), "w") as f:
+        json.dump(
+            {"special_tokens": {"pad_token": "<|_pad_|>", "unk_token": "<|_unk_|>"}}, f
+        )
+    return d
+
+
+@pytest.fixture
+def chat_tokenizer_dir(temp_dir, chat_tokenizer):
+    d = os.path.join(temp_dir, "tok")
+    os.makedirs(d, exist_ok=True)
+    chat_tokenizer._tokenizer.save(os.path.join(d, "tokenizer.json"))
+    with open(os.path.join(d, "tokenizer_config.json"), "w") as f:
+        json.dump(
+            {"special_tokens": _SPECIAL_TOKENS_CONFIG, "chat_template": _CHAT_TEMPLATE},
+            f,
+        )
+    return d

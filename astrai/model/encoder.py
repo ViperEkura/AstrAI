@@ -26,19 +26,7 @@ class EmbeddingEncoder(AutoModel):
         self.embed_tokens = Embedding(config.vocab_size, config.dim)
 
         self.layers = nn.ModuleList(
-            [
-                DecoderBlock(
-                    config.dim,
-                    config.n_heads,
-                    config.dim_ffn,
-                    config.n_kv_heads,
-                    config.norm_eps,
-                    config.use_qk_norm,
-                    config.use_gated_attention,
-                    layer_id,
-                )
-                for layer_id in range(config.n_layers)
-            ]
+            [DecoderBlock(config, layer_id) for layer_id in range(config.n_layers)]
         )
 
         self.norm = RMSNorm(config.dim, config.norm_eps)

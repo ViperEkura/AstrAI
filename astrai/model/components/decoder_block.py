@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from typing import Optional
 
 import torch.nn as nn
@@ -10,35 +11,13 @@ from astrai.model.components.norm import RMSNorm
 
 
 class DecoderBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        n_heads: int,
-        dim_ffn: int,
-        n_kv_heads: int,
-        norm_eps: float,
-        use_qk_norm: bool,
-        use_gated_attention: bool,
-        layer_id: int,
-        attn_type: str = "gqa",
-        ffn_type: str = "mlp",
-        **kwargs,
-    ):
+    def __init__(self, config, layer_id: int):
         super().__init__()
-        self.attention = AttnFactory.create(
-            attn_type,
-            dim=dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            use_qk_norm=use_qk_norm,
-            norm_eps=norm_eps,
-            use_gated_attention=use_gated_attention,
-            layer_id=layer_id,
-            **kwargs,
-        )
-        self.input_norm = RMSNorm(dim, norm_eps)
-        self.post_attention_norm = RMSNorm(dim, norm_eps)
-        self.mlp = FFNFactory.create(ffn_type, dim, dim_ffn, **kwargs)
+        cfg = asdict(config)
+        self.attention = AttnFactory.create(config.attn_type, **cfg, layer_id=layer_id)
+        self.input_norm = RMSNorm(config.dim, config.norm_eps)
+        self.post_attention_norm = RMSNorm(config.dim, config.norm_eps)
+        self.mlp = FFNFactory.create(config.ffn_type, **cfg)
 
     def forward(
         self,

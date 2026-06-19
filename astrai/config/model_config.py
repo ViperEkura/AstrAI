@@ -70,10 +70,12 @@ class EncoderConfig(BaseModelConfig):
     rope_theta: Optional[float] = None
     rope_scaling: Optional[dict] = None
 
+    attn_type: str = "gqa"
     n_heads: Optional[int] = None
     n_kv_heads: Optional[int] = None
     use_qk_norm: Optional[bool] = None
     use_gated_attention: Optional[bool] = None
 
+    ffn_type: str = "mlp"
     pooling_type: Optional[str] = None
     normalize_embeddings: Optional[bool] = None

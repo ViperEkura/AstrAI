@@ -62,28 +62,7 @@ class AutoRegressiveLM(AutoModel):
         self.embed_tokens = Embedding(config.vocab_size, config.dim)
 
         self.layers = nn.ModuleList(
-            [
-                DecoderBlock(
-                    config.dim,
-                    config.n_heads,
-                    config.dim_ffn,
-                    config.n_kv_heads,
-                    config.norm_eps,
-                    config.use_qk_norm,
-                    config.use_gated_attention,
-                    layer_id,
-                    attn_type=config.attn_type,
-                    ffn_type=config.ffn_type,
-                    n_routed_experts=config.n_routed_experts,
-                    n_shared_experts=config.n_shared_experts,
-                    n_activated_experts=config.n_activated_experts,
-                    topk_method=config.topk_method,
-                    kv_lora_rank=config.kv_lora_rank,
-                    qk_nope_head_dim=config.qk_nope_head_dim,
-                    qk_rope_head_dim=config.qk_rope_head_dim,
-                )
-                for layer_id in range(config.n_layers)
-            ]
+            [DecoderBlock(config, layer_id) for layer_id in range(config.n_layers)]
         )
 
         self.norm = RMSNorm(config.dim, config.norm_eps)

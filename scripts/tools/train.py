@@ -309,6 +309,7 @@ def train(
     # Load config
     config_path = os.path.join(param_path, "config.json")
     config = AutoRegressiveLMConfig.from_file(config_path)
+    config.neftune_alpha = neftune_alpha
 
     if window_size is None:
         window_size = config.max_len

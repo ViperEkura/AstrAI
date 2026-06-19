@@ -59,7 +59,9 @@ class AutoRegressiveLM(AutoModel):
         self.rotary_embedding = RotaryEmbedding(
             rope_dim, config.max_len, rope_base, rope_scaling=config.rope_scaling
         )
-        self.embed_tokens = Embedding(config.vocab_size, config.dim)
+        self.embed_tokens = Embedding(
+            config.vocab_size, config.dim, neftune_alpha=config.neftune_alpha
+        )
 
         self.layers = nn.ModuleList(
             [DecoderBlock(config, layer_id) for layer_id in range(config.n_layers)]

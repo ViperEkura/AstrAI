@@ -20,6 +20,7 @@ class BaseModelConfig(BaseConfig):
     """Base config with ``model_type`` dispatch and file I/O."""
 
     model_type: Optional[str] = None
+    neftune_alpha: float = 0.0
 
 
 @dataclass

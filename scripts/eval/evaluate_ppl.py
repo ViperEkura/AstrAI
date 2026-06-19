@@ -86,7 +86,7 @@ def process_file(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run perplexity with a Khaosz model.")
+    parser = argparse.ArgumentParser(description="Perplexity evaluation on JSONL text.")
     parser.add_argument(
         "--param_path", type=str, required=True, help="Path to the model directory."
     )

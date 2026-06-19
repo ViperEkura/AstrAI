@@ -161,7 +161,7 @@ See [Inference Guide](inference.md) for HTTP API documentation.
 | `--top_k` | int | `30` | Top-k filtering |
 | `--top_p` | float | `0.95` | Nucleus sampling threshold |
 | `--batch_size` | int | `1` | Batch size for generation |
-| `--max_tokens` | int | `2048` | Maximum tokens to generate |
+| `--max_tokens` | int | model config `max_len` | Maximum tokens to generate |
 
 Usage:
 ```bash

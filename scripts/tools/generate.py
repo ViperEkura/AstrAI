@@ -1,5 +1,6 @@
 import argparse
 import json
+from typing import Optional
 
 import torch
 
@@ -17,7 +18,7 @@ def processor(
     top_p: float,
     question_key: str,
     response_key: str,
-    max_tokens: int,
+    max_tokens: Optional[int],
     batch_size: int,
 ):
     # Load model and tokenizer
@@ -72,7 +73,7 @@ def processor(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run generate with a Khaosz model.")
+    parser = argparse.ArgumentParser(description="Batch generation from JSONL file.")
 
     parser.add_argument(
         "--param_path", type=str, required=True, help="Path to the model directory."
@@ -93,36 +94,42 @@ if __name__ == "__main__":
         "--question_key",
         type=str,
         default="question",
-        help="Key for the question in the input JSON.",
+        help="Key for the question in the input JSON (default: question).",
     )
     parser.add_argument(
         "--response_key",
         type=str,
         default="response",
-        help="Key for the response in the output JSON.",
+        help="Key for the response in the output JSON (default: response).",
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=0.60,
-        help="Temperature for generating responses.",
+        help="Temperature for generating responses (default: 0.60).",
     )
     parser.add_argument(
-        "--top_k", type=int, default=30, help="Top-k value for generating responses."
+        "--top_k",
+        type=int,
+        default=30,
+        help="Top-k value for generating responses (default: 30).",
     )
     parser.add_argument(
         "--top_p",
         type=float,
         default=0.95,
-        help="Top-p value for generating responses.",
+        help="Top-p value for generating responses (default: 0.95).",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=1, help="Batch size for generating responses."
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size for generating responses (default: 1).",
     )
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=2048,
+        default=None,
         help="Maximum tokens to generate (default: model config max_len).",
     )
 

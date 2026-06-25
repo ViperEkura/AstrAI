@@ -13,11 +13,11 @@ class FFNFactory(BaseFactory[nn.Module]):
 
 @FFNFactory.register("mlp")
 class MLP(nn.Module):
-    def __init__(self, dim: int, dim_ffn: int):
+    def __init__(self, dim: int, dim_ffn: int, down_init_std: float = 0.02):
         super().__init__()
         self.up = Linear(dim, dim_ffn)
         self.gate = Linear(dim, dim_ffn)
-        self.down = Linear(dim_ffn, dim)
+        self.down = Linear(dim_ffn, dim, init_std=down_init_std)
 
     def forward(self, x: Tensor) -> Tensor:
         gated = self.up(x) * F.silu(self.gate(x))
@@ -35,6 +35,7 @@ class DeepSeekMoE(nn.Module):
         n_shared_experts: int = 1,
         n_activated_experts: int = 2,
         topk_method: str = "greedy",
+        n_layers: int = 1,
     ):
         super().__init__()
         self.dim = dim
@@ -44,12 +45,20 @@ class DeepSeekMoE(nn.Module):
         self.topk_method = topk_method
 
         self.router = Linear(dim, n_routed_experts, bias=False)
+        moe_scale = 1 / max(n_shared_experts, 1) + 1 / n_activated_experts
+        down_init_std = 0.02 / (2 * n_layers * moe_scale) ** 0.5
 
         self.shared_experts = nn.ModuleList(
-            [MLP(dim, dim_ffn) for _ in range(n_shared_experts)]
+            [
+                MLP(dim, dim_ffn, down_init_std=down_init_std)
+                for _ in range(n_shared_experts)
+            ]
         )
         self.routed_experts = nn.ModuleList(
-            [MLP(dim, dim_ffn) for _ in range(n_routed_experts)]
+            [
+                MLP(dim, dim_ffn, down_init_std=down_init_std)
+                for _ in range(n_routed_experts)
+            ]
         )
 
     def forward(self, x: Tensor) -> Tensor:

@@ -38,6 +38,7 @@ class GQA(nn.Module):
         norm_eps: float,
         use_gated_attention: bool,
         layer_id: int,
+        n_layers: int = 1,
     ):
         super().__init__()
         assert dim % n_heads == 0
@@ -55,7 +56,7 @@ class GQA(nn.Module):
         self.q_proj = Linear(dim, n_heads * self.head_dim)
         self.k_proj = Linear(dim, n_kv_heads * self.head_dim)
         self.v_proj = Linear(dim, n_kv_heads * self.head_dim)
-        self.o_proj = Linear(dim, dim)
+        self.o_proj = Linear(dim, dim, init_std=0.02 / (2 * n_layers) ** 0.5)
 
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, norm_eps)
@@ -121,6 +122,7 @@ class MLA(nn.Module):
         use_qk_norm: bool,
         use_gated_attention: bool,
         layer_id: int,
+        n_layers: int = 1,
     ):
         super().__init__()
         self.dim = dim
@@ -148,7 +150,9 @@ class MLA(nn.Module):
             n_kv_heads * (2 * self.head_dim),
         )
 
-        self.o_proj = Linear(dim, dim, bias=False)
+        self.o_proj = Linear(
+            dim, dim, bias=False, init_std=0.02 / (2 * n_layers) ** 0.5
+        )
 
         if use_gated_attention:
             self.gate = Linear(dim, dim, bias=False)

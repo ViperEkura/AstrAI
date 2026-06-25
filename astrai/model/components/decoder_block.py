@@ -14,6 +14,7 @@ class DecoderBlock(nn.Module):
     def __init__(self, config, layer_id: int):
         super().__init__()
         cfg = asdict(config)
+        cfg["down_init_std"] = 0.02 / (2 * config.n_layers) ** 0.5
         self.attention = AttnFactory.create(config.attn_type, **cfg, layer_id=layer_id)
         self.input_norm = RMSNorm(config.dim, config.norm_eps)
         self.post_attention_norm = RMSNorm(config.dim, config.norm_eps)

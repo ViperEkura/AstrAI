@@ -34,6 +34,7 @@ class Trainer:
                 cfg.ckpt_dir,
                 cfg.ckpt_interval,
             ),
+            CallbackFactory.create("validation"),
             CallbackFactory.create(
                 "metric_logger",
                 log_dir=cfg.log_dir,
@@ -43,7 +44,6 @@ class Trainer:
             ),
             CallbackFactory.create("progress_bar", cfg.n_epoch),
             CallbackFactory.create("gradient_clipping", cfg.max_grad_norm),
-            CallbackFactory.create("validation"),
         ]
         return callbacks
 

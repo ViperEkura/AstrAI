@@ -571,7 +571,7 @@ def main():
     print(f"  Unsupported:    {summary['unsupported_constraints']}")
     print(f"{'=' * 60}")
 
-    print(f"\nPer-type accuracy:")
+    print("\nPer-type accuracy:")
     for inst_id, stats in sorted(summary["per_type_accuracy"].items()):
         print(
             f"  {inst_id:50s}  {stats['accuracy']:.2%}  "

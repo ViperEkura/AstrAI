@@ -4,7 +4,6 @@ import inspect
 import sys
 from abc import ABC
 from typing import (
-    Any,
     Callable,
     Dict,
     ForwardRef,

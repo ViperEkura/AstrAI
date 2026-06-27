@@ -269,7 +269,20 @@ def create_model(config):
 
 
 def create_optimizer(model, **kwargs) -> optim.Optimizer:
-    return optim.AdamW(model.parameters(), fused=True, **kwargs)
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.dim() < 2 or "norm" in name or "bias" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    param_groups = [
+        {"params": decay_params, "weight_decay": kwargs.pop("weight_decay", 0.01)},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    return optim.AdamW(param_groups, fused=True, **kwargs)
 
 
 def create_scheduler(

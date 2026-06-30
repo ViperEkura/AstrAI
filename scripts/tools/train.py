@@ -162,8 +162,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log_interval",
         type=int,
-        default=100,
-        help="Number of batch iterations between metric logs.",
+        default=1,
+        help="Number of optimizer steps between metric logs.",
     )
     parser.add_argument(
         "--grpo_sync_interval",

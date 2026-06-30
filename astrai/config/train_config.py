@@ -68,8 +68,8 @@ class TrainConfig(BaseConfig):
         default="./checkpoint/logs", metadata={"help": "Directory for metric logs."}
     )
     log_interval: int = field(
-        default=100,
-        metadata={"help": "Number of batch iterations between metric logs."},
+        default=1,
+        metadata={"help": "Number of optimizer steps between metric logs."},
     )
     metrics: List[str] = field(
         default_factory=lambda: ["loss", "lr", "grad_norm"],

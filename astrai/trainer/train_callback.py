@@ -229,13 +229,14 @@ class MetricLoggerCallback(TrainCallback):
         self,
         log_dir: str,
         save_interval: int,
-        log_interval: int = 10,
+        log_interval: int = 1,
         metrics: List[str] = None,
     ):
         self.last_log_iter = 0
         self._last_val_loss = None
+        self._last_log_step = 0
         self.save_interval = save_interval
-        self.log_interval = log_interval
+        self.log_interval = max(log_interval, 1)
         self.metrics = metrics or ["loss", "lr"]
 
         self.log_dir = Path(log_dir) if log_dir else Path.cwd() / "logs"
@@ -263,6 +264,7 @@ class MetricLoggerCallback(TrainCallback):
             "type": event_type,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "epoch": context.epoch,
+            "step": context.iteration // context.config.grad_accum_steps,
             "iter": context.iteration,
             **extra,
         }
@@ -277,14 +279,16 @@ class MetricLoggerCallback(TrainCallback):
                 f.write(json.dumps(log) + "\n")
 
     def on_batch_end(self, context):
-        if context.iteration % self.log_interval == 0:
-            step_metrics = [m for m in self.metrics if m != "val_loss"]
-            self._append("step", context, **self._metrics(context, step_metrics))
         if context.iteration - self.last_log_iter >= self.save_interval:
             self._flush(context.epoch, context.iteration)
             self.last_log_iter = context.iteration
 
     def on_optimizer_step(self, context):
+        step = context.iteration // context.config.grad_accum_steps
+        if step - self._last_log_step >= self.log_interval:
+            step_metrics = [m for m in self.metrics if m != "val_loss"]
+            self._append("step", context, **self._metrics(context, step_metrics))
+            self._last_log_step = step
         if context.val_loss is not None and context.val_loss != self._last_val_loss:
             self._append("validation", context, val_loss=context.val_loss)
             self._last_val_loss = context.val_loss

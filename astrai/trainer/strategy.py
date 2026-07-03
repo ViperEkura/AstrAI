@@ -196,7 +196,7 @@ class SFTStrategy(BaseStrategy):
 
         ignore_index = -100
         input_mask = make_doc_boundary_mask(position_ids)
-        target_ids = target_ids.masked_fill(loss_mask == 0, ignore_index)
+        target_ids = target_ids.masked_fill(~loss_mask, ignore_index)
         logits = self.model(
             input_ids=input_ids, position_ids=position_ids, input_mask=input_mask
         )["logits"]

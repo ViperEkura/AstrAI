@@ -53,7 +53,7 @@ class CosineScheduler(BaseScheduler):
         optimizer,
         warmup_steps: int,
         lr_decay_steps: int,
-        min_rate: float = 0.05,
+        min_rate: float = 0.01,
         last_epoch: int = -1,
     ):
         self.warmup_steps = warmup_steps
@@ -104,7 +104,7 @@ class SGDRScheduler(BaseScheduler):
         optimizer,
         warmup_steps: int,
         cycle_length: int,
-        min_rate: float = 0.05,
+        min_rate: float = 0.01,
         t_mult: int = 2,
         last_epoch: int = -1,
     ):
@@ -182,7 +182,7 @@ class WSDScheduler(BaseScheduler):
         warmup_steps: int,
         stable_steps: int,
         decay_steps: int,
-        min_rate: float = 0.0,
+        min_rate: float = 0.01,
         last_epoch: int = -1,
     ):
         self.warmup_steps = warmup_steps
@@ -194,7 +194,7 @@ class WSDScheduler(BaseScheduler):
 
     def get_lr(self) -> List[float]:
         if self.last_epoch < self.warmup_steps:
-            factor = self.last_epoch / max(self.warmup_steps, 1)
+            factor = max(self.min_rate, self.last_epoch / max(self.warmup_steps, 1))
             return [base_lr * factor for base_lr in self.base_lrs]
 
         offset = self.last_epoch - self.warmup_steps

@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 from pathlib import Path
 
 import torch
@@ -7,42 +8,82 @@ from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PARAMETER_ROOT = Path(PROJECT_ROOT, "params")
+
+
+def parse_args():
+    parser = ArgumentParser(description="Interactive streaming chat")
+    parser.add_argument(
+        "--model_path",
+        type=Path,
+        default=PROJECT_ROOT / "params",
+        help="Path to model weights (params/ or checkpoint/epoch_N_step_M/)",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Sampling temperature (default: 0.8)",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.95,
+        help="Top-p sampling threshold",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=50,
+        help="Top-k sampling threshold",
+    )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=2048,
+        help="Maximum tokens to generate",
+    )
+    parser.add_argument(
+        "--system_prompt",
+        type=str,
+        default="You are a helpful assistant.",
+        help="Optional system prompt",
+    )
+    return parser.parse_args()
 
 
 def chat():
-    model = AutoModel.from_pretrained(PARAMETER_ROOT)
-    tokenizer = AutoTokenizer.from_pretrained(PARAMETER_ROOT)
-    model.to(device="cuda", dtype=torch.bfloat16)
+    args = parse_args()
+    model_path = args.model_path
 
-    messages = [{"role": "system", "content": "You are a helpful assistant."}]
+    model = AutoModel.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model.to(device="cuda", dtype=torch.bfloat16)
     engine = InferenceEngine(model=model, tokenizer=tokenizer)
+
+    messages = [{"role": "system", "content": args.system_prompt}]
 
     while True:
         query = input(">> ")
         if query == "!exit":
             break
 
-        # Add user message
         messages.append({"role": "user", "content": query})
 
-        # Generate response
         full_response = ""
         prompt = tokenizer.apply_chat_template(messages, tokenize=False)
 
         for token in engine.generate(
             prompt=prompt,
             stream=True,
-            max_tokens=2048,
-            temperature=0.8,
-            top_p=0.95,
-            top_k=50,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
         ):
             print(token, end="", flush=True)
             full_response += token
 
         print()
-        # Add assistant response to messages
         messages.append({"role": "assistant", "content": full_response.strip()})
 
 

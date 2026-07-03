@@ -37,7 +37,7 @@ def _resolve_type(
     ns = vars(mod)
 
     if isinstance(arg, ForwardRef):
-        return arg._evaluate(ns, None, frozenset(), recursive_guard=frozenset())
+        return arg._evaluate(ns, None, recursive_guard=frozenset())
 
     return ns.get(name)
 

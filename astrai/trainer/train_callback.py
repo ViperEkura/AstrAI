@@ -199,23 +199,27 @@ class ProgressBarCallback(TrainCallback):
 
     @only_on_rank(0)
     def on_epoch_begin(self, context: TrainContext):
+        total_steps = len(context.dataloader) // context.executor.grad_accum_steps
         self.progress_bar = tqdm(
-            context.dataloader,
+            total=total_steps,
             desc=f"Epoch {context.epoch + 1}/{self.num_epoch}",
             dynamic_ncols=True,
             file=self.file or sys.stdout,
         )
 
     @only_on_rank(0)
-    def on_batch_end(self, context: TrainContext):
+    def on_optimizer_step(self, context: TrainContext):
+        self.progress_bar.update(1)
         postfix = {
+            "step": context.optimizer_step,
             "loss": f"{context.loss:.4f}",
             "lr": f"{context.optimizer.param_groups[-1]['lr']:.2e}",
         }
+        if context.grad_norm is not None:
+            postfix["grad_norm"] = f"{context.grad_norm:.2f}"
         if context.val_loss is not None:
             postfix["val_loss"] = f"{context.val_loss:.4f}"
         self.progress_bar.set_postfix(postfix)
-        self.progress_bar.update(1)
 
     @only_on_rank(0)
     def on_epoch_end(self, context: TrainContext):
@@ -224,21 +228,20 @@ class ProgressBarCallback(TrainCallback):
             self.progress_bar.close()
 
 
-@CallbackFactory.register("metric_logger")
-class MetricLoggerCallback(TrainCallback):
+@CallbackFactory.register("metric")
+class MetricCallback(TrainCallback):
     def __init__(
         self,
         log_dir: str,
         save_interval: int,
-        log_interval: int = 1,
         metrics: List[str] = None,
+        val_step: int = 0,
     ):
         self.last_log_flush_step = 0
-        self._last_val_loss = None
-        self._last_log_step = 0
         self.save_interval = save_interval
-        self.log_interval = max(log_interval, 1)
         self.metrics = metrics or ["loss", "lr"]
+        self.val_step = val_step
+        self._next_val_step = 0
 
         self.log_dir = Path(log_dir) if log_dir else Path.cwd() / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -271,42 +274,7 @@ class MetricLoggerCallback(TrainCallback):
         }
         self.log_cache.append(entry)
 
-    @only_on_rank(0)
-    def _flush(self, epoch, consumed):
-        log_file = self.log_dir / f"epoch_{epoch}_consumed_{consumed}_metric.jsonl"
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_file, "w") as f:
-            for log in self.log_cache:
-                f.write(json.dumps(log) + "\n")
-
-    def on_batch_end(self, context):
-        if context.optimizer_step - self.last_log_flush_step >= self.save_interval:
-            self._flush(context.epoch, context.optimizer_step)
-            self.last_log_flush_step = context.optimizer_step
-
-    def on_optimizer_step(self, context):
-        if context.optimizer_step - self._last_log_step >= self.log_interval:
-            step_metrics = [m for m in self.metrics if m != "val_loss"]
-            self._append("step", context, **self._metrics(context, step_metrics))
-            self._last_log_step = context.optimizer_step
-        if context.val_loss is not None and context.val_loss != self._last_val_loss:
-            self._append("validation", context, val_loss=context.val_loss)
-            self._last_val_loss = context.val_loss
-
-    def on_epoch_end(self, context):
-        self._append("epoch", context)
-
-    def on_train_end(self, context):
-        if context.optimizer_step != self.last_log_flush_step:
-            self._flush(context.epoch, context.optimizer_step)
-
-    def on_error(self, context):
-        self._flush(context.epoch, context.optimizer_step)
-
-
-@CallbackFactory.register("validation")
-class ValidationCallback(TrainCallback):
-    def _run_validation(self, context: TrainContext):
+    def _run_validation(self, context: TrainContext) -> float:
         context.model.eval()
 
         total_loss = 0.0
@@ -318,26 +286,49 @@ class ValidationCallback(TrainCallback):
                 total_loss += loss.item()
                 num_batches += 1
 
-        avg_loss = total_loss / max(num_batches, 1)
-
         if context.world_size > 1 and dist.is_initialized():
-            loss_tensor = torch.tensor([avg_loss], device=get_current_device())
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-            avg_loss = loss_tensor.item()
+            stats = torch.tensor(
+                [total_loss, float(num_batches)], device=get_current_device()
+            )
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            avg_loss = (stats[0] / stats[1]).item()
+        else:
+            avg_loss = total_loss / max(num_batches, 1)
 
-        context.val_loss = avg_loss
         context.model.train()
+        return avg_loss
 
-        logger.info(
-            f"Epoch {context.epoch + 1}, Step {context.optimizer_step}, "
-            f"Val Loss: {avg_loss:.4f}"
-        )
+    @only_on_rank(0)
+    def _flush(self, epoch, step):
+        log_file = self.log_dir / f"epoch_{epoch}_step_{step}_metric.jsonl"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "w") as f:
+            for log in self.log_cache:
+                f.write(json.dumps(log) + "\n")
 
-    def on_optimizer_step(self, context: TrainContext):
-        if context.val_dataloader is None:
-            return
-        cfg = context.config
-        if cfg.val_step <= 0:
-            return
-        if context.optimizer_step % cfg.val_step == 0:
-            self._run_validation(context)
+    def on_optimizer_step(self, context):
+        if (
+            context.val_dataloader is not None
+            and self.val_step > 0
+            and context.optimizer_step >= self._next_val_step
+        ):
+            context.val_loss = self._run_validation(context)
+            self._next_val_step = context.optimizer_step + self.val_step
+            self._append("validation", context, val_loss=context.val_loss)
+
+        step_metrics = [m for m in self.metrics if m != "val_loss"]
+        self._append("step", context, **self._metrics(context, step_metrics))
+
+        if context.optimizer_step - self.last_log_flush_step >= self.save_interval:
+            self._flush(context.epoch, context.optimizer_step)
+            self.last_log_flush_step = context.optimizer_step
+
+    def on_epoch_end(self, context):
+        self._append("epoch", context)
+
+    def on_train_end(self, context):
+        if context.optimizer_step != self.last_log_flush_step:
+            self._flush(context.epoch, context.optimizer_step)
+
+    def on_error(self, context):
+        self._flush(context.epoch, context.optimizer_step)

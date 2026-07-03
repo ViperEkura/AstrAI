@@ -160,12 +160,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory for metric logs.",
     )
     parser.add_argument(
-        "--log_interval",
-        type=int,
-        default=1,
-        help="Number of optimizer steps between metric logs.",
-    )
-    parser.add_argument(
         "--grpo_sync_interval",
         type=int,
         default=200,
@@ -329,7 +323,6 @@ def train(
     val_step: int,
     metrics: list[str],
     log_dir: str,
-    log_interval: int,
     dpo_beta: float,
     grpo_clip_eps: float,
     grpo_kl_coef: float,
@@ -465,7 +458,6 @@ def train(
         val_step=val_step,
         metrics=metrics,
         log_dir=log_dir,
-        log_interval=log_interval,
         gradient_checkpointing_modules=grad_ckpt_modules,
         executor_kwargs=executor_kwargs,
         extra_kwargs=strategy_kwargs,

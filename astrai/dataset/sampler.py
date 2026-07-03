@@ -74,6 +74,7 @@ class ResumableDistributedSampler(Sampler[int]):
 
         self.epoch += 1
         self._indices = None
+        self.iter = self.iter % self.num_samples_per_replica
 
     @property
     def _remaining(self):

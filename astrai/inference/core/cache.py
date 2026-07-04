@@ -62,7 +62,8 @@ class Allocator:
 
     def touch(self, idx: int):
         with self._lock:
-            self._lru.move_to_end(idx)
+            if idx in self._lru:
+                self._lru.move_to_end(idx)
 
 
 class PrefixCache:

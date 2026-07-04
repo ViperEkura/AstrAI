@@ -1,22 +1,21 @@
-"""HumanEval code generation benchmark.
+"""HumanEval benchmark — functional pipeline design.
 
-Generates n completions per problem, extracts function bodies, executes
-against hidden tests, and computes pass@k.
+Pipeline:
+    load -> generate -> extract -> test -> score -> report
 
-Usage::
-
-    python scripts/tools/evaluate_humaneval.py --param_path ./params \
-        --data_path HumanEval.jsonl.gz --output results.json \
-        --num_samples 200 --temperature 0.8 --max_tokens 512
+Each stage is a pure function (except GPU/CPU-bound I/O stages).
+Config is a single dataclass; side effects are isolated at pipeline boundaries.
 """
 
 import argparse
 import json
 import os
 import re
+import signal
+import sys
+from dataclasses import dataclass
 from math import prod
-from multiprocessing import Process, Queue
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -26,11 +25,15 @@ from astrai.inference import InferenceEngine
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 HUMANEVAL_URL = (
     "https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz"
 )
 
-_STOP_SEQUENCES = [
+STOP_SEQUENCES = [
     "\nclass ",
     "\ndef ",
     "\n# ",
@@ -40,43 +43,82 @@ _STOP_SEQUENCES = [
 ]
 
 
-def _download_humaneval(data_path: str):
-    if os.path.exists(data_path):
+@dataclass
+class EvalConfig:
+    param_path: str = "./params"
+    data_path: str = "./humaneval/HumanEval.jsonl"
+    output: Optional[str] = None
+
+    num_samples: int = 200
+    max_tokens: int = 512
+    temperature: float = 0.8
+    top_p: float = 0.95
+    top_k: int = 50
+    batch_size: int = 32
+    test_timeout: float = 3.0
+    test_workers: int = 8
+    k_values: Tuple[int, ...] = (1, 10, 100)
+    problem_indices: Optional[List[int]] = None
+
+
+def download(url: str, path: str):
+    if os.path.exists(path):
         return
     import gzip
     import urllib.request
 
-    os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
-    print(f"Downloading HumanEval from {HUMANEVAL_URL} ...")
-    tmp = data_path + ".tmp"
-    urllib.request.urlretrieve(HUMANEVAL_URL, tmp)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    print(f"Downloading {url} ...")
+    tmp = path + ".tmp"
+    urllib.request.urlretrieve(url, tmp)
     with gzip.open(tmp, "rb") as f_in:
-        with open(data_path, "wb") as f_out:
+        with open(path, "wb") as f_out:
             f_out.write(f_in.read())
     os.remove(tmp)
-    print(f"  saved to {data_path}")
+    print(f"  saved to {path}")
 
 
-def _load_problems(data_path: str) -> List[dict]:
-    problems = []
-    with open(data_path, "r", encoding="utf-8") as f:
+def load_jsonl(path: str) -> List[dict]:
+    rows = []
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
-                problems.append(json.loads(line))
-    return problems
+                rows.append(json.loads(line))
+    return rows
 
 
-def _extract_function_body(code: str, entry_point: str) -> Optional[str]:
-    """Extract the function body from a completion."""
+def save_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def create_engine(param_path: str, batch_size: int) -> InferenceEngine:
+    model = AutoModel.from_pretrained(param_path)
+    tokenizer = AutoTokenizer.from_pretrained(param_path)
+    model.to(device="cuda", dtype=torch.bfloat16)
+    return InferenceEngine(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=batch_size,
+    )
+
+
+def trim_stop(text: str) -> str:
+    for stop in STOP_SEQUENCES:
+        idx = text.find(stop)
+        if idx != -1:
+            text = text[:idx]
+    return text
+
+
+def extract_body(code: str, entry_point: str) -> Optional[str]:
     pattern = rf"def\s+{re.escape(entry_point)}\b[^:]*:"
     match = re.search(pattern, code)
     if not match:
-        # Use the full code as-is if we can't find the function
         return code
 
-    body_start = match.end()
-    lines = code[body_start:].split("\n")
+    lines = code[match.end() :].split("\n")
     body_lines = []
     started = False
 
@@ -94,240 +136,243 @@ def _extract_function_body(code: str, entry_point: str) -> Optional[str]:
         body_lines.append(stripped)
 
     body = "\n".join(body_lines)
-    if not body.strip():
-        return None
-    return body
+    return body if body.strip() else None
 
 
-def _trim_stop_sequences(text: str) -> str:
-    for stop in _STOP_SEQUENCES:
-        idx = text.find(stop)
-        if idx != -1:
-            text = text[:idx]
-    return text
-
-
-def _execute_code(problem: dict, completion: str, timeout: float = 3.0) -> bool:
-    """Run the completion against hidden tests in a subprocess."""
-
-    def _worker(queue, full_code):
-        try:
-            namespace = {}
-            exec(full_code, namespace)
-            check = namespace.get("check")
-            if check is None:
-                queue.put(False)
-                return
-            check(namespace.get(problem["entry_point"]))
-            queue.put(True)
-        except Exception:
-            queue.put(False)
-
-    full_code = problem["prompt"] + completion + "\n" + problem["test"]
-
-    queue: Queue = Queue()
-    proc = Process(target=_worker, args=(queue, full_code))
-    proc.start()
-    proc.join(timeout)
-
-    if proc.is_alive():
-        proc.terminate()
-        proc.join()
-        return False
-
-    try:
-        return queue.get_nowait()
-    except Exception:
-        return False
-
-
-def _pass_at_k(n: int, c: int, k: int) -> float:
-    """Unbiased estimator of pass@k."""
-    if n - c < k:
-        return 1.0
-    return 1.0 - float(prod(1.0 - k / np.arange(n - c + 1, n + 1)))
-
-
-def _deduplicate(completions: List[str]) -> List[str]:
+def deduplicate(seq: Sequence[str]) -> List[str]:
     seen = set()
-    unique = []
-    for c in completions:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-    return unique
+    return [x for x in seq if not (x in seen or seen.add(x))]
 
 
-def _generate(
+def generate_batch(
     engine: InferenceEngine,
     prompt: str,
-    num_samples: int,
+    n: int,
+    batch_size: int,
     max_tokens: int,
     temperature: float,
     top_p: float,
     top_k: int,
-    batch_size: int,
 ) -> List[str]:
-    batches = [prompt] * min(batch_size, num_samples)
     completions = []
-    remaining = num_samples
-
+    remaining = n
     while remaining > 0:
         current = min(batch_size, remaining)
-        batch_prompts = batches[:current]
         outputs = engine.generate(
-            prompt=batch_prompts,
+            prompt=[prompt] * current,
             stream=False,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
         )
-        if isinstance(outputs, str):
-            outputs = [outputs]
-        completions.extend(outputs)
+        completions.extend(outputs if isinstance(outputs, list) else [outputs])
         remaining -= current
+    return deduplicate(completions)
 
-    return _deduplicate(completions)
+
+def extract_completions(
+    raw: Sequence[str],
+    entry_point: str,
+) -> List[str]:
+    bodies = []
+    for r in raw:
+        t = trim_stop(r)
+        body = extract_body(t, entry_point)
+        if body:
+            bodies.append(body)
+    return bodies
 
 
-def evaluate(
+def generate_all(
     engine: InferenceEngine,
-    problems: List[dict],
-    num_samples: int,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-    batch_size: int,
-    k_values: Tuple[int, ...] = (1, 10, 100),
-) -> Dict:
-    results = {}
-    all_pass_at_k = {k: [] for k in k_values}
-
-    for problem in tqdm.tqdm(problems, desc="HumanEval", unit="problem"):
-        task_id = problem["task_id"]
-        prompt = problem["prompt"]
-        entry_point = problem["entry_point"]
-
-        raw_completions = _generate(
+    problems: Sequence[dict],
+    cfg: EvalConfig,
+) -> List[dict]:
+    results = []
+    for problem in tqdm.tqdm(problems, desc="Generating", unit="problem"):
+        raw = generate_batch(
             engine,
-            prompt,
-            num_samples,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            batch_size,
+            problem["prompt"],
+            cfg.num_samples,
+            cfg.batch_size,
+            cfg.max_tokens,
+            cfg.temperature,
+            cfg.top_p,
+            cfg.top_k,
         )
-
-        completions = []
-        for raw in raw_completions:
-            trimmed = _trim_stop_sequences(raw)
-            body = _extract_function_body(trimmed, entry_point)
-            if body:
-                completions.append(body)
-
-        passed = 0
-        for comp in completions:
-            if _execute_code(problem, comp):
-                passed += 1
-
-        n = len(completions)
-        c = passed
-        result = {"task_id": task_id, "n": n, "passed": c}
-        for k in k_values:
-            result[f"pass@{k}"] = round(_pass_at_k(n, c, k), 4)
-            all_pass_at_k[k].append(_pass_at_k(n, c, k))
-        results[task_id] = result
-
-    summary = {}
-    for k in k_values:
-        vals = all_pass_at_k[k]
-        summary[f"pass@{k}"] = round(float(np.mean(vals)), 4)
-    results["_summary"] = summary
-
+        bodies = extract_completions(raw, problem["entry_point"])
+        results.append(
+            dict(
+                task_id=problem["task_id"],
+                entry_point=problem["entry_point"],
+                prompt=problem["prompt"],
+                test=problem["test"],
+                completions=bodies,
+            )
+        )
     return results
 
 
-def main():
-    parser = argparse.ArgumentParser(description="HumanEval benchmark")
-    parser.add_argument(
-        "--param_path", type=str, default="./params", help="Model directory"
-    )
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        default="./humaneval/HumanEval.jsonl",
-        help="HumanEval JSONL file (auto-download if missing)",
-    )
-    parser.add_argument("--output", type=str, default=None, help="Output JSON path")
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=200,
-        help="Completions per problem",
-    )
-    parser.add_argument(
-        "--max_tokens", type=int, default=512, help="Max generation tokens"
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=0.8, help="Sampling temperature"
-    )
-    parser.add_argument("--top_p", type=float, default=0.95, help="Top-p sampling")
-    parser.add_argument("--top_k", type=int, default=50, help="Top-k sampling")
-    parser.add_argument(
-        "--batch_size", type=int, default=1, help="Inference batch size"
-    )
-    parser.add_argument(
-        "--problems",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Specific problem indices (0-based)",
-    )
-    args = parser.parse_args()
+def _timeout_handler(signum, frame):
+    raise TimeoutError("execution timeout")
 
-    _download_humaneval(args.data_path)
-    problems = _load_problems(args.data_path)
-    if args.problems:
-        problems = [problems[i] for i in args.problems if i < len(problems)]
 
-    model = AutoModel.from_pretrained(args.param_path)
-    tokenizer = AutoTokenizer.from_pretrained(args.param_path)
-    model.to(device="cuda", dtype=torch.bfloat16)
+def execute_one(args: tuple) -> bool:
+    full_code, entry_point, timeout = args
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(int(timeout))
+    with open(os.devnull, "w") as devnull:
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = devnull, devnull
+        try:
+            ns = {}
+            exec(full_code, ns)
+            candidate = ns.get(entry_point)
+            check = ns.get("check")
+            if check is None or candidate is None:
+                return False
+            check(candidate)
+            return True
+        except Exception:
+            return False
+        finally:
+            signal.alarm(0)
+            sys.stdout, sys.stderr = old_out, old_err
 
-    engine = InferenceEngine(
-        model=model,
-        tokenizer=tokenizer,
-        max_batch_size=args.batch_size,
-    )
 
-    results = evaluate(
-        engine=engine,
-        problems=problems,
+def test_one(item: dict, cfg: EvalConfig) -> Tuple[str, int, int]:
+    from concurrent.futures import ProcessPoolExecutor
+
+    task_id = item["task_id"]
+    completions = item["completions"]
+    codes = [
+        (
+            item["prompt"] + c + "\n" + item["test"],
+            item["entry_point"],
+            cfg.test_timeout,
+        )
+        for c in completions
+    ]
+    n = len(codes)
+    passed = 0
+    with ProcessPoolExecutor(max_workers=cfg.test_workers) as pool:
+        for ok in pool.map(execute_one, codes):
+            if ok:
+                passed += 1
+    return task_id, n, passed
+
+
+def test_all(
+    items: Sequence[dict],
+    cfg: EvalConfig,
+) -> Iterator[Tuple[str, int, int]]:
+    for item in tqdm.tqdm(items, desc="Testing", unit="problem"):
+        yield test_one(item, cfg)
+
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    if n - c < k:
+        return 1.0
+    return 1.0 - float(prod(1.0 - k / np.arange(n - c + 1, n + 1)))
+
+
+def score_results(
+    results: Iterator[Tuple[str, int, int]],
+    k_values: Tuple[int, ...],
+) -> Dict:
+    scores = {k: [] for k in k_values}
+    output = {}
+    for task_id, n, passed in results:
+        scores["task_id"] = task_id
+        entry = {"task_id": task_id, "n": n, "passed": passed}
+        for k in k_values:
+            pk = round(pass_at_k(n, passed, k), 4)
+            entry[f"pass@{k}"] = pk
+            scores[k].append(pk)
+        output[task_id] = entry
+
+    summary = {}
+    for k in k_values:
+        vals = scores[k]
+        summary[f"pass@{k}"] = round(float(np.mean(vals)), 4)
+    output["_summary"] = summary
+    return output
+
+
+def run_pipeline(cfg: EvalConfig) -> Dict:
+    download(HUMANEVAL_URL, cfg.data_path)
+
+    problems = load_jsonl(cfg.data_path)
+    if cfg.problem_indices:
+        problems = [problems[i] for i in cfg.problem_indices if i < len(problems)]
+
+    engine = create_engine(cfg.param_path, cfg.batch_size)
+
+    try:
+        generated = generate_all(engine, problems, cfg)
+
+        if cfg.output:
+            mid = cfg.output.replace(".json", "_completions.json")
+            save_json(mid, generated)
+            print(f"Completions saved to {mid}")
+
+        results = test_all(generated, cfg)
+        scored = score_results(results, cfg.k_values)
+    finally:
+        engine.shutdown()
+
+    return scored
+
+
+def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
+    p = argparse.ArgumentParser(description="HumanEval benchmark")
+    p.add_argument("--param_path", type=str, default="./params")
+    p.add_argument("--data_path", type=str, default="./humaneval/HumanEval.jsonl")
+    p.add_argument("--output", type=str, default=None)
+    p.add_argument("--num_samples", type=int, default=200)
+    p.add_argument("--max_tokens", type=int, default=512)
+    p.add_argument("--temperature", type=float, default=0.8)
+    p.add_argument("--top_p", type=float, default=0.95)
+    p.add_argument("--top_k", type=int, default=50)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--test_workers", type=int, default=8)
+    p.add_argument("--test_timeout", type=float, default=3.0)
+    p.add_argument("--problems", type=int, nargs="+", default=None)
+    args = p.parse_args(argv)
+
+    return EvalConfig(
+        param_path=args.param_path,
+        data_path=args.data_path,
+        output=args.output,
         num_samples=args.num_samples,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
         batch_size=args.batch_size,
-        k_values=(1, 10, 100),
+        test_workers=args.test_workers,
+        test_timeout=args.test_timeout,
+        problem_indices=args.problems,
     )
 
-    summary = results.pop("_summary")
+
+def report(scored: Dict):
+    summary = scored.pop("_summary", {})
     print(f"\n{'=' * 60}")
     for k, v in summary.items():
         print(f"  {k}: {v:.2%}")
     print(f"{'=' * 60}")
+    scored["_summary"] = summary
 
-    if args.output:
-        results["_summary"] = summary
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"Results saved to {args.output}")
 
-    engine.shutdown()
+def main():
+    cfg = parse_args()
+    scored = run_pipeline(cfg)
+    report(scored)
+    if cfg.output:
+        save_json(cfg.output, scored)
+        print(f"Results saved to {cfg.output}")
 
 
 if __name__ == "__main__":

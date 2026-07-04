@@ -96,7 +96,7 @@ class OutputConfig(BaseConfig):
     storage_format: str = "bin"
     max_tokens_per_shard: int = 100_000_000
     dtype: Dict[str, str] = field(default_factory=dict)
-    position_ids_mode: str = "none"
+    position_ids_mode: str = "doc_reset"
 
 
 @dataclass

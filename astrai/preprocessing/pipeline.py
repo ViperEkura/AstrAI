@@ -144,7 +144,7 @@ class Pipeline:
         for key in list(bucket.keys()):
             if key in result:
                 continue
-            bucket[key].append([1] * len(ids))
+            bucket[key].append([0] * len(ids))
 
     def _iter_items(self):
         for path in self.paths:
@@ -160,6 +160,12 @@ class Pipeline:
             idx = shard_idx[domain]
 
             pp = self.config.preprocessing
+            original_sequences = keys.get("sequence", [])
+            mode = self.config.output.position_ids_mode
+
+            if mode == "doc_reset" and original_sequences:
+                keys["position_ids"] = [list(range(len(s))) for s in original_sequences]
+
             keys = self._packer.apply(dict(keys), pp.max_packed_len, pp.truncation_mode)
 
             tensors: Dict[str, List[torch.Tensor]] = {}
@@ -171,9 +177,10 @@ class Pipeline:
                     torch.tensor(list(chain.from_iterable(ids_list)), dtype=dt)
                 ]
 
-            pos_ids = self._position_id.generate(keys.get("sequence", []))
-            if pos_ids:
-                tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
+            if mode == "continuous" and original_sequences:
+                pos_ids = self._position_id.generate(keys.get("sequence", []))
+                if pos_ids:
+                    tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
 
             self._writer.save(self.output_dir, domain, idx, tensors)
             shard_idx[domain] = idx + 1

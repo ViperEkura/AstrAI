@@ -5,8 +5,10 @@
 !*/
 
 # Allow specific file types and root files
-!*.py
-!*.sh
+!astrai/**/*.py
+!scripts/**/*.py
+!scripts/**/*.sh
+!tests/**/*.py
 
 # Allow GitHub files
 !/.github/**

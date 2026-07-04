@@ -89,8 +89,12 @@ def _compute_ifd_raw(model, tokenizer, instruction, response, device, max_len) -
     qa_ids = instr_ids + resp_ids
 
     with torch.inference_mode():
-        logits_qa = model(torch.tensor([qa_ids], device=device, dtype=torch.long))["logits"][0]
-        logits_resp = model(torch.tensor([resp_ids], device=device, dtype=torch.long))["logits"][0]
+        logits_qa = model(torch.tensor([qa_ids], device=device, dtype=torch.long))[
+            "logits"
+        ][0]
+        logits_resp = model(torch.tensor([resp_ids], device=device, dtype=torch.long))[
+            "logits"
+        ][0]
 
     resp_logits = logits_qa[instr_len - 1 : -1]
     resp_targets = logits_resp.new_tensor(resp_ids, dtype=torch.long)

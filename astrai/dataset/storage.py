@@ -14,85 +14,31 @@ Key properties:
   - Explicit length: _length = min(total elements across keys), set at load,
                       __len__ returns O(1)
   - Zero-copy mmap:  MmapStore wraps np.memmap(mode="r"), all DataLoader
-                      workers share OS page-cache pages
+                       workers share OS page-cache pages
 """
 
 import bisect
 import glob
 import json
-import os
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Union
 
-import h5py
-import numpy as np
 import torch
 from torch import Tensor
 
+from astrai.config.preprocess_config import PipelineConfig
 from astrai.factory import BaseFactory
+from astrai.preprocessing.builder import MaskBuilderFactory
+from astrai.preprocessing.position_id import PositionIdStrategyFactory
+from astrai.serialization import (
+    load_bin,
+    load_h5,
+)
+from astrai.tokenize import AutoTokenizer
 
-
-def save_h5(file_path: str, file_name: str, tensor_group: Dict[str, List[Tensor]]):
-    os.makedirs(file_path, exist_ok=True)
-    full_file_path = os.path.join(file_path, f"{file_name}.h5")
-    with h5py.File(full_file_path, "w") as f:
-        for key, tensors in tensor_group.items():
-            grp = f.create_group(key)
-            for idx, tensor in enumerate(tensors):
-                arr = tensor.cpu().numpy()
-                grp.create_dataset(f"data_{idx}", data=arr)
-
-
-def load_h5(file_path: str, share_memory=True) -> Dict[str, List[Tensor]]:
-    tensor_group: Dict[str, List[Tensor]] = {}
-
-    root_path = Path(file_path)
-    h5_files = list(root_path.rglob("*.h5")) + list(root_path.rglob("*.hdf5"))
-
-    for h5_file in h5_files:
-        with h5py.File(h5_file, "r") as f:
-            for key in f.keys():
-                grp = f[key]
-                dsets = []
-                for dset_name in grp.keys():
-                    dset = grp[dset_name]
-                    tensor = torch.from_numpy(dset[:])
-                    if share_memory:
-                        tensor = tensor.share_memory_()
-                    dsets.append(tensor)
-
-                if tensor_group.get(key) is None:
-                    tensor_group[key] = []
-                tensor_group[key].extend(dsets)
-
-    return tensor_group
-
-
-def save_bin(file_path: str, tensor_group: Dict[str, List[Tensor]]):
-    os.makedirs(file_path, exist_ok=True)
-    meta = {}
-    for key, tensors in tensor_group.items():
-        cat = torch.cat(tensors, dim=0)
-        meta[key] = {"shape": list(cat.shape), "dtype": str(cat.dtype).split(".")[-1]}
-        np.asarray(cat.cpu().numpy()).tofile(os.path.join(file_path, f"{key}.bin"))
-    with open(os.path.join(file_path, "meta.json"), "w") as f:
-        json.dump(meta, f)
-
-
-def load_bin(file_path: str) -> Dict[str, List[Tensor]]:
-    with open(os.path.join(file_path, "meta.json"), "r") as f:
-        meta = json.load(f)
-    segments: Dict[str, List[Tensor]] = {}
-    for key, info in meta.items():
-        arr = np.memmap(
-            os.path.join(file_path, f"{key}.bin"),
-            dtype=info["dtype"],
-            mode="r+",
-            shape=tuple(info["shape"]),
-        )
-        segments[key] = [torch.from_numpy(arr)]
-    return segments
+logger = logging.getLogger(__name__)
 
 
 def detect_format(load_path: str) -> str:
@@ -102,7 +48,7 @@ def detect_format(load_path: str) -> str:
         load_path: Directory or file path
 
     Returns:
-        Format string ("h5" or "bin")
+        Format string ("h5", "bin", or "jsonl")
 
     Raises:
         FileNotFoundError: If no supported data files are found
@@ -112,6 +58,8 @@ def detect_format(load_path: str) -> str:
         suffix = root.suffix.lower()
         if suffix in (".h5", ".hdf5"):
             return "h5"
+        if suffix == ".jsonl":
+            return "jsonl"
         raise ValueError(f"Unsupported file format: {suffix}")
 
     h5_files = [
@@ -128,6 +76,11 @@ def detect_format(load_path: str) -> str:
         ) > 0
         if has_meta:
             return "bin"
+    jsonl_files = [
+        Path(p) for p in glob.glob(str(root / "**" / "*.jsonl"), recursive=True)
+    ]
+    if jsonl_files:
+        return "jsonl"
     raise FileNotFoundError(f"No supported data files found at {load_path}")
 
 
@@ -264,3 +217,96 @@ class MmapStore(Store):
         self._normalize(all_raw)
         for tensors in self._data.values():
             self._mmap_refs.extend(tensors)
+
+
+@StoreFactory.register("jsonl")
+class JsonlStore(Store):
+    """On-the-fly tokenization store for raw JSONL files.
+
+    A JSONL dataset directory contains ``*.jsonl`` files plus a
+    ``dataset_config.json`` file that follows the same schema as
+    :class:`PipelineConfig` with an additional ``tokenizer_path`` field.
+    Records are tokenized when the store is loaded and concatenated into
+    segmented tensors matching the key layout expected by the dataset
+    classes (``sequence``, ``loss_mask``, ``position_ids``, ...).
+    """
+
+    CONFIG_NAME = "dataset_config.json"
+
+    def load(self, path: str):
+        root = Path(path)
+        config_path = root / self.CONFIG_NAME
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"JSONL dataset config not found: {config_path}. "
+                f"Expected {self.CONFIG_NAME} alongside *.jsonl files."
+            )
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+
+        tokenizer_path = raw_config.pop("tokenizer_path", None)
+        if tokenizer_path is None:
+            raise ValueError(
+                f"JSONL dataset config must specify 'tokenizer_path': {config_path}"
+            )
+
+        self.config = PipelineConfig.from_dict(raw_config)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        mask_builder = MaskBuilderFactory.create("sectioned")
+        position_strategy = PositionIdStrategyFactory.create(
+            self.config.output.position_ids_mode
+        )
+
+        raw: Dict[str, List[Tensor]] = {}
+        doc_sequences: List[List[int]] = []
+
+        for jsonl_path in sorted(root.glob("*.jsonl")):
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Failed to parse JSON line in %s, skipping", jsonl_path
+                        )
+                        continue
+
+                    result = mask_builder.build(item, self.config, tokenizer)
+                    if result is None:
+                        continue
+
+                    result.pop("domain", None)
+                    primary_ids = self._primary_ids(result)
+                    if not primary_ids:
+                        continue
+
+                    doc_sequences.append(primary_ids)
+                    for key, ids in result.items():
+                        if key not in raw:
+                            raw[key] = []
+                        raw[key].append(torch.tensor(ids, dtype=self._infer_dtype(ids)))
+
+        pos_ids = position_strategy.generate(doc_sequences)
+        if pos_ids:
+            raw["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
+
+        self._normalize(raw)
+
+    @staticmethod
+    def _primary_ids(result: dict) -> List[int]:
+        """Return the first integer list in *result* as the primary id sequence."""
+        for val in result.values():
+            if isinstance(val, list) and val and isinstance(val[0], int):
+                return val
+        return []
+
+    @staticmethod
+    def _infer_dtype(ids: List) -> torch.dtype:
+        """Infer tensor dtype from the first element of a token/value list."""
+        if ids and isinstance(ids[0], float):
+            return torch.float32
+        return torch.int32

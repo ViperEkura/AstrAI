@@ -48,24 +48,26 @@ class BaseDataset(Dataset, ABC):
                 f"Missing: {missing}"
             )
 
-    def load(self, load_path: str, storage_type: Optional[str] = None):
+    def load(self, load_path: str, storage_type: Optional[str] = None, **kwargs):
         """Load dataset from the given path.
 
         Auto-detects the storage format if not specified.
 
         Args:
             load_path: Path to the data directory or file
-            storage_type: Force a specific storage type ("h5", "bin"),
+            storage_type: Force a specific storage type ("h5", "bin", "jsonl"),
                           or None for auto-detection
+            **kwargs: Extra arguments forwarded to the store constructor and
+                      to ``store.load()``.
 
         Raises:
             KeyError: If the loaded storage is missing required keys.
         """
         if storage_type is None:
             storage_type = detect_format(load_path)
-        self.storage = StoreFactory.create(storage_type)
+        self.storage = StoreFactory.create(storage_type, **kwargs)
         self._load_path = load_path
-        self.storage.load(load_path)
+        self.storage.load(load_path, **kwargs)
         self._validate_keys()
 
     @property
@@ -144,6 +146,7 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
         window_size: int,
         stride: Optional[int] = None,
         storage_type: Optional[str] = None,
+        **kwargs,
     ) -> "BaseDataset":
         """Create and load a dataset in one step.
 
@@ -152,7 +155,8 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
             load_path: Path to the data file
             window_size: Window size for data sampling
             stride: Stride between consecutive samples (default: same as window_size)
-            storage_type: Storage type ("h5", "bin") or None for auto-detection
+            storage_type: Storage type ("h5", "bin", "jsonl") or None for auto-detection
+            **kwargs: Extra arguments forwarded to ``dataset.load()``.
 
         Returns:
             Loaded dataset instance
@@ -161,7 +165,7 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
             stride = window_size
 
         dataset = cls.create(train_type, window_size, stride)
-        dataset.load(load_path, storage_type=storage_type)
+        dataset.load(load_path, storage_type=storage_type, **kwargs)
 
         return dataset
 

@@ -14,8 +14,8 @@ from typing import Dict, List
 
 import torch
 
-from astrai.dataset.storage import save_bin, save_h5
 from astrai.factory import BaseFactory
+from astrai.serialization import save_bin, save_h5
 
 logger = logging.getLogger(__name__)
 

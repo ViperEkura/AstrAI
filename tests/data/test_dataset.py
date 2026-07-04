@@ -1,14 +1,18 @@
+import json
 import os
 
 import numpy as np
 import pytest
 import torch
 
+from astrai.config.preprocess_config import PipelineConfig
 from astrai.dataset.dataset import DatasetFactory, SEQDataset
 from astrai.dataset.storage import (
     H5Store,
     StoreFactory,
     detect_format,
+)
+from astrai.serialization import (
     load_bin,
     save_bin,
     save_h5,
@@ -17,6 +21,39 @@ from astrai.dataset.storage import (
 
 def _rand_seq(length, vocab=1000):
     return torch.randint(0, vocab, (length,), dtype=torch.int64)
+
+
+def _save_test_tokenizer(test_dir, tokenizer):
+    tokenizer_path = os.path.join(test_dir, "tokenizer")
+    os.makedirs(tokenizer_path, exist_ok=True)
+    tokenizer.save_pretrained(tokenizer_path)
+    return tokenizer_path
+
+
+def _write_jsonl_dataset(test_dir, tokenizer_path, records, config_overrides=None):
+    data_dir = os.path.join(test_dir, "jsonl_data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    with open(os.path.join(data_dir, "data.jsonl"), "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    config = {
+        "tokenizer_path": tokenizer_path,
+        "version": 1,
+        "input": {"sections": [{"field": "text", "action": "train"}]},
+        "preprocessing": {"max_seq_len": 128},
+        "output": {"position_ids_mode": "continuous"},
+    }
+    if config_overrides:
+        config.update(config_overrides)
+
+    with open(
+        os.path.join(data_dir, "dataset_config.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    return data_dir
 
 
 def _make_seq_dataset(
@@ -372,3 +409,106 @@ def test_dataset_load_explicit_storage_type(base_test_env):
     dataset = _make_seq_dataset(test_dir, "explicit", storage_type="h5")
     assert len(dataset) > 0
     assert dataset.count == 200
+
+
+def test_detect_format_jsonl_dir(base_test_env):
+    test_dir = base_test_env["test_dir"]
+    tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
+    data_dir = _write_jsonl_dataset(
+        test_dir,
+        tokenizer_path,
+        [{"text": "hello world"}, {"text": "foo bar baz"}],
+    )
+    assert detect_format(data_dir) == "jsonl"
+
+
+def test_jsonl_store_seq(base_test_env):
+    test_dir = base_test_env["test_dir"]
+    tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
+    data_dir = _write_jsonl_dataset(
+        test_dir,
+        tokenizer_path,
+        [{"text": "hello world"}, {"text": "foo bar baz qux"}],
+        config_overrides={"preprocessing": {"max_seq_len": 128, "min_chars": 0}},
+    )
+
+    store = StoreFactory.create("jsonl")
+    store.load(data_dir)
+    assert len(store) > 0
+    assert "sequence" in store.keys
+
+    dataset = DatasetFactory.load("seq", data_dir, window_size=8)
+    assert len(dataset) > 0
+    item = dataset[0]
+    assert "input_ids" in item
+    assert "target_ids" in item
+    assert item["input_ids"].dtype == torch.long
+
+
+def test_jsonl_store_sft(base_test_env):
+    test_dir = base_test_env["test_dir"]
+    tokenizer = base_test_env["tokenizer"]
+    tokenizer.set_chat_template(
+        "{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}\n{% endfor %}"
+    )
+    tokenizer_path = _save_test_tokenizer(test_dir, tokenizer)
+    data_dir = _write_jsonl_dataset(
+        test_dir,
+        tokenizer_path,
+        [
+            {
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            }
+        ],
+        config_overrides={
+            "input": {
+                "sections": [{"field": "messages", "action": "$role", "template": True}]
+            },
+            "mask": {"system": "mask", "user": "mask", "assistant": "train"},
+            "mask_default": "mask",
+        },
+    )
+
+    store = StoreFactory.create("jsonl")
+    store.load(data_dir)
+    assert "sequence" in store.keys
+    assert "loss_mask" in store.keys
+    assert "position_ids" in store.keys
+
+    dataset = DatasetFactory.load("sft", data_dir, window_size=8)
+    item = dataset[0]
+    assert "input_ids" in item
+    assert "target_ids" in item
+    assert "loss_mask" in item
+    assert "position_ids" in item
+    assert item["loss_mask"].dtype == torch.bool
+
+
+def test_jsonl_store_pipeline_config_roundtrip(base_test_env):
+    test_dir = base_test_env["test_dir"]
+    config_path = os.path.join(test_dir, "dataset_config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "tokenizer_path": os.path.join(test_dir, "tokenizer"),
+                "version": 1,
+                "input": {"sections": [{"field": "text", "action": "train"}]},
+                "mask": {"assistant": "train"},
+                "preprocessing": {"max_seq_len": 64},
+                "output": {"position_ids_mode": "doc_reset"},
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    raw.pop("tokenizer_path")
+    config = PipelineConfig.from_dict(raw)
+    assert config.output.position_ids_mode == "doc_reset"
+    assert config.preprocessing.max_seq_len == 64

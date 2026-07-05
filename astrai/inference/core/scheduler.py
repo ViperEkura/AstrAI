@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from astrai.inference.core.cache import KVCache
+from astrai.inference.core.cache import ContiguousCache, KVCache
 from astrai.inference.core.executor import Executor
 from astrai.inference.core.task import STOP, Task, TaskManager, TaskStatus
 from astrai.model.automodel import AutoModel
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class InferenceScheduler:
-    """Four-phase continuous batching loop: cleanup -> refill -> prefill -> decode."""
+    """Continuous batching loop: cleanup -> refill -> prefill -> decode (all groups)."""
 
     def __init__(
         self,
@@ -26,6 +26,7 @@ class InferenceScheduler:
         page_size: int = 64,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
+        cache: Optional[KVCache] = None,
     ):
         config = model.config
 
@@ -41,19 +42,20 @@ class InferenceScheduler:
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
 
-        n_pages = (
-            max_batch_size * (self.max_seq_len + page_size) + page_size - 1
-        ) // page_size
+        head_dim = config.dim // config.n_heads
 
-        self._page_cache = KVCache(
-            config.n_layers,
-            n_pages,
-            page_size,
-            config.n_kv_heads,
-            config.dim // config.n_heads,
-            self.device,
-            self.dtype,
-        )
+        if cache is not None:
+            self._cache = cache
+        else:
+            self._cache = ContiguousCache(
+                config.n_layers,
+                max_batch_size,
+                self.max_seq_len,
+                config.n_kv_heads,
+                head_dim,
+                self.device,
+                self.dtype,
+            )
 
         self._task_mgr = TaskManager(
             tokenizer=tokenizer,
@@ -65,7 +67,7 @@ class InferenceScheduler:
         self._executor = Executor(
             model=model,
             tokenizer=tokenizer,
-            page_cache=self._page_cache,
+            page_cache=self._cache,
             device=self.device,
             dtype=self.dtype,
         )
@@ -78,18 +80,35 @@ class InferenceScheduler:
 
     def remove_task(self, task_id: str):
         for task in self._task_mgr.remove_task(task_id):
-            self._page_cache.task_free(task.task_id)
+            self._cache.task_free(task.task_id)
 
     def get_stats(self) -> Dict[str, Any]:
         return self._task_mgr.get_stats()
 
+    @staticmethod
+    def _cached(cache: KVCache, task_id: str) -> int:
+        fn = getattr(cache, "task_cached", None)
+        return fn(task_id) if fn else 0
+
+    @staticmethod
+    def _record_hashes(
+        cache: KVCache,
+        task_id: str,
+        prompt_ids: List[int],
+        start_logical_page: int = 0,
+    ):
+        fn = getattr(cache, "task_record_hashes", None)
+        if fn:
+            fn(task_id, prompt_ids, start_logical_page=start_logical_page)
+
     def _run_generation_loop(self):
         stop_ids = self._task_mgr.tokenizer.stop_ids
+        cache = self._cache
         try:
             while not self._stop_event.is_set():
                 finished = self._task_mgr.remove_finished_tasks(stop_ids)
                 for task in finished:
-                    self._page_cache.task_free(task.task_id)
+                    cache.task_free(task.task_id)
 
                 active = self._task_mgr.get_active_tasks()
                 available = self._task_mgr.max_batch_size - len(active)
@@ -97,7 +116,7 @@ class InferenceScheduler:
                     candidates = self._task_mgr.pull_candidates(available)
                     failed = []
                     for task in candidates:
-                        if self._page_cache.task_alloc(task.task_id, task.prompt_ids):
+                        if cache.task_alloc(task.task_id, task.prompt_ids):
                             self._task_mgr.activate(task)
                         else:
                             failed.append(task)
@@ -112,7 +131,7 @@ class InferenceScheduler:
                     t
                     for t in self._task_mgr.get_active_tasks()
                     if t.output_tokens == 0
-                    and self._page_cache.task_cached(t.task_id) < len(t.prompt_ids)
+                    and self._cached(cache, t.task_id) < len(t.prompt_ids)
                 ]
                 if to_prefill:
                     for t in to_prefill:
@@ -122,31 +141,30 @@ class InferenceScheduler:
                     for t in to_prefill:
                         key = (
                             len(t.prompt_ids),
-                            self._page_cache.task_cached(t.task_id),
+                            self._cached(cache, t.task_id),
                         )
                         groups.setdefault(key, []).append(t)
 
                     for (prompt_len, start_pos), group in groups.items():
                         self._executor.execute_prefill(group, prompt_len, start_pos)
-                        start_logical_page = start_pos // self._page_cache.page_size
+                        start_logical_page = start_pos // getattr(
+                            cache, "page_size", 64
+                        )
                         for t in group:
-                            self._page_cache.task_record_hashes(
-                                t.task_id,
-                                t.prompt_ids,
-                                start_logical_page=start_logical_page,
+                            self._record_hashes(
+                                cache, t.task_id, t.prompt_ids, start_logical_page
                             )
 
                 pos_groups: Dict[int, List[Task]] = {}
                 for t in self._task_mgr.get_active_tasks():
                     pos_groups.setdefault(t.next_pos, []).append(t)
 
-                if pos_groups:
-                    best_key = max(pos_groups, key=lambda k: len(pos_groups[k]))
-                    group = sorted(pos_groups[best_key], key=lambda t: t.task_id)
+                for next_pos in sorted(pos_groups.keys()):
+                    group = sorted(pos_groups[next_pos], key=lambda t: t.task_id)
 
                     valid: List[Task] = []
                     for t in group:
-                        if self._page_cache.task_extend(t.task_id, t.next_pos):
+                        if cache.task_extend(t.task_id, t.next_pos):
                             valid.append(t)
                         else:
                             t.status = TaskStatus.ABORTED
@@ -159,16 +177,10 @@ class InferenceScheduler:
                         for t, ntok in zip(valid, next_tokens):
                             t.output_ids.append(ntok)
                             t.output_tokens += 1
-                            pos = t.input_tokens + t.output_tokens
-                            extend_ok = self._page_cache.task_extend(t.task_id, pos)
                             if t.stream_callback:
                                 t.stream_callback(
                                     self._task_mgr.tokenizer.decode([ntok])
                                 )
-                            if not extend_ok:
-                                t.status = TaskStatus.ABORTED
-                                if t.stream_callback:
-                                    t.stream_callback(STOP)
 
                         for t in valid:
                             if t.is_finished(stop_ids):
@@ -181,7 +193,7 @@ class InferenceScheduler:
             for task in self._task_mgr.get_active_tasks():
                 if task.stream_callback:
                     task.stream_callback(STOP)
-                self._page_cache.task_free(task.task_id)
+                cache.task_free(task.task_id)
             for task in self._task_mgr.get_waiting_tasks():
                 if task.stream_callback:
                     task.stream_callback(STOP)
@@ -204,7 +216,7 @@ class InferenceScheduler:
         for task in self._task_mgr.get_active_tasks():
             if task.stream_callback:
                 task.stream_callback(STOP)
-            self._page_cache.task_free(task.task_id)
+            self._cache.task_free(task.task_id)
         for task in self._task_mgr.get_waiting_tasks():
             if task.stream_callback:
                 task.stream_callback(STOP)

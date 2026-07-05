@@ -4,7 +4,7 @@ from typing import Optional
 import torch.nn as nn
 from torch import Tensor
 
-from astrai.inference.core.cache import KvcacheView
+from astrai.inference.core.cache import CacheView
 from astrai.model.components.attention import AttnFactory
 from astrai.model.components.mlp import FFNFactory
 from astrai.model.components.norm import RMSNorm
@@ -25,7 +25,7 @@ class DecoderBlock(nn.Module):
         x: Tensor,
         rotary_emb: Tensor,
         attention_mask: Optional[Tensor] = None,
-        paged_cache: Optional[KvcacheView] = None,
+        paged_cache: Optional[CacheView] = None,
     ) -> Tensor:
         attn_output = self.attention(
             self.input_norm(x),

@@ -2,8 +2,12 @@
 
 from astrai.inference.core.cache import (
     Allocator,
+    CacheView,
+    ContiguousCache,
+    ContiguousCacheView,
     KVCache,
-    KvcacheView,
+    PageCache,
+    PageCacheView,
     PagePool,
     PrefixCache,
     Storage,
@@ -16,8 +20,12 @@ from astrai.inference.core.task import STOP, Task, TaskManager, TaskStatus
 
 __all__ = [
     "Allocator",
+    "CacheView",
     "KVCache",
-    "KvcacheView",
+    "ContiguousCache",
+    "ContiguousCacheView",
+    "PageCache",
+    "PageCacheView",
     "PagePool",
     "PrefixCache",
     "Storage",

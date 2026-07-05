@@ -1,4 +1,5 @@
 import threading
+from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -275,7 +276,35 @@ class Storage:
         return k, v
 
 
-class KvcacheView:
+class CacheView(ABC):
+    """Abstract view passed to attention layers for KV-cache I/O."""
+
+    @abstractmethod
+    def write(self, layer_id: int, k: Tensor, v: Tensor): ...
+
+    @abstractmethod
+    def gather(self, layer_id: int) -> Tuple[Tensor, Tensor]: ...
+
+
+class KVCache(ABC):
+    """Abstract KV-cache facade for scheduler/executor."""
+
+    @abstractmethod
+    def task_alloc(self, task_id: str, prompt_ids: List[int]) -> bool: ...
+
+    @abstractmethod
+    def task_free(self, task_id: str): ...
+
+    @abstractmethod
+    def task_extend(self, task_id: str, pos: int) -> bool: ...
+
+    @abstractmethod
+    def bind_tasks(
+        self, task_ids: List[str], total_len: int, device: torch.device
+    ) -> CacheView: ...
+
+
+class PageCacheView(CacheView):
     """Bundles Storage + page_table + total_len for attention layers."""
 
     def __init__(self, storage: Storage, page_table: Tensor, total_len: int = 0):
@@ -291,8 +320,8 @@ class KvcacheView:
         return self._storage.gather(layer_id, self._page_table, self._total_len)
 
 
-class KVCache:
-    """Facade: page management + KV-cache I/O for continuous batching."""
+class PageCache(KVCache):
+    """Paged KV-cache with prefix sharing."""
 
     def __init__(
         self,
@@ -362,8 +391,102 @@ class KVCache:
         for i in range(start_logical_page, full_pages):
             self._pool.record(page_table[i], prompt_ids, i)
 
-    def make_table_tensor(self, task_ids: List[str], device: torch.device) -> Tensor:
-        return self._table.table_tensor(task_ids, device)
+    def bind_tasks(
+        self, task_ids: List[str], total_len: int, device: torch.device
+    ) -> PageCacheView:
+        page_table = self._table.table_tensor(task_ids, device)
+        return PageCacheView(self._storage, page_table, total_len)
 
-    def bind(self, page_table: Tensor, total_len: int = 0) -> KvcacheView:
-        return KvcacheView(self._storage, page_table, total_len)
+
+class ContiguousCacheView(CacheView):
+    """Contiguous KV-cache view for attention layers."""
+
+    def __init__(
+        self, cache: "ContiguousCache", batch_indices: Tensor, total_len: int = 0
+    ):
+        self._cache = cache
+        self._batch_indices = batch_indices
+        self._total_len = total_len
+
+    def write(self, layer_id: int, k: Tensor, v: Tensor):
+        seq_len = k.size(1)
+        start_pos = self._total_len - seq_len
+        indices = self._batch_indices
+        self._cache.k[layer_id, indices, start_pos : start_pos + seq_len] = k
+        self._cache.v[layer_id, indices, start_pos : start_pos + seq_len] = v
+        new_len = start_pos + seq_len
+        for s in indices.tolist():
+            cur = self._cache._slot_len.get(s, 0)
+            if new_len > cur:
+                self._cache._slot_len[s] = new_len
+
+    def gather(self, layer_id: int) -> Tuple[Tensor, Tensor]:
+        max_len = max(
+            self._cache._slot_len.get(int(s), 0) for s in self._batch_indices.tolist()
+        )
+        indices = self._batch_indices
+        k = self._cache.k[layer_id, indices, :max_len]
+        v = self._cache.v[layer_id, indices, :max_len]
+        return k, v
+
+
+class ContiguousCache(KVCache):
+    """Contiguous per-slot KV cache (default implementation)."""
+
+    def __init__(
+        self,
+        n_layers: int,
+        max_batch_size: int,
+        max_seq_len: int,
+        n_kv_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        self.max_seq_len = max_seq_len
+        self.k = torch.zeros(
+            n_layers,
+            max_batch_size,
+            max_seq_len,
+            n_kv_heads,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self.v = torch.zeros(
+            n_layers,
+            max_batch_size,
+            max_seq_len,
+            n_kv_heads,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        self._slot_len: Dict[int, int] = {}
+        self._task_slot: Dict[str, int] = {}
+        self._free_slots = list(range(max_batch_size))
+        self._device = device
+
+    def task_alloc(self, task_id: str, prompt_ids: List[int]) -> bool:
+        if not self._free_slots:
+            return False
+        slot = self._free_slots.pop(0)
+        self._task_slot[task_id] = slot
+        self._slot_len[slot] = 0
+        return True
+
+    def task_free(self, task_id: str):
+        slot = self._task_slot.pop(task_id, None)
+        if slot is not None:
+            self._slot_len.pop(slot, None)
+            self._free_slots.append(slot)
+
+    def task_extend(self, task_id: str, pos: int) -> bool:
+        return pos < self.max_seq_len
+
+    def bind_tasks(
+        self, task_ids: List[str], total_len: int, device: torch.device
+    ) -> ContiguousCacheView:
+        slots = [self._task_slot[tid] for tid in task_ids]
+        batch_indices = torch.tensor(slots, dtype=torch.long, device=device)
+        return ContiguousCacheView(self, batch_indices, total_len)

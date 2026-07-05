@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.factory import BaseFactory
-from astrai.inference.core.cache import KvcacheView
+from astrai.inference.core.cache import CacheView
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import apply_rotary_emb
@@ -75,7 +75,7 @@ class GQA(nn.Module):
         x: Tensor,
         rotary_emb: Tensor,
         attn_mask: Tensor = None,
-        paged_cache: Optional[KvcacheView] = None,
+        paged_cache: Optional[CacheView] = None,
     ) -> Tensor:
         is_causal = attn_mask is None
 
@@ -162,7 +162,7 @@ class MLA(nn.Module):
         x: Tensor,
         rotary_emb: Tensor,
         attn_mask: Tensor = None,
-        paged_cache: Optional[KvcacheView] = None,
+        paged_cache: Optional[CacheView] = None,
     ) -> Tensor:
         bsz, seq_len, _ = x.size()
         is_causal = attn_mask is None

@@ -4,7 +4,7 @@ import torch
 
 from astrai.inference import (
     Allocator,
-    KVCache,
+    PageCache,
     PagePool,
     PrefixCache,
     Storage,
@@ -161,7 +161,7 @@ def test_task_table_pop():
 
 
 def test_kv_cache_task_extend_allocates():
-    cache = KVCache(
+    cache = PageCache(
         n_layers=1,
         n_pages=8,
         page_size=64,
@@ -177,7 +177,7 @@ def test_kv_cache_task_extend_allocates():
 
 
 def test_kv_cache_task_extend_fails_when_pool_full():
-    cache = KVCache(
+    cache = PageCache(
         n_layers=1,
         n_pages=2,
         page_size=64,

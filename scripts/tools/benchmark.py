@@ -1,12 +1,13 @@
 """Benchmark AutoRegressiveLM with KVCache"""
 
+import argparse
 from dataclasses import dataclass
 from typing import Any, Dict
 
 import torch
 
 from astrai.config import AutoRegressiveLMConfig
-from astrai.inference import KVCache
+from astrai.inference import ContiguousCache, PageCache
 from astrai.model.transformer import AutoRegressiveLM
 
 
@@ -24,41 +25,14 @@ class GenerationBenchmark:
         config: AutoRegressiveLMConfig,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
-        page_size: int = 128,
+        cache_type: str = "contiguous",
     ):
         self.config = config
         self.device = device
         self.dtype = dtype
+        self.cache_type = cache_type
         self.model = AutoRegressiveLM(config).to(device=device, dtype=dtype)
         self.model.eval()
-        head_dim = config.dim // config.n_heads
-        n_pages = (config.max_len * 4 + page_size - 1) // page_size
-        self._page_cache = KVCache(
-            config.n_layers,
-            n_pages,
-            page_size,
-            config.n_kv_heads,
-            head_dim,
-            device,
-            dtype,
-        )
-
-    def _prepare_inputs(self, batch_size: int, prompt_length: int, total_length: int):
-        prompt_ids = torch.randint(
-            low=0,
-            high=self.config.vocab_size,
-            size=(batch_size, prompt_length),
-            device=self.device,
-            dtype=torch.long,
-        )
-        gen_ids = torch.randint(
-            low=0,
-            high=self.config.vocab_size,
-            size=(batch_size, total_length - prompt_length),
-            device=self.device,
-            dtype=torch.long,
-        )
-        return prompt_ids, gen_ids
 
     @torch.inference_mode()
     def run_prefill_benchmark(
@@ -68,8 +42,12 @@ class GenerationBenchmark:
         num_trials: int = 10,
     ) -> BenchmarkResult:
         for _ in range(3):
-            prompt_ids, _ = self._prepare_inputs(
-                batch_size, prompt_length, prompt_length
+            prompt_ids = torch.randint(
+                0,
+                self.config.vocab_size,
+                (batch_size, prompt_length),
+                device=self.device,
+                dtype=torch.long,
             )
             _ = self.model(prompt_ids)
         torch.cuda.synchronize()
@@ -78,12 +56,15 @@ class GenerationBenchmark:
         total_tokens = batch_size * prompt_length * num_trials
 
         for trial in range(num_trials):
-            prompt_ids, _ = self._prepare_inputs(
-                batch_size, prompt_length, prompt_length
+            prompt_ids = torch.randint(
+                0,
+                self.config.vocab_size,
+                (batch_size, prompt_length),
+                device=self.device,
+                dtype=torch.long,
             )
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
-
             start.record()
             _ = self.model(prompt_ids)
             end.record()
@@ -107,6 +88,7 @@ class GenerationBenchmark:
                 "prompt_length": prompt_length,
                 "dtype": str(self.dtype),
                 "device": self.device,
+                "cache": "none",
             },
         )
 
@@ -120,29 +102,56 @@ class GenerationBenchmark:
     ) -> BenchmarkResult:
         total_time = 0.0
         total_tokens = batch_size * gen_length * num_trials
-        page_size = self._page_cache.page_size
 
         for trial in range(num_trials):
-            prompt_ids, gen_ids = self._prepare_inputs(
-                batch_size,
-                prompt_length,
-                prompt_length + gen_length,
-            )
-
-            n_pages = (prompt_length + gen_length + page_size - 1) // page_size
-            total = n_pages * batch_size
-            pages = []
-            for _ in range(total):
-                p = self._page_cache._pool.alloc()
-                assert p >= 0, "OOM"
-                pages.append(p)
-            page_table = torch.tensor(
-                [pages[i * n_pages : (i + 1) * n_pages] for i in range(batch_size)],
-                dtype=torch.long,
+            prompt_ids = torch.randint(
+                0,
+                self.config.vocab_size,
+                (batch_size, prompt_length),
                 device=self.device,
+                dtype=torch.long,
+            )
+            gen_ids = torch.randint(
+                0,
+                self.config.vocab_size,
+                (batch_size, gen_length),
+                device=self.device,
+                dtype=torch.long,
             )
 
-            cv = self._page_cache.bind(page_table, total_len=prompt_length)
+            head_dim = self.config.dim // self.config.n_heads
+            max_seq = prompt_length + gen_length
+
+            if self.cache_type == "contiguous":
+                cache = ContiguousCache(
+                    self.config.n_layers,
+                    batch_size,
+                    max_seq,
+                    self.config.n_kv_heads,
+                    head_dim,
+                    self.device,
+                    self.dtype,
+                )
+            else:
+                page_size = 128
+                n_pages = (max_seq + page_size - 1) // page_size * batch_size
+                cache = PageCache(
+                    self.config.n_layers,
+                    n_pages,
+                    page_size,
+                    self.config.n_kv_heads,
+                    head_dim,
+                    self.device,
+                    self.dtype,
+                )
+
+            task_ids = [f"b{i}" for i in range(batch_size)]
+            for tid in task_ids:
+                cache.task_alloc(tid, [0] * max_seq)
+                for p in range(max_seq):
+                    cache.task_extend(tid, p)
+
+            cv = cache.bind_tasks(task_ids, prompt_length, self.device)
             _ = self.model(
                 prompt_ids,
                 paged_cache=cv,
@@ -152,36 +161,34 @@ class GenerationBenchmark:
                 .unsqueeze(0)
                 .expand(batch_size, -1),
             )
-
             torch.cuda.synchronize()
 
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
-
             start.record()
-            current_pos = prompt_length
+
             for i in range(gen_length):
-                input_token = gen_ids[:, i : i + 1]
-                cv = self._page_cache.bind(page_table, total_len=current_pos + 1)
+                pos = prompt_length + i
+                cv = cache.bind_tasks(task_ids, pos + 1, self.device)
                 _ = self.model(
-                    input_token,
+                    gen_ids[:, i : i + 1],
                     paged_cache=cv,
                     position_ids=torch.full(
                         (batch_size, 1),
-                        current_pos,
+                        pos,
                         dtype=torch.long,
                         device=self.device,
                     ),
                 )
-                current_pos += 1
+
             end.record()
             torch.cuda.synchronize()
 
+            for tid in task_ids:
+                cache.task_free(tid)
+
             trial_time = start.elapsed_time(end) / 1000
             total_time += trial_time
-
-            for idx in pages:
-                self._page_cache._pool.free(idx)
 
             print(
                 f"  Trial {trial + 1}/{num_trials}: {gen_length} tokens in {trial_time:.3f}s "
@@ -199,6 +206,7 @@ class GenerationBenchmark:
                 "gen_length": gen_length,
                 "dtype": str(self.dtype),
                 "device": self.device,
+                "cache": self.cache_type,
             },
         )
 
@@ -216,6 +224,42 @@ def print_benchmark_result(result: BenchmarkResult):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AutoRegressiveLM benchmark")
+    parser.add_argument(
+        "--device", type=str, default="cuda", help="Device (default: cuda)"
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="Dtype",
+    )
+    parser.add_argument(
+        "--cache",
+        type=str,
+        default="contiguous",
+        choices=["contiguous", "paged"],
+        help="KV cache type",
+    )
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--prompt_length", type=int, default=512, help="Prompt length")
+    parser.add_argument("--gen_length", type=int, default=128, help="Generation length")
+    parser.add_argument("--num_trials", type=int, default=5, help="Number of trials")
+    parser.add_argument(
+        "--prefill_only", action="store_true", help="Run prefill benchmark only"
+    )
+    parser.add_argument(
+        "--decode_only", action="store_true", help="Run decoding benchmark only"
+    )
+    args = parser.parse_args()
+
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+
     config = AutoRegressiveLMConfig(
         vocab_size=10000,
         dim=1536,
@@ -227,23 +271,29 @@ if __name__ == "__main__":
         norm_eps=1e-5,
     )
 
-    benchmark = GenerationBenchmark(config)
+    benchmark = GenerationBenchmark(
+        config, device=args.device, dtype=dtype_map[args.dtype], cache_type=args.cache
+    )
 
     print("=" * 80)
-    print("Running AutoRegressiveLM Generation Benchmark (KVCache)")
+    print(
+        f"Running AutoRegressiveLM Benchmark (device={args.device}, dtype={args.dtype})"
+    )
     print("=" * 80)
 
-    prefill_result = benchmark.run_prefill_benchmark(
-        batch_size=4,
-        prompt_length=512,
-        num_trials=5,
-    )
-    print_benchmark_result(prefill_result)
+    if not args.decode_only:
+        prefill_result = benchmark.run_prefill_benchmark(
+            batch_size=args.batch_size,
+            prompt_length=args.prompt_length,
+            num_trials=args.num_trials,
+        )
+        print_benchmark_result(prefill_result)
 
-    gen_result = benchmark.run_decoding_benchmark(
-        batch_size=4,
-        prompt_length=512,
-        gen_length=128,
-        num_trials=5,
-    )
-    print_benchmark_result(gen_result)
+    if not args.prefill_only:
+        gen_result = benchmark.run_decoding_benchmark(
+            batch_size=args.batch_size,
+            prompt_length=args.prompt_length,
+            gen_length=args.gen_length,
+            num_trials=args.num_trials,
+        )
+        print_benchmark_result(gen_result)

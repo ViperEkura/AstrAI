@@ -8,10 +8,11 @@ Config is a single dataclass; side effects are isolated at pipeline boundaries.
 """
 
 import argparse
+import itertools
 import json
 import os
 import re
-import signal
+import subprocess
 import sys
 from dataclasses import dataclass
 from math import prod
@@ -48,6 +49,9 @@ class EvalConfig:
     param_path: str = "./params"
     data_path: str = "./humaneval/HumanEval.jsonl"
     output: Optional[str] = None
+
+    test_only: Optional[str] = None
+    generate_only: bool = False
 
     num_samples: int = 200
     max_tokens: int = 512
@@ -214,31 +218,19 @@ def generate_all(
     return results
 
 
-def _timeout_handler(signum, frame):
-    raise TimeoutError("execution timeout")
-
-
 def execute_one(args: tuple) -> bool:
     full_code, entry_point, timeout = args
-    signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(int(timeout))
-    with open(os.devnull, "w") as devnull:
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout, sys.stderr = devnull, devnull
-        try:
-            ns = {}
-            exec(full_code, ns)
-            candidate = ns.get(entry_point)
-            check = ns.get("check")
-            if check is None or candidate is None:
-                return False
-            check(candidate)
-            return True
-        except Exception:
-            return False
-        finally:
-            signal.alarm(0)
-            sys.stdout, sys.stderr = old_out, old_err
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", full_code],
+            capture_output=True,
+            timeout=timeout,
+        )
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        return False
 
 
 def test_one(item: dict, cfg: EvalConfig) -> Tuple[str, int, int]:
@@ -281,10 +273,15 @@ def score_results(
     results: Iterator[Tuple[str, int, int]],
     k_values: Tuple[int, ...],
 ) -> Dict:
+    # filter to k <= n (peek first result to get n)
+    first = next(results)
+    results = itertools.chain([first], results)
+    n = first[1]
+    k_values = tuple(k for k in k_values if k <= n)
+
     scores = {k: [] for k in k_values}
     output = {}
     for task_id, n, passed in results:
-        scores["task_id"] = task_id
         entry = {"task_id": task_id, "n": n, "passed": passed}
         for k in k_values:
             pk = round(pass_at_k(n, passed, k), 4)
@@ -301,27 +298,33 @@ def score_results(
 
 
 def run_pipeline(cfg: EvalConfig) -> Dict:
-    download(HUMANEVAL_URL, cfg.data_path)
+    if cfg.test_only:
+        with open(cfg.test_only, encoding="utf-8") as f:
+            generated = json.load(f)
+    else:
+        download(HUMANEVAL_URL, cfg.data_path)
 
-    problems = load_jsonl(cfg.data_path)
-    if cfg.problem_indices:
-        problems = [problems[i] for i in cfg.problem_indices if i < len(problems)]
+        problems = load_jsonl(cfg.data_path)
+        if cfg.problem_indices:
+            problems = [problems[i] for i in cfg.problem_indices if i < len(problems)]
 
-    engine = create_engine(cfg.param_path, cfg.batch_size)
+        engine = create_engine(cfg.param_path, cfg.batch_size)
 
-    try:
-        generated = generate_all(engine, problems, cfg)
+        try:
+            generated = generate_all(engine, problems, cfg)
+        finally:
+            engine.shutdown()
 
         if cfg.output:
             mid = cfg.output.replace(".json", "_completions.json")
             save_json(mid, generated)
             print(f"Completions saved to {mid}")
 
-        results = test_all(generated, cfg)
-        scored = score_results(results, cfg.k_values)
-    finally:
-        engine.shutdown()
+        if cfg.generate_only:
+            return {}
 
+    results = test_all(generated, cfg)
+    scored = score_results(results, cfg.k_values)
     return scored
 
 
@@ -330,6 +333,15 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
     p.add_argument("--param_path", type=str, default="./params")
     p.add_argument("--data_path", type=str, default="./humaneval/HumanEval.jsonl")
     p.add_argument("--output", type=str, default=None)
+    p.add_argument(
+        "--test_only",
+        type=str,
+        default=None,
+        help="Skip generation, test existing completions JSON",
+    )
+    p.add_argument(
+        "--generate_only", action="store_true", help="Only generate, skip testing"
+    )
     p.add_argument("--num_samples", type=int, default=200)
     p.add_argument("--max_tokens", type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.8)
@@ -345,6 +357,8 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
         param_path=args.param_path,
         data_path=args.data_path,
         output=args.output,
+        test_only=args.test_only,
+        generate_only=args.generate_only,
         num_samples=args.num_samples,
         max_tokens=args.max_tokens,
         temperature=args.temperature,

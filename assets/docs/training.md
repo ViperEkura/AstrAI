@@ -80,13 +80,13 @@ on_train_end
 | `on_train_begin` | Before training starts | `GradientCheckpointingCallback` |
 | `on_epoch_begin` | Start of each epoch | `ProgressBarCallback` |
 | `on_batch_begin` | Every batch | — |
-| `on_optimizer_step` | Every accumulation window | `GradientClippingCallback`, `MetricLoggerCallback`, `ValidationCallback` |
-| `on_batch_end` | Every batch | `CheckpointCallback`, `MetricLoggerCallback`, `ProgressBarCallback` |
-| `on_epoch_end` | End of each epoch | `ProgressBarCallback` |
-| `on_error` | On exception during training | `CheckpointCallback`, `MetricLoggerCallback` |
-| `on_train_end` | Training ends (always via finally) | `CheckpointCallback`, `MetricLoggerCallback`, `GradientCheckpointingCallback` |
+| `on_optimizer_step` | Every accumulation window | `GradientClippingCallback`, `MetricCallback`, `ProgressBarCallback` |
+| `on_batch_end` | Every batch | `CheckpointCallback` |
+| `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
+| `on_error` | On exception during training | `CheckpointCallback`, `MetricCallback` |
+| `on_train_end` | Training ends (always via finally) | `CheckpointCallback`, `MetricCallback`, `GradientCheckpointingCallback` |
 
-Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `validation` (periodic validation on val_dataset), `metric_logger` (JSONL, rank-0), `progress_bar` (tqdm), `gradient_clipping`.
+Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm), `gradient_clipping`.
 
 ## Strategies
 
@@ -108,7 +108,7 @@ $$
 L_{\text{SFT}} = -\sum_{t=P+1}^{P+L} \log P(s_t \mid s_{\lt t}; \theta)
 $$
 
-Keys: `input_ids`, `target_ids`, `loss_mask`. Optional: `label_smoothing`.
+Keys: `input_ids`, `target_ids`, `loss_mask`, `position_ids`. Optional: `label_smoothing`.
 
 ### DPO (Direct Preference Optimization)
 
@@ -214,4 +214,4 @@ nohup python scripts/tools/train.py \
 
 Full parameter reference at [params.md](params.md).
 
-> Document Update Time: 2026-05-30
+> Document Update Time: 2026-07-05

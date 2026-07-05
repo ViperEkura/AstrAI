@@ -23,27 +23,38 @@ RoPE is applied **before** KV cache write, not after — otherwise position enco
 
 ## KVCache System
 
-Seven classes working together:
+Seven classes working together, with two concrete cache implementations:
+
+### ContiguousCache (default)
 
 ```
-KVCache (facade)
-  ├── PagePool         orchestrates page allocation + prefix matching
-  │     ├── Allocator   bitmask-based page allocator + ref-count + LRU eviction (inside PagePool)
-  │     └── PrefixCache hash-based prefix matching (page_hash via polynomial hash) (inside PagePool)
-  ├── TaskTable        maps task_id → page_table + cached token count
-  ├── Storage          k_cache / v_cache tensors (n_layers × n_pages × page_size × n_kv_heads × head_dim)
-  └── KvcacheView      bundles Storage + page_table + total_len for attention layers (returned by bind())
+ContiguousCache (simple contiguous per-slot cache)
+  ├── ContiguousCacheView  bundles k/v tensors + slot indices for attention layers
 ```
 
-`KVCache.bind(page_table, total_len)` returns a `KvcacheView` used by attention layers via `write()` / `gather()`.
+Created by default when no cache is passed to `InferenceScheduler`. Each task occupies a fixed slot of `[max_seq_len, n_kv_heads, head_dim]`. Simple and efficient for small-to-medium batch sizes.
+
+### PageCache (paged with prefix sharing)
+
+```
+PageCache (paged KV cache with prefix sharing, alternative)
+  ├── PagePool               orchestrates page allocation + prefix matching
+  │     ├── Allocator         bitmask-based page allocator + ref-count + LRU
+  │     └── PrefixCache       hash-based prefix matching (page_hash via polynomial hash)
+  ├── TaskTable              maps task_id → page_table + cached token count
+  ├── Storage                k_cache / v_cache tensors (n_layers × n_pages × page_size × n_kv_heads × head_dim)
+  └── PageCacheView          bundles Storage + page_table + total_len for attention layers
+```
+
+`isinstance(cache, KVCache)` checks dispatch to the correct view. Both implement the abstract `KVCache` interface used by `Executor` and `InferenceScheduler`.
 
 ## Continuous Batching
 
 `InferenceScheduler` runs a daemon thread with a 4-phase loop:
 
 ```
-1. Cleanup → Remove finished tasks, free KV pages
-2. Refill  → Pop from waiting_queue, task_alloc pages, activate
+1. Cleanup → Remove finished tasks, free KV cache slots/pages
+2. Refill  → Pop from waiting_queue, task_alloc resources, activate
 3. Prefill → Group by (prompt_len, start_pos), run full forward
 4. Decode  → Pick largest same-position group, single-token forward
 ```
@@ -238,4 +249,4 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
     print(token)
 ```
 
-> Document Update Time: 2026-06-19
+> Document Update Time: 2026-07-05

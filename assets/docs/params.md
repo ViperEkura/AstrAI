@@ -67,7 +67,6 @@
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--log_dir` | Directory for metric logs | checkpoint/logs |
-| `--log_interval` | Number of optimizer steps between metric logs | 1 |
 | `--metrics` | Metrics to log (e.g. --metrics loss lr val_loss) | ["loss", "lr", "grad_norm"] |
 
 ### Gradient Checkpointing
@@ -200,4 +199,4 @@ See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 
 ---
 
-> Document Update Time: 2026-06-19
+> Document Update Time: 2026-07-05

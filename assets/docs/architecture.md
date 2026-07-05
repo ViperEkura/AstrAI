@@ -125,7 +125,6 @@ classDiagram
             +str ckpt_dir
             +int ckpt_interval
             +str log_dir
-            +int log_interval
             +List[str] metrics
             +Optional[LoRAConfig] lora
             +int random_seed
@@ -559,7 +558,7 @@ classDiagram
         }
 
         class GradientCheckpointingCallback {
-            +tuple modules
+            +Optional[List[type]] modules
             +on_train_begin(context)
             +on_train_end(context)
         }
@@ -573,31 +572,29 @@ classDiagram
             +on_batch_end(context)
             +on_train_end(context)
             +on_error(context)
-            +save_extra(context) dict$
+            +save_extra(context) dict
         }
 
         class ProgressBarCallback {
             +int num_epoch
             +int log_interval
             +IO file
+            +tqdm progress_bar
             +on_epoch_begin(context)
-            +on_batch_end(context)
+            +on_optimizer_step(context)
             +on_epoch_end(context)
         }
 
-        class MetricLoggerCallback {
+        class MetricCallback {
             +Path log_dir
             +int save_interval
-            +int log_interval
             +List[str] metrics
-            +on_batch_end(context)
+            +int val_step
+            +on_optimizer_step(context)
+            +on_epoch_end(context)
             +on_train_end(context)
             +on_error(context)
-        }
-
-        class ValidationCallback {
             -_run_validation(context)
-            +on_optimizer_step(context)
         }
 
         class CallbackFactory {
@@ -684,22 +681,54 @@ classDiagram
         }
 
         class KVCache {
-            -PagePool _pool
-            -Storage _storage
-            -TaskTable _table
-            +int page_size
+            <<abstract>>
             +task_alloc(task_id, prompt_ids) bool
             +task_free(task_id)
             +task_extend(task_id, pos) bool
             +task_cached(task_id) int
             +task_record_hashes(task_id, prompt_ids, start_logical_page)
-            +make_table_tensor(task_ids, device) Tensor
-            +bind(page_table, total_len) KvcacheView
+            +bind_tasks(task_ids, total_len, device) CacheView
         }
 
-        class KvcacheView {
+        class PageCache {
+            +int page_size
+            -PagePool _pool
+            -Storage _storage
+            -TaskTable _table
+            +task_alloc(task_id, prompt_ids) bool
+            +task_free(task_id)
+            +task_extend(task_id, pos) bool
+            +task_cached(task_id) int
+            +task_record_hashes(task_id, prompt_ids, start_logical_page)
+            +bind_tasks(task_ids, total_len, device) PageCacheView
+        }
+
+        class ContiguousCache {
+            +int max_seq_len
+            +Tensor k, v
+            +task_alloc(task_id, prompt_ids) bool
+            +task_free(task_id)
+            +task_extend(task_id, pos) bool
+            +bind_tasks(task_ids, total_len, device) ContiguousCacheView
+        }
+
+        class CacheView {
+            <<abstract>>
+            +write(layer_id, k, v)
+            +gather(layer_id) Tuple[Tensor, Tensor]
+        }
+
+        class PageCacheView {
             -Storage _storage
             +Tensor _page_table
+            +int _total_len
+            +write(layer_id, k, v)
+            +gather(layer_id) Tuple[Tensor, Tensor]
+        }
+
+        class ContiguousCacheView {
+            -ContiguousCache _cache
+            +Tensor _batch_indices
             +int _total_len
             +write(layer_id, k, v)
             +gather(layer_id) Tuple[Tensor, Tensor]
@@ -1035,14 +1064,14 @@ classDiagram
     TrainCallback <|-- GradientCheckpointingCallback
     TrainCallback <|-- CheckpointCallback
     TrainCallback <|-- ProgressBarCallback
-    TrainCallback <|-- MetricLoggerCallback
-    TrainCallback <|-- ValidationCallback
+    TrainCallback <|-- MetricCallback
     BaseDataset <|-- SEQDataset
     BaseDataset <|-- SFTDataset
     BaseDataset <|-- DPODataset
     BaseDataset <|-- GRPODataset
     Store <|-- H5Store
     Store <|-- MmapStore
+    Store <|-- JsonlStore
     BaseSamplingStrategy <|-- TemperatureStrategy
     BaseSamplingStrategy <|-- TopKStrategy
     BaseSamplingStrategy <|-- TopPStrategy
@@ -1075,11 +1104,15 @@ classDiagram
     ResponseBuilder <|-- OpenAIResponseBuilder
     ResponseBuilder <|-- AnthropicResponseBuilder
     BaseMaskBuilder <|-- SectionedMaskBuilder
+    KVCache <|-- PageCache
+    KVCache <|-- ContiguousCache
+    CacheView <|-- PageCacheView
+    CacheView <|-- ContiguousCacheView
 
     %% --- Composition (strong ownership, part destroyed with whole) ---
-    KVCache *-- PagePool
-    KVCache *-- Storage
-    KVCache *-- TaskTable
+    PageCache *-- PagePool
+    PageCache *-- Storage
+    PageCache *-- TaskTable
     InferenceEngine *-- InferenceScheduler
     InferenceScheduler *-- KVCache
     InferenceScheduler *-- Executor
@@ -1107,7 +1140,8 @@ classDiagram
     TrainContext o-- BaseScheduler
     TrainContext o-- Checkpoint
     TrainContext o-- BaseExecutor
-    KvcacheView o-- Storage
+    PageCacheView o-- Storage
+    ContiguousCacheView o-- ContiguousCache
     SamplingPipeline o-- BaseSamplingStrategy
     BaseDataset o-- Store
     Pipeline o-- PipelineConfig
@@ -1129,6 +1163,7 @@ classDiagram
     DecoderBlock ..> FFNFactory : uses
     StoreFactory ..> H5Store : creates
     StoreFactory ..> MmapStore : creates
+    StoreFactory ..> JsonlStore : creates
     ConfigFactory ..> AutoRegressiveLMConfig : creates
     ConfigFactory ..> EncoderConfig : creates
     ExecutorFactory ..> NoneExecutor : creates
@@ -1142,7 +1177,8 @@ classDiagram
     TrainContextBuilder ..> ResumableDistributedSampler : creates
     Checkpoint ..> Checkpoint : serializes
     CheckpointCallback ..> Checkpoint : creates
-    KVCache ..> KvcacheView : binds
+    PageCache ..> PageCacheView : binds
+    ContiguousCache ..> ContiguousCacheView : binds
     InferenceEngine ..> GenerationRequest : uses
     InferenceEngine ..> GenerateResult : creates
     OpenAIResponseBuilder ..> ChatCompletionRequest : receives
@@ -1171,12 +1207,12 @@ classDiagram
 |--------|------------|-------------|
 | **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
 | **astrai.preprocessing** | BaseMaskBuilder, MaskBuilderFactory, SectionedMaskBuilder, Pipeline, filter_by_length, PackingStrategy, PackingStrategyFactory, PositionIdStrategy, PositionIdStrategyFactory, StoreWriter, StoreWriterFactory | Declarative JSON-driven data preprocessing |
-| **astrai.dataset** | BaseDataset–GRPODataset, Store–MmapStore, StoreFactory, ResumableDistributedSampler, DatasetFactory | Dataset loading and management |
+| **astrai.dataset** | BaseDataset–GRPODataset, Store–JsonlStore/MmapStore/H5Store, StoreFactory, ResumableDistributedSampler, DatasetFactory | Dataset loading and management |
 | **astrai.serialization** | Checkpoint | Model serialization |
 | **astrai.model** | AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
-| **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–ValidationCallback, CallbackFactory | Training workflow |
-| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, KVCache–KvcacheView, Allocator–Storage, Task, TaskManager, TaskStatus, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, ChatMessage–MessagesRequest, app | Inference service |
+| **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory | Training workflow |
+| **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, KVCache–ContiguousCache/PageCache, CacheView–ContiguousCacheView/PageCacheView, Allocator–Storage, Task, TaskManager, TaskStatus, GenerationRequest, GenerateResult, BaseSamplingStrategy–SamplingPipeline, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, ChatMessage–MessagesRequest, app | Inference service |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, ParallelModel, RowParallelLinear, ColumnParallelLinear | Distributed parallel & gradient accumulation |
 | **astrai.factory** | BaseFactory | Component registration |
 | **astrai.protocols** | OptimizerProtocol, SchedulerProtocol | Structural subtyping for optimizer/scheduler wrappers |
@@ -1195,7 +1231,7 @@ classDiagram
 | **Context** | `TrainContext` | Unified training state bag |
 | **Object Pool** | `Allocator`, `PagePool` | Page-based KV cache with LRU eviction |
 | **Executor** | `BaseExecutor`, `NoneExecutor`, `DDPExecutor`, `FSDPExecutor` | Gradient accumulation & model distribution |
-| **Storage** | `Store`, `H5Store`, `MmapStore` | Format-agnostic data access with multi-segment support |
+| **Storage** | `Store`, `H5Store`, `MmapStore`, `JsonlStore` | Format-agnostic data access with multi-segment support |
 | **Producer-Consumer** | `InferenceScheduler`, `Task`, queues | Continuous batching |
 | **AutoModel Registry** | `AutoModel`, `AutoRegressiveLM`, `EmbeddingEncoder` | Model-type dynamic loading |
 
@@ -1207,10 +1243,10 @@ classDiagram
 4. **Executor Selection**: `ExecutorFactory.create(cfg.parallel_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
 5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `KVCache` + `SamplingPipeline`
 6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` for multi-process DDP
-7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (H5Store/MmapStore) loads data with explicit `_length` and multi-segment `_data`
+7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (H5Store/MmapStore/JsonlStore) loads data with explicit `_length` and multi-segment `_data`
 8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata (rank-0 only), extra state saved as `{key}.pt`
 9. **Scheduler**: `SchedulerFactory` creates `CosineScheduler`/`SGDRScheduler`/`WSDScheduler`
 10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
 11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` — structural subtyping for `AccumOptimizer` / `AccumScheduler` wrappers
 
-> Document Update Time: 2026-05-30
+> Document Update Time: 2026-07-05

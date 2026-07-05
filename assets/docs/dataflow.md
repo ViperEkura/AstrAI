@@ -48,23 +48,26 @@ The output `meta.json` records the storage format, key names, dtype, total token
 
 `detect_format(load_path)` inspects the path:
 
-- If `load_path` is a file: checks suffix — `.h5`/`.hdf5` → `"h5"`, unknown suffix raises `ValueError`
-- If `load_path` is a directory: recursively globs for `*.h5`/`*.hdf5` files → `"h5"`, or `*.bin` + `**/meta.json` → `"bin"`
+- If `load_path` is a file: checks suffix — `.h5`/`.hdf5` → `"h5"`, `.jsonl` → `"jsonl"`, unknown suffix raises `ValueError`
+- If `load_path` is a directory: recursively globs for `*.h5`/`*.hdf5` files → `"h5"`, `*.bin` + `**/meta.json` → `"bin"`, or `*.jsonl` + `dataset_config.json` → `"jsonl"`
 
 ### Store Backends
 
 Storage format is auto-detected by `detect_format()`; backends are dispatched via registry:
 
 ```
-StoreFactory.create("h5")  → H5Store
-StoreFactory.create("bin") → MmapStore
+StoreFactory.create("h5")    → H5Store
+StoreFactory.create("bin")   → MmapStore
+StoreFactory.create("jsonl") → JsonlStore
 ```
 
 **H5Store**: Reads HDF5 files, supports `share_memory_()` for multi-process DataLoader workers (copies tensors to shared memory).
 
 **MmapStore**: Memory-maps `.bin` files. OS page cache sharing is native — no explicit `share_memory_()` needed. Uses `torch.from_numpy(np.memmap(...))`.
 
-Both backends normalise tensors into `Store._data[Dict[str, List[Tensor]]]` + `Store._cum[Dict[str, List[int]]]` (cumulative lengths for bisect-based indexing).
+**JsonlStore**: On-the-fly tokenization of raw JSONL files at load time. Requires a `dataset_config.json` alongside the `.jsonl` files following the same `PipelineConfig` schema with an additional `tokenizer_path` field.
+
+All backends normalise tensors into `Store._data[Dict[str, List[Tensor]]]` + `Store._cum[Dict[str, List[int]]]` (cumulative lengths for bisect-based indexing).
 
 ## Data Keys by Training Type
 
@@ -106,4 +109,4 @@ DatasetFactory.load(train_type, load_path, window_size, stride=None, storage_typ
 
 Standard PyTorch `DataLoader` with configurable `batch_size`, `num_workers`, `pin_memory`, `prefetch_factor`. Sampler produces indices; dataloader fetches tensor batches via `__getitem__`.
 
-> Document Update Time: 2026-06-19
+> Document Update Time: 2026-07-05

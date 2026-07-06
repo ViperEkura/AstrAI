@@ -209,7 +209,6 @@ class ProgressBarCallback(TrainCallback):
 
     @only_on_rank(0)
     def on_optimizer_step(self, context: TrainContext):
-        self.progress_bar.update(1)
         postfix = {
             "step": context.optimizer_step,
             "loss": f"{context.loss:.4f}",
@@ -220,6 +219,7 @@ class ProgressBarCallback(TrainCallback):
         if context.val_loss is not None:
             postfix["val_loss"] = f"{context.val_loss:.4f}"
         self.progress_bar.set_postfix(postfix)
+        self.progress_bar.update(1)
 
     @only_on_rank(0)
     def on_epoch_end(self, context: TrainContext):

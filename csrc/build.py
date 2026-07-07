@@ -20,13 +20,23 @@ def _arch_flags() -> list[str]:
 _kernels_dir = Path("csrc/kernels")
 REGISTRY: dict[str, dict] = {}
 
+CXX_FLAGS = ["-O3", "-march=native", "-funroll-loops"]
+NVCC_FLAGS = [
+    "-O3",
+    "--expt-relaxed-constexpr",
+    "--use_fast_math",
+    "--ptxas-options=-O3,-v",
+    "--extra-device-vectorization",
+]
+
 
 def register(name: str, sources: list[str] | None = None, **kwargs):
     if sources is None:
         sources = [str(_kernels_dir / f"{name}.cu")]
     REGISTRY[name] = {
         "sources": sources,
-        "nvcc_flags": ["-O3", "--expt-relaxed-constexpr", *_arch_flags()],
+        "cxx_flags": [*CXX_FLAGS],
+        "nvcc_flags": [*NVCC_FLAGS, *_arch_flags()],
         "extra_link_args": kwargs.pop("extra_link_args", []),
         **kwargs,
     }

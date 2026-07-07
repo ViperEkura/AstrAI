@@ -41,7 +41,10 @@ if _should_build():
             CUDAExtension(
                 f"astrai.extension.{name}",
                 info["sources"],
-                extra_compile_args={"cxx": ["-O3"], "nvcc": info["nvcc_flags"]},
+                extra_compile_args={
+                    "cxx": info["cxx_flags"],
+                    "nvcc": info["nvcc_flags"],
+                },
                 extra_link_args=[f"-Wl,-rpath,{_torch_lib}"],
             )
         )

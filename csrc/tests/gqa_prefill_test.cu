@@ -1,4 +1,10 @@
-// Pure-C test: nvcc -I csrc -arch=sm_89 csrc/tests/gqa_prefill_test.cu -o test && ./test
+/*
+Pure-C test:
+nvcc -I csrc -arch=sm_89 -O3 \
+    --use_fast_math --ptxas-options=-O3 --extra-device-vectorization \
+    csrc/tests/gqa_prefill_test.cu -o test && ./test
+*/
+
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

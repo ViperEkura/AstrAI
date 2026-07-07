@@ -1,6 +1,6 @@
 #pragma once
 #include "gqa_common.cuh"
-#include "gqa_prefill_attn_mma.cuh"  // mma16816, ldmatrix_*, pk2
+#include "gqa_mma_utils.cuh"
 
 // Tensor-core decode via GQA head-packing.
 //

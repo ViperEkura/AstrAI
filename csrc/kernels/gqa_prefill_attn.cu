@@ -8,10 +8,11 @@
 template <int HEAD_DIM>
 static void dispatch_prefill(GQAParams& p) {
 #ifndef ASTRAI_NO_MMA
-    constexpr int WARPS = 4, BC = 32, BR = 16, LD = HEAD_DIM + 8;
+    constexpr int WARPS = 4, BC = 32, BR = 16, LD = HEAD_DIM;
     dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
     dim3 block(WARPS * 32, 1, 1);
-    int smem = (2 * BC * LD + WARPS * BR * LD) * (int)sizeof(bf16);
+    // shared sQ: single staging area (BR*LD), not per-warp
+    int smem = (2 * BC * LD + BR * LD) * (int)sizeof(bf16);
     cudaFuncSetAttribute(gqa_prefill_attn_mma_kernel<HEAD_DIM, WARPS, BC>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     gqa_prefill_attn_mma_kernel<HEAD_DIM, WARPS, BC><<<grid, block, smem>>>(p);

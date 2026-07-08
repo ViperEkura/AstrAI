@@ -11,6 +11,16 @@
 // for-element onto the P matrix_a (bf16) operand, so softmax needs no shuffle
 // repack; row reductions fold across the 4-lane thread group. Templated on
 // <HEAD_DIM, WARPS, BC> with BC a multiple of 16.
+//
+// Optimizations vs v6 baseline: shared sQ staging (single area, serialized
+// per-warp load) → cuts smem from (2*BC + WARPS*BR)*LD to (2*BC + BR)*LD bf16,
+// raising occupancy; pre-scale Q by attention scale during Q load → removes
+// per-tile scale multiply in the softmax loop; cp.async global→shared for K/V
+// full-tile loads → eliminates shared-store bank conflicts and register staging,
+// scalar fallback only for the last partial tile; causal tile skipping (block-
+// level early break + warp-level skip); XOR swizzle (swiz_col) at 8-bf16 chunk
+// granularity → eliminates ldmatrix bank conflicts without LD padding, setting
+// LD=HEAD_DIM (zero waste).
 
 template <int HEAD_DIM, int WARPS, int BC>
 __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
@@ -19,9 +29,7 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     constexpr int NC8 = BC / 8;        // S n-tiles (N=8 each)
     constexpr int KT2 = BC / 16;       // P k-tiles (K=16 each)
     constexpr int DN8 = HEAD_DIM / 8;  // O n-tiles (N=8 each)
-    constexpr int LD = HEAD_DIM + 8;   // padded smem row stride (kills ldmatrix
-                                       // bank conflicts: consecutive rows land
-                                       // in distinct banks instead of colliding)
+    constexpr int LD = HEAD_DIM;   // XOR swizzle (swiz_col) handles bank conflicts
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -35,26 +43,33 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     const int qrow0 = (blockIdx.x * WARPS + warp) * BR;
 
     extern __shared__ __align__(16) bf16 smem[];
-    bf16* sK = smem;                                          // [BC][LD]
-    bf16* sV = sK + BC * LD;                                  // [BC][LD]
-    bf16* sQ = sV + BC * LD + warp * (BR * LD);               // per-warp [BR][LD]
+    bf16* sK = smem;                       // [BC][LD]
+    bf16* sV = sK + BC * LD;               // [BC][LD]
+    bf16* sQ = sV + BC * LD;               // shared staging [BR][LD]
 
-    // stage Q into smem (zero-padded past q_len)
+    // Q resident A-fragments (loaded once per warp via shared staging).
+    // Pre-scale by attention scale so softmax doesn't need to multiply later.
     const int q_base = ((batch * p.q_head + q_head) * p.q_len) * HEAD_DIM;
-    for (int i = lane; i < BR * HEAD_DIM; i += 32) {
-        int r = i / HEAD_DIM, d = i % HEAD_DIM;
-        int qr = qrow0 + r;
-        sQ[r * LD + d] = (qr < p.q_len) ? p.q[q_base + qr * HEAD_DIM + d] : __float2bfloat16(0.0f);
-    }
-    __syncwarp();
-
-    // Q resident A-fragments: Qa[kt][0..3] (loaded once via ldmatrix.x4)
     unsigned Qa[KD][4];
+    bf16 scale_bf16 = __float2bfloat16(p.scale);
     int qrow_l = (lane & 7) + (lane & 8);       // 0..15
     int qcol_l = (lane & 16) ? 8 : 0;
-#pragma unroll
-    for (int kt = 0; kt < KD; kt++)
-        ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + kt * 16 + qcol_l]);
+    for (int w = 0; w < WARPS; w++) {
+        if (warp == w) {
+            for (int i = lane; i < BR * HEAD_DIM; i += 32) {
+                int r = i / HEAD_DIM, d = i % HEAD_DIM;
+                int qr = qrow0 + r;
+                bf16 qv = (qr < p.q_len) ? p.q[q_base + qr * HEAD_DIM + d]
+                                         : __float2bfloat16(0.0f);
+                sQ[r * LD + swiz_col(d, r)] = __hmul(qv, scale_bf16);
+            }
+            __syncwarp();
+        #pragma unroll
+            for (int kt = 0; kt < KD; kt++)
+                ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l)]);
+        }
+        __syncthreads();  // prevent next warp from overwriting sQ prematurely
+    }
 
     float Oacc[DN8][4];
 #pragma unroll
@@ -67,60 +82,90 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     const int qr0 = qrow0 + gid;      // row for c0/c1
     const int qr1 = qrow0 + gid + 8;  // row for c2/c3
 
+    // Causal tile-skip bounds (no-op when is_causal == 0)
+    const int use_skip = p.is_causal;
+    const int max_kv = qrow0 + BR - 1 + p.causal_offset;
+    const int block_max_kv =
+        blockIdx.x * WARPS * BR + WARPS * BR - 1 + p.causal_offset;
+    const int has_mask = p.use_mask && p.mask;
+    const int mb = batch * p.kv_len;
+
     for (int ti = 0; ti < tiles; ti++) {
         int kv0 = ti * BC;
 
-        for (int i = threadIdx.x; i < BC * HEAD_DIM; i += nthreads) {
-            int r = i / HEAD_DIM, d = i % HEAD_DIM;
-            int kc = kv0 + r;
-            bf16 z = __float2bfloat16(0.0f);
-            sK[r * LD + d] = (kc < p.kv_len) ? p.k[kv_base + kc * HEAD_DIM + d] : z;
-            sV[r * LD + d] = (kc < p.kv_len) ? p.v[kv_base + kc * HEAD_DIM + d] : z;
+        // Block-level causal early break
+        if (use_skip && kv0 > block_max_kv) break;
+
+        // ---- load K/V tile to shared memory (cp.async on full tiles) ----
+        bool full_tile = (kv0 + BC <= p.kv_len);
+        if (full_tile) {
+            constexpr int VEC = 8;  // bf16 per cp.async unit (16 bytes)
+            int total = BC * HEAD_DIM;
+#pragma unroll
+            for (int i = threadIdx.x * VEC; i < total; i += nthreads * VEC) {
+                int r = i / HEAD_DIM;
+                int d = i % HEAD_DIM;
+                int kc = kv0 + r;
+                cp_async_16(&sK[r * LD + swiz_col(d, r)], &p.k[kv_base + kc * HEAD_DIM + d]);
+                cp_async_16(&sV[r * LD + swiz_col(d, r)], &p.v[kv_base + kc * HEAD_DIM + d]);
+            }
+            cp_async_commit();
+            cp_async_wait_all();
+        } else {
+            for (int i = threadIdx.x; i < BC * HEAD_DIM; i += nthreads) {
+                int r = i / HEAD_DIM, d = i % HEAD_DIM;
+                int kc = kv0 + r;
+                bf16 z = __float2bfloat16(0.0f);
+                sK[r * LD + swiz_col(d, r)] = (kc < p.kv_len)
+                                     ? p.k[kv_base + kc * HEAD_DIM + d] : z;
+                sV[r * LD + swiz_col(d, r)] = (kc < p.kv_len)
+                                     ? p.v[kv_base + kc * HEAD_DIM + d] : z;
+            }
         }
         __syncthreads();
+
+        // Warp-level causal skip
+        if (!use_skip || kv0 <= max_kv) {
 
         // S = Q @ K^T  → Sacc[n8][0..3]   (n8: 8 kv cols each)
         float Sacc[NC8][4];
 #pragma unroll
         for (int n8 = 0; n8 < NC8; n8++) {
             Sacc[n8][0] = Sacc[n8][1] = Sacc[n8][2] = Sacc[n8][3] = 0.0f;
-            int kv = kv0 + n8 * 8 + gid;
-            int krow_l = n8 * 8 + (lane & 7);        // kv within tile
-            int kcol_h = (lane & 8) ? 8 : 0;         // which k-half
+            int krow_l = n8 * 8 + (lane & 7);
+            int kcol_h = (lane & 8) ? 8 : 0;
 #pragma unroll
             for (int kt = 0; kt < KD; kt++) {
                 unsigned b[2];
-                ldmatrix_x2(b, &sK[krow_l * LD + kt * 16 + kcol_h]);
+                ldmatrix_x2(b, &sK[krow_l * LD + swiz_col(kt * 16 + kcol_h, krow_l)]);
                 mma16816(Sacc[n8], Qa[kt], b, Sacc[n8]);
             }
-            (void)kv;
         }
 
         // ---- online softmax (in registers) ----
-        // scale + mask, then per-row (gid, gid+8) max over held cols
+        // Q is pre-scaled, so Sacc already includes the attention scale.
+        int maxc0 = p.is_causal ? min(p.kv_len, qr0 + p.causal_offset + 1)
+                                : p.kv_len;
+        int maxc1 = p.is_causal ? min(p.kv_len, qr1 + p.causal_offset + 1)
+                                : p.kv_len;
         float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
 #pragma unroll
         for (int n8 = 0; n8 < NC8; n8++) {
-            int cc = kv0 + n8 * 8 + 2 * tid4;  // col for c0/c2
-            bool bc0 = (cc >= p.kv_len) ||
-                       (p.use_mask && p.mask && !p.mask[batch * p.kv_len + cc]);
-            bool bc1 = (cc + 1 >= p.kv_len) ||
-                       (p.use_mask && p.mask && !p.mask[batch * p.kv_len + cc + 1]);
-            bool cz = p.is_causal;
-            int off = p.causal_offset;
-            bool bad0 = bc0 || (cz && cc > qr0 + off);
-            bool bad1 = bc1 || (cz && (cc + 1) > qr0 + off);
-            bool bad2 = bc0 || (cz && cc > qr1 + off);
-            bool bad3 = bc1 || (cz && (cc + 1) > qr1 + off);
-            float s0 = bad0 ? -FLT_MAX : Sacc[n8][0] * p.scale;
-            float s1 = bad1 ? -FLT_MAX : Sacc[n8][1] * p.scale;
-            float s2 = bad2 ? -FLT_MAX : Sacc[n8][2] * p.scale;
-            float s3 = bad3 ? -FLT_MAX : Sacc[n8][3] * p.scale;
-            Sacc[n8][0] = s0; Sacc[n8][1] = s1; Sacc[n8][2] = s2; Sacc[n8][3] = s3;
+            int cc = kv0 + n8 * 8 + 2 * tid4;
+            int c1 = cc + 1;
+            bool b0 = (cc >= maxc0) || (has_mask && !p.mask[mb + cc]);
+            bool b1 = (c1 >= maxc0) || (has_mask && !p.mask[mb + c1]);
+            bool b2 = (cc >= maxc1) || (has_mask && !p.mask[mb + cc]);
+            bool b3 = (c1 >= maxc1) || (has_mask && !p.mask[mb + c1]);
+            float s0 = b0 ? -FLT_MAX : Sacc[n8][0];
+            float s1 = b1 ? -FLT_MAX : Sacc[n8][1];
+            float s2 = b2 ? -FLT_MAX : Sacc[n8][2];
+            float s3 = b3 ? -FLT_MAX : Sacc[n8][3];
+            Sacc[n8][0] = s0; Sacc[n8][1] = s1;
+            Sacc[n8][2] = s2; Sacc[n8][3] = s3;
             rmax0 = fmaxf(rmax0, fmaxf(s0, s1));
             rmax1 = fmaxf(rmax1, fmaxf(s2, s3));
         }
-        // reduce max across the 4-lane group (tid4)
         rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
         rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
         rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
@@ -133,11 +178,16 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
         float rsum0 = 0.0f, rsum1 = 0.0f;
 #pragma unroll
         for (int n8 = 0; n8 < NC8; n8++) {
-            float p0 = (Sacc[n8][0] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][0] - nm0);
-            float p1 = (Sacc[n8][1] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][1] - nm0);
-            float p2 = (Sacc[n8][2] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][2] - nm1);
-            float p3 = (Sacc[n8][3] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][3] - nm1);
-            Sacc[n8][0] = p0; Sacc[n8][1] = p1; Sacc[n8][2] = p2; Sacc[n8][3] = p3;
+            float p0 = (Sacc[n8][0] == -FLT_MAX) ? 0.0f
+                                                 : __expf(Sacc[n8][0] - nm0);
+            float p1 = (Sacc[n8][1] == -FLT_MAX) ? 0.0f
+                                                 : __expf(Sacc[n8][1] - nm0);
+            float p2 = (Sacc[n8][2] == -FLT_MAX) ? 0.0f
+                                                 : __expf(Sacc[n8][2] - nm1);
+            float p3 = (Sacc[n8][3] == -FLT_MAX) ? 0.0f
+                                                 : __expf(Sacc[n8][3] - nm1);
+            Sacc[n8][0] = p0; Sacc[n8][1] = p1;
+            Sacc[n8][2] = p2; Sacc[n8][3] = p3;
             rsum0 += p0 + p1;
             rsum1 += p2 + p3;
         }
@@ -164,15 +214,16 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
             Pa[1] = pk2(Sacc[kt2 * 2][2], Sacc[kt2 * 2][3]);
             Pa[2] = pk2(Sacc[kt2 * 2 + 1][0], Sacc[kt2 * 2 + 1][1]);
             Pa[3] = pk2(Sacc[kt2 * 2 + 1][2], Sacc[kt2 * 2 + 1][3]);
-            int vrow_l = kt2 * 16 + (lane & 15);  // kv within tile (0..15)
+            int vrow_l = kt2 * 16 + (lane & 15);
 #pragma unroll
             for (int dn8 = 0; dn8 < DN8; dn8++) {
                 unsigned b[2];
-                ldmatrix_x2_trans(b, &sV[vrow_l * LD + dn8 * 8]);
+                ldmatrix_x2_trans(b, &sV[vrow_l * LD + swiz_col(dn8 * 8, vrow_l)]);
                 mma16816(Oacc[dn8], Pa, b, Oacc[dn8]);
             }
         }
-        __syncthreads();  // sK/sV reused next tile
+        }  // if active (warp-level causal skip)
+        __syncthreads();
     }
 
     // ---- write output ----
@@ -183,12 +234,16 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     for (int dn8 = 0; dn8 < DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
         if (qr0 < p.q_len) {
-            p.o[o_base + qr0 * HEAD_DIM + d] = __float2bfloat16(Oacc[dn8][0] * rl0);
-            p.o[o_base + qr0 * HEAD_DIM + d + 1] = __float2bfloat16(Oacc[dn8][1] * rl0);
+            p.o[o_base + qr0 * HEAD_DIM + d] =
+                __float2bfloat16(Oacc[dn8][0] * rl0);
+            p.o[o_base + qr0 * HEAD_DIM + d + 1] =
+                __float2bfloat16(Oacc[dn8][1] * rl0);
         }
         if (qr1 < p.q_len) {
-            p.o[o_base + qr1 * HEAD_DIM + d] = __float2bfloat16(Oacc[dn8][2] * rl1);
-            p.o[o_base + qr1 * HEAD_DIM + d + 1] = __float2bfloat16(Oacc[dn8][3] * rl1);
+            p.o[o_base + qr1 * HEAD_DIM + d] =
+                __float2bfloat16(Oacc[dn8][2] * rl1);
+            p.o[o_base + qr1 * HEAD_DIM + d + 1] =
+                __float2bfloat16(Oacc[dn8][3] * rl1);
         }
     }
 }

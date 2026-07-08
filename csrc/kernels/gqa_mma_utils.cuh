@@ -55,3 +55,37 @@ __device__ __forceinline__ void ldmatrix_x2_trans(unsigned* r, const bf16* p) {
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(a));
 }
+
+// XOR swizzle for shared-memory column at 8-bf16 chunk granularity.
+// Eliminates ldmatrix bank conflicts without LD padding: consecutive rows
+// land in distinct bank groups. swiz_col(d, r) = ((d>>3)^(r&7))<<3 | (d&7).
+// Works for any d; aligned (d%8==0) simplifies to d ^ ((r&7)<<3).
+__device__ __forceinline__ int swiz_col(int d, int r) {
+    return ((d >> 3) ^ (r & 7)) << 3 | (d & 7);
+}
+
+// cp.async: copy 16 bytes (8 bf16) from global to shared memory directly,
+// bypassing registers. Eliminates shared-store bank conflicts and cuts
+// load-loop instruction count in half (1 cp.async vs 1 LDG + 1 STS).
+// Requires sm_80+.
+__device__ __forceinline__ void cp_async_16(bf16* smem_ptr, const void* gmem_ptr) {
+    unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+                 :: "r"(smem_addr), "l"(gmem_ptr));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;");
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;");
+}
+
+// Wait until at most N commit groups are still in flight. Used for
+// double-buffered pipelining: wait_group<1> lets the next tile's cp.async
+// continue while ensuring the current tile's data is ready.
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+}

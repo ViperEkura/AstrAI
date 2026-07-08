@@ -10,7 +10,11 @@ from astrai.config.preprocess_config import (
     PipelineConfig,
     ProcessingConfig,
 )
-from astrai.preprocessing.builder import SectionedMaskBuilder
+from astrai.preprocessing.builder import (
+    MultiOutputMaskBuilder,
+    SectionedMaskBuilder,
+    SingleOutputMaskBuilder,
+)
 from astrai.tokenize import AutoTokenizer
 
 _SPECIAL_TOKENS_CONFIG = {
@@ -208,6 +212,16 @@ def make_grpo_no_template_config():
 @pytest.fixture
 def builder():
     return SectionedMaskBuilder()
+
+
+@pytest.fixture
+def single_builder():
+    return SingleOutputMaskBuilder()
+
+
+@pytest.fixture
+def multi_builder():
+    return MultiOutputMaskBuilder()
 
 
 @pytest.fixture

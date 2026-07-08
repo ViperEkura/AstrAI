@@ -1,8 +1,10 @@
 """Mask building for preprocessing pipeline.
 
 :class:`SectionRenderer` converts section specs into token ids and loss
-masks (template / text / value extraction).  :class:`SectionedMaskBuilder`
-orchestrates single-output / multi-output (DPO / GRPO) assembly.
+masks (template / text / value extraction).  :class:`SingleOutputMaskBuilder`
+handles single-output (SFT / pretrain), :class:`MultiOutputMaskBuilder`
+handles multi-output (DPO / GRPO), and :class:`SectionedMaskBuilder`
+orchestrates both modes as a façade.
 """
 
 from abc import ABC, abstractmethod
@@ -212,42 +214,17 @@ class MaskBuilderFactory(BaseFactory["BaseMaskBuilder"]):
     pass
 
 
-@MaskBuilderFactory.register("sectioned")
-class SectionedMaskBuilder(BaseMaskBuilder):
-    """Config-driven builder supporting single and multi-output modes.
+@MaskBuilderFactory.register("single")
+class SingleOutputMaskBuilder(BaseMaskBuilder):
+    """Build a single output sequence with optional loss mask.
 
-    Single-output::
-
-        {"input": {"sections": [
-            {"field": "messages", "action": "$role", "template": true}
-        ]}}
-        → {"sequence": [...], "loss_mask": [...], "domain": "..."}
-
-    Multi-output (DPO / GRPO)::
-
-        {"input": {"sources": {
-            "chosen": {"sections": [{"field": "chosen", "action": "$role", "template": true}]},
-            "rejected": {"sections": [{"field": "rejected", "action": "$role", "template": true}]},
-        }}}
-        → {"chosen": [...], "chosen_mask": [...], "rejected": [...], "rejected_mask": [...], "domain": "..."}
-
-    Output spec fields::
-
-        sections      – list of section specs (same format as single-output)
-        list_field    – True when JSONL field holds a list (GRPO responses)
-        mask_key      – explicit loss-mask output key (default: ``"{output_key}_mask"``)
+    Expects ``config.input.sections`` (list of section specs).
     """
 
-    def __init__(self):
-        self.renderer = SectionRenderer()
+    def __init__(self, renderer: Optional[SectionRenderer] = None):
+        self.renderer = renderer or SectionRenderer()
 
     def build(self, item: dict, config, tokenizer) -> Optional[dict]:
-        sources_spec = getattr(config.input, "sources", None)
-        if sources_spec:
-            return self._build_multi(item, sources_spec, config, tokenizer)
-        return self._build_single(item, config, tokenizer)
-
-    def _build_single(self, item: dict, config, tokenizer) -> Optional[dict]:
         sections = config.input.sections
         if not sections:
             return None
@@ -266,9 +243,22 @@ class SectionedMaskBuilder(BaseMaskBuilder):
             result["loss_mask"] = mask
         return result
 
-    def _build_multi(
-        self, item: dict, sources_spec: dict, config, tokenizer
-    ) -> Optional[dict]:
+
+@MaskBuilderFactory.register("multi")
+class MultiOutputMaskBuilder(BaseMaskBuilder):
+    """Build multiple output sequences (DPO / GRPO).
+
+    Expects ``config.input.sources`` (dict of output_key → spec).
+    """
+
+    def __init__(self, renderer: Optional[SectionRenderer] = None):
+        self.renderer = renderer or SectionRenderer()
+
+    def build(self, item: dict, config, tokenizer) -> Optional[dict]:
+        sources_spec = getattr(config.input, "sources", None)
+        if not sources_spec:
+            return None
+
         result: dict = {}
         any_output = False
 
@@ -313,3 +303,22 @@ class SectionedMaskBuilder(BaseMaskBuilder):
 
         result["domain"] = _extract_domain(item, config.output.domain_key)
         return result
+
+
+@MaskBuilderFactory.register("sectioned")
+class SectionedMaskBuilder(BaseMaskBuilder):
+    """Façade that dispatches to SingleOutputMaskBuilder or MultiOutputMaskBuilder.
+
+    Preserves backward compatibility for existing configs and code that rely
+    on the ``"sectioned"`` factory name.
+    """
+
+    def __init__(self):
+        self._single = SingleOutputMaskBuilder()
+        self._multi = MultiOutputMaskBuilder()
+
+    def build(self, item: dict, config, tokenizer) -> Optional[dict]:
+        sources_spec = getattr(config.input, "sources", None)
+        if sources_spec:
+            return self._multi.build(item, config, tokenizer)
+        return self._single.build(item, config, tokenizer)

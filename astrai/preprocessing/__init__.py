@@ -1,7 +1,9 @@
 from astrai.preprocessing.builder import (
     BaseMaskBuilder,
     MaskBuilderFactory,
+    MultiOutputMaskBuilder,
     SectionedMaskBuilder,
+    SingleOutputMaskBuilder,
 )
 from astrai.preprocessing.packing import (
     PackingStrategy,
@@ -20,12 +22,14 @@ from astrai.preprocessing.writer import (
 __all__ = [
     "BaseMaskBuilder",
     "MaskBuilderFactory",
+    "MultiOutputMaskBuilder",
     "PackingStrategy",
     "PackingStrategyFactory",
     "Pipeline",
     "PositionIdStrategy",
     "PositionIdStrategyFactory",
     "SectionedMaskBuilder",
+    "SingleOutputMaskBuilder",
     "StoreWriter",
     "StoreWriterFactory",
     "filter_by_length",

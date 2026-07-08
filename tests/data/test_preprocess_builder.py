@@ -8,7 +8,9 @@ from astrai.config.preprocess_config import (
 )
 from astrai.preprocessing.builder import (
     MaskBuilderFactory,
+    MultiOutputMaskBuilder,
     SectionedMaskBuilder,
+    SingleOutputMaskBuilder,
 )
 from tests.data.conftest import (
     _CHAT_SECTIONS,
@@ -272,12 +274,18 @@ def test_sectioned_text_too_short(test_tokenizer, builder):
 
 def test_factory_registered():
     names = MaskBuilderFactory.list_registered()
+    assert "single" in names
+    assert "multi" in names
     assert "sectioned" in names
 
 
 def test_factory_create():
-    builder_obj = MaskBuilderFactory.create("sectioned")
-    assert isinstance(builder_obj, SectionedMaskBuilder)
+    single = MaskBuilderFactory.create("single")
+    assert isinstance(single, SingleOutputMaskBuilder)
+    multi = MaskBuilderFactory.create("multi")
+    assert isinstance(multi, MultiOutputMaskBuilder)
+    sectioned = MaskBuilderFactory.create("sectioned")
+    assert isinstance(sectioned, SectionedMaskBuilder)
 
 
 def test_dpo_chat_basic(chat_tokenizer, builder):
@@ -367,3 +375,59 @@ def test_grpo_single_reward(chat_tokenizer, builder):
     }
     result = builder.build(item, config, chat_tokenizer)
     assert result["rewards"] == [0.9]
+
+
+def test_single_builder_matches_facade(chat_tokenizer, builder, single_builder):
+    config = make_chat_config()
+    item = {
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+        ]
+    }
+    facade_result = builder.build(item, config, chat_tokenizer)
+    single_result = single_builder.build(item, config, chat_tokenizer)
+    assert single_result == facade_result
+
+
+def test_single_builder_rejects_multi_config(chat_tokenizer, single_builder):
+    config = make_dpo_chat_config()
+    item = {
+        "chosen": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+        ],
+        "rejected": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "5"},
+        ],
+    }
+    assert single_builder.build(item, config, chat_tokenizer) is None
+
+
+def test_multi_builder_matches_facade(chat_tokenizer, builder, multi_builder):
+    config = make_dpo_chat_config()
+    item = {
+        "chosen": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+        ],
+        "rejected": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "5"},
+        ],
+    }
+    facade_result = builder.build(item, config, chat_tokenizer)
+    multi_result = multi_builder.build(item, config, chat_tokenizer)
+    assert multi_result == facade_result
+
+
+def test_multi_builder_rejects_single_config(chat_tokenizer, multi_builder):
+    config = make_chat_config()
+    item = {
+        "messages": [
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+        ]
+    }
+    assert multi_builder.build(item, config, chat_tokenizer) is None

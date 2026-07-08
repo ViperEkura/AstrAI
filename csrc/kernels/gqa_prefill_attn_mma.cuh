@@ -30,6 +30,7 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     constexpr int KT2 = BC / 16;       // P k-tiles (K=16 each)
     constexpr int DN8 = HEAD_DIM / 8;  // O n-tiles (N=8 each)
     constexpr int LD = HEAD_DIM;   // XOR swizzle (swiz_col) handles bank conflicts
+    constexpr int SWIZ_MASK = (HEAD_DIM >= 64) ? 7 : (HEAD_DIM / 8 - 1);  // chunk bits, stay within LD
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -61,12 +62,12 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
                 int qr = qrow0 + r;
                 bf16 qv = (qr < p.q_len) ? p.q[q_base + qr * HEAD_DIM + d]
                                          : __float2bfloat16(0.0f);
-                sQ[r * LD + swiz_col(d, r)] = __hmul(qv, scale_bf16);
+                sQ[r * LD + swiz_col(d, r, SWIZ_MASK)] = __hmul(qv, scale_bf16);
             }
             __syncwarp();
         #pragma unroll
             for (int kt = 0; kt < KD; kt++)
-                ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l)]);
+                ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l, SWIZ_MASK)]);
         }
         __syncthreads();  // prevent next warp from overwriting sQ prematurely
     }
@@ -106,8 +107,8 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
                 int r = i / HEAD_DIM;
                 int d = i % HEAD_DIM;
                 int kc = kv0 + r;
-                cp_async_16(&sK[r * LD + swiz_col(d, r)], &p.k[kv_base + kc * HEAD_DIM + d]);
-                cp_async_16(&sV[r * LD + swiz_col(d, r)], &p.v[kv_base + kc * HEAD_DIM + d]);
+                cp_async_16(&sK[r * LD + swiz_col(d, r, SWIZ_MASK)], &p.k[kv_base + kc * HEAD_DIM + d]);
+                cp_async_16(&sV[r * LD + swiz_col(d, r, SWIZ_MASK)], &p.v[kv_base + kc * HEAD_DIM + d]);
             }
             cp_async_commit();
             cp_async_wait_all();
@@ -116,9 +117,9 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
                 int r = i / HEAD_DIM, d = i % HEAD_DIM;
                 int kc = kv0 + r;
                 bf16 z = __float2bfloat16(0.0f);
-                sK[r * LD + swiz_col(d, r)] = (kc < p.kv_len)
+                sK[r * LD + swiz_col(d, r, SWIZ_MASK)] = (kc < p.kv_len)
                                      ? p.k[kv_base + kc * HEAD_DIM + d] : z;
-                sV[r * LD + swiz_col(d, r)] = (kc < p.kv_len)
+                sV[r * LD + swiz_col(d, r, SWIZ_MASK)] = (kc < p.kv_len)
                                      ? p.v[kv_base + kc * HEAD_DIM + d] : z;
             }
         }
@@ -137,7 +138,7 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
 #pragma unroll
             for (int kt = 0; kt < KD; kt++) {
                 unsigned b[2];
-                ldmatrix_x2(b, &sK[krow_l * LD + swiz_col(kt * 16 + kcol_h, krow_l)]);
+                ldmatrix_x2(b, &sK[krow_l * LD + swiz_col(kt * 16 + kcol_h, krow_l, SWIZ_MASK)]);
                 mma16816(Sacc[n8], Qa[kt], b, Sacc[n8]);
             }
         }
@@ -218,7 +219,7 @@ __global__ void gqa_prefill_attn_mma_kernel(GQAParams p) {
 #pragma unroll
             for (int dn8 = 0; dn8 < DN8; dn8++) {
                 unsigned b[2];
-                ldmatrix_x2_trans(b, &sV[vrow_l * LD + swiz_col(dn8 * 8, vrow_l)]);
+                ldmatrix_x2_trans(b, &sV[vrow_l * LD + swiz_col(dn8 * 8, vrow_l, SWIZ_MASK)]);
                 mma16816(Oacc[dn8], Pa, b, Oacc[dn8]);
             }
         }

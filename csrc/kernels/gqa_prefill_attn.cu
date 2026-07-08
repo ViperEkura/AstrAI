@@ -68,6 +68,9 @@ torch::Tensor gqa_prefill_attn(
     p.o = (bf16*)O.data_ptr();
 
     switch (p.head_dim) {
+        case 32:
+            dispatch_prefill<32>(p);
+            break;
         case 64:
             dispatch_prefill<64>(p);
             break;
@@ -79,7 +82,7 @@ torch::Tensor gqa_prefill_attn(
             break;
         default:
             TORCH_CHECK(false, "prefill: unsupported head_dim ", p.head_dim,
-                        " (supported: 64,128,256)");
+                        " (supported: 32,64,128,256)");
     }
     return O;
 }

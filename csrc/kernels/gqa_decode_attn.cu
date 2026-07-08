@@ -21,13 +21,20 @@ static void dispatch_decode(GQAParams& p) {
         gqa_decode_attn_mma_kernel<HEAD_DIM, BC><<<grid, block, smem>>>(p);
         return;
     }
-#endif
     // scalar fallback (per-KV-head, one warp per query head)
     int group_size = p.q_head / p.kv_head;
     size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
     dim3 block(32, group_size);
     dim3 grid(p.batch * p.kv_head);
     gqa_decode_attn_kernel<<<grid, block, smem>>>(p);
+#else
+    // scalar fallback (per-KV-head, one warp per query head)
+    int group_size = p.q_head / p.kv_head;
+    size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
+    dim3 block(32, group_size);
+    dim3 grid(p.batch * p.kv_head);
+    gqa_decode_attn_kernel<<<grid, block, smem>>>(p);
+#endif
 }
 
 torch::Tensor gqa_decode_attn(
@@ -74,6 +81,9 @@ torch::Tensor gqa_decode_attn(
     p.o = (bf16*)O.data_ptr();
 
     switch (p.head_dim) {
+        case 32:
+            dispatch_decode<32>(p);
+            break;
         case 64:
             dispatch_decode<64>(p);
             break;
@@ -85,7 +95,7 @@ torch::Tensor gqa_decode_attn(
             break;
         default:
             TORCH_CHECK(false, "decode: unsupported head_dim ", p.head_dim,
-                        " (supported: 64, 128, 256)");
+                        " (supported: 32, 64, 128, 256)");
     }
     return O;
 }

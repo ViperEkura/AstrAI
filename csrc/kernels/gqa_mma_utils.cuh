@@ -58,10 +58,12 @@ __device__ __forceinline__ void ldmatrix_x2_trans(unsigned* r, const bf16* p) {
 
 // XOR swizzle for shared-memory column at 8-bf16 chunk granularity.
 // Eliminates ldmatrix bank conflicts without LD padding: consecutive rows
-// land in distinct bank groups. swiz_col(d, r) = ((d>>3)^(r&7))<<3 | (d&7).
-// Works for any d; aligned (d%8==0) simplifies to d ^ ((r&7)<<3).
-__device__ __forceinline__ int swiz_col(int d, int r) {
-    return ((d >> 3) ^ (r & 7)) << 3 | (d & 7);
+// land in distinct bank groups. swiz_col(d, r, mask) = ((d>>3)^(r&mask))<<3 | (d&7).
+// mask must cover log2(HEAD_DIM/8) chunk bits but stay within LD: use 7 for
+// HEAD_DIM>=64 (8+ chunks), 3 for HEAD_DIM=32 (4 chunks). Default 7 keeps
+// existing HEAD_DIM>=64 call sites working unchanged.
+__device__ __forceinline__ int swiz_col(int d, int r, int mask = 7) {
+    return ((d >> 3) ^ (r & mask)) << 3 | (d & 7);
 }
 
 // cp.async: copy 16 bytes (8 bf16) from global to shared memory directly,

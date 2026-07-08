@@ -43,7 +43,13 @@ class MuonMix(optim.Optimizer):
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if param.dim() >= 2 and "norm" not in name and "bias" not in name:
+            if (
+                param.dim() >= 2
+                and "norm" not in name
+                and "bias" not in name
+                and "embed" not in name
+                and "lm_head" not in name
+            ):
                 matrix_params.append(param)
             else:
                 other_params.append(param)

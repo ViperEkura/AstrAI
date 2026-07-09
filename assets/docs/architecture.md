@@ -63,7 +63,6 @@ classDiagram
             +Optional[int] n_heads
             +Optional[int] n_kv_heads
             +Optional[bool] use_qk_norm
-            +Optional[bool] use_gated_attention
             +str ffn_type
             +Optional[dict] rope_scaling
             +Optional[str] pooling_type
@@ -743,23 +742,22 @@ classDiagram
             +table_tensor(task_ids, device) Tensor
         }
 
-        class Task {
-            +str task_id
-            +List prompt_ids
-            +Optional[int] max_tokens
-            +float temperature
-            +float top_p
-            +int top_k
-            +TaskStatus status
-            +List output_ids
-            +int input_tokens
-            +int output_tokens
-            +float arrival_time
-            +Optional[float] finish_time
-            +Optional[Callable] stream_callback
-            +int next_pos
-            +is_finished(stop_ids) bool
-        }
+    class Task {
+        +str task_id
+        +List prompt_ids
+        +Optional[int] max_tokens
+        +float temperature
+        +float top_p
+        +int top_k
+        +TaskStatus status
+        +List output_ids
+        +int input_tokens
+        +int output_tokens
+        +float arrival_time
+        +Optional[float] finish_time
+        +int next_pos
+        +is_finished(stop_ids) bool
+    }
 
         class TaskStatus {
             <<enumeration>>
@@ -1249,4 +1247,4 @@ classDiagram
 10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
 11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` — structural subtyping for `AccumOptimizer` / `AccumScheduler` wrappers
 
-> Document Update Time: 2026-07-05
+> Document Update Time: 2026-07-09

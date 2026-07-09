@@ -56,7 +56,7 @@ PageCache (paged KV cache with prefix sharing, alternative)
 1. Cleanup → Remove finished tasks, free KV cache slots/pages
 2. Refill  → Pop from waiting_queue, task_alloc resources, activate
 3. Prefill → Group by (prompt_len, start_pos), run full forward
-4. Decode  → Pick largest same-position group, single-token forward
+4. Decode  → Run single-token forward for each same-position group
 ```
 
 ## Sampling (Strategy Pattern)
@@ -249,4 +249,4 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
     print(token)
 ```
 
-> Document Update Time: 2026-07-05
+> Document Update Time: 2026-07-09

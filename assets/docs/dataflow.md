@@ -61,7 +61,7 @@ StoreFactory.create("bin")   → MmapStore
 StoreFactory.create("jsonl") → JsonlStore
 ```
 
-**H5Store**: Reads HDF5 files, supports `share_memory_()` for multi-process DataLoader workers (copies tensors to shared memory).
+**H5Store**: Reads HDF5 files. Tensors are loaded into host memory and normalized into segmented storage.
 
 **MmapStore**: Memory-maps `.bin` files. OS page cache sharing is native — no explicit `share_memory_()` needed. Uses `torch.from_numpy(np.memmap(...))`.
 
@@ -109,4 +109,4 @@ DatasetFactory.load(train_type, load_path, window_size, stride=None, storage_typ
 
 Standard PyTorch `DataLoader` with configurable `batch_size`, `num_workers`, `pin_memory`, `prefetch_factor`. Sampler produces indices; dataloader fetches tensor batches via `__getitem__`.
 
-> Document Update Time: 2026-07-05
+> Document Update Time: 2026-07-09

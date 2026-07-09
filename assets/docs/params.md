@@ -28,13 +28,17 @@
 | `--max_lr` | Maximum learning rate (cosine decay after warmup) | 3e-4 |
 | `--max_grad_norm` | Maximum gradient norm for clipping | 1.0 |
 
-### Optimizer (AdamW)
+### Optimizer (MuonMix)
+
+Combined optimizer: matrix parameters via **Muon**, non-matrix via **AdamW** (`fused=True`).
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--adamw_beta1` | AdamW beta1 | 0.9 |
-| `--adamw_beta2` | AdamW beta2 | 0.95 |
-| `--adamw_weight_decay` | AdamW weight decay | 0.01 |
+| `--weight_decay` | Weight decay (applied to Muon matrix params; non-matrix use 0) | 0.1 |
+| `--muon_momentum` | Muon momentum factor | 0.95 |
+| `--muon_nesterov` | Enable Nesterov momentum for Muon | True |
+| `--muon_ns_steps` | Newton-Schulz iteration steps for Muon | 5 |
+| `--muon_adjust_lr` | Muon LR adjustment strategy (`original`, `match_rms_adamw`) | `match_rms_adamw` |
 
 ### Data Loading
 
@@ -104,7 +108,7 @@
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--schedule_type` | LR scheduler type (`cosine`, `sgdr`, `wsd`) | cosine |
-| `--min_rate` | Minimum LR as fraction of base LR | None (scheduler default) |
+| `--min_rate` | Minimum LR as fraction of base LR | None (scheduler default: 0.01) |
 | `--cycle_length` | SGDR first cycle length in steps | None (total_steps - warmup_steps) |
 | `--t_mult` | SGDR cycle length multiplier per restart | 2 |
 | `--stable_steps` | WSD stable plateau steps | None (required for wsd) |
@@ -126,9 +130,7 @@ nohup python scripts/tools/train.py \
     --warmup_ratio=0.05 \
     --max_lr=1e-4 \
     --max_grad_norm=1.0 \
-    --adamw_beta1=0.9 \
-    --adamw_beta2=0.95 \
-    --adamw_weight_decay=0.01 \
+    --weight_decay=0.1 \
     --window_size=2048 \
     --ckpt_interval=10000 \
     --ckpt_dir=./checkpoint \
@@ -199,4 +201,4 @@ See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 
 ---
 
-> Document Update Time: 2026-07-05
+> Document Update Time: 2026-07-09

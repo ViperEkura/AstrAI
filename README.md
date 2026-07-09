@@ -103,9 +103,7 @@ nohup python scripts/tools/train.py \
     --warmup_ratio=0.05 \
     --max_lr=1e-4 \
     --max_grad_norm=1.0 \
-    --adamw_beta1=0.9 \
-    --adamw_beta2=0.95 \
-    --adamw_weight_decay=0.01 \
+    --weight_decay=0.1 \
     --window_size=2048 \
     --ckpt_interval=10000 \
     --ckpt_dir=./checkpoint \

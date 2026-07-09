@@ -4,23 +4,25 @@
 
 // Tensor-core prefill flash attention (raw mma.sync PTX).
 // One warp owns BR=16 query rows. S = Q@K^T and O = P@V run on bf16 tensor
-// cores via mma.sync.m16n8k16 (f32 accumulate). Q is staged in static shared
-// memory (sQ) and reloaded per tile via ldmatrix — this avoids keeping KD*4
-// fragment registers resident across the tile loop, cutting ~32 regs for
-// HEAD_DIM=128 and enabling 4 blocks/SM (33% occupancy, up from 25%). S, O,
-// and the online-softmax stats (m, l) live in registers. Shared memory is
-// statically sized via template parameters — no dynamic allocation. The mma
-// fragment layout is used directly: the S accumulator (f32) maps element-
-// for-element onto the P matrix_a (bf16) operand, so softmax needs no shuffle
-// repack; row reductions fold across the 4-lane thread group. Templated on
-// <HEAD_DIM, WARPS, BC, MIN_BLOCKS> with BC a multiple of 16.
+// cores via mma.sync.m16n8k16 (f32 accumulate). Q fragments are loaded once
+// per warp via shared sQ staging and kept resident in registers across the
+// tile loop. S, O, and the online-softmax stats (m, l) also live in registers.
+// Shared memory is statically sized via template parameters — no dynamic
+// allocation. The mma fragment layout is used directly: the S accumulator
+// (f32) maps element-for-element onto the P matrix_a (bf16) operand, so
+// softmax needs no shuffle repack; row reductions fold across the 4-lane
+// thread group. Templated on <HEAD_DIM, WARPS, BC, MIN_BLOCKS> with BC a
+// multiple of 16.
 //
-// Optimizations: shared sQ staging (single area, serialized per-warp load) with
-// per-tile reload → cuts registers; pre-scale Q by attention scale during Q
-// load; cp.async global→shared for K/V; scalar fallback only for the last
-// partial tile; causal tile skipping (block-level early break + warp-level
-// skip); XOR swizzle (swiz_col) → eliminates ldmatrix bank conflicts without
-// LD padding (LD=HEAD_DIM).
+// Occupancy: __launch_bounds__ forces the compiler to fit MIN_BLOCKS blocks/SM,
+// spilling to local memory as needed. For HEAD_DIM=128, MIN_BLOCKS=4 → 128 reg
+// budget → 33% occupancy (up from 25% at 168 regs without launch_bounds).
+//
+// Optimizations: shared sQ staging (single area, serialized per-warp load);
+// pre-scale Q by attention scale during Q load; cp.async global→shared for K/V;
+// scalar fallback only for the last partial tile; causal tile skipping
+// (block-level early break + warp-level skip); XOR swizzle (swiz_col) →
+// eliminates ldmatrix bank conflicts without LD padding (LD=HEAD_DIM).
 
 template <int HEAD_DIM, int WARPS, int BC, int MIN_BLOCKS>
 __global__ __launch_bounds__(WARPS * 32, MIN_BLOCKS)
@@ -52,9 +54,11 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
 
     // Load Q into sQ with pre-scaling (staged per-warp to avoid smem conflicts).
     // Pre-scale by attention scale so softmax doesn't need to multiply later.
-    // Q fragments are NOT kept resident — reloaded from sQ each tile via
-    // ldmatrix to cut ~KD*4 registers.
+    // Q fragments are loaded via ldmatrix during this phase and kept resident
+    // in registers across the tile loop — sQ is only valid for the current warp
+    // during this loop, so Qa must be loaded here, not in the tile loop.
     const int q_base = ((batch * p.q_head + q_head) * p.q_len) * HEAD_DIM;
+    unsigned Qa[KD][4];
     bf16 scale_bf16 = __float2bfloat16(p.scale);
     int qrow_l = (lane & 7) + (lane & 8);       // 0..15
     int qcol_l = (lane & 16) ? 8 : 0;
@@ -68,6 +72,9 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
                 sQ[r * LD + swiz_col(d, r, SWIZ_MASK)] = __hmul(qv, scale_bf16);
             }
             __syncwarp();
+        #pragma unroll
+            for (int kt = 0; kt < KD; kt++)
+                ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l, SWIZ_MASK)]);
         }
         __syncthreads();  // prevent next warp from overwriting sQ prematurely
     }
@@ -127,14 +134,6 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
 
         // Warp-level causal skip
         if (!use_skip || kv0 <= max_kv) {
-
-        // Reload Q fragments from sQ each tile — saves KD*4 resident registers.
-        // ldmatrix.sync is warp-cooperative; all 32 lanes execute it together
-        // (the if condition is uniform per warp).
-        unsigned Qa[KD][4];
-#pragma unroll
-        for (int kt = 0; kt < KD; kt++)
-            ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l, SWIZ_MASK)]);
 
         // S = Q @ K^T  → Sacc[n8][0..3]   (n8: 8 kv cols each)
         float Sacc[NC8][4];

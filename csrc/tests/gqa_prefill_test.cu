@@ -97,14 +97,13 @@ int main() {
         constexpr int G=8, ROWS=32, P_BC=32;
         dim3 grid((ql+ROWS-1)/ROWS, Hq, B);
         dim3 block(G, ROWS, 1);
-        size_t smem=2*P_BC*D*sizeof(bf16);
-        printf("grid=(%d,%d,%d) block=(%d,%d,%d) smem=%zu\n",
-               grid.x,grid.y,grid.z, block.x,block.y,block.z, smem);
+        printf("grid=(%d,%d,%d) block=(%d,%d,%d)\n",
+               grid.x,grid.y,grid.z, block.x,block.y,block.z);
 
         double t0=now_ms();
         switch (D) {
-            case 64:  gqa_prefill_attn_kernel_t<64, G,ROWS,P_BC><<<grid,block,smem>>>(p); break;
-            case 128: gqa_prefill_attn_kernel_t<128,G,ROWS,P_BC><<<grid,block,smem>>>(p); break;
+            case 64:  gqa_prefill_attn_kernel_t<64, G,ROWS,P_BC><<<grid,block>>>(p); break;
+            case 128: gqa_prefill_attn_kernel_t<128,G,ROWS,P_BC><<<grid,block>>>(p); break;
             default: printf("unsupported D=%d\n",D); return 1;
         }
         cudaDeviceSynchronize();

@@ -43,9 +43,8 @@ __global__ void gqa_prefill_attn_kernel_t(GQAParams p) {
 
     int kv_head = q_head / (p.q_head / p.kv_head);
 
-    extern __shared__ __align__(16) bf16 smem[];
-    bf16* sK = smem;
-    bf16* sV = sK + P_BC * HEAD_DIM;
+    __shared__ __align__(16) bf16 sK[P_BC * HEAD_DIM];
+    __shared__ __align__(16) bf16 sV[P_BC * HEAD_DIM];
 
     float qreg[DPT];
     if (q_row < p.q_len) {

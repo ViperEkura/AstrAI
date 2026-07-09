@@ -8,20 +8,19 @@
 template <int HEAD_DIM>
 static void dispatch_prefill(GQAParams& p) {
 #ifndef ASTRAI_NO_MMA
-    constexpr int WARPS = 4, BC = 32, BR = 16, LD = HEAD_DIM;
+    constexpr int WARPS = 4, BC = 32, BR = 16;
+    // Target higher occupancy for smaller HEAD_DIM (fewer Oacc/Qa registers)
+    constexpr int MIN_BLOCKS = (HEAD_DIM <= 64) ? 6 : (HEAD_DIM <= 128) ? 4 : 2;
     dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
     dim3 block(WARPS * 32, 1, 1);
-    // sK + sV (each BC*LD) + shared sQ staging (BR*LD)
-    int smem = (2 * BC * LD + BR * LD) * (int)sizeof(bf16);
-    cudaFuncSetAttribute(gqa_prefill_attn_mma_kernel<HEAD_DIM, WARPS, BC>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    gqa_prefill_attn_mma_kernel<HEAD_DIM, WARPS, BC><<<grid, block, smem>>>(p);
+    // Static shared memory — no dynamic smem or cudaFuncSetAttribute needed.
+    // sK[BC*LD] + sV[BC*LD] + sQ[BR*LD], all sized by template params.
+    gqa_prefill_attn_mma_kernel<HEAD_DIM, WARPS, BC, MIN_BLOCKS><<<grid, block>>>(p);
 #else
     constexpr int G = 8, ROWS = 32, P_BC = 32;
     dim3 grid((p.q_len + ROWS - 1) / ROWS, p.q_head, p.batch);
     dim3 block(G, ROWS, 1);
-    size_t smem = 2 * P_BC * HEAD_DIM * sizeof(bf16);
-    gqa_prefill_attn_kernel_t<HEAD_DIM, G, ROWS, P_BC><<<grid, block, smem>>>(p);
+    gqa_prefill_attn_kernel_t<HEAD_DIM, G, ROWS, P_BC><<<grid, block>>>(p);
 #endif
 }
 

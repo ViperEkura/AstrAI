@@ -8,9 +8,10 @@
 template <int HEAD_DIM>
 static void dispatch_prefill(GQAParams& p) {
 #ifndef ASTRAI_NO_MMA
-    constexpr int WARPS = 4, BC = 32, BR = 16;
-    // Target higher occupancy for smaller HEAD_DIM (fewer Oacc/Qa registers)
-    constexpr int MIN_BLOCKS = (HEAD_DIM <= 64) ? 6 : (HEAD_DIM <= 128) ? 4 : 2;
+    constexpr int WARPS = 4, BC = 16, BR = 16;
+    // Double-buffered K/V doubles smem, so BC is halved to 16 to keep 3+
+    // blocks/SM. Register-hint MIN_BLOCKS tuned per HEAD_DIM's smem footprint.
+    constexpr int MIN_BLOCKS = (HEAD_DIM <= 64) ? 6 : (HEAD_DIM <= 128) ? 3 : 2;
     dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
     dim3 block(WARPS * 32, 1, 1);
     // Static shared memory — no dynamic smem or cudaFuncSetAttribute needed.

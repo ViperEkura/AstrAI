@@ -15,14 +15,22 @@
 // multiple of 16.
 //
 // Occupancy: __launch_bounds__ forces the compiler to fit MIN_BLOCKS blocks/SM,
-// spilling to local memory as needed. For HEAD_DIM=128, MIN_BLOCKS=4 → 128 reg
-// budget → 33% occupancy (up from 25% at 168 regs without launch_bounds).
+// spilling to local memory as needed. MIN_BLOCKS is tuned per HEAD_DIM to the
+// double-buffered smem footprint (2*BC*LD for each of K/V).
+//
+// Software pipeline: K/V are double-buffered and loaded via cp.async one tile
+// ahead, so the next tile streams from global memory while the current tile's
+// tensor-core math runs — hiding load latency (long_scoreboard). A single
+// __syncthreads per tile both publishes the freshly loaded tile cross-warp and
+// (because it runs before the next prefetch) guards the buffer being refilled,
+// so no second barrier is needed. Predicated cp.async (cp_async_16_pred)
+// zero-fills rows past kv_len, unifying full and partial tiles on one path.
 //
 // Optimizations: shared sQ staging (single area, serialized per-warp load);
-// pre-scale Q by attention scale during Q load; cp.async global→shared for K/V;
-// scalar fallback only for the last partial tile; causal tile skipping
-// (block-level early break + warp-level skip); XOR swizzle (swiz_col) →
-// eliminates ldmatrix bank conflicts without LD padding (LD=HEAD_DIM).
+// pre-scale Q by attention scale during Q load; packed bf16x2 output stores;
+// causal tile skipping (block-level prefetch bound + warp-level compute skip);
+// XOR swizzle (swiz_col) → eliminates ldmatrix bank conflicts without LD
+// padding (LD=HEAD_DIM).
 
 template <int HEAD_DIM, int WARPS, int BC, int MIN_BLOCKS>
 __global__ __launch_bounds__(WARPS * 32, MIN_BLOCKS)
@@ -47,9 +55,12 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     const int qrow0 = (blockIdx.x * WARPS + warp) * BR;
 
     // Static shared memory — sized by template parameters at compile time.
-    // No extern __shared__ / cudaFuncSetAttribute needed.
-    __shared__ __align__(16) bf16 sK[BC * LD];
-    __shared__ __align__(16) bf16 sV[BC * LD];
+    // K/V are double-buffered (STAGES=2): the next tile's cp.async load runs
+    // while the current tile's tensor-core math executes, hiding global-load
+    // latency (FA2-style software pipeline). No dynamic smem / carveout opt-in.
+    constexpr int STAGES = 2;
+    __shared__ __align__(16) bf16 sK[STAGES * BC * LD];
+    __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
     __shared__ __align__(16) bf16 sQ[BR * LD];
 
     // Load Q into sQ with pre-scaling (staged per-warp to avoid smem conflicts).
@@ -98,39 +109,53 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     const int has_mask = p.use_mask && p.mask;
     const int mb = batch * p.kv_len;
 
-    for (int ti = 0; ti < tiles; ti++) {
+    // Last active tile: block-level causal bound (all warps in the block share
+    // the K/V load, so the prefetch range is the block max, not per-warp).
+    int t_end = tiles - 1;
+    if (use_skip) {
+        int bt = block_max_kv / BC;
+        if (bt < t_end) t_end = bt;
+    }
+
+    constexpr int VEC = 8;  // bf16 per cp.async unit (16 bytes)
+    constexpr int TOTAL = BC * HEAD_DIM;
+
+    // Issue cp.async loads for tile `ti` into shared buffer `buf`. Predicated
+    // loads zero-fill rows past kv_len, so partial tiles need no scalar path.
+    auto load_tile = [&](int ti, int buf) {
         int kv0 = ti * BC;
-
-        // Block-level causal early break
-        if (use_skip && kv0 > block_max_kv) break;
-
-        // ---- load K/V tile to shared memory (cp.async on full tiles) ----
-        bool full_tile = (kv0 + BC <= p.kv_len);
-        if (full_tile) {
-            constexpr int VEC = 8;  // bf16 per cp.async unit (16 bytes)
-            int total = BC * HEAD_DIM;
+        bf16* dK = sK + buf * BC * LD;
+        bf16* dV = sV + buf * BC * LD;
 #pragma unroll
-            for (int i = threadIdx.x * VEC; i < total; i += nthreads * VEC) {
-                int r = i / HEAD_DIM;
-                int d = i % HEAD_DIM;
-                int kc = kv0 + r;
-                cp_async_16(&sK[r * LD + swiz_col(d, r, SWIZ_MASK)], &p.k[kv_base + kc * HEAD_DIM + d]);
-                cp_async_16(&sV[r * LD + swiz_col(d, r, SWIZ_MASK)], &p.v[kv_base + kc * HEAD_DIM + d]);
-            }
-            cp_async_commit();
-            cp_async_wait_all();
-        } else {
-            for (int i = threadIdx.x; i < BC * HEAD_DIM; i += nthreads) {
-                int r = i / HEAD_DIM, d = i % HEAD_DIM;
-                int kc = kv0 + r;
-                bf16 z = __float2bfloat16(0.0f);
-                sK[r * LD + swiz_col(d, r, SWIZ_MASK)] = (kc < p.kv_len)
-                                     ? p.k[kv_base + kc * HEAD_DIM + d] : z;
-                sV[r * LD + swiz_col(d, r, SWIZ_MASK)] = (kc < p.kv_len)
-                                     ? p.v[kv_base + kc * HEAD_DIM + d] : z;
-            }
+        for (int i = threadIdx.x * VEC; i < TOTAL; i += nthreads * VEC) {
+            int r = i / HEAD_DIM, d = i % HEAD_DIM;
+            int kc = kv0 + r;
+            bool valid = kc < p.kv_len;
+            int off = r * LD + swiz_col(d, r, SWIZ_MASK);
+            cp_async_16_pred(&dK[off], &p.k[kv_base + kc * HEAD_DIM + d], valid);
+            cp_async_16_pred(&dV[off], &p.v[kv_base + kc * HEAD_DIM + d], valid);
         }
+        cp_async_commit();
+    };
+
+    // Prologue: kick off the first tile's load.
+    load_tile(0, 0);
+
+    for (int ti = 0; ti <= t_end; ti++) {
+        int buf = ti & 1;
+
+        // Wait for the current tile's async copies, then a single barrier: it
+        // both publishes this tile's data cross-warp AND guarantees the prior
+        // compute on the buffer we are about to refill has finished. Issuing
+        // the next tile's load *after* this barrier lets one barrier cover both
+        // hazards (vs two), while the load still overlaps this tile's math.
+        cp_async_wait_group<0>();
         __syncthreads();
+        if (ti < t_end) load_tile(ti + 1, (ti + 1) & 1);
+
+        const bf16* bK = sK + buf * BC * LD;
+        const bf16* bV = sV + buf * BC * LD;
+        int kv0 = ti * BC;
 
         // Warp-level causal skip
         if (!use_skip || kv0 <= max_kv) {
@@ -145,7 +170,7 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
 #pragma unroll
             for (int kt = 0; kt < KD; kt++) {
                 unsigned b[2];
-                ldmatrix_x2(b, &sK[krow_l * LD + swiz_col(kt * 16 + kcol_h, krow_l, SWIZ_MASK)]);
+                ldmatrix_x2(b, &bK[krow_l * LD + swiz_col(kt * 16 + kcol_h, krow_l, SWIZ_MASK)]);
                 mma16816(Sacc[n8], Qa[kt], b, Sacc[n8]);
             }
         }
@@ -226,15 +251,15 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
 #pragma unroll
             for (int dn8 = 0; dn8 < DN8; dn8++) {
                 unsigned b[2];
-                ldmatrix_x2_trans(b, &sV[vrow_l * LD + swiz_col(dn8 * 8, vrow_l, SWIZ_MASK)]);
+                ldmatrix_x2_trans(b, &bV[vrow_l * LD + swiz_col(dn8 * 8, vrow_l, SWIZ_MASK)]);
                 mma16816(Oacc[dn8], Pa, b, Oacc[dn8]);
             }
         }
         }  // if active (warp-level causal skip)
-        __syncthreads();
     }
 
-    // ---- write output ----
+    // ---- write output ---- (packed bf16x2 stores: one 32-bit STG per pair,
+    // halves store count and removes the uncoalesced scalar-store penalty)
     float rl0 = (l0 > 1e-20f) ? (1.0f / l0) : 0.0f;
     float rl1 = (l1 > 1e-20f) ? (1.0f / l1) : 0.0f;
     const int o_base = ((batch * p.q_head + q_head) * p.q_len) * HEAD_DIM;
@@ -242,16 +267,14 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     for (int dn8 = 0; dn8 < DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
         if (qr0 < p.q_len) {
-            p.o[o_base + qr0 * HEAD_DIM + d] =
-                __float2bfloat16(Oacc[dn8][0] * rl0);
-            p.o[o_base + qr0 * HEAD_DIM + d + 1] =
-                __float2bfloat16(Oacc[dn8][1] * rl0);
+            __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][0] * rl0,
+                                                     Oacc[dn8][1] * rl0);
+            *reinterpret_cast<__nv_bfloat162*>(&p.o[o_base + qr0 * HEAD_DIM + d]) = v;
         }
         if (qr1 < p.q_len) {
-            p.o[o_base + qr1 * HEAD_DIM + d] =
-                __float2bfloat16(Oacc[dn8][2] * rl1);
-            p.o[o_base + qr1 * HEAD_DIM + d + 1] =
-                __float2bfloat16(Oacc[dn8][3] * rl1);
+            __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][2] * rl1,
+                                                     Oacc[dn8][3] * rl1);
+            *reinterpret_cast<__nv_bfloat162*>(&p.o[o_base + qr1 * HEAD_DIM + d]) = v;
         }
     }
 }

@@ -76,6 +76,19 @@ __device__ __forceinline__ void cp_async_16(bf16* smem_ptr, const void* gmem_ptr
                  :: "r"(smem_addr), "l"(gmem_ptr));
 }
 
+// Predicated cp.async: copy 16 bytes when `pred`, otherwise zero-fill the
+// destination (src-size operand = 0 → no bytes read from src, so an
+// out-of-bounds src address is never dereferenced). Lets full and partial
+// tiles share one uniform async load path — no scalar fallback branch.
+__device__ __forceinline__ void cp_async_16_pred(bf16* smem_ptr,
+                                                  const void* gmem_ptr,
+                                                  bool pred) {
+    unsigned smem_addr = __cvta_generic_to_shared(smem_ptr);
+    int src_size = pred ? 16 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(smem_addr), "l"(gmem_ptr), "r"(src_size));
+}
+
 __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;");
 }

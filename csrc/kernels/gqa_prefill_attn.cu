@@ -8,10 +8,17 @@
 template <int HEAD_DIM>
 static void dispatch_prefill(GQAParams& p) {
 #ifndef ASTRAI_NO_MMA
-    constexpr int WARPS = 4, BC = 16, BR = 16;
-    // Double-buffered K/V doubles smem, so BC is halved to 16 to keep 3+
-    // blocks/SM. Register-hint MIN_BLOCKS tuned per HEAD_DIM's smem footprint.
-    constexpr int MIN_BLOCKS = (HEAD_DIM <= 64) ? 6 : (HEAD_DIM <= 128) ? 3 : 2;
+    constexpr int WARPS = 4, BR = 16;
+    // KV tile: bigger tiles amortize the per-tile cp.async wait + barrier +
+    // loop overhead over more tensor-core work (this kernel is latency-bound,
+    // not compute/bandwidth-bound), so BC=32 wins ~6-8% over BC=16 for
+    // D<=128. D=256 stays at 16: BC=32 double-buffered would need 64KB smem,
+    // over the 48KB static cap. Both keep 3 blocks/SM (2 for D=256).
+    constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
+    // Register-hint MIN_BLOCKS tuned per HEAD_DIM's (BC=32) smem+register
+    // footprint: the largest blocks/SM that avoids register spills.
+    constexpr int MIN_BLOCKS = (HEAD_DIM <= 32) ? 6 : (HEAD_DIM <= 64) ? 4
+                             : (HEAD_DIM <= 128) ? 3 : 2;
     dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
     dim3 block(WARPS * 32, 1, 1);
     // Static shared memory — no dynamic smem or cudaFuncSetAttribute needed.

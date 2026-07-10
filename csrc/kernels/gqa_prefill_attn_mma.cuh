@@ -26,6 +26,9 @@
 // (because it runs before the next prefetch) guards the buffer being refilled,
 // so no second barrier is needed. Predicated cp.async (cp_async_16_pred)
 // zero-fills rows past kv_len, unifying full and partial tiles on one path.
+// BC=32 (D<=128) amortizes the per-tile wait+barrier+loop overhead over more
+// tensor-core work — this kernel is latency-bound (low occupancy from high
+// register pressure), so fewer, larger tiles beat many tiny ones.
 //
 // Optimizations: load Q fragments directly from global in mma A-operand layout
 // (no sQ staging, no prologue barriers); pre-scale Q by attention scale during Q load; packed bf16x2 output stores;

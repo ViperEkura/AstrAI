@@ -5,8 +5,9 @@
 // Tensor-core prefill flash attention (raw mma.sync PTX).
 // One warp owns BR=16 query rows. S = Q@K^T and O = P@V run on bf16 tensor
 // cores via mma.sync.m16n8k16 (f32 accumulate). Q fragments are loaded once
-// per warp via shared sQ staging and kept resident in registers across the
-// tile loop. S, O, and the online-softmax stats (m, l) also live in registers.
+// straight from global into the mma A-operand layout (no smem staging) and
+// kept resident in registers across the tile loop. S, O, and the online-softmax
+// stats (m, l) also live in registers.
 // Shared memory is statically sized via template parameters — no dynamic
 // allocation. The mma fragment layout is used directly: the S accumulator
 // (f32) maps element-for-element onto the P matrix_a (bf16) operand, so
@@ -26,8 +27,8 @@
 // so no second barrier is needed. Predicated cp.async (cp_async_16_pred)
 // zero-fills rows past kv_len, unifying full and partial tiles on one path.
 //
-// Optimizations: shared sQ staging (single area, serialized per-warp load);
-// pre-scale Q by attention scale during Q load; packed bf16x2 output stores;
+// Optimizations: load Q fragments directly from global in mma A-operand layout
+// (no sQ staging, no prologue barriers); pre-scale Q by attention scale during Q load; packed bf16x2 output stores;
 // causal tile skipping (block-level prefetch bound + warp-level compute skip);
 // XOR swizzle (swiz_col) → eliminates ldmatrix bank conflicts without LD
 // padding (LD=HEAD_DIM).
@@ -61,33 +62,32 @@ void gqa_prefill_attn_mma_kernel(GQAParams p) {
     constexpr int STAGES = 2;
     __shared__ __align__(16) bf16 sK[STAGES * BC * LD];
     __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
-    __shared__ __align__(16) bf16 sQ[BR * LD];
 
-    // Load Q into sQ with pre-scaling (staged per-warp to avoid smem conflicts).
-    // Pre-scale by attention scale so softmax doesn't need to multiply later.
-    // Q fragments are loaded via ldmatrix during this phase and kept resident
-    // in registers across the tile loop — sQ is only valid for the current warp
-    // during this loop, so Qa must be loaded here, not in the tile loop.
+    // Load the Q fragments straight from global into the mma A-operand layout
+    // (m16n8k16, row-major): no sQ staging area and no serialized per-warp
+    // prologue barriers. Each lane reads exactly the 8 Q elements ldmatrix
+    // would have produced, pre-scaled by the attention scale. Kept resident in
+    // registers across the tile loop.
+    //   frag[0]/[2]: row = qrow0 + gid ;  frag[1]/[3]: row = qrow0 + gid + 8
+    //   frag[0]/[1]: cols kt*16 + tid4*2 + {0,1} ; frag[2]/[3]: + 8
     const int q_base = ((batch * p.q_head + q_head) * p.q_len) * HEAD_DIM;
+    const int qra = qrow0 + gid;
+    const int qrb = qrow0 + gid + 8;
+    const bool va = qra < p.q_len, vb = qrb < p.q_len;
     unsigned Qa[KD][4];
-    bf16 scale_bf16 = __float2bfloat16(p.scale);
-    int qrow_l = (lane & 7) + (lane & 8);       // 0..15
-    int qcol_l = (lane & 16) ? 8 : 0;
-    for (int w = 0; w < WARPS; w++) {
-        if (warp == w) {
-            for (int i = lane; i < BR * HEAD_DIM; i += 32) {
-                int r = i / HEAD_DIM, d = i % HEAD_DIM;
-                int qr = qrow0 + r;
-                bf16 qv = (qr < p.q_len) ? p.q[q_base + qr * HEAD_DIM + d]
-                                         : __float2bfloat16(0.0f);
-                sQ[r * LD + swiz_col(d, r, SWIZ_MASK)] = __hmul(qv, scale_bf16);
-            }
-            __syncwarp();
-        #pragma unroll
-            for (int kt = 0; kt < KD; kt++)
-                ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l, SWIZ_MASK)]);
-        }
-        __syncthreads();  // prevent next warp from overwriting sQ prematurely
+#pragma unroll
+    for (int kt = 0; kt < KD; kt++) {
+        int c = kt * 16 + tid4 * 2;
+        const bf16* pa = &p.q[q_base + qra * HEAD_DIM + c];
+        const bf16* pb = &p.q[q_base + qrb * HEAD_DIM + c];
+        Qa[kt][0] = va ? pk2(__bfloat162float(pa[0]) * p.scale,
+                             __bfloat162float(pa[1]) * p.scale) : 0u;
+        Qa[kt][1] = vb ? pk2(__bfloat162float(pb[0]) * p.scale,
+                             __bfloat162float(pb[1]) * p.scale) : 0u;
+        Qa[kt][2] = va ? pk2(__bfloat162float(pa[8]) * p.scale,
+                             __bfloat162float(pa[9]) * p.scale) : 0u;
+        Qa[kt][3] = vb ? pk2(__bfloat162float(pb[8]) * p.scale,
+                             __bfloat162float(pb[9]) * p.scale) : 0u;
     }
 
     float Oacc[DN8][4];

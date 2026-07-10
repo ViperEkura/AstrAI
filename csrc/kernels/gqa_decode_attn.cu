@@ -5,37 +5,73 @@
 #include "gqa_decode_attn_mma.cuh"
 #endif
 
+// Scalar fallback: one warp per query head, per (batch, kv_head) block.
+static void launch_scalar_decode(const GQAParams& p) {
+    int group_size = p.q_head / p.kv_head;
+    size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
+    gqa_decode_attn_kernel<<<p.batch * p.kv_head, dim3(32, group_size), smem>>>(p);
+}
+
+#ifndef ASTRAI_NO_MMA
+// Tensor-core head-packing requires 1 < G <= 16 (the MMA M dim) and no mask.
+static bool decode_use_mma(const GQAParams& p) {
+    int G = p.q_head / p.kv_head;
+    return !p.use_mask && G > 1 && G <= 16;
+}
+
+// Decode has only batch*kv_head independent tasks; without split-K the grid is
+// tiny (e.g. 16 blocks) and leaves most SMs idle. Pick the smallest split count
+// that fills the device (~2 blocks/SM), capped by the tile count and 32.
+static int decode_num_splits(const GQAParams& p, int tiles_total) {
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+    int base_blocks = p.kv_head * p.batch;
+    int desired = 2 * (sm_count > 0 ? sm_count : 64);
+    int n = (desired + base_blocks - 1) / base_blocks;
+    return std::max(1, std::min(n, std::min(tiles_total, 32)));
+}
+
+template <int HEAD_DIM, int BC>
+static void launch_mma_decode(GQAParams& p) {
+    constexpr int BR = 16, LD = HEAD_DIM;  // XOR swizzle → no padding
+    int smem = (2 * BC * LD + BR * LD) * (int)sizeof(bf16);
+    int tiles_total = (p.kv_len + BC - 1) / BC;
+    int num_splits = decode_num_splits(p, tiles_total);
+
+    // Enough (batch, kv_head) work to fill the SMs → single pass, direct write.
+    if (num_splits <= 1) {
+        cudaFuncSetAttribute(gqa_decode_attn_mma_kernel<HEAD_DIM, BC>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        gqa_decode_attn_mma_kernel<HEAD_DIM, BC>
+            <<<dim3(p.kv_head, p.batch), 32, smem>>>(p);
+        return;
+    }
+
+    // Split-K (FlashDecoding): partition kv across blocks, then reduce.
+    auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto o_part = torch::empty({p.batch, p.q_head, num_splits, p.head_dim}, fopt);
+    auto ml_part = torch::empty({p.batch, p.q_head, num_splits, 2}, fopt);
+
+    cudaFuncSetAttribute(gqa_decode_attn_mma_splitk_kernel<HEAD_DIM, BC>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    gqa_decode_attn_mma_splitk_kernel<HEAD_DIM, BC>
+        <<<dim3(p.kv_head, p.batch, num_splits), 32, smem>>>(
+            p, o_part.data_ptr<float>(), ml_part.data_ptr<float>(), num_splits);
+    gqa_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(
+        o_part.data_ptr<float>(), ml_part.data_ptr<float>(), p.o,
+        num_splits, p.head_dim);
+}
+#endif
+
 template <int HEAD_DIM>
 static void dispatch_decode(GQAParams& p) {
 #ifndef ASTRAI_NO_MMA
-    constexpr int BC = 32, BR = 16, LD = HEAD_DIM;  // XOR swizzle → no padding
-    int G = p.q_head / p.kv_head;
-    // head-packing tensor-core path needs 1 < G <= 16 (MMA M dim) and no mask;
-    // everything else uses the scalar kernel
-    if (!p.use_mask && G > 1 && G <= 16) {
-        dim3 grid(p.kv_head, p.batch, 1);
-        dim3 block(32, 1, 1);
-        // sK + sV + sQ, each BC/BR * LD (single buffer for high occupancy)
-        int smem = (2 * BC * LD + BR * LD) * (int)sizeof(bf16);
-        cudaFuncSetAttribute(gqa_decode_attn_mma_kernel<HEAD_DIM, BC>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        gqa_decode_attn_mma_kernel<HEAD_DIM, BC><<<grid, block, smem>>>(p);
+    if (decode_use_mma(p)) {
+        launch_mma_decode<HEAD_DIM, 32>(p);
         return;
     }
-    // scalar fallback (per-KV-head, one warp per query head)
-    int group_size = p.q_head / p.kv_head;
-    size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
-    dim3 block(32, group_size);
-    dim3 grid(p.batch * p.kv_head);
-    gqa_decode_attn_kernel<<<grid, block, smem>>>(p);
-#else
-    // scalar fallback (per-KV-head, one warp per query head)
-    int group_size = p.q_head / p.kv_head;
-    size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
-    dim3 block(32, group_size);
-    dim3 grid(p.batch * p.kv_head);
-    gqa_decode_attn_kernel<<<grid, block, smem>>>(p);
 #endif
+    launch_scalar_decode(p);
 }
 
 torch::Tensor gqa_decode_attn(

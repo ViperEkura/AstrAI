@@ -1,6 +1,14 @@
 #pragma once
 #include "gqa_common.cuh"
 
+constexpr int DC_CHUNK = 64;
+
+__device__ inline float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
 __global__ void gqa_decode_attn_kernel(GQAParams p) {
     int batch = blockIdx.x / p.kv_head;
     int kv_head = blockIdx.x % p.kv_head;

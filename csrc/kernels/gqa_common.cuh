@@ -7,15 +7,6 @@
 using bf16 = __nv_bfloat16;
 using std::min;
 
-constexpr int DC_CHUNK = 64;
-constexpr int Br = 32, Bc = 64;
-
-__device__ inline float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
 struct GQAParams {
     int batch;
     int q_head;

@@ -109,92 +109,16 @@ __global__ void gqa_decode_attn_mma_kernel(GQAParams p) {
         }
         __syncwarp();
 
-        // S = Q @ K^T  (Q already pre-scaled, so Sacc includes scale)
+        // S = Q @ K^T + online softmax + O += P @ V  (shared MMA functions)
         float Sacc[NC8][4];
-#pragma unroll
-        for (int n8 = 0; n8 < NC8; n8++) {
-            Sacc[n8][0] = Sacc[n8][1] = Sacc[n8][2] = Sacc[n8][3] = 0.0f;
-            int krow_l = n8 * 8 + (lane & 7);
-            int kcol_h = (lane & 8) ? 8 : 0;
-#pragma unroll
-            for (int kt = 0; kt < KD; kt++) {
-                unsigned b[2];
-                ldmatrix_x2(b, &sK[krow_l * LD + swiz_col(kt * 16 + kcol_h, krow_l, SWIZ_MASK)]);
-                mma16816(Sacc[n8], Qa[kt], b, Sacc[n8]);
-            }
-        }
+        mma_compute_scores<KD, NC8>(Qa, sK, LD, SWIZ_MASK, lane, Sacc);
 
-        // ---- online softmax (Q pre-scaled → no per-tile scale multiply) ----
-        float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
-#pragma unroll
-        for (int n8 = 0; n8 < NC8; n8++) {
-            int cc = kv0 + n8 * 8 + 2 * tid4;
-            bool bc0 = (cc >= p.kv_len) ||
-                       (has_mask && !p.mask[mask_base + cc]);
-            bool bc1 = (cc + 1 >= p.kv_len) ||
-                       (has_mask && !p.mask[mask_base + cc + 1]);
-            bool cz = p.is_causal;
-            int off = p.causal_offset;
-            bool bad0 = bc0 || (cz && cc > off);
-            bool bad1 = bc1 || (cz && (cc + 1) > off);
-            float s0 = bad0 ? -FLT_MAX : Sacc[n8][0];
-            float s1 = bad1 ? -FLT_MAX : Sacc[n8][1];
-            float s2 = bad0 ? -FLT_MAX : Sacc[n8][2];
-            float s3 = bad1 ? -FLT_MAX : Sacc[n8][3];
-            Sacc[n8][0] = s0; Sacc[n8][1] = s1; Sacc[n8][2] = s2; Sacc[n8][3] = s3;
-            rmax0 = fmaxf(rmax0, fmaxf(s0, s1));
-            rmax1 = fmaxf(rmax1, fmaxf(s2, s3));
-        }
-        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
-        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
-        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
-        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
+        int maxc = p.is_causal ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
+        mma_softmax_tile<NC8, DN8>(kv0, maxc, maxc,
+                                    mask_base, p.mask, has_mask,
+                                    Sacc, Oacc, m0, m1, l0, l1, lane);
 
-        float nm0 = fmaxf(m0, rmax0), nm1 = fmaxf(m1, rmax1);
-        float corr0 = (nm0 == -FLT_MAX) ? 1.0f : __expf(m0 - nm0);
-        float corr1 = (nm1 == -FLT_MAX) ? 1.0f : __expf(m1 - nm1);
-
-        float rsum0 = 0.0f, rsum1 = 0.0f;
-#pragma unroll
-        for (int n8 = 0; n8 < NC8; n8++) {
-            float p0 = (Sacc[n8][0] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][0] - nm0);
-            float p1 = (Sacc[n8][1] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][1] - nm0);
-            float p2 = (Sacc[n8][2] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][2] - nm1);
-            float p3 = (Sacc[n8][3] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][3] - nm1);
-            Sacc[n8][0] = p0; Sacc[n8][1] = p1; Sacc[n8][2] = p2; Sacc[n8][3] = p3;
-            rsum0 += p0 + p1;
-            rsum1 += p2 + p3;
-        }
-        rsum0 += __shfl_xor_sync(0xFFFFFFFF, rsum0, 1);
-        rsum0 += __shfl_xor_sync(0xFFFFFFFF, rsum0, 2);
-        rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 1);
-        rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 2);
-        l0 = l0 * corr0 + rsum0;
-        l1 = l1 * corr1 + rsum1;
-        m0 = nm0; m1 = nm1;
-
-#pragma unroll
-        for (int j = 0; j < DN8; j++) {
-            Oacc[j][0] *= corr0; Oacc[j][1] *= corr0;
-            Oacc[j][2] *= corr1; Oacc[j][3] *= corr1;
-        }
-
-        // O += P @ V
-#pragma unroll
-        for (int kt2 = 0; kt2 < KT2; kt2++) {
-            unsigned Pa[4];
-            Pa[0] = pk2(Sacc[kt2 * 2][0], Sacc[kt2 * 2][1]);
-            Pa[1] = pk2(Sacc[kt2 * 2][2], Sacc[kt2 * 2][3]);
-            Pa[2] = pk2(Sacc[kt2 * 2 + 1][0], Sacc[kt2 * 2 + 1][1]);
-            Pa[3] = pk2(Sacc[kt2 * 2 + 1][2], Sacc[kt2 * 2 + 1][3]);
-            int vrow_l = kt2 * 16 + (lane & 15);
-#pragma unroll
-            for (int dn8 = 0; dn8 < DN8; dn8++) {
-                unsigned b[2];
-                ldmatrix_x2_trans(b, &sV[vrow_l * LD + swiz_col(dn8 * 8, vrow_l, SWIZ_MASK)]);
-                mma16816(Oacc[dn8], Pa, b, Oacc[dn8]);
-            }
-        }
+        mma_pv_accumulate<DN8, KT2>(Sacc, sV, LD, SWIZ_MASK, lane, Oacc);
         __syncwarp();  // sK/sV reused next tile
     }
 
@@ -322,86 +246,14 @@ __global__ void gqa_decode_attn_mma_splitk_kernel(GQAParams p,
         __syncwarp();
 
         float Sacc[NC8][4];
-#pragma unroll
-        for (int n8 = 0; n8 < NC8; n8++) {
-            Sacc[n8][0] = Sacc[n8][1] = Sacc[n8][2] = Sacc[n8][3] = 0.0f;
-            int krow_l = n8 * 8 + (lane & 7);
-            int kcol_h = (lane & 8) ? 8 : 0;
-#pragma unroll
-            for (int kt = 0; kt < KD; kt++) {
-                unsigned b[2];
-                ldmatrix_x2(b, &sK[krow_l * LD + swiz_col(kt * 16 + kcol_h, krow_l, SWIZ_MASK)]);
-                mma16816(Sacc[n8], Qa[kt], b, Sacc[n8]);
-            }
-        }
+        mma_compute_scores<KD, NC8>(Qa, sK, LD, SWIZ_MASK, lane, Sacc);
 
-        float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
-#pragma unroll
-        for (int n8 = 0; n8 < NC8; n8++) {
-            int cc = kv0 + n8 * 8 + 2 * tid4;
-            bool bc0 = (cc >= p.kv_len) || (has_mask && !p.mask[mask_base + cc]);
-            bool bc1 = (cc + 1 >= p.kv_len) || (has_mask && !p.mask[mask_base + cc + 1]);
-            bool cz = p.is_causal;
-            int off = p.causal_offset;
-            bool bad0 = bc0 || (cz && cc > off);
-            bool bad1 = bc1 || (cz && (cc + 1) > off);
-            float s0 = bad0 ? -FLT_MAX : Sacc[n8][0];
-            float s1 = bad1 ? -FLT_MAX : Sacc[n8][1];
-            float s2 = bad0 ? -FLT_MAX : Sacc[n8][2];
-            float s3 = bad1 ? -FLT_MAX : Sacc[n8][3];
-            Sacc[n8][0] = s0; Sacc[n8][1] = s1; Sacc[n8][2] = s2; Sacc[n8][3] = s3;
-            rmax0 = fmaxf(rmax0, fmaxf(s0, s1));
-            rmax1 = fmaxf(rmax1, fmaxf(s2, s3));
-        }
-        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
-        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
-        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
-        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
+        int maxc = p.is_causal ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
+        mma_softmax_tile<NC8, DN8>(kv0, maxc, maxc,
+                                    mask_base, p.mask, has_mask,
+                                    Sacc, Oacc, m0, m1, l0, l1, lane);
 
-        float nm0 = fmaxf(m0, rmax0), nm1 = fmaxf(m1, rmax1);
-        float corr0 = (nm0 == -FLT_MAX) ? 1.0f : __expf(m0 - nm0);
-        float corr1 = (nm1 == -FLT_MAX) ? 1.0f : __expf(m1 - nm1);
-
-        float rsum0 = 0.0f, rsum1 = 0.0f;
-#pragma unroll
-        for (int n8 = 0; n8 < NC8; n8++) {
-            float p0 = (Sacc[n8][0] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][0] - nm0);
-            float p1 = (Sacc[n8][1] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][1] - nm0);
-            float p2 = (Sacc[n8][2] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][2] - nm1);
-            float p3 = (Sacc[n8][3] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][3] - nm1);
-            Sacc[n8][0] = p0; Sacc[n8][1] = p1; Sacc[n8][2] = p2; Sacc[n8][3] = p3;
-            rsum0 += p0 + p1;
-            rsum1 += p2 + p3;
-        }
-        rsum0 += __shfl_xor_sync(0xFFFFFFFF, rsum0, 1);
-        rsum0 += __shfl_xor_sync(0xFFFFFFFF, rsum0, 2);
-        rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 1);
-        rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 2);
-        l0 = l0 * corr0 + rsum0;
-        l1 = l1 * corr1 + rsum1;
-        m0 = nm0; m1 = nm1;
-
-#pragma unroll
-        for (int j = 0; j < DN8; j++) {
-            Oacc[j][0] *= corr0; Oacc[j][1] *= corr0;
-            Oacc[j][2] *= corr1; Oacc[j][3] *= corr1;
-        }
-
-#pragma unroll
-        for (int kt2 = 0; kt2 < KT2; kt2++) {
-            unsigned Pa[4];
-            Pa[0] = pk2(Sacc[kt2 * 2][0], Sacc[kt2 * 2][1]);
-            Pa[1] = pk2(Sacc[kt2 * 2][2], Sacc[kt2 * 2][3]);
-            Pa[2] = pk2(Sacc[kt2 * 2 + 1][0], Sacc[kt2 * 2 + 1][1]);
-            Pa[3] = pk2(Sacc[kt2 * 2 + 1][2], Sacc[kt2 * 2 + 1][3]);
-            int vrow_l = kt2 * 16 + (lane & 15);
-#pragma unroll
-            for (int dn8 = 0; dn8 < DN8; dn8++) {
-                unsigned b[2];
-                ldmatrix_x2_trans(b, &sV[vrow_l * LD + swiz_col(dn8 * 8, vrow_l, SWIZ_MASK)]);
-                mma16816(Oacc[dn8], Pa, b, Oacc[dn8]);
-            }
-        }
+        mma_pv_accumulate<DN8, KT2>(Sacc, sV, LD, SWIZ_MASK, lane, Oacc);
         __syncwarp();
     }
 

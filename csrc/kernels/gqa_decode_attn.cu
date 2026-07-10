@@ -1,5 +1,5 @@
 #include "gqa_decode_attn.cuh"
-#include <torch/extension.h>
+#include "gqa_entry_utils.cuh"
 
 #ifndef ASTRAI_NO_MMA
 #include "gqa_decode_attn_mma.cuh"
@@ -76,43 +76,17 @@ static void dispatch_decode(GQAParams& p) {
 
 torch::Tensor gqa_decode_attn(
     torch::Tensor q,
-    torch::Tensor k, 
+    torch::Tensor k,
     torch::Tensor v,
     c10::optional<torch::Tensor> mask,
-    bool is_causal = false, 
+    bool is_causal = false,
     int64_t causal_offset = 0,
     c10::optional<double> scale = c10::nullopt
 ) {
-    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
-    TORCH_CHECK(q.dtype() == torch::kBFloat16);
-    TORCH_CHECK(k.dtype() == torch::kBFloat16);
-    TORCH_CHECK(v.dtype() == torch::kBFloat16);
-    TORCH_CHECK(q.size(2) == 1, "Q seq_len must be 1");
-
     GQAParams p;
-    p.batch = q.size(0);
-    p.q_head = q.size(1);
-    p.kv_head = k.size(1);
-    p.q_len = 1;
-    p.kv_len = k.size(2);
-    p.head_dim = q.size(3);
+    gqa_pack_params(q, k, v, mask, is_causal, causal_offset, scale, p);
+    TORCH_CHECK(p.q_len == 1, "Q seq_len must be 1");
     TORCH_CHECK(p.head_dim % 32 == 0, "head_dim must be multiple of 32");
-    p.use_mask = mask.has_value();
-    p.is_causal = (int)is_causal;
-    p.causal_offset = (int)causal_offset;
-    p.scale = scale.has_value() ? (float)scale.value() : 1.0f / sqrtf((float)p.head_dim);
-    p.q = (const bf16*)q.data_ptr();
-    p.k = (const bf16*)k.data_ptr();
-    p.v = (const bf16*)v.data_ptr();
-    if (p.use_mask) {
-        TORCH_CHECK(mask.value().dtype() == torch::kBool);
-        TORCH_CHECK(mask.value().dim() == 2);
-        TORCH_CHECK(mask.value().size(0) == p.batch);
-        TORCH_CHECK(mask.value().size(1) == p.kv_len);
-        p.mask = mask.value().data_ptr<bool>();
-    } else {
-        p.mask = nullptr;
-    }
 
     auto O = torch::empty_like(q);
     p.o = (bf16*)O.data_ptr();

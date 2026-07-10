@@ -84,32 +84,30 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams p) {
 }
 
 // Reduce split-K partials into the final bf16 output. One block per (batch,
-// q_head); each thread owns one head_dim element and folds across all splits
-// with a numerically-stable online rescale.
+// q_head); each thread folds across all splits with a single-pass
+// online-rescale reduction (expf + FMA counts halved vs 3-pass original).
 __global__ void attn_decode_combine_kernel(AttentionParams p) {
     int bh = blockIdx.x;
     int d = threadIdx.x;
     if (d >= p.head_dim) return;
 
     size_t split_base = (size_t)bh * p.num_splits;
-
     const float* mlp = p.ml_part + split_base * 2;
-    float mstar = -FLT_MAX;
-    for (int s = 0; s < p.num_splits; s++)
-        mstar = fmaxf(mstar, mlp[s * 2]);
-
-    float lstar = 0.0f;
-    for (int s = 0; s < p.num_splits; s++) {
-        float mi = mlp[s * 2];
-        if (mi > -FLT_MAX) lstar += mlp[s * 2 + 1] * __expf(mi - mstar);
-    }
-
     const float* op = p.o_part + split_base * p.head_dim;
-    float acc = 0.0f;
+
+    float m = -FLT_MAX, l = 0.0f, acc = 0.0f;
     for (int s = 0; s < p.num_splits; s++) {
         float mi = mlp[s * 2];
-        if (mi > -FLT_MAX) acc += op[s * p.head_dim + d] * __expf(mi - mstar);
+        if (mi <= -FLT_MAX) continue;
+        float li = mlp[s * 2 + 1];
+        float nm = fmaxf(m, mi);
+        float corr = __expf(m - nm);
+        float e = __expf(mi - nm);
+        acc = acc * corr + op[s * p.head_dim + d] * e;
+        l = l * corr + li * e;
+        m = nm;
     }
-    float inv = (lstar > 1e-20f) ? (1.0f / lstar) : 0.0f;
+
+    float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
     p.o[(size_t)bh * p.head_dim + d] = __float2bfloat16(acc * inv);
 }

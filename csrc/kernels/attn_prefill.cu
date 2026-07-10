@@ -1,12 +1,12 @@
-#include "gqa_prefill_attn.cuh"
-#include "gqa_entry_utils.cuh"
+#include "attn_prefill_split_q.cuh"
+#include "attn_entry_utils.cuh"
 
 #ifndef ASTRAI_NO_MMA
-#include "gqa_prefill_attn_mma.cuh"
+#include "attn_prefill_split_q_mma.cuh"
 #endif
 
 template <int HEAD_DIM>
-static void dispatch_prefill(GQAParams& p) {
+static void dispatch_prefill(AttentionParams& p) {
 #ifndef ASTRAI_NO_MMA
     constexpr int WARPS = 4, BR = 16;
     // KV tile: bigger tiles amortize the per-tile cp.async wait + barrier +
@@ -23,16 +23,16 @@ static void dispatch_prefill(GQAParams& p) {
     dim3 block(WARPS * 32, 1, 1);
     // Static shared memory — no dynamic smem or cudaFuncSetAttribute needed.
     // sK[BC*LD] + sV[BC*LD] + sQ[BR*LD], all sized by template params.
-    gqa_prefill_attn_mma_kernel<HEAD_DIM, WARPS, BC, MIN_BLOCKS><<<grid, block>>>(p);
+    attn_prefill_split_q_mma_kernel<HEAD_DIM, WARPS, BC, MIN_BLOCKS><<<grid, block>>>(p);
 #else
     constexpr int G = 8, ROWS = 32, P_BC = 32;
     dim3 grid((p.q_len + ROWS - 1) / ROWS, p.q_head, p.batch);
     dim3 block(G, ROWS, 1);
-    gqa_prefill_attn_kernel_t<HEAD_DIM, G, ROWS, P_BC><<<grid, block>>>(p);
+    attn_prefill_split_q_kernel_t<HEAD_DIM, G, ROWS, P_BC><<<grid, block>>>(p);
 #endif
 }
 
-torch::Tensor gqa_prefill_attn(
+torch::Tensor attn_prefill(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -41,8 +41,8 @@ torch::Tensor gqa_prefill_attn(
     int64_t causal_offset = 0,
     c10::optional<double> scale = c10::nullopt
 ) {
-    GQAParams p;
-    gqa_pack_params(q, k, v, mask, is_causal, causal_offset, scale, p);
+    AttentionParams p;
+    attn_pack_params(q, k, v, mask, is_causal, causal_offset, scale, p);
     TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
 
     auto O = torch::empty_like(q);
@@ -69,7 +69,7 @@ torch::Tensor gqa_prefill_attn(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("gqa_prefill_attn", &gqa_prefill_attn,
+    m.def("attn_prefill", &attn_prefill,
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),

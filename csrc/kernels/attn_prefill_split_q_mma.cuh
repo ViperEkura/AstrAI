@@ -1,6 +1,6 @@
 #pragma once
-#include "gqa_common.cuh"
-#include "gqa_mma_utils.cuh"
+#include "attn_common.cuh"
+#include "attn_mma_utils.cuh"
 
 // Tensor-core prefill flash attention (raw mma.sync PTX).
 // One warp owns BR=16 query rows. S = Q@K^T and O = P@V run on bf16 tensor
@@ -38,7 +38,7 @@
 
 template <int HEAD_DIM, int WARPS, int BC, int MIN_BLOCKS>
 __global__ __launch_bounds__(WARPS * 32, MIN_BLOCKS)
-void gqa_prefill_attn_mma_kernel(GQAParams p) {
+void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     constexpr int BR = 16;
     constexpr int KD = HEAD_DIM / 16;  // Q/K k-tiles
     constexpr int NC8 = BC / 8;        // S n-tiles (N=8 each)

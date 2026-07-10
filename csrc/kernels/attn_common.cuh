@@ -7,7 +7,7 @@
 using bf16 = __nv_bfloat16;
 using std::min;
 
-struct GQAParams {
+struct AttentionParams {
     int batch;
     int q_head;
     int kv_head;
@@ -22,5 +22,9 @@ struct GQAParams {
     const bf16* __restrict__ k;
     const bf16* __restrict__ v;
     const bool* __restrict__ mask;
+    
     bf16* __restrict__ o;
+    float* __restrict__ o_part;
+    float* __restrict__ ml_part;
+    int num_splits;
 };

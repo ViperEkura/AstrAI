@@ -2,16 +2,16 @@
 Pure-C test:
 nvcc -I csrc -arch=sm_89 -O3 \
     --use_fast_math --ptxas-options=-O3 --extra-device-vectorization \
-    csrc/tests/gqa_decode_test.cu -o test && ./test
+    csrc/tests/attn_decode_test.cu -o test && ./test
 */
 
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <sys/time.h>
-#include "../kernels/gqa_decode_attn.cuh"
+#include "../kernels/attn_decode_split_kv.cuh"
 #ifndef ASTRAI_NO_MMA
-#include "../kernels/gqa_decode_attn_mma.cuh"
+#include "../kernels/attn_decode_split_kv_mma.cuh"
 #endif
 
 static double now_ms() {
@@ -28,63 +28,58 @@ struct DecodeScratch {
     float* ml_part = nullptr;
 };
 
-// Launch the production decode path (tensor-core head-packing MMA on sm_80+,
-// scalar fallback otherwise), mirroring dispatch_decode() in gqa_decode_attn.cu.
-#ifndef ASTRAI_NO_MMA
-static bool decode_use_mma(const GQAParams& p) {
-    int G = p.q_head / p.kv_head;
-    return !p.use_mask && G > 1 && G <= 16;
-}
-
-static int decode_num_splits(const GQAParams& p, int tiles_total) {
+static int decode_num_splits(const AttentionParams& p, int tiles_total) {
     int sm_count = 0;
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
     int base_blocks = p.kv_head * p.batch;
     int desired = 2 * (sm_count > 0 ? sm_count : 64);
     int n = (desired + base_blocks - 1) / base_blocks;
-    return max(1, min(n, min(tiles_total, 32)));
+    int max_by_work = tiles_total / 8;
+    return max(1, min(min(min(n, tiles_total), 32), max_by_work));
+}
+
+// Launch the production decode path (tensor-core head-packing MMA on sm_80+,
+// scalar fallback otherwise), mirroring dispatch_decode() in attn_decode.cu.
+#ifndef ASTRAI_NO_MMA
+static bool decode_use_mma(const AttentionParams& p) {
+    int G = p.q_head / p.kv_head;
+    return !p.use_mask && G > 1 && G <= 16;
 }
 
 template <int HEAD_DIM, int BC>
-static void launch_mma_decode(GQAParams& p, DecodeScratch& sc) {
-    constexpr int BR = 16, LD = HEAD_DIM;
-    int smem = (2 * BC * LD + BR * LD) * (int)sizeof(bf16);
+static void launch_mma_decode(AttentionParams& p, DecodeScratch& sc) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
-    int num_splits = decode_num_splits(p, tiles_total);
+    p.num_splits = decode_num_splits(p, tiles_total);
+    p.o_part = sc.o_part;
+    p.ml_part = sc.ml_part;
 
-    if (num_splits <= 1) {
-        cudaFuncSetAttribute(gqa_decode_attn_mma_kernel<HEAD_DIM, BC>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        gqa_decode_attn_mma_kernel<HEAD_DIM, BC>
-            <<<dim3(p.kv_head, p.batch), 32, smem>>>(p);
-        return;
-    }
-    cudaFuncSetAttribute(gqa_decode_attn_mma_splitk_kernel<HEAD_DIM, BC>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    gqa_decode_attn_mma_splitk_kernel<HEAD_DIM, BC>
-        <<<dim3(p.kv_head, p.batch, num_splits), 32, smem>>>(
-            p, sc.o_part, sc.ml_part, num_splits);
-    gqa_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(
-        sc.o_part, sc.ml_part, p.o, num_splits, p.head_dim);
+    attn_decode_split_kv_mma_kernel<HEAD_DIM, BC>
+        <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
+    attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 #endif
 
-static void launch_scalar_decode(const GQAParams& p) {
+static void launch_scalar_decode(AttentionParams& p, DecodeScratch& sc) {
     int gs = p.q_head / p.kv_head;
+    int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
+    p.num_splits = decode_num_splits(p, chunks_total);
+    p.o_part = sc.o_part;
+    p.ml_part = sc.ml_part;
+
     size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
-    gqa_decode_attn_kernel<<<p.batch * p.kv_head, dim3(32, gs), smem>>>(p);
+    attn_decode_split_kv_kernel<<<dim3(p.batch * p.kv_head, 1, p.num_splits), dim3(32, gs), smem>>>(p);
+    attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 
 template <int HEAD_DIM>
-static void dispatch_decode_t(GQAParams& p, DecodeScratch& sc) {
+static void dispatch_decode_t(AttentionParams& p, DecodeScratch& sc) {
 #ifndef ASTRAI_NO_MMA
     if (decode_use_mma(p)) { launch_mma_decode<HEAD_DIM, 32>(p, sc); return; }
 #endif
-    (void)sc;
-    launch_scalar_decode(p);
+    launch_scalar_decode(p, sc);
 }
 
-static void dispatch_decode(GQAParams& p, DecodeScratch& sc) {
+static void dispatch_decode(AttentionParams& p, DecodeScratch& sc) {
     switch (p.head_dim) {
         case 32:  dispatch_decode_t<32>(p, sc);  break;
         case 64:  dispatch_decode_t<64>(p, sc);  break;
@@ -169,7 +164,7 @@ static void bench() {
         for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(randf());
         cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
 
-        GQAParams p;
+        AttentionParams p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
         p.use_mask=0; p.is_causal=0; p.causal_offset=0;
         p.scale=1.0f/sqrtf((float)D);
@@ -245,7 +240,7 @@ int main() {
         cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
         cudaMemcpy(dMask,hMask,B*sl,cudaMemcpyHostToDevice);
 
-        GQAParams p;
+        AttentionParams p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
         p.use_mask=0; p.is_causal=0; p.causal_offset=0;
         p.scale=1.0f/sqrtf((float)D);

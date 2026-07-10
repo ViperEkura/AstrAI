@@ -2,16 +2,16 @@
 Pure-C test:
 nvcc -I csrc -arch=sm_89 -O3 \
     --use_fast_math --ptxas-options=-O3 --extra-device-vectorization \
-    csrc/tests/gqa_prefill_test.cu -o test && ./test
+    csrc/tests/attn_prefill_test.cu -o test && ./test
 */
 
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <sys/time.h>
-#include "../kernels/gqa_prefill_attn.cuh"
+#include "../kernels/attn_prefill_split_q.cuh"
 #ifndef ASTRAI_NO_MMA
-#include "../kernels/gqa_prefill_attn_mma.cuh"
+#include "../kernels/attn_prefill_split_q_mma.cuh"
 #endif
 
 static double now_ms() {
@@ -21,9 +21,9 @@ static double now_ms() {
 }
 
 // Launch the production prefill path (tensor-core MMA on sm_80+, else the
-// scalar fallback), mirroring dispatch_prefill() in gqa_prefill_attn.cu.
+// scalar fallback), mirroring dispatch_prefill() in attn_prefill.cu.
 template <int HEAD_DIM>
-static void launch_prefill(GQAParams& p) {
+static void launch_prefill(AttentionParams& p) {
 #ifndef ASTRAI_NO_MMA
     constexpr int WARPS = 4, BR = 16;
     constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
@@ -31,16 +31,16 @@ static void launch_prefill(GQAParams& p) {
                              : (HEAD_DIM <= 128) ? 3 : 2;
     dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
     dim3 block(WARPS * 32, 1, 1);
-    gqa_prefill_attn_mma_kernel<HEAD_DIM, WARPS, BC, MIN_BLOCKS><<<grid, block>>>(p);
+    attn_prefill_split_q_mma_kernel<HEAD_DIM, WARPS, BC, MIN_BLOCKS><<<grid, block>>>(p);
 #else
     constexpr int G = 8, ROWS = 32, P_BC = 32;
     dim3 grid((p.q_len + ROWS - 1) / ROWS, p.q_head, p.batch);
     dim3 block(G, ROWS, 1);
-    gqa_prefill_attn_kernel_t<HEAD_DIM, G, ROWS, P_BC><<<grid, block>>>(p);
+    attn_prefill_split_q_kernel_t<HEAD_DIM, G, ROWS, P_BC><<<grid, block>>>(p);
 #endif
 }
 
-static void dispatch_prefill(GQAParams& p) {
+static void dispatch_prefill(AttentionParams& p) {
     switch (p.head_dim) {
         case 64:  launch_prefill<64>(p);  break;
         case 128: launch_prefill<128>(p); break;
@@ -123,7 +123,7 @@ static void bench() {
         for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(randf());
         cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
 
-        GQAParams p;
+        AttentionParams p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=ql; p.kv_len=kl; p.head_dim=D;
         p.use_mask=0; p.is_causal=causal; p.causal_offset=0;
         p.scale=1.0f/sqrtf((float)D);
@@ -191,7 +191,7 @@ int main() {
         for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(hV[i]);
         cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
 
-        GQAParams p;
+        AttentionParams p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=ql; p.kv_len=kl; p.head_dim=D;
         p.use_mask=0; p.is_causal=causal; p.causal_offset=0;
         p.scale=1.0f/sqrtf((float)D);

@@ -1,8 +1,8 @@
 #pragma once
 #include <torch/extension.h>
-#include "gqa_common.cuh"
+#include "attn_common.cuh"
 
-inline void gqa_pack_params(
+inline void attn_pack_params(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -10,7 +10,7 @@ inline void gqa_pack_params(
     bool is_causal,
     int64_t causal_offset,
     c10::optional<double> scale,
-    GQAParams& p
+    AttentionParams& p
 ) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda());
     TORCH_CHECK(q.dtype() == torch::kBFloat16);

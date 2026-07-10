@@ -42,7 +42,7 @@ def _torch_fallback(
     )
 
 
-def gqa_decode_attn(
+def attn_decode(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -51,8 +51,8 @@ def gqa_decode_attn(
     causal_offset: int = 0,
     scale: float | None = None,
 ) -> torch.Tensor:
-    if _available["gqa_decode_attn"]:
-        return _modules["gqa_decode_attn"].gqa_decode_attn(
+    if _available["attn_decode"]:
+        return _modules["attn_decode"].attn_decode(
             q,
             k,
             v,
@@ -64,7 +64,7 @@ def gqa_decode_attn(
     return _torch_fallback(q, k, v, mask, is_causal, scale)
 
 
-def gqa_prefill_attn(
+def attn_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -73,8 +73,8 @@ def gqa_prefill_attn(
     causal_offset: int = 0,
     scale: float | None = None,
 ) -> torch.Tensor:
-    if _available["gqa_prefill_attn"]:
-        return _modules["gqa_prefill_attn"].gqa_prefill_attn(
+    if _available["attn_prefill"]:
+        return _modules["attn_prefill"].attn_prefill(
             q,
             k,
             v,

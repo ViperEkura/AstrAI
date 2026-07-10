@@ -1,5 +1,5 @@
 #pragma once
-#include "gqa_common.cuh"
+#include "attn_common.cuh"
 
 // v9: group-split register blocking. G threads cooperate on one query row,
 // each owning HEAD_DIM/G dims of qreg[]/acc[]. Small per-thread footprint keeps
@@ -31,7 +31,7 @@ __device__ __forceinline__ void ld8(const bf16* p, float* o) {
 }
 
 template <int HEAD_DIM, int G, int ROWS, int P_BC>
-__global__ void gqa_prefill_attn_kernel_t(GQAParams p) {
+__global__ void attn_prefill_split_q_kernel_t(AttentionParams p) {
     constexpr int DPT = HEAD_DIM / G;
 
     int q_tile = blockIdx.x;

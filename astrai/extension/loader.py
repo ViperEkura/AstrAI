@@ -11,7 +11,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-KERNEL_NAMES = ["gqa_decode_attn", "gqa_prefill_attn"]
+KERNEL_NAMES = ["attn_decode", "attn_prefill"]
 
 _available: dict[str, bool] = {}
 _modules: dict[str, object] = {}

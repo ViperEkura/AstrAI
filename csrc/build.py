@@ -42,5 +42,5 @@ def register(name: str, sources: list[str] | None = None, **kwargs):
     }
 
 
-register("gqa_decode_attn")
-register("gqa_prefill_attn")
+register("attn_decode")
+register("attn_prefill")

@@ -49,7 +49,6 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     __shared__ __align__(16) bf16 sV[BC * HEAD_DIM];
     __shared__ __align__(16) bf16 sQ[BR * HEAD_DIM];
 
-    bf16 scale_bf16 = __float2bfloat16(p.scale);
     for (int i = lane; i < BR * HEAD_DIM; i += 32) {
         int r = i / HEAD_DIM, d = i % HEAD_DIM;
         bf16 val = __float2bfloat16(0.0f);
@@ -57,7 +56,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
             int qh = q_head0 + r;
             val = p.q[(batch * p.q_head + qh) * HEAD_DIM + d];
         }
-        sQ[r * LD + swiz_col(d, r, SWIZ_MASK)] = __hmul(val, scale_bf16);
+        sQ[r * LD + swiz_col(d, r, SWIZ_MASK)] = val;
     }
     __syncwarp();
 
@@ -115,6 +114,11 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
 
         float Sacc[NC8][4];
         mma_compute_scores<KD, NC8>(Qa, sK, LD, SWIZ_MASK, lane, Sacc);
+
+        #pragma unroll
+        for (int n8 = 0; n8 < NC8; n8++)
+            Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
+            Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
 
         int maxc = p.is_causal ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
         mma_softmax_tile<NC8, DN8>(kv0, maxc, maxc,

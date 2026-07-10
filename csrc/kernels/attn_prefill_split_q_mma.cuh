@@ -81,16 +81,14 @@ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
 #pragma unroll
     for (int kt = 0; kt < KD; kt++) {
         int c = kt * 16 + tid4 * 2;
-        const bf16* pa = &p.q[q_base + qra * HEAD_DIM + c];
-        const bf16* pb = &p.q[q_base + qrb * HEAD_DIM + c];
-        Qa[kt][0] = va ? pk2(__bfloat162float(pa[0]) * p.scale,
-                             __bfloat162float(pa[1]) * p.scale) : 0u;
-        Qa[kt][1] = vb ? pk2(__bfloat162float(pb[0]) * p.scale,
-                             __bfloat162float(pb[1]) * p.scale) : 0u;
-        Qa[kt][2] = va ? pk2(__bfloat162float(pa[8]) * p.scale,
-                             __bfloat162float(pa[9]) * p.scale) : 0u;
-        Qa[kt][3] = vb ? pk2(__bfloat162float(pb[8]) * p.scale,
-                             __bfloat162float(pb[9]) * p.scale) : 0u;
+        const unsigned* pau = reinterpret_cast<const unsigned*>(
+            &p.q[q_base + qra * HEAD_DIM + c]);
+        const unsigned* pbu = reinterpret_cast<const unsigned*>(
+            &p.q[q_base + qrb * HEAD_DIM + c]);
+        Qa[kt][0] = va ? pau[0] : 0u;
+        Qa[kt][1] = vb ? pbu[0] : 0u;
+        Qa[kt][2] = va ? pau[4] : 0u;
+        Qa[kt][3] = vb ? pbu[4] : 0u;
     }
 
     float Oacc[DN8][4];
@@ -163,9 +161,15 @@ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
         // Warp-level causal skip
         if (!use_skip || kv0 <= max_kv) {
 
-        // S = Q @ K^T + online softmax + O += P @ V  (shared MMA functions)
+        // S = Q @ K^T + scale + online softmax + O += P @ V
         float Sacc[NC8][4];
         mma_compute_scores<KD, NC8>(Qa, bK, LD, SWIZ_MASK, lane, Sacc);
+
+        // post-multiply scale in float (no bf16 precision loss from pre-scaling Q)
+        #pragma unroll
+        for (int n8 = 0; n8 < NC8; n8++)
+            Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
+            Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
 
         int maxc0 = p.is_causal ? min(p.kv_len, qr0 + p.causal_offset + 1)
                                 : p.kv_len;

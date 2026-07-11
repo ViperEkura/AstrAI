@@ -30,12 +30,8 @@ static void launch_scalar_decode(AttentionParams<bf16>& p) {
 }
 
 #ifndef ASTRAI_NO_MMA
-// Tensor-core head-packing requires 1 < G <= 16 (the MMA M dim) and no mask.
-static bool decode_use_mma(const AttentionParams<bf16>& p) {
-    int G = p.q_head / p.kv_head;
-    return !p.use_mask && G > 1 && G <= 16;
-}
-
+// MMA head-packing requires G <= 16 (sQ has BR=16 rows). sm_80+ tensor-core
+// + cp.async wins even at G=1 (decode is memory-bound, not compute-bound).
 template <int HEAD_DIM, int BC>
 static void launch_mma_decode(AttentionParams<bf16>& p) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
@@ -56,7 +52,8 @@ static void launch_mma_decode(AttentionParams<bf16>& p) {
 template <int HEAD_DIM>
 static void dispatch_decode(AttentionParams<bf16>& p) {
 #ifndef ASTRAI_NO_MMA
-    if (decode_use_mma(p)) {
+    int G = p.q_head / p.kv_head;
+    if (!p.use_mask && G >= 1 && G <= 16) {
         launch_mma_decode<HEAD_DIM, 32>(p);
         return;
     }

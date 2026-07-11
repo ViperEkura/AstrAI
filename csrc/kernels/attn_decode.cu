@@ -5,25 +5,18 @@
 #include "attn_decode_split_kv_mma.cuh"
 #endif
 
-// Decode has only batch*kv_head independent tasks; without split-K the grid is
-// tiny (e.g. 16 blocks) and leaves most SMs idle. Pick the smallest split count
-// that fills the device (~2 blocks/SM), capped by the tile count, min work per
-// split (at least 8 tiles), and 32.
-static int decode_num_splits(const AttentionParams<bf16>& p, int tiles_total) {
+static int decode_num_splits(int base_blocks, int tiles_total) {
     int sm_count = 0;
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
-    int base_blocks = p.kv_head * p.batch;
-    int desired = 2 * (sm_count > 0 ? sm_count : 64);
-    int n = (desired + base_blocks - 1) / base_blocks;
-    int max_by_work = tiles_total / 8;
-    return std::max(1, std::min({n, tiles_total, 32, max_by_work}));
+    int n = (2 * sm_count + base_blocks - 1) / base_blocks;
+    return std::max(1, std::min(n, std::min(tiles_total, 32)));
 }
 
 // Scalar fallback: one warp per query head, split-KV across grid.z.
 static void launch_scalar_decode(AttentionParams<bf16>& p) {
     int group_size = p.q_head / p.kv_head;
     int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
-    p.num_splits = decode_num_splits(p, chunks_total);
+    p.num_splits = decode_num_splits(p.batch * p.kv_head, chunks_total);
 
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto o_part = torch::empty({p.batch, p.q_head, p.num_splits, p.head_dim}, fopt);
@@ -46,7 +39,7 @@ static bool decode_use_mma(const AttentionParams<bf16>& p) {
 template <int HEAD_DIM, int BC>
 static void launch_mma_decode(AttentionParams<bf16>& p) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
-    p.num_splits = decode_num_splits(p, tiles_total);
+    p.num_splits = decode_num_splits(p.batch * p.kv_head, tiles_total);
 
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto o_part = torch::empty({p.batch, p.q_head, p.num_splits, p.head_dim}, fopt);

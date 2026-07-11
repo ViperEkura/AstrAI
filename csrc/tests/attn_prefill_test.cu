@@ -5,20 +5,11 @@ nvcc -I csrc -arch=sm_89 -O3 \
     csrc/tests/attn_prefill_test.cu -o test && ./test
 */
 
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <sys/time.h>
+#include "test_utils.cuh"
 #include "../kernels/attn_prefill_split_q.cuh"
 #ifndef ASTRAI_NO_MMA
 #include "../kernels/attn_prefill_split_q_mma.cuh"
 #endif
-
-static double now_ms() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
 
 // Launch the production prefill path (tensor-core MMA on sm_80+, else the
 // scalar fallback), mirroring dispatch_prefill() in attn_prefill.cu.
@@ -47,45 +38,6 @@ static void dispatch_prefill(AttentionParams<bf16>& p) {
         default:  printf("bench: unsupported D=%d\n", p.head_dim);
     }
 }
-
-static void cpu_attention(const float* Q, const float* K, const float* V, float* O,
-                          int B, int Hq, int Hk, int q_len, int kv_len, int D,
-                          int is_causal, int causal_off) {
-    float scale = 1.0f / sqrtf((float)D);
-    int n_rep = Hq / Hk;
-    for (int b = 0; b < B; b++) {
-        for (int h = 0; h < Hq; h++) {
-            for (int qi = 0; qi < q_len; qi++) {
-                int kv_h = h / n_rep;
-                float mv = -INFINITY, sv = 0.0f;
-                float accum[256] = {0};
-                int lim = is_causal ? min(kv_len, qi + causal_off + 1) : kv_len;
-                for (int kj = 0; kj < lim; kj++) {
-                    float dot = 0.0f;
-                    for (int d = 0; d < D; d++)
-                        dot += Q[((b*Hq + h)*q_len + qi)*D + d]
-                             * K[((b*Hk + kv_h)*kv_len + kj)*D + d];
-                    dot *= scale;
-                    float nm = fmaxf(mv, dot);
-                    float al = expf(mv - nm);
-                    float be = expf(dot - nm);
-                    sv = sv * al + be;
-                    for (int d = 0; d < D; d++)
-                        accum[d] = accum[d] * al
-                                 + V[((b*Hk + kv_h)*kv_len + kj)*D + d] * be;
-                    mv = nm;
-                }
-                float inv = 1.0f / sv;
-                for (int d = 0; d < D; d++)
-                    O[((b*Hq + h)*q_len + qi)*D + d] = accum[d] * inv;
-            }
-        }
-    }
-}
-
-static __nv_bfloat16 f2bf(float x) { return __float2bfloat16(x); }
-static float bf2f(__nv_bfloat16 x) { return __bfloat162float(x); }
-static float randf() { return (float)rand() / (float)RAND_MAX - 0.5f; }
 
 // Warmed-up, CUDA-event timed throughput sweep over the production MMA path.
 // Reports per-call latency and effective tensor-core TFLOP/s (2 matmuls:
@@ -208,7 +160,7 @@ int main() {
         cudaMemcpy(hOut,dO,nQ*2,cudaMemcpyDeviceToHost);
 
         float* ref=new float[nQ];
-        cpu_attention(hQ,hK,hV,ref,B,Hq,Hk,ql,kl,D,causal,0);
+        cpu_attention_ref(hQ, hK, hV, nullptr, ref, B, Hq, Hk, ql, kl, D, causal, 0);
 
         float max_err=0;
         for (size_t i=0;i<nQ;i++) {

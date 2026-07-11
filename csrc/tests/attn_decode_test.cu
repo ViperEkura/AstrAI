@@ -5,20 +5,11 @@ nvcc -I csrc -arch=sm_89 -O3 \
     csrc/tests/attn_decode_test.cu -o test && ./test
 */
 
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <sys/time.h>
+#include "test_utils.cuh"
 #include "../kernels/attn_decode_split_kv.cuh"
 #ifndef ASTRAI_NO_MMA
 #include "../kernels/attn_decode_split_kv_mma.cuh"
 #endif
-
-static double now_ms() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
-}
 
 // Split-K scratch (torch-free): the production launcher allocates these from
 // torch; here we pass pre-allocated device buffers so the bench loop doesn't
@@ -27,13 +18,6 @@ struct DecodeScratch {
     float* o_part = nullptr;
     float* ml_part = nullptr;
 };
-
-static int decode_num_splits(int base_blocks, int tiles_total) {
-    int sm_count = 0;
-    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
-    int n = (2 * sm_count + base_blocks - 1) / base_blocks;
-    return std::max(1, std::min(n, std::min(tiles_total, 32)));
-}
 
 // Launch the production decode path (tensor-core head-packing MMA on sm_80+,
 // scalar fallback otherwise), mirroring dispatch_decode() in attn_decode.cu.
@@ -46,7 +30,7 @@ static bool decode_use_mma(const AttentionParams<bf16>& p) {
 template <int HEAD_DIM, int BC>
 static void launch_mma_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
-    p.num_splits = decode_num_splits(p.batch * p.kv_head, tiles_total);
+    p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
     p.o_part = sc.o_part;
     p.ml_part = sc.ml_part;
 
@@ -59,7 +43,7 @@ static void launch_mma_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
 static void launch_scalar_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     int gs = p.q_head / p.kv_head;
     int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
-    p.num_splits = decode_num_splits(p.batch * p.kv_head, chunks_total);
+    p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
     p.o_part = sc.o_part;
     p.ml_part = sc.ml_part;
 
@@ -85,43 +69,6 @@ static void dispatch_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
         default:  printf("bench: unsupported D=%d\n", p.head_dim);
     }
 }
-
-static void cpu_decode(const float* Q, const float* K, const float* V,
-                        const bool* mask, float* O,
-                        int B, int Hq, int Hk, int seq_len, int D) {
-    float scale = 1.0f / sqrtf((float)D);
-    int n_rep = Hq / Hk;
-    for (int b = 0; b < B; b++) {
-        for (int h = 0; h < Hq; h++) {
-            int kv_h = h / n_rep;
-            float mv = -INFINITY, sv = 0.0f;
-            float accum[256] = {0};
-            for (int s = 0; s < seq_len; s++) {
-                if (!mask[b * seq_len + s]) continue;
-                float dot = 0.0f;
-                for (int d = 0; d < D; d++)
-                    dot += Q[((b * Hq + h) * 1 + 0) * D + d]
-                         * K[((b * Hk + kv_h) * seq_len + s) * D + d];
-                dot *= scale;
-                float nm = fmaxf(mv, dot);
-                float al = expf(mv - nm);
-                float be = expf(dot - nm);
-                sv = sv * al + be;
-                for (int d = 0; d < D; d++)
-                    accum[d] = accum[d] * al
-                             + V[((b * Hk + kv_h) * seq_len + s) * D + d] * be;
-                mv = nm;
-            }
-            float inv = 1.0f / sv;
-            for (int d = 0; d < D; d++)
-                O[((b * Hq + h) * 1 + 0) * D + d] = accum[d] * inv;
-        }
-    }
-}
-
-static bf16 f2bf(float x) { return __float2bfloat16(x); }
-static float bf2f(bf16 x) { return __bfloat162float(x); }
-static float randf() { return (float)rand() / (float)RAND_MAX - 0.5f; }
 
 // Warmed-up, CUDA-event timed sweep over the production decode MMA path.
 // Decode (q_len==1) is memory-bound: the two matmuls are GEMV-shaped, so we
@@ -259,7 +206,7 @@ int main() {
         cudaMemcpy(hOut,dO,nQ*2,cudaMemcpyDeviceToHost);
 
         float* ref=new float[nQ];
-        cpu_decode(hQ,hK,hV,hMask,ref,B,Hq,Hk,sl,D);
+        cpu_attention_ref(hQ, hK, hV, hMask, ref, B, Hq, Hk, 1, sl, D, 0, 0);
 
         float max_err=0;
         for (size_t i=0;i<nQ;i++){

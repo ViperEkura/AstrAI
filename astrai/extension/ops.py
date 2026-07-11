@@ -42,6 +42,40 @@ def _torch_fallback(
     )
 
 
+def _gather_kv_from_pages(
+    page_table: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_size: int,
+    kv_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather contiguous K/V from paged cache for torch SDPA fallback.
+
+    Shapes:
+        page_table : [batch, max_pages] (int64)
+        k_cache    : [n_pages, page_size, n_kv_heads, head_dim]
+        v_cache    : same as k_cache
+    Returns:
+        k, v : [batch, n_kv_heads, kv_len, head_dim]
+    """
+    batch, max_pages = page_table.shape
+    n_pages, ps, n_kv_heads, head_dim = k_cache.shape
+    if ps != page_size:
+        raise ValueError(f"k_cache page_size mismatch: {ps} vs {page_size}")
+
+    k = k_cache.new_empty(batch, n_kv_heads, kv_len, head_dim)
+    v = v_cache.new_empty(batch, n_kv_heads, kv_len, head_dim)
+
+    for b in range(batch):
+        for pos in range(kv_len):
+            log_pg = pos // page_size
+            pg_off = pos % page_size
+            phys = int(page_table[b, log_pg].item())
+            k[b, :, pos, :] = k_cache[phys, pg_off, :, :]
+            v[b, :, pos, :] = v_cache[phys, pg_off, :, :]
+    return k, v
+
+
 def attn_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -83,4 +117,33 @@ def attn_prefill(
             causal_offset=causal_offset,
             scale=scale,
         )
+    return _torch_fallback(q, k, v, mask, is_causal, scale)
+
+
+def attn_paged_decode(
+    q: torch.Tensor,
+    page_table: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_size: int,
+    kv_len: int,
+    mask: torch.Tensor | None = None,
+    is_causal: bool = False,
+    causal_offset: int = 0,
+    scale: float | None = None,
+) -> torch.Tensor:
+    if _available["attn_paged_decode"]:
+        return _modules["attn_paged_decode"].attn_paged_decode(
+            q,
+            page_table,
+            k_cache,
+            v_cache,
+            page_size,
+            kv_len,
+            mask=mask,
+            is_causal=is_causal,
+            causal_offset=causal_offset,
+            scale=scale,
+        )
+    k, v = _gather_kv_from_pages(page_table, k_cache, v_cache, page_size, kv_len)
     return _torch_fallback(q, k, v, mask, is_causal, scale)

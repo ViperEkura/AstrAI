@@ -79,7 +79,7 @@ torch::Tensor attn_paged_decode(
     int batch = q.size(0);
     int q_head = q.size(1);
     int head_dim = q.size(3);
-    int kv_head = k_cache.size(3);
+    int kv_head = k_cache.size(2);
     int max_pages = page_table.size(1);
 
     TORCH_CHECK(q.is_cuda() && page_table.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda());

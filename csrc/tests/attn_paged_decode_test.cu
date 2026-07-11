@@ -221,17 +221,16 @@ static const TestCase TESTS[] = {
 };
 
 static int dispatch_test(const TestCase& tc) {
-    switch (tc.head_dim) {
-        case 32:  return run_test<32>(tc.B, tc.Hq, tc.Hkv, tc.kv_len, tc.page_size, tc.seed);
-        case 64:  return run_test<64>(tc.B, tc.Hq, tc.Hkv, tc.kv_len, tc.page_size, tc.seed);
-        case 128: return run_test<128>(tc.B, tc.Hq, tc.Hkv, tc.kv_len, tc.page_size, tc.seed);
-        case 256: return run_test<256>(tc.B, tc.Hq, tc.Hkv, tc.kv_len, tc.page_size, tc.seed);
-        default:  return 1;
-    }
+    bool matched = false;
+    int r = 0;
+    dispatch_by_head_dim(tc.head_dim, [&]<int D>() {
+        matched = true;
+        r = run_test<D>(tc.B, tc.Hq, tc.Hkv, tc.kv_len, tc.page_size, tc.seed);
+    });
+    return matched ? r : 1;
 }
 
 // Warmed-up, CUDA-event timed sweep over paged decode configs.
-// Reports per-call latency and effective K/V read bandwidth.
 // Bytes = K + V read through page table (B*Hk*kv*D each), bf16.
 template <int HEAD_DIM>
 static void bench_config(int B, int Hq, int Hkv, int kv_len, int page_size) {
@@ -281,43 +280,27 @@ static void bench_config(int B, int Hq, int Hkv, int kv_len, int page_size) {
     pa.o_part = d_op; pa.ml_part = d_ml;
 
     const int WARMUP = 10, ITERS = 100;
-    for (int i = 0; i < WARMUP; i++) launch_paged_decode<HEAD_DIM>(pa);
-    cudaDeviceSynchronize();
-    CUDA_CHECK(cudaGetLastError());
-
-    cudaEvent_t s, e;
-    cudaEventCreate(&s); cudaEventCreate(&e);
-    cudaEventRecord(s);
-    for (int i = 0; i < ITERS; i++) launch_paged_decode<HEAD_DIM>(pa);
-    cudaEventRecord(e); cudaEventSynchronize(e);
-    float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= ITERS;
-
+    auto launch = [&]() { launch_paged_decode<HEAD_DIM>(pa); };
     double flops = 4.0 * B * Hq * (double)kv_len * HEAD_DIM;
-    double tflops = flops / (ms * 1e-3) / 1e12;
     size_t nKV = (size_t)B * Hkv * kv_len * HEAD_DIM;
-    double bytes = 2.0 * (2.0 * nKV);
-    double gbps = bytes / (ms * 1e-3) / 1e9;
+    double bytes = 2.0 * (2.0 * nKV * sizeof(bf16));
+    BenchResult r = bench_kernel(launch, WARMUP, ITERS, flops, bytes);
 
     char cfg[64];
     snprintf(cfg, sizeof(cfg),
              "B=%2d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d page=%3d",
              B, Hq, Hkv, 1, kv_len, HEAD_DIM, page_size);
-    printf("%-46s | %7.4f ms | %7.1f GB/s | %6.2f TFLOP/s\n",
-           cfg, ms, gbps, tflops);
+    print_bench_row(cfg, r);
 
     free(tmp);
     cudaFree(d_q); cudaFree(d_o);
     cudaFree(d_k_pool); cudaFree(d_v_pool); cudaFree(d_pt);
     cudaFree(d_op); cudaFree(d_ml);
-    cudaEventDestroy(s); cudaEventDestroy(e);
 }
 
 static void bench() {
     printf("\n===== PAGED DECODE BENCH =====\n");
-    printf("%-46s | %10s | %10s | %10s\n",
-           "config", "latency", "bandwidth", "throughput");
-    printf("---------------------------------------------------------------"
-           "----------------------------\n");
+    print_bench_header();
     bench_config<128>(1, 32, 4, 512, 128);
     bench_config<128>(1, 32, 4, 1024, 128);
     bench_config<128>(1, 32, 4, 2048, 128);

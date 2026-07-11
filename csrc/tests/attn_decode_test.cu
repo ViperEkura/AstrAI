@@ -61,90 +61,64 @@ static void dispatch_decode_t(AttentionParams<bf16>& p, DecodeScratch& sc) {
 }
 
 static void dispatch_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
-    switch (p.head_dim) {
-        case 32:  dispatch_decode_t<32>(p, sc);  break;
-        case 64:  dispatch_decode_t<64>(p, sc);  break;
-        case 128: dispatch_decode_t<128>(p, sc); break;
-        case 256: dispatch_decode_t<256>(p, sc); break;
-        default:  printf("bench: unsupported D=%d\n", p.head_dim);
-    }
+    dispatch_by_head_dim(p.head_dim, [&]<int D>() { dispatch_decode_t<D>(p, sc); });
 }
 
 // Warmed-up, CUDA-event timed sweep over the production decode MMA path.
-// Decode (q_len==1) is memory-bound: the two matmuls are GEMV-shaped, so we
-// report both effective K/V read bandwidth and the (small) attention FLOP/s.
-// FLOP/s = 2 matmuls (q@K^T, P@V), each 2*B*Hq*kv*D flops.
-// Bytes    = K + V read = 2 * B*Hk*kv*D * sizeof(bf16).
 static void bench() {
     const int cfgs[][5] = {
-        {1, 32, 4, 512, 128},    // B,Hq,Hk,seq,D
+        {1, 32, 4, 512, 128},    // B, Hq, Hk, kv_len, D
         {1, 32, 4, 1024, 128},
         {1, 32, 4, 2048, 128},
         {1, 32, 4, 4096, 128},
         {16, 32, 4, 2048, 128},
         {32, 32, 4, 1024, 128},
     };
-    int n = sizeof(cfgs)/sizeof(cfgs[0]);
     const int WARMUP = 10, ITERS = 100;
     printf("\n===== DECODE BENCH (warmup=%d iters=%d) =====\n", WARMUP, ITERS);
-    printf("%-46s | %10s | %10s | %10s\n",
-           "config", "latency", "bandwidth", "throughput");
-    printf("---------------------------------------------------------------"
-           "----------------------------\n");
+    print_bench_header();
 
-    for (int ci = 0; ci < n; ci++) {
-        int B=cfgs[ci][0], Hq=cfgs[ci][1], Hk=cfgs[ci][2];
-        int sl=cfgs[ci][3], D=cfgs[ci][4];
-        size_t nQ=(size_t)B*Hq*D, nKV=(size_t)B*Hk*sl*D;
+    for (int ci = 0; ci < 6; ci++) {
+        int B = cfgs[ci][0], Hq = cfgs[ci][1], Hk = cfgs[ci][2];
+        int sl = cfgs[ci][3], D = cfgs[ci][4];
+        size_t nQ = (size_t)B * Hq * D;
+        size_t nKV = (size_t)B * Hk * sl * D;
 
-        bf16 *dQ,*dK,*dV,*dO,*tmp;
-        cudaMalloc(&dQ,nQ*2); cudaMalloc(&dK,nKV*2);
-        cudaMalloc(&dV,nKV*2); cudaMalloc(&dO,nQ*2);
-        size_t big = nQ>nKV?nQ:nKV; tmp=new bf16[big];
-        for (size_t i=0;i<nQ;i++)  tmp[i]=f2bf(randf());
-        cudaMemcpy(dQ,tmp,nQ*2,cudaMemcpyHostToDevice);
-        for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(randf());
-        cudaMemcpy(dK,tmp,nKV*2,cudaMemcpyHostToDevice);
-        for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(randf());
-        cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
+        bf16 *dQ, *dK, *dV, *dO;
+        cudaMalloc(&dQ, nQ*2); cudaMalloc(&dK, nKV*2);
+        cudaMalloc(&dV, nKV*2); cudaMalloc(&dO, nQ*2);
+        size_t big = nQ > nKV ? nQ : nKV; bf16* tmp = new bf16[big];
+        for (size_t i = 0; i < nQ; i++)  tmp[i] = f2bf(randf());
+        cudaMemcpy(dQ, tmp, nQ*2, cudaMemcpyHostToDevice);
+        for (size_t i = 0; i < nKV; i++) tmp[i] = f2bf(randf());
+        cudaMemcpy(dK, tmp, nKV*2, cudaMemcpyHostToDevice);
+        for (size_t i = 0; i < nKV; i++) tmp[i] = f2bf(randf());
+        cudaMemcpy(dV, tmp, nKV*2, cudaMemcpyHostToDevice);
+        delete[] tmp;
 
         AttentionParams<bf16> p;
-        p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
-        p.use_mask=0; p.is_causal=0; p.causal_offset=0;
-        p.scale=1.0f/sqrtf((float)D);
-        p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
+        p.batch = B; p.q_head = Hq; p.kv_head = Hk; p.q_len = 1; p.kv_len = sl;
+        p.head_dim = D; p.use_mask = 0; p.is_causal = 0; p.causal_offset = 0;
+        p.scale = 1.0f / sqrtf((float)D);
+        p.q = dQ; p.k = dK; p.v = dV; p.mask = nullptr; p.o = dO;
 
         DecodeScratch sc;
         cudaMalloc(&sc.o_part, (size_t)B*Hq*32*D*sizeof(float));
         cudaMalloc(&sc.ml_part, (size_t)B*Hq*32*2*sizeof(float));
 
-        for (int i=0;i<WARMUP;i++) dispatch_decode(p, sc);
-        cudaDeviceSynchronize();
-        cudaError_t err=cudaGetLastError();
-        if (err!=cudaSuccess){printf("CUDA err: %s\n",cudaGetErrorString(err));return;}
-
-        cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e);
-        cudaEventRecord(s);
-        for (int i=0;i<ITERS;i++) dispatch_decode(p, sc);
-        cudaEventRecord(e); cudaEventSynchronize(e);
-        float ms=0; cudaEventElapsedTime(&ms,s,e); ms/=ITERS;
-
-        double flops = 4.0*B*Hq*(double)sl*D;
-        double tflops = flops/(ms*1e-3)/1e12;
-        // HBM traffic: K + V read (B*Hk*sl*D each), bf16; Q/O negligible.
-        double bytes = 2.0 * (2.0*nKV);
-        double gbps = bytes/(ms*1e-3)/1e9;
+        auto launch = [&]() { dispatch_decode(p, sc); };
+        double flops = 4.0 * B * Hq * (double)sl * D;
+        double bytes = 2.0 * (2.0 * nKV * sizeof(bf16));
+        BenchResult r = bench_kernel(launch, WARMUP, ITERS, flops, bytes);
 
         char cfg[64];
         snprintf(cfg, sizeof(cfg),
                  "B=%2d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d causal=%d",
-                 B,Hq,Hk,1,sl,D,0);
-        printf("%-46s | %7.4f ms | %7.1f GB/s | %6.2f TFLOP/s\n",
-               cfg, ms, gbps, tflops);
+                 B, Hq, Hk, 1, sl, D, 0);
+        print_bench_row(cfg, r);
 
-        cudaFree(dQ);cudaFree(dK);cudaFree(dV);cudaFree(dO);
-        cudaFree(sc.o_part);cudaFree(sc.ml_part);
-        delete[]tmp; cudaEventDestroy(s); cudaEventDestroy(e);
+        cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+        cudaFree(sc.o_part); cudaFree(sc.ml_part);
     }
 }
 

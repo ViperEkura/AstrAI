@@ -37,6 +37,70 @@ inline int compute_num_splits(int base_blocks, int tiles_total) {
         } \
     } while (0)
 
+struct BenchResult {
+    float ms;
+    double gbps;
+    double tflops;
+};
+
+template <typename Fn>
+BenchResult bench_kernel(Fn launch, int warmup, int iters,
+                         double flops, double bytes) {
+    for (int i = 0; i < warmup; i++) launch();
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA error before bench: %s\n", cudaGetErrorString(err));
+        return {0, 0, 0};
+    }
+
+    cudaEvent_t s, e;
+    cudaEventCreate(&s); cudaEventCreate(&e);
+    cudaEventRecord(s);
+    for (int i = 0; i < iters; i++) launch();
+    cudaEventRecord(e); cudaEventSynchronize(e);
+    float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= iters;
+    cudaEventDestroy(s); cudaEventDestroy(e);
+
+    return {ms, bytes / (ms * 1e-3) / 1e9, flops / (ms * 1e-3) / 1e12};
+}
+
+inline void print_bench_header() {
+    printf("%-46s | %10s | %10s | %10s\n",
+           "config", "latency", "bandwidth", "throughput");
+    printf("---------------------------------------------------------------"
+           "----------------------------\n");
+}
+
+inline void print_bench_row(const char* cfg, const BenchResult& r) {
+    printf("%-46s | %7.4f ms | %7.1f GB/s | %6.2f TFLOP/s\n",
+           cfg, r.ms, r.gbps, r.tflops);
+}
+
+template <int... Ds>
+struct _HeadSwitch;
+
+template <int D>
+struct _HeadSwitch<D> {
+    template <typename Fn>
+    static void call(int hd, Fn&& fn) { if (hd == D) fn.template operator()<D>(); }
+};
+
+template <int D, int... Rest>
+struct _HeadSwitch<D, Rest...> {
+    template <typename Fn>
+    static void call(int hd, Fn&& fn) {
+        if (hd == D) fn.template operator()<D>();
+        else _HeadSwitch<Rest...>::call(hd, fn);
+    }
+};
+
+// Default set: 32, 64, 128, 256
+template <typename Fn>
+void dispatch_by_head_dim(int head_dim, Fn&& fn) {
+    _HeadSwitch<32, 64, 128, 256>::call(head_dim, fn);
+}
+
 // Generic CPU reference for multi-query / grouped-query attention.
 // Tensor shapes (all float*):
 //   Q : [B, Hq, q_len, D]

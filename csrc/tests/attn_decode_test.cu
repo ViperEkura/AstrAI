@@ -28,7 +28,7 @@ struct DecodeScratch {
     float* ml_part = nullptr;
 };
 
-static int decode_num_splits(const AttentionParams& p, int tiles_total) {
+static int decode_num_splits(const AttentionParams<bf16>& p, int tiles_total) {
     int sm_count = 0;
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
     int base_blocks = p.kv_head * p.batch;
@@ -41,13 +41,13 @@ static int decode_num_splits(const AttentionParams& p, int tiles_total) {
 // Launch the production decode path (tensor-core head-packing MMA on sm_80+,
 // scalar fallback otherwise), mirroring dispatch_decode() in attn_decode.cu.
 #ifndef ASTRAI_NO_MMA
-static bool decode_use_mma(const AttentionParams& p) {
+static bool decode_use_mma(const AttentionParams<bf16>& p) {
     int G = p.q_head / p.kv_head;
     return !p.use_mask && G > 1 && G <= 16;
 }
 
 template <int HEAD_DIM, int BC>
-static void launch_mma_decode(AttentionParams& p, DecodeScratch& sc) {
+static void launch_mma_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
     p.num_splits = decode_num_splits(p, tiles_total);
     p.o_part = sc.o_part;
@@ -59,7 +59,7 @@ static void launch_mma_decode(AttentionParams& p, DecodeScratch& sc) {
 }
 #endif
 
-static void launch_scalar_decode(AttentionParams& p, DecodeScratch& sc) {
+static void launch_scalar_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     int gs = p.q_head / p.kv_head;
     int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
     p.num_splits = decode_num_splits(p, chunks_total);
@@ -72,14 +72,14 @@ static void launch_scalar_decode(AttentionParams& p, DecodeScratch& sc) {
 }
 
 template <int HEAD_DIM>
-static void dispatch_decode_t(AttentionParams& p, DecodeScratch& sc) {
+static void dispatch_decode_t(AttentionParams<bf16>& p, DecodeScratch& sc) {
 #ifndef ASTRAI_NO_MMA
     if (decode_use_mma(p)) { launch_mma_decode<HEAD_DIM, 32>(p, sc); return; }
 #endif
     launch_scalar_decode(p, sc);
 }
 
-static void dispatch_decode(AttentionParams& p, DecodeScratch& sc) {
+static void dispatch_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     switch (p.head_dim) {
         case 32:  dispatch_decode_t<32>(p, sc);  break;
         case 64:  dispatch_decode_t<64>(p, sc);  break;
@@ -164,7 +164,7 @@ static void bench() {
         for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(randf());
         cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
 
-        AttentionParams p;
+        AttentionParams<bf16> p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
         p.use_mask=0; p.is_causal=0; p.causal_offset=0;
         p.scale=1.0f/sqrtf((float)D);
@@ -240,7 +240,7 @@ int main() {
         cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
         cudaMemcpy(dMask,hMask,B*sl,cudaMemcpyHostToDevice);
 
-        AttentionParams p;
+        AttentionParams<bf16> p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
         p.use_mask=0; p.is_causal=0; p.causal_offset=0;
         p.scale=1.0f/sqrtf((float)D);

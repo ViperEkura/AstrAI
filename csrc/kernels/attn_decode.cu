@@ -9,7 +9,7 @@
 // tiny (e.g. 16 blocks) and leaves most SMs idle. Pick the smallest split count
 // that fills the device (~2 blocks/SM), capped by the tile count, min work per
 // split (at least 8 tiles), and 32.
-static int decode_num_splits(const AttentionParams& p, int tiles_total) {
+static int decode_num_splits(const AttentionParams<bf16>& p, int tiles_total) {
     int sm_count = 0;
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
     int base_blocks = p.kv_head * p.batch;
@@ -20,7 +20,7 @@ static int decode_num_splits(const AttentionParams& p, int tiles_total) {
 }
 
 // Scalar fallback: one warp per query head, split-KV across grid.z.
-static void launch_scalar_decode(AttentionParams& p) {
+static void launch_scalar_decode(AttentionParams<bf16>& p) {
     int group_size = p.q_head / p.kv_head;
     int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
     p.num_splits = decode_num_splits(p, chunks_total);
@@ -38,13 +38,13 @@ static void launch_scalar_decode(AttentionParams& p) {
 
 #ifndef ASTRAI_NO_MMA
 // Tensor-core head-packing requires 1 < G <= 16 (the MMA M dim) and no mask.
-static bool decode_use_mma(const AttentionParams& p) {
+static bool decode_use_mma(const AttentionParams<bf16>& p) {
     int G = p.q_head / p.kv_head;
     return !p.use_mask && G > 1 && G <= 16;
 }
 
 template <int HEAD_DIM, int BC>
-static void launch_mma_decode(AttentionParams& p) {
+static void launch_mma_decode(AttentionParams<bf16>& p) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
     p.num_splits = decode_num_splits(p, tiles_total);
 
@@ -61,7 +61,7 @@ static void launch_mma_decode(AttentionParams& p) {
 #endif
 
 template <int HEAD_DIM>
-static void dispatch_decode(AttentionParams& p) {
+static void dispatch_decode(AttentionParams<bf16>& p) {
 #ifndef ASTRAI_NO_MMA
     if (decode_use_mma(p)) {
         launch_mma_decode<HEAD_DIM, 32>(p);
@@ -80,7 +80,7 @@ torch::Tensor attn_decode(
     int64_t causal_offset = 0,
     c10::optional<double> scale = c10::nullopt
 ) {
-    AttentionParams p;
+    AttentionParams<bf16> p;
     attn_pack_params(q, k, v, mask, is_causal, causal_offset, scale, p);
     TORCH_CHECK(p.q_len == 1, "Q seq_len must be 1");
     TORCH_CHECK(p.head_dim % 32 == 0, "head_dim must be multiple of 32");

@@ -1,6 +1,9 @@
 #pragma once
-#include "attn_common.cuh"
+#include <cuda_bf16.h>
+#include <float.h>
+#include "attn_common.h"
 
+using bf16 = __nv_bfloat16;
 constexpr int DC_CHUNK = 64;
 
 __device__ inline float warp_reduce_sum(float val) {
@@ -9,7 +12,7 @@ __device__ inline float warp_reduce_sum(float val) {
     return val;
 }
 
-__global__ void attn_decode_split_kv_kernel(AttentionParams p) {
+__global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     int batch = blockIdx.x / p.kv_head;
     int kv_head = blockIdx.x % p.kv_head;
     int split = blockIdx.z;
@@ -86,7 +89,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams p) {
 // Reduce split-K partials into the final bf16 output. One block per (batch,
 // q_head); each thread folds across all splits with a single-pass
 // online-rescale reduction (expf + FMA counts halved vs 3-pass original).
-__global__ void attn_decode_combine_kernel(AttentionParams p) {
+__global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     int bh = blockIdx.x;
     int d = threadIdx.x;
     if (d >= p.head_dim) return;

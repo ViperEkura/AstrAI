@@ -11,6 +11,7 @@
 !csrc/**/*.py
 
 !csrc/**/*.cu
+!csrc/**/*.h
 !csrc/**/*.cuh
 
 !scripts/**/*.sh

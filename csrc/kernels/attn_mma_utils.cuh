@@ -1,4 +1,7 @@
 #pragma once
+#include <cfloat>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 // Shared MMA utilities for tensor-core GQA kernels.
 // mma.sync.m16n8k16 PTX wrappers, ldmatrix helpers, and bf16 packing.

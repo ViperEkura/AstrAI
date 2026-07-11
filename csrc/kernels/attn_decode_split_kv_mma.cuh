@@ -1,6 +1,10 @@
 #pragma once
-#include "attn_common.cuh"
+#include <cfloat>
+#include <cuda_bf16.h>
+#include "attn_common.h"
 #include "attn_mma_utils.cuh"
+
+using bf16 = __nv_bfloat16;
 
 // Split-K (FlashDecoding) tensor-core decode via GQA head-packing.
 //
@@ -26,7 +30,7 @@
 //   - pre-scaled Q: Q scaled during load, softmax skips per-tile multiply
 //   - single-buffer: keeps smem small for high occupancy
 template <int HEAD_DIM, int BC>
-__global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
+__global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     constexpr int BR = 16;
     constexpr int KD = HEAD_DIM / 16;
     constexpr int NC8 = BC / 8;

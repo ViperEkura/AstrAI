@@ -6,7 +6,7 @@
 #endif
 
 template <int HEAD_DIM>
-static void dispatch_prefill(AttentionParams& p) {
+static void dispatch_prefill(AttentionParams<bf16>& p) {
 #ifndef ASTRAI_NO_MMA
     constexpr int WARPS = 4, BR = 16;
     // KV tile: bigger tiles amortize the per-tile cp.async wait + barrier +
@@ -41,7 +41,7 @@ torch::Tensor attn_prefill(
     int64_t causal_offset = 0,
     c10::optional<double> scale = c10::nullopt
 ) {
-    AttentionParams p;
+    AttentionParams<bf16> p;
     attn_pack_params(q, k, v, mask, is_causal, causal_offset, scale, p);
     TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
 

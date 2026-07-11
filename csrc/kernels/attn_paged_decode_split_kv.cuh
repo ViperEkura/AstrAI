@@ -1,0 +1,140 @@
+#pragma once
+#include <cuda_bf16.h>
+#include <float.h>
+#include "attn_common.h"
+
+using bf16 = __nv_bfloat16;
+constexpr int PDC_CHUNK = 64;
+
+__device__ inline float paged_warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
+// Split-KV scalar decode: one warp per query head, grid.z partitions KV.
+__global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) {
+    int batch = blockIdx.x / p.kv_head;
+    int kv_head = blockIdx.x % p.kv_head;
+    int split = blockIdx.z;
+    int group_size = blockDim.y;
+    int q_head = kv_head * group_size + threadIdx.y;
+    int lane = threadIdx.x;
+    int hd_per_thread = p.head_dim / 32;
+
+    float q_reg[8];
+    int q_off = ((batch * p.q_head + q_head) * 1) * p.head_dim + lane * hd_per_thread;
+    #pragma unroll
+    for (int i = 0; i < hd_per_thread; i++)
+        q_reg[i] = __bfloat162float(p.q[q_off + i]);
+
+    float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
+
+    extern __shared__ __align__(16) bf16 k_smem[];
+
+    int chunks_total = (p.kv_len + PDC_CHUNK - 1) / PDC_CHUNK;
+    int chunks_per_split = (chunks_total + p.num_splits - 1) / p.num_splits;
+    int ch_begin = split * chunks_per_split;
+    int ch_end = min(chunks_total, ch_begin + chunks_per_split);
+
+    const int mask_base = batch * p.kv_len;
+
+    for (int ci = ch_begin; ci < ch_end; ci++) {
+        int chunk_start = ci * PDC_CHUNK;
+        int this_chunk = min(PDC_CHUNK, p.kv_len - chunk_start);
+
+        int total = this_chunk * p.head_dim;
+        for (int i = threadIdx.y * 32 + lane; i < total; i += blockDim.x * blockDim.y) {
+            int s = i / p.head_dim;
+            int d_dim = i % p.head_dim;
+            int pos = chunk_start + s;
+            int logical_page = pos / p.page_size;
+            int page_offset = pos % p.page_size;
+            int phys_page = p.page_table[batch * p.max_pages + logical_page];
+            if (phys_page >= 0) {
+                int64_t off = (int64_t)phys_page * p.page_size * p.kv_head * p.head_dim
+                            + (int64_t)page_offset * p.kv_head * p.head_dim
+                            + (int64_t)kv_head * p.head_dim
+                            + d_dim;
+                k_smem[i] = p.k_cache[off];
+            } else {
+                k_smem[i] = __float2bfloat16(0.0f);
+            }
+        }
+        __syncthreads();
+
+        for (int s = 0; s < this_chunk; s++) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < hd_per_thread; i++)
+                partial += q_reg[i] * __bfloat162float(k_smem[s * p.head_dim + lane * hd_per_thread + i]);
+            partial = paged_warp_reduce_sum(partial) * p.scale;
+
+            if (p.use_mask && p.mask && !p.mask[mask_base + chunk_start + s])
+                partial = -FLT_MAX;
+            if (p.is_causal && (chunk_start + s) > p.causal_offset)
+                partial = -FLT_MAX;
+
+            float new_m = fmaxf(m, partial);
+            float alpha = expf(m - new_m);
+            float beta  = expf(partial - new_m);
+            d = d * alpha + beta;
+
+            int pos = chunk_start + s;
+            int logical_page = pos / p.page_size;
+            int page_offset = pos % p.page_size;
+            int phys_page = p.page_table[batch * p.max_pages + logical_page];
+            if (phys_page >= 0) {
+                int64_t v_base = (int64_t)phys_page * p.page_size * p.kv_head * p.head_dim
+                               + (int64_t)page_offset * p.kv_head * p.head_dim
+                               + (int64_t)kv_head * p.head_dim;
+                #pragma unroll
+                for (int i = 0; i < hd_per_thread; i++)
+                    acc_reg[i] = acc_reg[i] * alpha + __bfloat162float(p.v_cache[v_base + lane * hd_per_thread + i]) * beta;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < hd_per_thread; i++)
+                    acc_reg[i] = acc_reg[i] * alpha + 0.0f * beta;
+            }
+            m = new_m;
+        }
+        __syncthreads();
+    }
+
+    size_t bh = (size_t)batch * p.q_head + q_head;
+    size_t slot = bh * p.num_splits + split;
+    int d0 = lane * hd_per_thread;
+    #pragma unroll
+    for (int i = 0; i < hd_per_thread; i++)
+        p.o_part[slot * p.head_dim + (d0 + i)] = acc_reg[i];
+    if (lane == 0) {
+        p.ml_part[slot * 2] = m;
+        p.ml_part[slot * 2 + 1] = d;
+    }
+}
+
+__global__ void paged_attn_decode_combine_kernel(PagedAttentionParams<bf16> p) {
+    int bh = blockIdx.x;
+    int d = threadIdx.x;
+    if (d >= p.head_dim) return;
+
+    size_t split_base = (size_t)bh * p.num_splits;
+    const float* mlp = p.ml_part + split_base * 2;
+    const float* op = p.o_part + split_base * p.head_dim;
+
+    float m = -FLT_MAX, l = 0.0f, acc = 0.0f;
+    for (int s = 0; s < p.num_splits; s++) {
+        float mi = mlp[s * 2];
+        if (mi <= -FLT_MAX) continue;
+        float li = mlp[s * 2 + 1];
+        float nm = fmaxf(m, mi);
+        float corr = __expf(m - nm);
+        float e = __expf(mi - nm);
+        acc = acc * corr + op[s * p.head_dim + d] * e;
+        l = l * corr + li * e;
+        m = nm;
+    }
+
+    float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
+    p.o[(size_t)bh * p.head_dim + d] = __float2bfloat16(acc * inv);
+}

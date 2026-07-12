@@ -499,7 +499,6 @@ classDiagram
             +float clip_eps
             +float kl_coef
             +int group_size
-            +str reduction
             +int sync_interval
             +compute_loss(batch) Tensor
             +sync_ref_model()

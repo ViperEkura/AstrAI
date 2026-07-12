@@ -122,17 +122,23 @@ Parameters: `beta=0.1`, `reduction="mean"`. Keys: `chosen`, `rejected`, `chosen_
 
 ### GRPO (Group Relative Policy Optimization)
 
-On-policy PPO with group-normalized advantages:
+Token-level PPO with group-normalized advantages. Advantages are derived from
+scalar per-response rewards, group-normalized, and broadcast across all response
+tokens. Only response tokens contribute to the loss (prompt tokens are masked
+out):
 
 $$
 \text{Advantage}_i = \frac{r_i - \mu}{\sigma + \epsilon}
 $$
 
 $$
-L_{\text{GRPO}} = -\mathbb{E}\left[\min\left(\frac{\pi_\theta}{\pi_{\text{ref}}}A,\; \text{clip}\left(\frac{\pi_\theta}{\pi_{\text{ref}}}, 1-\epsilon, 1+\epsilon\right)A\right)\right] + \lambda \cdot \mathbb{E}\left[(\log\pi_\theta - \log\pi_{\text{ref}})^2\right]
+L_{\text{GRPO}} = -\mathbb{E}_t\left[\min\left(\rho_t A,\; \text{clip}\left(\rho_t, 1-\epsilon, 1+\epsilon\right)A\right)\right] + \lambda \cdot \mathbb{E}_t\left[\frac{\pi_{\text{ref}}}{\pi_\theta} - \log\frac{\pi_{\text{ref}}}{\pi_\theta} - 1\right]
 $$
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`, `sync_interval=200`, `reduction="mean"`.
+where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{ref}}(a_t|s_t)$ is the
+per-token probability ratio and the expectations are over valid response tokens.
+
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`, `sync_interval=200`.
 
 Keys: `prompts`, `responses`, `masks`, `rewards`.
 

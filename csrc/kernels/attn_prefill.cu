@@ -13,12 +13,14 @@ static void dispatch_prefill(AttentionParams<bf16>& p) {
     // loop overhead over more tensor-core work (this kernel is latency-bound,
     // not compute/bandwidth-bound), so BC=32 wins ~6-8% over BC=16 for
     // D<=128. D=256 stays at 16: BC=32 double-buffered would need 64KB smem,
-    // over the 48KB static cap. Both keep 3 blocks/SM (2 for D=256).
+    // over the 48KB static cap.
     constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
     dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
     dim3 block(WARPS * 32, 1, 1);
-    // Static shared memory — no dynamic smem or cudaFuncSetAttribute needed.
-    // sK[BC*LD] + sV[BC*LD] + sQ[BR*LD], all sized by template params.
+    // Static shared memory — double-buffered K/V only (no sQ: Q goes direct
+    // to registers). 2*BC*LD bf16 each for sK and sV → 4*BC*HEAD_DIM*2 bytes.
+    // Occupancy is smem-capped: D=64→3 blocks/SM (16KB), D=128→1 (32KB),
+    // D=256→1 (32KB, BC=16).
     attn_prefill_split_q_mma_kernel<HEAD_DIM, WARPS, BC><<<grid, block>>>(p);
 #else
     constexpr int G = 8, ROWS = 32, P_BC = 32;

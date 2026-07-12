@@ -114,7 +114,8 @@ __device__ __forceinline__ void cp_async_wait_group() {
 // between the two kernels; only the per-row causal/mask bounds differ.
 // ---------------------------------------------------------------------------
 
-// S = Q @ K^T  (Qa pre-loaded and pre-scaled by the caller).
+// S = Q @ K^T  (Qa pre-loaded by the caller; scale applied post-mma in the
+// caller to avoid bf16 precision loss).
 // LD and SWIZ_MASK are constexpr in the calling kernel — passing them as
 // runtime ints lets the compiler fold them while keeping the signature clean.
 template <int KD, int NC8>
@@ -138,10 +139,11 @@ __device__ inline void mma_compute_scores(
     }
 }
 
-// Online softmax + Oacc rescale for one K/V tile. maxc0/maxc1 are the per-row
-// KV column bounds — prefill passes per-query-row causal limits while decode
-// passes the same value for both rows (q_len==1). Sacc is consumed in place
-// (replaced by P = exp(S - nm) for the subsequent P@V step).
+// Online softmax + Oacc rescale for one K/V tile.
+//   maxc0/maxc1: per-row KV column bounds (prefill: per-query-row causal limits;
+//     decode: same value for both rows since q_len==1).
+// Reads Sacc (Q@K^T scores), applies causal/mask, computes P = exp(S - nm),
+// rescales Oacc by exp(m_old - nm), and updates m/l — all in place.
 template <int NC8, int DN8>
 __device__ inline void mma_softmax_tile(
     int kv0,
@@ -157,6 +159,8 @@ __device__ inline void mma_softmax_tile(
 {
     int tid4 = lane & 3;
 
+    // Mask out-of-bounds / masked columns: set -FLT_MAX so expf → 0 downstream
+    // without per-element sentinel checks. Compute tile-local row maxima.
     float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
     #pragma unroll
     for (int n8 = 0; n8 < NC8; n8++) {
@@ -175,22 +179,33 @@ __device__ inline void mma_softmax_tile(
         rmax0 = fmaxf(rmax0, fmaxf(s0, s1));
         rmax1 = fmaxf(rmax1, fmaxf(s2, s3));
     }
+    // Warp-reduce row maxima across the 4-lane thread group (xor 1, xor 2).
     rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
     rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
 
+    // nm = max(running max m, tile-local max rmax) — updated running maximum.
     float nm0 = fmaxf(m0, rmax0), nm1 = fmaxf(m1, rmax1);
-    float corr0 = (nm0 == -FLT_MAX) ? 1.0f : __expf(m0 - nm0);
-    float corr1 = (nm1 == -FLT_MAX) ? 1.0f : __expf(m1 - nm1);
+    // corr rescales Oacc and l by exp(m_old - nm). When all-masked (m == nm ==
+    // -FLT_MAX), exp(0) = 1 — correct, no guard needed.
+    float corr0 = __expf(m0 - nm0);
+    float corr1 = __expf(m1 - nm1);
+    // pn guards only the all-masked-row edge: if nm == -FLT_MAX, exp(S - nm)
+    // gives 1 not 0 for masked entries. Two scalar masks replace 4*NC8
+    // per-element comparisons.
+    float pn0 = (nm0 == -FLT_MAX) ? 0.0f : 1.0f;
+    float pn1 = (nm1 == -FLT_MAX) ? 0.0f : 1.0f;
 
+    // P = exp(S - nm) for each element. Masked entries (Sacc = -FLT_MAX) give
+    // exp(-inf) ≈ 0 naturally; pn zero-fills the all-masked-row edge.
     float rsum0 = 0.0f, rsum1 = 0.0f;
     #pragma unroll
     for (int n8 = 0; n8 < NC8; n8++) {
-        float p0 = (Sacc[n8][0] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][0] - nm0);
-        float p1 = (Sacc[n8][1] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][1] - nm0);
-        float p2 = (Sacc[n8][2] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][2] - nm1);
-        float p3 = (Sacc[n8][3] == -FLT_MAX) ? 0.0f : __expf(Sacc[n8][3] - nm1);
+        float p0 = pn0 * __expf(Sacc[n8][0] - nm0);
+        float p1 = pn0 * __expf(Sacc[n8][1] - nm0);
+        float p2 = pn1 * __expf(Sacc[n8][2] - nm1);
+        float p3 = pn1 * __expf(Sacc[n8][3] - nm1);
         Sacc[n8][0] = p0; Sacc[n8][1] = p1;
         Sacc[n8][2] = p2; Sacc[n8][3] = p3;
         rsum0 += p0 + p1;

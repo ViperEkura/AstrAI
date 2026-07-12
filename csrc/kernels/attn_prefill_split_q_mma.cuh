@@ -30,7 +30,8 @@ using bf16 = __nv_bfloat16;
 // register pressure), so fewer, larger tiles beat many tiny ones.
 //
 // Optimizations: load Q fragments directly from global in mma A-operand layout
-// (no sQ staging, no prologue barriers); pre-scale Q by attention scale during Q load; packed bf16x2 output stores;
+// (no sQ staging, no prologue barriers); post-multiply scale in float after
+// S=Q@K^T to avoid bf16 precision loss; packed bf16x2 output stores;
 // causal tile skipping (block-level prefetch bound + warp-level compute skip);
 // XOR swizzle (swiz_col) → eliminates ldmatrix bank conflicts without LD
 // padding (LD=HEAD_DIM).

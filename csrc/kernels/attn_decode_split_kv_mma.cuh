@@ -27,9 +27,18 @@ using bf16 = __nv_bfloat16;
 // Optimizations:
 //   - cp.async global→shared for K/V (bypasses registers, cuts instruction count)
 //   - XOR swizzle (swiz_col): LD=HEAD_DIM, zero waste, no bank conflicts
-//   - pre-scaled Q: Q scaled during load, softmax skips per-tile multiply
-//   - single-buffer: keeps smem small for high occupancy
-template <int HEAD_DIM, int BC>
+//   - Q loaded directly from global into mma A-operand registers (no sQ staging,
+//     no prologue syncwarp) — frees shared memory for double-buffering
+//   - Double-buffered KV (STAGES=2): next tile's cp.async overlaps current
+//     tile's MMA compute — hides global load latency / boosts bandwidth
+//     utilization for small-batch (low-occupancy) decode
+//   - Predicated cp.async (cp_async_16_pred) for full AND partial tiles on one
+//     uniform path — eliminates the scalar fallback branch
+//
+// Smem footprint (BC=32): STAGES=2 → 2*(sK+sV) = 2*2*32*HEAD_DIM*2 bytes.
+//   D=128: 16 KB (fits 48 KB static cap).  D=256: 32 KB (also fits).
+// STAGES=1 fallback (4/8 KB) for smem-constrained configs.
+template <int HEAD_DIM, int BC, int STAGES = 2>
 __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     constexpr int BR = 16;
     constexpr int KD = HEAD_DIM / 16;
@@ -38,6 +47,8 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     constexpr int DN8 = HEAD_DIM / 8;
     constexpr int LD = HEAD_DIM;
     constexpr int SWIZ_MASK = (HEAD_DIM >= 64) ? 7 : (HEAD_DIM / 8 - 1);
+    constexpr int VEC = 8;
+    constexpr int TOTAL = BC * HEAD_DIM;
 
     const int lane = threadIdx.x;
     const int gid = lane >> 2;
@@ -49,27 +60,31 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int G = p.q_head / p.kv_head;
     const int q_head0 = kv_head * G;
 
-    __shared__ __align__(16) bf16 sK[BC * HEAD_DIM];
-    __shared__ __align__(16) bf16 sV[BC * HEAD_DIM];
-    __shared__ __align__(16) bf16 sQ[BR * HEAD_DIM];
+    // Double-buffered shared memory for K/V (no sQ needed — Q goes direct
+    // from global to registers).
+    __shared__ __align__(16) bf16 sK[STAGES * BC * LD];
+    __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
 
-    for (int i = lane; i < BR * HEAD_DIM; i += 32) {
-        int r = i / HEAD_DIM, d = i % HEAD_DIM;
-        bf16 val = __float2bfloat16(0.0f);
-        if (r < G) {
-            int qh = q_head0 + r;
-            val = p.q[(batch * p.q_head + qh) * HEAD_DIM + d];
-        }
-        sQ[r * LD + swiz_col(d, r, SWIZ_MASK)] = val;
-    }
-    __syncwarp();
-
+    // ---- Load Q directly from global into mma A-operand registers ----
+    // Same layout as prefill: frag[0]/[2] = row gid, frag[1]/[3] = row gid+8
+    // cols kt*16 + tid4*2 + {0,1} / +{8,9}. pau[0]=cols c,c+1; pau[4]=c+8,c+9.
+    const int q_base = (batch * p.q_head + q_head0) * HEAD_DIM;
+    const int qra = gid;
+    const int qrb = gid + 8;
+    const bool va = qra < G, vb = qrb < G;
     unsigned Qa[KD][4];
-    int qrow_l = (lane & 7) + (lane & 8);
-    int qcol_l = (lane & 16) ? 8 : 0;
 #pragma unroll
-    for (int kt = 0; kt < KD; kt++)
-        ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l, SWIZ_MASK)]);
+    for (int kt = 0; kt < KD; kt++) {
+        int c = kt * 16 + tid4 * 2;
+        const unsigned* pau = reinterpret_cast<const unsigned*>(
+            &p.q[q_base + qra * HEAD_DIM + c]);
+        const unsigned* pbu = reinterpret_cast<const unsigned*>(
+            &p.q[q_base + qrb * HEAD_DIM + c]);
+        Qa[kt][0] = va ? pau[0] : 0u;
+        Qa[kt][1] = vb ? pbu[0] : 0u;
+        Qa[kt][2] = va ? pau[4] : 0u;
+        Qa[kt][3] = vb ? pbu[4] : 0u;
+    }
 
     float Oacc[DN8][4];
 #pragma unroll
@@ -85,39 +100,48 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
     const int has_mask = p.use_mask && p.mask;
 
+    // ---- Load tile lambda: predicated cp.async, unified full/partial ----
+    auto load_tile = [&](int ti, int buf) {
+        int kv0 = ti * BC;
+        bf16* dK = sK + buf * BC * LD;
+        bf16* dV = sV + buf * BC * LD;
+#pragma unroll
+        for (int i = lane * VEC; i < TOTAL; i += 32 * VEC) {
+            int r = i / HEAD_DIM, d = i % HEAD_DIM;
+            int kc = kv0 + r;
+            bool valid = kc < p.kv_len;
+            int off = r * LD + swiz_col(d, r, SWIZ_MASK);
+            cp_async_16_pred(&dK[off], &p.k[kv_base + kc * HEAD_DIM + d], valid);
+            cp_async_16_pred(&dV[off], &p.v[kv_base + kc * HEAD_DIM + d], valid);
+        }
+        cp_async_commit();
+    };
+
+    // ---- Prologue: issue first tile load ----
+    if (ti_begin < ti_end) {
+        load_tile(ti_begin, 0);
+    }
+
     for (int ti = ti_begin; ti < ti_end; ti++) {
+        constexpr int BUF_MASK = (STAGES > 1) ? (STAGES - 1) : 0;
+        int buf = (ti - ti_begin) & BUF_MASK;
+
+        // Wait for current tile, then issue next tile's prefetch (overlaps
+        // with this tile's compute). Single syncwarp covers both hazards.
+        // When STAGES==1, no prefetch — load happens at end of prior iter.
+        cp_async_wait_group<0>();
+        __syncwarp();
+        if constexpr (STAGES > 1) {
+            if (ti + 1 < ti_end)
+                load_tile(ti + 1, (ti + 1 - ti_begin) & BUF_MASK);
+        }
+
+        const bf16* bK = sK + buf * BC * LD;
+        const bf16* bV = sV + buf * BC * LD;
         int kv0 = ti * BC;
 
-        bool full_tile = (kv0 + BC <= p.kv_len);
-        if (full_tile) {
-            constexpr int VEC = 8;
-            int total = BC * HEAD_DIM;
-#pragma unroll
-            for (int i = lane * VEC; i < total; i += 32 * VEC) {
-                int r = i / HEAD_DIM, d = i % HEAD_DIM;
-                int kc = kv0 + r;
-                cp_async_16(&sK[r * LD + swiz_col(d, r, SWIZ_MASK)],
-                            &p.k[kv_base + kc * HEAD_DIM + d]);
-                cp_async_16(&sV[r * LD + swiz_col(d, r, SWIZ_MASK)],
-                            &p.v[kv_base + kc * HEAD_DIM + d]);
-            }
-            cp_async_commit();
-            cp_async_wait_all();
-        } else {
-            for (int i = lane; i < BC * HEAD_DIM; i += 32) {
-                int r = i / HEAD_DIM, d = i % HEAD_DIM;
-                int kc = kv0 + r;
-                bf16 z = __float2bfloat16(0.0f);
-                sK[r * LD + swiz_col(d, r, SWIZ_MASK)] =
-                    (kc < p.kv_len) ? p.k[kv_base + kc * HEAD_DIM + d] : z;
-                sV[r * LD + swiz_col(d, r, SWIZ_MASK)] =
-                    (kc < p.kv_len) ? p.v[kv_base + kc * HEAD_DIM + d] : z;
-            }
-        }
-        __syncwarp();
-
         float Sacc[NC8][4];
-        mma_compute_scores<KD, NC8>(Qa, sK, LD, SWIZ_MASK, lane, Sacc);
+        mma_compute_scores<KD, NC8>(Qa, bK, LD, SWIZ_MASK, lane, Sacc);
 
         #pragma unroll
         for (int n8 = 0; n8 < NC8; n8++)
@@ -129,8 +153,13 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
                                     mask_base, p.mask, has_mask,
                                     Sacc, Oacc, m0, m1, l0, l1, lane);
 
-        mma_pv_accumulate<DN8, KT2>(Sacc, sV, LD, SWIZ_MASK, lane, Oacc);
+        mma_pv_accumulate<DN8, KT2>(Sacc, bV, LD, SWIZ_MASK, lane, Oacc);
         __syncwarp();
+
+        if constexpr (STAGES == 1) {
+            if (ti + 1 < ti_end)
+                load_tile(ti + 1, 0);
+        }
     }
 
     // ---- write UN-normalised partials for this split ----
@@ -169,4 +198,3 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         }
     }
 }
-

@@ -30,9 +30,12 @@ static void launch_scalar_decode(AttentionParams<bf16>& p) {
 }
 
 #ifndef ASTRAI_NO_MMA
-// MMA head-packing requires G <= 16 (sQ has BR=16 rows). sm_80+ tensor-core
+// MMA head-packing requires G <= 16 (BR=16 rows). sm_80+ tensor-core
 // + cp.async wins even at G=1 (decode is memory-bound, not compute-bound).
-template <int HEAD_DIM, int BC>
+// STAGES=2 (double-buffer) for D<=128 (smem 16 KB); STAGES=1 for D=256
+// (double-buffer would be 32 KB, near the 48 KB static cap — keep single
+// to preserve occupancy).
+template <int HEAD_DIM, int BC, int STAGES = (HEAD_DIM <= 128) ? 2 : 1>
 static void launch_mma_decode(AttentionParams<bf16>& p) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
     p.num_splits = decode_num_splits(p.batch * p.kv_head, tiles_total);
@@ -43,8 +46,7 @@ static void launch_mma_decode(AttentionParams<bf16>& p) {
     p.o_part = o_part.data_ptr<float>();
     p.ml_part = ml_part.data_ptr<float>();
 
-    attn_decode_split_kv_mma_kernel<HEAD_DIM, BC>
-        <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
+    attn_decode_split_kv_mma_kernel<HEAD_DIM, BC, STAGES><<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
     attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 #endif

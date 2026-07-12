@@ -33,7 +33,7 @@ static void launch_paged_scalar_decode(PagedAttentionParams<bf16>& p) {
 }
 
 #ifndef ASTRAI_NO_MMA
-template <int HEAD_DIM, int BC>
+template <int HEAD_DIM, int BC, int STAGES = (HEAD_DIM <= 128) ? 2 : 1>
 static void launch_paged_mma_decode(PagedAttentionParams<bf16>& p) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
     p.num_splits = paged_decode_num_splits(p.batch * p.kv_head, tiles_total);
@@ -44,8 +44,7 @@ static void launch_paged_mma_decode(PagedAttentionParams<bf16>& p) {
     p.o_part = o_part.data_ptr<float>();
     p.ml_part = ml_part.data_ptr<float>();
 
-    paged_attn_decode_split_kv_mma_kernel<HEAD_DIM, BC>
-        <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
+    paged_attn_decode_split_kv_mma_kernel<HEAD_DIM, BC, STAGES><<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
     paged_attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 #endif

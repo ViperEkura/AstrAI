@@ -42,9 +42,10 @@ static void launch_paged_decode(PagedAttentionParams<bf16, float>& p) {
     int G_check = p.q_head / p.kv_head;
     bool use_mma = !p.use_mask && G_check >= 1 && G_check <= 16 && p.page_size >= 32;
     if (use_mma) {
+        constexpr int STAGES = (HEAD_DIM <= 128) ? 2 : 1;
         int tiles_total = (p.kv_len + 32 - 1) / 32;
         p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
-        paged_attn_decode_split_kv_mma_kernel<HEAD_DIM, 32>
+        paged_attn_decode_split_kv_mma_kernel<HEAD_DIM, 32, STAGES>
             <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
     } else
 #endif

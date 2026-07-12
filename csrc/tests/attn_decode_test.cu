@@ -27,14 +27,14 @@ static bool decode_use_mma(const AttentionParams<bf16>& p) {
     return !p.use_mask && G > 1 && G <= 16;
 }
 
-template <int HEAD_DIM, int BC>
+template <int HEAD_DIM, int BC, int STAGES = (HEAD_DIM <= 128) ? 2 : 1>
 static void launch_mma_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     int tiles_total = (p.kv_len + BC - 1) / BC;
     p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
     p.o_part = sc.o_part;
     p.ml_part = sc.ml_part;
 
-    attn_decode_split_kv_mma_kernel<HEAD_DIM, BC>
+    attn_decode_split_kv_mma_kernel<HEAD_DIM, BC, STAGES>
         <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
     attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }

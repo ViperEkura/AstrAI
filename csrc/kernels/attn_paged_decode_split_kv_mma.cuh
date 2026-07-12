@@ -11,7 +11,12 @@ using bf16 = __nv_bfloat16;
 // directly from the page pool through a page table, eliminating the gather
 // copy.  Each tile (BC=32) fits within a single page (page_size >= 32), so
 // the page-table lookup happens once per tile for cp.async.
-template <int HEAD_DIM, int BC>
+//
+// Optimizations mirror attn_decode_split_kv_mma_kernel:
+//   - Q loaded directly from global into mma A-operand registers (no sQ)
+//   - Double-buffered KV (STAGES=2) for D<=128, single-buffer for D=256
+//   - Predicated cp.async for unified full/partial tile path
+template <int HEAD_DIM, int BC, int STAGES = (HEAD_DIM <= 128) ? 2 : 1>
 __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16> p) {
     constexpr int BR = 16;
     constexpr int KD = HEAD_DIM / 16;
@@ -20,6 +25,8 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     constexpr int DN8 = HEAD_DIM / 8;
     constexpr int LD = HEAD_DIM;
     constexpr int SWIZ_MASK = (HEAD_DIM >= 64) ? 7 : (HEAD_DIM / 8 - 1);
+    constexpr int VEC = 8;
+    constexpr int TOTAL = BC * HEAD_DIM;
 
     const int lane = threadIdx.x;
     const int gid = lane >> 2;
@@ -31,31 +38,30 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     const int G = p.q_head / p.kv_head;
     const int q_head0 = kv_head_idx * G;
 
-    __shared__ __align__(16) bf16 sK[BC * HEAD_DIM];
-    __shared__ __align__(16) bf16 sV[BC * HEAD_DIM];
-    __shared__ __align__(16) bf16 sQ[BR * HEAD_DIM];
+    __shared__ __align__(16) bf16 sK[STAGES * BC * LD];
+    __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
 
-    // ---- load Q into registers via ldmatrix ----
-    for (int i = lane; i < BR * HEAD_DIM; i += 32) {
-        int r = i / HEAD_DIM, d = i % HEAD_DIM;
-        bf16 val = __float2bfloat16(0.0f);
-        if (r < G) {
-            int qh = q_head0 + r;
-            val = p.q[(batch * p.q_head + qh) * HEAD_DIM + d];
-        }
-        sQ[r * LD + swiz_col(d, r, SWIZ_MASK)] = val;
-    }
-    __syncwarp();
-
+    // ---- Load Q directly from global into mma A-operand registers ----
+    const int q_base = (batch * p.q_head + q_head0) * HEAD_DIM;
+    const int qra = gid;
+    const int qrb = gid + 8;
+    const bool va = qra < G, vb = qrb < G;
     unsigned Qa[KD][4];
-    int qrow_l = (lane & 7) + (lane & 8);
-    int qcol_l = (lane & 16) ? 8 : 0;
-    #pragma unroll
-    for (int kt = 0; kt < KD; kt++)
-        ldmatrix_x4(Qa[kt], &sQ[qrow_l * LD + swiz_col(kt * 16 + qcol_l, qrow_l, SWIZ_MASK)]);
+#pragma unroll
+    for (int kt = 0; kt < KD; kt++) {
+        int c = kt * 16 + tid4 * 2;
+        const unsigned* pau = reinterpret_cast<const unsigned*>(
+            &p.q[q_base + qra * HEAD_DIM + c]);
+        const unsigned* pbu = reinterpret_cast<const unsigned*>(
+            &p.q[q_base + qrb * HEAD_DIM + c]);
+        Qa[kt][0] = va ? pau[0] : 0u;
+        Qa[kt][1] = vb ? pbu[0] : 0u;
+        Qa[kt][2] = va ? pau[4] : 0u;
+        Qa[kt][3] = vb ? pbu[4] : 0u;
+    }
 
     float Oacc[DN8][4];
-    #pragma unroll
+#pragma unroll
     for (int j = 0; j < DN8; j++)
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
@@ -72,57 +78,54 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     const int64_t pos_stride  = (int64_t)p.kv_head * HEAD_DIM;
     const int64_t head_off    = (int64_t)kv_head_idx * HEAD_DIM;
 
-    for (int ti = ti_begin; ti < ti_end; ti++) {
+    // ---- Load tile lambda: predicated cp.async, paged addressing ----
+    auto load_tile = [&](int ti, int buf) {
         int kv0 = ti * BC;
-
-        // phys_page is constant for the whole tile (BC <= page_size).
+        bf16* dK = sK + buf * BC * LD;
+        bf16* dV = sV + buf * BC * LD;
         int logical_page = kv0 / p.page_size;
         int phys_page = p.page_table[batch * p.max_pages + logical_page];
         bool page_valid = (phys_page >= 0);
-
-        bool full_tile = page_valid && (kv0 + BC <= p.kv_len);
-        if (full_tile) {
-            constexpr int VEC = 8;
-            int total = BC * HEAD_DIM;
-            #pragma unroll
-            for (int i = lane * VEC; i < total; i += 32 * VEC) {
-                int r = i / HEAD_DIM, d = i % HEAD_DIM;
-                int kc = kv0 + r;
-                int page_off = kc % p.page_size;
-                int64_t gmem_base = (int64_t)phys_page * page_stride
-                                  + (int64_t)page_off * pos_stride
-                                  + head_off;
-                cp_async_16(&sK[r * LD + swiz_col(d, r, SWIZ_MASK)],
-                            &p.k_cache[gmem_base + d]);
-                cp_async_16(&sV[r * LD + swiz_col(d, r, SWIZ_MASK)],
-                            &p.v_cache[gmem_base + d]);
-            }
-            cp_async_commit();
-            cp_async_wait_all();
-        } else {
-            for (int i = lane; i < BC * HEAD_DIM; i += 32) {
-                int r = i / HEAD_DIM, d = i % HEAD_DIM;
-                int kc = kv0 + r;
-                bf16 z = __float2bfloat16(0.0f);
-                if (kc < p.kv_len && page_valid) {
-                    int page_off = kc % p.page_size;
-                    int64_t gmem_base = (int64_t)phys_page * page_stride
-                                      + (int64_t)page_off * pos_stride
-                                      + head_off;
-                    sK[r * LD + swiz_col(d, r, SWIZ_MASK)] = p.k_cache[gmem_base + d];
-                    sV[r * LD + swiz_col(d, r, SWIZ_MASK)] = p.v_cache[gmem_base + d];
-                } else {
-                    sK[r * LD + swiz_col(d, r, SWIZ_MASK)] = z;
-                    sV[r * LD + swiz_col(d, r, SWIZ_MASK)] = z;
-                }
-            }
+#pragma unroll
+        for (int i = lane * VEC; i < TOTAL; i += 32 * VEC) {
+            int r = i / HEAD_DIM, d = i % HEAD_DIM;
+            int kc = kv0 + r;
+            bool valid = (kc < p.kv_len) && page_valid;
+            int page_off = kc % p.page_size;
+            int64_t gmem_base = (int64_t)phys_page * page_stride
+                              + (int64_t)page_off * pos_stride
+                              + head_off;
+            int off = r * LD + swiz_col(d, r, SWIZ_MASK);
+            cp_async_16_pred(&dK[off], &p.k_cache[gmem_base + d], valid);
+            cp_async_16_pred(&dV[off], &p.v_cache[gmem_base + d], valid);
         }
+        cp_async_commit();
+    };
+
+    // ---- Prologue: issue first tile load ----
+    if (ti_begin < ti_end) {
+        load_tile(ti_begin, 0);
+    }
+
+    for (int ti = ti_begin; ti < ti_end; ti++) {
+        constexpr int BUF_MASK = (STAGES > 1) ? (STAGES - 1) : 0;
+        int buf = (ti - ti_begin) & BUF_MASK;
+
+        cp_async_wait_group<0>();
         __syncwarp();
+        if constexpr (STAGES > 1) {
+            if (ti + 1 < ti_end)
+                load_tile(ti + 1, (ti + 1 - ti_begin) & BUF_MASK);
+        }
+
+        const bf16* bK = sK + buf * BC * LD;
+        const bf16* bV = sV + buf * BC * LD;
+        int kv0 = ti * BC;
 
         float Sacc[NC8][4];
-        mma_compute_scores<KD, NC8>(Qa, sK, LD, SWIZ_MASK, lane, Sacc);
+        mma_compute_scores<KD, NC8>(Qa, bK, LD, SWIZ_MASK, lane, Sacc);
 
-        #pragma unroll
+#pragma unroll
         for (int n8 = 0; n8 < NC8; n8++)
             Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
             Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
@@ -132,8 +135,13 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
                                     mask_base, p.mask, has_mask,
                                     Sacc, Oacc, m0, m1, l0, l1, lane);
 
-        mma_pv_accumulate<DN8, KT2>(Sacc, sV, LD, SWIZ_MASK, lane, Oacc);
+        mma_pv_accumulate<DN8, KT2>(Sacc, bV, LD, SWIZ_MASK, lane, Oacc);
         __syncwarp();
+
+        if constexpr (STAGES == 1) {
+            if (ti + 1 < ti_end)
+                load_tile(ti + 1, 0);
+        }
     }
 
     // ---- write UN-normalised partials for this split ----
@@ -141,7 +149,7 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
         size_t bh = (size_t)batch * p.q_head + h;
         return bh * p.num_splits + split;
     };
-    #pragma unroll
+#pragma unroll
     for (int dn8 = 0; dn8 < DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
         int r0 = gid, r1 = gid + 8;

@@ -25,10 +25,9 @@ static void launch_paged_scalar_decode(PagedAttentionParams<bf16>& p) {
     p.ml_part = ml_part.data_ptr<float>();
 
     size_t smem = PDC_CHUNK * p.head_dim * sizeof(bf16);
-    paged_attn_decode_split_kv_kernel<<<
-        dim3(p.batch * p.kv_head, 1, p.num_splits),
-        dim3(32, group_size),
-        smem>>>(p);
+    dim3 grid = dim3(p.batch * p.kv_head, 1, p.num_splits);
+    dim3 block = dim3(32, group_size);
+    paged_attn_decode_split_kv_kernel<<<grid, block, smem>>>(p);
     paged_attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 
@@ -103,13 +102,12 @@ torch::Tensor attn_paged_decode(
     p.batch = batch;
     p.q_head = q_head;
     p.kv_head = kv_head;
-    p.q_len = 1;
+    p.q_len = static_cast<int>(q.size(2));
     p.kv_len = static_cast<int>(kv_len);
     p.head_dim = head_dim;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
     p.is_causal = is_causal ? 1 : 0;
     p.causal_offset = static_cast<int>(causal_offset);
-    p.num_splits = 1;
     p.scale = scale_val;
     p.page_size = static_cast<int>(page_size);
     p.max_pages = max_pages;

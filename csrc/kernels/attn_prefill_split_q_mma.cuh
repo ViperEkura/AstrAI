@@ -16,12 +16,7 @@ using bf16 = __nv_bfloat16;
 // allocation. The mma fragment layout is used directly: the S accumulator
 // (f32) maps element-for-element onto the P matrix_a (bf16) operand, so
 // softmax needs no shuffle repack; row reductions fold across the 4-lane
-// thread group. Templated on <HEAD_DIM, WARPS, BC, MIN_BLOCKS> with BC a
-// multiple of 16.
-//
-// Occupancy: __launch_bounds__ forces the compiler to fit MIN_BLOCKS blocks/SM,
-// spilling to local memory as needed. MIN_BLOCKS is tuned per HEAD_DIM to the
-// double-buffered smem footprint (2*BC*LD for each of K/V).
+// thread group. Templated on <HEAD_DIM, WARPS, BC> with BC a multiple of 16.
 //
 // Software pipeline: K/V are double-buffered and loaded via cp.async one tile
 // ahead, so the next tile streams from global memory while the current tile's
@@ -40,9 +35,8 @@ using bf16 = __nv_bfloat16;
 // XOR swizzle (swiz_col) → eliminates ldmatrix bank conflicts without LD
 // padding (LD=HEAD_DIM).
 
-template <int HEAD_DIM, int WARPS, int BC, int MIN_BLOCKS>
-__global__ __launch_bounds__(WARPS * 32, MIN_BLOCKS)
-void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
+template <int HEAD_DIM, int WARPS, int BC>
+__global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     constexpr int BR = 16;
     constexpr int KD = HEAD_DIM / 16;  // Q/K k-tiles
     constexpr int NC8 = BC / 8;        // S n-tiles (N=8 each)

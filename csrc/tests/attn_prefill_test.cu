@@ -18,11 +18,9 @@ static void launch_prefill(AttentionParams<bf16>& p) {
 #ifndef ASTRAI_NO_MMA
     constexpr int WARPS = 4, BR = 16;
     constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
-    constexpr int MIN_BLOCKS = (HEAD_DIM <= 32) ? 6 : (HEAD_DIM <= 64) ? 4
-                             : (HEAD_DIM <= 128) ? 3 : 2;
     dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
     dim3 block(WARPS * 32, 1, 1);
-    attn_prefill_split_q_mma_kernel<HEAD_DIM, WARPS, BC, MIN_BLOCKS><<<grid, block>>>(p);
+    attn_prefill_split_q_mma_kernel<HEAD_DIM, WARPS, BC><<<grid, block>>>(p);
 #else
     constexpr int G = 8, ROWS = 32, P_BC = 32;
     dim3 grid((p.q_len + ROWS - 1) / ROWS, p.q_head, p.batch);

@@ -1,12 +1,19 @@
 import os
+import socket
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import wraps
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+
+def find_free_port() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return str(s.getsockname()[1])
 
 
 def get_current_device():
@@ -217,11 +224,13 @@ def spawn_parallel_fn(
     world_size: int,
     backend: str = "nccl",
     master_addr: str = "localhost",
-    master_port: str = "29500",
+    master_port: Optional[str] = None,
     device_type: str = "cuda",
     start_method: str = "spawn",
     **kwargs,
 ):
+    if master_port is None:
+        master_port = find_free_port()
     launcher = _detect_launcher()
     if launcher in ("torchelastic", "torchrun", "external"):
         strategy = TorchrunStrategy(

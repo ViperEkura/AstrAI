@@ -20,7 +20,7 @@ def _arch_flags() -> list[str]:
 _kernels_dir = Path("csrc/kernels")
 REGISTRY: dict[str, dict] = {}
 
-CXX_FLAGS = ["-O3", "-march=native", "-funroll-loops"]
+CXX_FLAGS = ["-O3", "-funroll-loops"]
 NVCC_FLAGS = [
     "-O3",
     "--expt-relaxed-constexpr",

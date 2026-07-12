@@ -1,4 +1,4 @@
-__version__ = "1.3.8"
+__version__ = "1.3.9"
 __author__ = "ViperEkura"
 
 from astrai.config import (

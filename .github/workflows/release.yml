@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-pure:
+    name: Build pure-Python wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel (no CUDA)
+        run: |
+          pip wheel . --no-deps -w dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pure-wheel
+          path: dist/*.whl
+
+  build-cuda-linux:
+    name: Build CUDA wheel (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install torch (CUDA 12.8)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+      - name: Setup CUDA
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "12.8.0"
+
+      - name: Build wheel (with CUDA kernels)
+        run: |
+          CSRC_KERNELS=true pip wheel . --no-deps --no-build-isolation -w dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda-wheel-linux
+          path: dist/*.whl
+
+  release:
+    name: Attach wheels to release
+    needs: [build-pure, build-cuda-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-wheel"
+          merge-multiple: true
+
+      - name: Create release & upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./*.whl
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true

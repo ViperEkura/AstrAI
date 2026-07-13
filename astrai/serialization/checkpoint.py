@@ -148,9 +148,6 @@ class Checkpoint:
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
 
-        if get_rank() != 0:
-            return
-
         meta = {
             "epoch": self.epoch,
             "consumed_samples": self.consumed_samples,

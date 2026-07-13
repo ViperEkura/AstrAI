@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from astrai.factory import BaseFactory
 from astrai.parallel import only_on_rank
-from astrai.parallel.setup import get_current_device, get_rank
+from astrai.parallel.setup import get_current_device
 from astrai.serialization import Checkpoint
 from astrai.trainer.metric_util import (
     ctx_get_grad_norm,
@@ -142,25 +142,25 @@ class CheckpointCallback(TrainCallback):
         self.last_ckpt_step = 0
 
     def _save_checkpoint(self, context: TrainContext):
-        state_dict = context.executor.unwrap_model(context.model)
         self.last_ckpt_step = context.optimizer_step
 
-        if get_rank() == 0:
-            save_path = os.path.join(
-                self.save_dir,
-                f"epoch_{context.epoch}_step_{context.optimizer_step}",
-            )
-            extra = self.save_extra_fn(context)
-            meta = context.config.to_dict()
-            context.checkpoint = Checkpoint(
-                state_dict=state_dict,
-                epoch=context.epoch,
-                consumed_samples=context.consumed_samples,
-                config=context.model_config,
-                extra=extra,
-                meta=meta,
-            )
-            context.checkpoint.save(save_path)
+        with context.executor.checkpoint_context(context.model) as state_dict:
+            if state_dict is not None:
+                save_path = os.path.join(
+                    self.save_dir,
+                    f"epoch_{context.epoch}_step_{context.optimizer_step}",
+                )
+                extra = self.save_extra_fn(context)
+                meta = context.config.to_dict()
+                context.checkpoint = Checkpoint(
+                    state_dict=state_dict,
+                    epoch=context.epoch,
+                    consumed_samples=context.consumed_samples,
+                    config=context.model_config,
+                    extra=extra,
+                    meta=meta,
+                )
+                context.checkpoint.save(save_path)
 
     def on_batch_end(self, context: TrainContext):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:

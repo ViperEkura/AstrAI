@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -120,6 +121,21 @@ class BaseExecutor:
     def unwrap_model(self, model: nn.Module):
         return model.state_dict()
 
+    @contextmanager
+    def checkpoint_context(self, model: nn.Module):
+        if self.use_distributed:
+            dist.barrier()
+        state_dict = self._gather_state_dict(model)
+        yield state_dict
+        if self.use_distributed:
+            dist.barrier()
+
+    def _gather_state_dict(self, model: nn.Module):
+        state_dict = self.unwrap_model(model)
+        if self.use_distributed and get_rank() != 0:
+            return None
+        return state_dict
+
     @property
     def use_distributed(self) -> bool:
         return get_world_size() > 1
@@ -208,6 +224,13 @@ class DDPExecutor(BaseExecutor):
             return model.module.state_dict()
         return model.state_dict()
 
+    def _gather_state_dict(self, model: nn.Module):
+        if not self.use_distributed:
+            return self.unwrap_model(model)
+        if get_rank() != 0:
+            return None
+        return self.unwrap_model(model)
+
 
 @ExecutorFactory.register("fsdp")
 class FSDPExecutor(BaseExecutor):
@@ -279,7 +302,7 @@ class FSDPExecutor(BaseExecutor):
             with FSDP.state_dict_type(
                 model,
                 StateDictType.FULL_STATE_DICT,
-                FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
             ):
                 return model.state_dict()
 

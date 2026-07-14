@@ -253,12 +253,6 @@ def parse_args() -> argparse.Namespace:
         help="Directory for metric logs.",
     )
     parser.add_argument(
-        "--grpo_sync_interval",
-        type=int,
-        default=200,
-        help="GRPO ref model sync interval (steps).",
-    )
-    parser.add_argument(
         "--start_epoch", type=int, default=0, help="Start epoch for training."
     )
     parser.add_argument(
@@ -444,7 +438,6 @@ def train(
         "clip_eps": kwargs.pop("grpo_clip_eps"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
-        "sync_interval": kwargs.pop("grpo_sync_interval"),
     }
 
     executor_kwargs = {

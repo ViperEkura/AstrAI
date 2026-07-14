@@ -56,19 +56,32 @@ def _make_batch(
     }
 
 
+def _make_frozen_copy(model, device):
+    """Create a frozen copy of ``model`` with independent weights loaded."""
+    config = _make_config()
+    copy = AutoRegressiveLM(config).to(device=device)
+    copy.load_state_dict(model.state_dict())
+    copy.requires_grad_(False)
+    copy.eval()
+    return copy
+
+
 @pytest.fixture
 def grpo_strategy():
     """Build a GRPOStrategy with a small real model and fake executor."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, config = _make_model(device)
+    old_model = _make_frozen_copy(model, device)
+    ref_model = _make_frozen_copy(model, device)
 
     strategy = GRPOStrategy(
         model=model,
         device=device,
+        old_model=old_model,
+        ref_model=ref_model,
         clip_eps=0.2,
         kl_coef=0.01,
         group_size=4,
-        sync_interval=200,
         model_fn=lambda c=config: AutoRegressiveLM(c).to(device=device),
         executor=_FakeExecutor(),
     )
@@ -108,6 +121,16 @@ def test_grpo_ref_model_not_updated(grpo_strategy):
         assert p.grad is None
 
 
+def test_grpo_old_model_not_updated(grpo_strategy):
+    """Backward should not populate gradients on old_model."""
+    strategy, device = grpo_strategy
+    batch = _make_batch(device=device)
+    loss = strategy.compute_loss(batch)
+    loss.backward()
+    for p in strategy.old_model.parameters():
+        assert p.grad is None
+
+
 def test_grpo_prompt_tokens_masked(grpo_strategy):
     """When only prompt-equivalent tokens are unmasked (response mask all 0),
     the policy loss should be zero (no valid tokens contribute)."""
@@ -127,45 +150,32 @@ def test_grpo_identical_rewards_zero_advantage(grpo_strategy):
     batch = _make_batch(device=device)
     batch["rewards"] = torch.ones(batch["rewards"].shape, device=device)
     loss = strategy.compute_loss(batch)
-    # At init policy == ref, so ratio == 1, KL == 0; advantage == 0.
+    # At init policy == old == ref, so ratio == 1, KL == 0; advantage == 0.
     assert loss.item() == pytest.approx(0.0, abs=1e-5)
 
 
-def test_grpo_kl_zero_at_init(grpo_strategy):
-    """At initialization policy == ref_model, so KL penalty must be 0."""
+def test_grpo_sync_old_model(grpo_strategy):
+    """sync_old_model copies current policy weights into old_model."""
     strategy, device = grpo_strategy
-    batch = _make_batch(device=device)
-    # Make rewards distinct so advantages are non-zero (isolates KL term).
-    loss = strategy.compute_loss(batch)
-    # KL term is 0 at init; loss is purely policy surrogate.
-    # With ratio==1, surr1==surr2==advantage, so policy_loss = -mean(|adv|).
-    # Just assert KL portion is negligible by checking loss is finite and
-    # re-running after a model update increases loss magnitude.
-    assert torch.isfinite(loss).item()
-
-
-def test_grpo_sync_ref_model(grpo_strategy):
-    """sync_ref_model copies current policy weights into ref_model."""
-    strategy, device = grpo_strategy
-    # Perturb policy model so it differs from ref.
+    # Perturb policy model so it differs from old.
     with torch.no_grad():
         for p in strategy.model.parameters():
             p.add_(0.05)
-    # ref_model should still hold original weights (differ from policy).
+    # old_model should still hold original weights (differ from policy).
     policy_sd = strategy.model.state_dict()
-    ref_sd = strategy.ref_model.state_dict()
+    old_sd = strategy.old_model.state_dict()
     differs_before = any(
-        not torch.allclose(policy_sd[k], ref_sd[k]) for k in policy_sd if k in ref_sd
+        not torch.allclose(policy_sd[k], old_sd[k]) for k in policy_sd if k in old_sd
     )
     assert differs_before
 
-    strategy.sync_ref_model()
+    strategy.sync_old_model()
 
-    ref_sd_after = strategy.ref_model.state_dict()
+    old_sd_after = strategy.old_model.state_dict()
     matches = all(
-        torch.allclose(policy_sd[k], ref_sd_after[k])
+        torch.allclose(policy_sd[k], old_sd_after[k])
         for k in policy_sd
-        if k in ref_sd_after
+        if k in old_sd_after
     )
     assert matches
 

@@ -13,7 +13,7 @@ from astrai.parallel.executor import BaseExecutor, ExecutorFactory
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import Checkpoint, load_json
-from astrai.trainer.strategy import BaseStrategy, StrategyFactory
+from astrai.trainer.strategy import BaseStrategy, StrategyFactory, create_ref_model
 
 
 @dataclass
@@ -177,13 +177,27 @@ class TrainContextBuilder:
                     if obj is not None:
                         obj.load_state_dict(extra[name])
 
+        strategy_kwargs = dict(cfg.extra_kwargs)
+
+        if cfg.strategy in ("dpo", "grpo"):
+            ref_model = create_ref_model(
+                cfg.model_fn, executor.unwrap_model(context.model)
+            ).to(device=device)
+            strategy_kwargs["ref_model"] = ref_model
+
+        if cfg.strategy == "grpo":
+            old_model = create_ref_model(
+                cfg.model_fn, executor.unwrap_model(context.model)
+            ).to(device=device)
+            strategy_kwargs["old_model"] = old_model
+
         context.strategy = StrategyFactory.create(
             cfg.strategy,
             model=context.model,
             device=device,
             executor=executor,
             model_fn=cfg.model_fn,
-            **cfg.extra_kwargs,
+            **strategy_kwargs,
         )
 
         return context

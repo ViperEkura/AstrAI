@@ -75,7 +75,8 @@ static void bench() {
 
         AttentionParams<bf16> p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=ql; p.kv_len=kl; p.head_dim=D;
-        p.use_mask=0; p.is_causal=causal; p.causal_offset=0;
+        p.use_mask=0; p.causal_offset=causal?0:-1;
+        set_default_strides(p);
         p.scale=1.0f/sqrtf((float)D);
         p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
@@ -143,7 +144,8 @@ int main() {
 
         AttentionParams<bf16> p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=ql; p.kv_len=kl; p.head_dim=D;
-        p.use_mask=0; p.is_causal=causal; p.causal_offset=0;
+        p.use_mask=0; p.causal_offset=causal?0:-1;
+        set_default_strides(p);
         p.scale=1.0f/sqrtf((float)D);
         p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
@@ -158,7 +160,7 @@ int main() {
         cudaMemcpy(hOut,dO,nQ*2,cudaMemcpyDeviceToHost);
 
         float* ref=new float[nQ];
-        cpu_attention_ref(hQ, hK, hV, nullptr, ref, B, Hq, Hk, ql, kl, D, causal, 0);
+        cpu_attention_ref(hQ, hK, hV, nullptr, ref, B, Hq, Hk, ql, kl, D, causal ? 0 : -1);
 
         float max_err=0;
         for (size_t i=0;i<nQ;i++) {

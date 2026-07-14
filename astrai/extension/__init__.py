@@ -5,6 +5,14 @@ Public API:
     - ``attn_prefill`` — multi-query prefill attention
     - ``attn_paged_decode`` — paged decode attention (direct page-table access)
 
+Interface (shared by all wrappers):
+    causal_offset: -1 = non-causal; >=0 = absolute position of first Q token
+    mask:       2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True = keep)
+    scale:      0.0 = auto (1/sqrt(head_dim)); >0 = explicit
+    layout:     "bhld" (default) or "blhd"
+
+Causal and mask can coexist — both are applied simultaneously.
+
 Each wrapper dispatches to its compiled CUDA kernel (``astrai.extension.attn_*``)
 when available, otherwise falls back to ``torch.nn.functional.scaled_dot_product_attention``.
 """

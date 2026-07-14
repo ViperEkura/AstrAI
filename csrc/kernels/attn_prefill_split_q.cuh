@@ -50,12 +50,14 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     __shared__ __align__(16) bf16 sK[P_BC * HEAD_DIM];
     __shared__ __align__(16) bf16 sV[P_BC * HEAD_DIM];
 
+    // Q: stride-based load [batch, q_head, q_len, head_dim]
     float qreg[DPT];
     if (q_row < p.q_len) {
-        int q_off = ((batch * p.q_head + q_head) * p.q_len + q_row) * HEAD_DIM + gpos * DPT;
+        int q_off = batch * p.q_stride_b + q_head * p.q_stride_h
+                  + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            qreg[i] = __bfloat162float(p.q[q_off + i]) * p.scale;
+            qreg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]) * p.scale;
     }
 
     float m = -FLT_MAX, l = 0.0f;
@@ -64,7 +66,9 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     for (int i = 0; i < DPT; i++)
         acc[i] = 0.0f;
 
-    int kv_base = ((batch * p.kv_head + kv_head) * p.kv_len) * HEAD_DIM;
+    // KV: stride-based base
+    int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
+    int mask_batch_base = batch * p.mask_b_stride;
     int tiles   = (p.kv_len + P_BC - 1) / P_BC;
     int tt      = G * ROWS;
     int lid     = row * G + gpos;
@@ -79,15 +83,19 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
         int kv0  = ti * P_BC;
         int tlen = min(P_BC, p.kv_len - kv0);
 
+        // Load K/V into shared memory from strided global
         for (int i = lid; i < tlen * HEAD_DIM; i += tt) {
-            int gidx = kv_base + (kv0 + i / HEAD_DIM) * HEAD_DIM + (i % HEAD_DIM);
-            sK[i] = p.k[gidx];
-            sV[i] = p.v[gidx];
+            int s = i / HEAD_DIM;
+            int d_dim = i % HEAD_DIM;
+            int kv_idx = kv0 + s;
+            int g_off = kv_base + kv_idx * p.kv_stride_l + d_dim * p.kv_stride_d;
+            sK[i] = p.k[g_off];
+            sV[i] = p.v[g_off];
         }
         __syncthreads();
 
         int lim = tlen;
-        if (p.is_causal && q_row < p.q_len) {
+        if (p.causal_offset >= 0 && q_row < p.q_len) {
             int ep = q_row + p.causal_offset + 1;
             if (kv0 >= ep)
                 lim = 0;
@@ -95,6 +103,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
                 lim = ep - kv0;
         }
 
+        int mask_row_base = mask_batch_base + q_row * p.mask_q_stride;
         for (int s = 0; s < lim; s++) {
             const bf16* kr = sK + s * HEAD_DIM + gpos * DPT;
             float part = 0.0f;
@@ -108,7 +117,8 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
             }
             float dot = group_reduce_sum<G>(part, gmask);
 
-            if (p.use_mask && p.mask && !p.mask[batch * p.kv_len + kv0 + s])
+            int kv_idx = kv0 + s;
+            if (p.use_mask && p.mask && !p.mask[mask_row_base + kv_idx])
                 dot = -FLT_MAX;
 
             float nm = fmaxf(m, dot);
@@ -131,10 +141,12 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     }
 
     if (q_row < p.q_len) {
-        int o_off = ((batch * p.q_head + q_head) * p.q_len + q_row) * HEAD_DIM + gpos * DPT;
+        // O: stride-based write
+        int o_off = batch * p.q_stride_b + q_head * p.q_stride_h
+                  + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
         float rl = (l > 1e-10f) ? (1.0f / l) : 0.0f;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            p.o[o_off + i] = __float2bfloat16(acc[i] * rl);
+            p.o[o_off + i * p.q_stride_d] = __float2bfloat16(acc[i] * rl);
     }
 }

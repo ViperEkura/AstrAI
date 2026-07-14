@@ -138,13 +138,14 @@ static int run_test(int B, int Hq, int Hkv, int kv_len, int page_size, int seed)
     }
 
     float* h_o_ref = (float*)calloc(B * Hq * HEAD_DIM, sizeof(float));
-    cpu_attention_ref(h_q_f, h_k_f, h_v_f, nullptr, h_o_ref, B, Hq, Hkv, 1, kv_len, HEAD_DIM, 0, 0);
+    cpu_attention_ref(h_q_f, h_k_f, h_v_f, nullptr, h_o_ref, B, Hq, Hkv, 1, kv_len, HEAD_DIM, -1);
 
     float scale_val = 1.0f / sqrtf((float)HEAD_DIM);
     PagedAttentionParams<bf16, float> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv; p.q_len = 1;
     p.kv_len = kv_len; p.head_dim = HEAD_DIM;
-    p.use_mask = 0; p.is_causal = 0; p.causal_offset = 0;
+    p.use_mask = 0; p.causal_offset = -1;
+    set_default_strides(p);
     p.num_splits = 1; p.scale = scale_val;
     p.page_size = page_size; p.max_pages = max_pages;
     p.page_table = d_pt;
@@ -272,7 +273,8 @@ static void bench_config(int B, int Hq, int Hkv, int kv_len, int page_size) {
     PagedAttentionParams<bf16, float> pa;
     pa.batch = B; pa.q_head = Hq; pa.kv_head = Hkv; pa.q_len = 1;
     pa.kv_len = kv_len; pa.head_dim = HEAD_DIM;
-    pa.use_mask = 0; pa.is_causal = 0; pa.causal_offset = 0;
+    pa.use_mask = 0; pa.causal_offset = -1;
+    set_default_paged_strides(pa);
     pa.num_splits = 1; pa.scale = scale_val;
     pa.page_size = page_size; pa.max_pages = max_pages;
     pa.page_table = d_pt;

@@ -101,6 +101,32 @@ void dispatch_by_head_dim(int head_dim, Fn&& fn) {
     _HeadSwitch<32, 64, 128, 256>::call(head_dim, fn);
 }
 
+// Set default strides for contiguous b h l d layout on AttentionParams.
+template<typename P>
+inline void set_default_strides(P& p) {
+    p.q_stride_b  = p.q_head * p.q_len * p.head_dim;
+    p.q_stride_h  = p.q_len * p.head_dim;
+    p.q_stride_l  = p.head_dim;
+    p.q_stride_d  = 1;
+    p.kv_stride_b = p.kv_head * p.kv_len * p.head_dim;
+    p.kv_stride_h = p.kv_len * p.head_dim;
+    p.kv_stride_l = p.head_dim;
+    p.kv_stride_d = 1;
+    p.mask_b_stride = p.kv_len;
+    p.mask_q_stride = 0;
+}
+
+// Set default Q strides for contiguous b h l d layout on PagedAttentionParams.
+template<typename P>
+inline void set_default_paged_strides(P& p) {
+    p.q_stride_b  = p.q_head * p.q_len * p.head_dim;
+    p.q_stride_h  = p.q_len * p.head_dim;
+    p.q_stride_l  = p.head_dim;
+    p.q_stride_d  = 1;
+    p.mask_b_stride = p.kv_len;
+    p.mask_q_stride = 0;
+}
+
 // Generic CPU reference for multi-query / grouped-query attention.
 // Tensor shapes (all float*):
 //   Q : [B, Hq, q_len, D]
@@ -108,10 +134,11 @@ void dispatch_by_head_dim(int head_dim, Fn&& fn) {
 //   V : [B, Hk, kv_len, D]
 //   O : [B, Hq, q_len, D]
 // mask: if q_len == 1, shape is [B, kv_len]; otherwise mask is not supported.
+// causal_offset: -1 = non-causal; >=0 = absolute position of first Q token.
 static void cpu_attention_ref(
     const float* Q, const float* K, const float* V, const bool* mask,
     float* O, int B, int Hq, int Hk, int q_len, int kv_len, int D,
-    int is_causal, int causal_offset
+    int causal_offset
 ) {
     float scale = 1.0f / sqrtf((float)D);
     int n_rep = Hq / Hk;
@@ -122,7 +149,7 @@ static void cpu_attention_ref(
                 float mv = -INFINITY, sv = 0.0f;
                 float accum[256] = {0.0f};
                 int lim = kv_len;
-                if (is_causal) {
+                if (causal_offset >= 0) {
                     int c = qi + causal_offset + 1;
                     lim = (c < kv_len) ? c : kv_len;
                 }

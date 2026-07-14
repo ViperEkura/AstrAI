@@ -35,34 +35,19 @@ torch::Tensor attn_prefill(
     torch::Tensor k,
     torch::Tensor v,
     c10::optional<torch::Tensor> mask,
-    bool is_causal = false,
-    int64_t causal_offset = 0,
-    c10::optional<double> scale = c10::nullopt
+    int64_t causal_offset,
+    double scale,
+    int64_t layout
 ) {
     AttentionParams<bf16> p;
-    attn_pack_params(q, k, v, mask, is_causal, causal_offset, scale, p);
+    attn_pack_params(q, k, v, mask, causal_offset, scale, layout, p);
     TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
 
-    auto O = torch::empty_like(q);
-    p.o = (bf16*)O.data_ptr();
+    auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());
+    auto O_view = (layout == 1) ? O.transpose(1, 2) : O;
+    p.o = (bf16*)O_view.data_ptr();
 
-    switch (p.head_dim) {
-        case 32:
-            dispatch_prefill<32>(p);
-            break;
-        case 64:
-            dispatch_prefill<64>(p);
-            break;
-        case 128:
-            dispatch_prefill<128>(p);
-            break;
-        case 256:
-            dispatch_prefill<256>(p);
-            break;
-        default:
-            TORCH_CHECK(false, "prefill: unsupported head_dim ", p.head_dim,
-                        " (supported: 32,64,128,256)");
-    }
+    dispatch_head_dim(p.head_dim, [&]<int D>() { dispatch_prefill<D>(p); });
     return O;
 }
 
@@ -72,8 +57,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("k"),
         py::arg("v"),
         py::arg("mask") = py::none(),
-        py::arg("is_causal") = false,
-        py::arg("causal_offset") = 0,
-        py::arg("scale") = py::none(),
+        py::arg("causal_offset") = -1,
+        py::arg("scale") = 0.0,
+        py::arg("layout") = 0,
         "GQA prefill (tensor-core mma on sm_80+, scalar fallback)");
 }

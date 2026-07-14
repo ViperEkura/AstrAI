@@ -122,7 +122,9 @@ template <int KD, int NC8>
 __device__ inline void mma_compute_scores(
     const unsigned Qa[KD][4],
     const bf16* __restrict__ sK,
-    int LD, int SWIZ_MASK, int lane,
+    int LD, 
+    int SWIZ_MASK, 
+    int lane,
     float Sacc[NC8][4])
 {
     #pragma unroll
@@ -142,13 +144,20 @@ __device__ inline void mma_compute_scores(
 // Online softmax + Oacc rescale for one K/V tile.
 //   maxc0/maxc1: per-row KV column bounds (prefill: per-query-row causal limits;
 //     decode: same value for both rows since q_len==1).
+//   qrow0/qrow1: query row indices (for 3D mask indexing; decode passes 0).
+//   mask_b_stride/mask_q_stride: mask layout (2D: mask_q_stride=0; 3D: =kv_len).
 // Reads Sacc (Q@K^T scores), applies causal/mask, computes P = exp(S - nm),
 // rescales Oacc by exp(m_old - nm), and updates m/l — all in place.
 template <int NC8, int DN8>
 __device__ inline void mma_softmax_tile(
     int kv0,
-    int maxc0, int maxc1,
-    int mask_base,
+    int maxc0, 
+    int maxc1,
+    int qrow0, 
+    int qrow1,
+    int mask_b_stride, 
+    int mask_q_stride,
+    int mask_batch,
     const bool* __restrict__ mask,
     bool has_mask,
     float Sacc[NC8][4],
@@ -162,14 +171,16 @@ __device__ inline void mma_softmax_tile(
     // Mask out-of-bounds / masked columns: set -FLT_MAX so expf → 0 downstream
     // without per-element sentinel checks. Compute tile-local row maxima.
     float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
+    int mask_base0 = mask_batch * mask_b_stride + qrow0 * mask_q_stride;
+    int mask_base1 = mask_batch * mask_b_stride + qrow1 * mask_q_stride;
     #pragma unroll
     for (int n8 = 0; n8 < NC8; n8++) {
         int cc = kv0 + n8 * 8 + 2 * tid4;
         int c1 = cc + 1;
-        bool b0 = (cc >= maxc0) || (has_mask && !mask[mask_base + cc]);
-        bool b1 = (c1 >= maxc0) || (has_mask && !mask[mask_base + c1]);
-        bool b2 = (cc >= maxc1) || (has_mask && !mask[mask_base + cc]);
-        bool b3 = (c1 >= maxc1) || (has_mask && !mask[mask_base + c1]);
+        bool b0 = (cc >= maxc0) || (has_mask && !mask[mask_base0 + cc]);
+        bool b1 = (c1 >= maxc0) || (has_mask && !mask[mask_base0 + c1]);
+        bool b2 = (cc >= maxc1) || (has_mask && !mask[mask_base1 + cc]);
+        bool b3 = (c1 >= maxc1) || (has_mask && !mask[mask_base1 + c1]);
         float s0 = b0 ? -FLT_MAX : Sacc[n8][0];
         float s1 = b1 ? -FLT_MAX : Sacc[n8][1];
         float s2 = b2 ? -FLT_MAX : Sacc[n8][2];

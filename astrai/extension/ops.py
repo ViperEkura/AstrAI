@@ -3,14 +3,42 @@
 Each wrapper dispatches to its CUDA kernel (loaded in ``loader.py``) when
 available, otherwise falls back to ``torch`` SDPA.
 
+Interface (all functions):
+    causal_offset: -1 = non-causal; >=0 = absolute position of first Q token
+    mask:       2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool)
+    scale:      0.0 = auto (1/sqrt(head_dim)); >0 = explicit
+    layout:     "bhld" (default) or "blhd"
+
 Add new kernel wrappers here; split into per-variant files only if this file
 grows large.
 """
+
+import math
 
 import torch
 import torch.nn.functional as F
 
 from astrai.extension.loader import _available, _modules
+
+_LAYOUT_CODES: dict[str, int] = {"bhld": 0, "blhd": 1}
+
+
+def _parse_layout(layout: str | int) -> int:
+    if isinstance(layout, int):
+        return layout
+    code = _LAYOUT_CODES.get(layout.lower())
+    if code is None:
+        raise ValueError(
+            f"unknown layout '{layout}', expected one of {list(_LAYOUT_CODES)}"
+        )
+    return code
+
+
+def _to_bhld(t: torch.Tensor, layout: int) -> torch.Tensor:
+    """Normalize to b h l d view. Zero-copy transpose if layout==1 (b l h d)."""
+    if layout == 1:
+        return t.transpose(1, 2)
+    return t
 
 
 def _expand_kv_heads(
@@ -26,20 +54,84 @@ def _expand_kv_heads(
     return k, v
 
 
+def _build_attn_mask(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    mask: torch.Tensor | None,
+    causal_offset: int,
+    scale: float,
+) -> tuple[torch.Tensor | None, float]:
+    """Build SDPA-compatible attn_mask + resolved scale.
+
+    q and k must already be in b h l d layout.
+    Causal and mask can coexist: causal sets -inf above the diagonal, mask
+    sets -inf for padded positions. Both are OR'd into a single bool mask.
+    """
+    q_len = q.size(2)
+    kv_len = k.size(2)
+    head_dim = q.size(3)
+    resolved_scale = scale if scale and scale > 0 else 1.0 / math.sqrt(head_dim)
+
+    attn_mask = None
+
+    if mask is not None:
+        if mask.dim() == 2:
+            # [batch, kv_len] → [batch, 1, 1, kv_len]
+            attn_mask = mask[:, None, None, :]
+        elif mask.dim() == 3:
+            # [batch, q_len, kv_len] → [batch, 1, q_len, kv_len]
+            attn_mask = mask[:, None, :, :]
+        else:
+            raise ValueError(f"mask must be 2D or 3D, got {mask.dim()}D")
+
+    if causal_offset >= 0:
+        batch = q.size(0)
+        # q row i attends to kv cols 0..(causal_offset + i)
+        q_idx = torch.arange(q_len, device=q.device).unsqueeze(1)  # [q_len, 1]
+        kv_idx = torch.arange(kv_len, device=q.device).unsqueeze(0)  # [1, kv_len]
+        causal_bool = kv_idx > (causal_offset + q_idx)  # True = masked out
+        causal_mask = causal_bool.unsqueeze(0).expand(
+            batch, -1, -1
+        )  # [batch, q_len, kv_len]
+        causal_mask = causal_mask[:, None, :, :]  # [batch, 1, q_len, kv_len]
+
+        if attn_mask is not None:
+            attn_mask = attn_mask | causal_mask
+        else:
+            attn_mask = causal_mask
+
+    return attn_mask, resolved_scale
+
+
 def _torch_fallback(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     mask: torch.Tensor | None,
-    is_causal: bool,
-    scale: float | None,
+    causal_offset: int,
+    scale: float,
+    q_layout: int,
+    kv_layout: int | None = None,
 ) -> torch.Tensor:
-    """Reference attention via ``scaled_dot_product_attention``."""
+    """Reference attention via ``scaled_dot_product_attention``.
+
+    q_layout / kv_layout: 0 = b h l d, 1 = b l h d.
+    If kv_layout is None, uses q_layout (Q and K/V share the same layout).
+    """
+    if kv_layout is None:
+        kv_layout = q_layout
+    q = _to_bhld(q, q_layout)
+    k = _to_bhld(k, kv_layout)
+    v = _to_bhld(v, kv_layout)
     k, v = _expand_kv_heads(k, v, q.size(1))
-    attn_mask = mask[:, None, None, :] if mask is not None else None
-    return F.scaled_dot_product_attention(
-        q, k, v, attn_mask=attn_mask, is_causal=is_causal and mask is None, scale=scale
+    attn_mask, resolved_scale = _build_attn_mask(q, k, mask, causal_offset, scale)
+    out = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=False, scale=resolved_scale
     )
+    # Restore Q's original layout
+    if q_layout == 1:
+        out = out.transpose(1, 2)
+    return out
 
 
 def _gather_kv_from_pages(
@@ -56,23 +148,22 @@ def _gather_kv_from_pages(
         k_cache    : [n_pages, page_size, n_kv_heads, head_dim]
         v_cache    : same as k_cache
     Returns:
-        k, v : [batch, n_kv_heads, kv_len, head_dim]
+        k, v : [batch, kv_len, n_kv_heads, head_dim]  (b l h d)
     """
     batch, max_pages = page_table.shape
-    n_pages, ps, n_kv_heads, head_dim = k_cache.shape
+    _, ps, n_kv_heads, head_dim = k_cache.shape
     if ps != page_size:
         raise ValueError(f"k_cache page_size mismatch: {ps} vs {page_size}")
 
-    k = k_cache.new_empty(batch, n_kv_heads, kv_len, head_dim)
-    v = v_cache.new_empty(batch, n_kv_heads, kv_len, head_dim)
+    # Vectorized gather: build physical page + offset indices, then advanced-index
+    positions = torch.arange(kv_len, device=page_table.device)
+    logical_pages = positions // page_size  # [kv_len]
+    page_offsets = positions % page_size  # [kv_len]
 
-    for b in range(batch):
-        for pos in range(kv_len):
-            log_pg = pos // page_size
-            pg_off = pos % page_size
-            phys = int(page_table[b, log_pg].item())
-            k[b, :, pos, :] = k_cache[phys, pg_off, :, :]
-            v[b, :, pos, :] = v_cache[phys, pg_off, :, :]
+    phys_pages = page_table[:, logical_pages]  # [batch, kv_len]
+    # k_cache[phys_pages, page_offsets] → [batch, kv_len, n_kv_heads, head_dim] (b l h d)
+    k = k_cache[phys_pages, page_offsets]
+    v = v_cache[phys_pages, page_offsets]
     return k, v
 
 
@@ -81,21 +172,22 @@ def attn_decode(
     k: torch.Tensor,
     v: torch.Tensor,
     mask: torch.Tensor | None = None,
-    is_causal: bool = False,
-    causal_offset: int = 0,
-    scale: float | None = None,
+    causal_offset: int = -1,
+    scale: float = 0.0,
+    layout: str = "bhld",
 ) -> torch.Tensor:
+    li = _parse_layout(layout)
     if _available["attn_decode"]:
         return _modules["attn_decode"].attn_decode(
             q,
             k,
             v,
             mask=mask,
-            is_causal=is_causal,
             causal_offset=causal_offset,
             scale=scale,
+            layout=li,
         )
-    return _torch_fallback(q, k, v, mask, is_causal, scale)
+    return _torch_fallback(q, k, v, mask, causal_offset, scale, q_layout=li)
 
 
 def attn_prefill(
@@ -103,21 +195,22 @@ def attn_prefill(
     k: torch.Tensor,
     v: torch.Tensor,
     mask: torch.Tensor | None = None,
-    is_causal: bool = False,
-    causal_offset: int = 0,
-    scale: float | None = None,
+    causal_offset: int = -1,
+    scale: float = 0.0,
+    layout: str = "bhld",
 ) -> torch.Tensor:
+    li = _parse_layout(layout)
     if _available["attn_prefill"]:
         return _modules["attn_prefill"].attn_prefill(
             q,
             k,
             v,
             mask=mask,
-            is_causal=is_causal,
             causal_offset=causal_offset,
             scale=scale,
+            layout=li,
         )
-    return _torch_fallback(q, k, v, mask, is_causal, scale)
+    return _torch_fallback(q, k, v, mask, causal_offset, scale, q_layout=li)
 
 
 def attn_paged_decode(
@@ -128,10 +221,11 @@ def attn_paged_decode(
     page_size: int,
     kv_len: int,
     mask: torch.Tensor | None = None,
-    is_causal: bool = False,
-    causal_offset: int = 0,
-    scale: float | None = None,
+    causal_offset: int = -1,
+    scale: float = 0.0,
+    layout: str = "bhld",
 ) -> torch.Tensor:
+    li = _parse_layout(layout)
     if _available["attn_paged_decode"]:
         return _modules["attn_paged_decode"].attn_paged_decode(
             q,
@@ -141,9 +235,12 @@ def attn_paged_decode(
             page_size,
             kv_len,
             mask=mask,
-            is_causal=is_causal,
             causal_offset=causal_offset,
             scale=scale,
+            layout=li,
         )
+    # Gathered K/V are always b l h d
     k, v = _gather_kv_from_pages(page_table, k_cache, v_cache, page_size, kv_len)
-    return _torch_fallback(q, k, v, mask, is_causal, scale)
+    return _torch_fallback(
+        q, k, v, mask, causal_offset, scale, q_layout=li, kv_layout=1
+    )

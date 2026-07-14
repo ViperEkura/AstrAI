@@ -68,7 +68,8 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     // ---- Load Q directly from global into mma A-operand registers ----
     // Same layout as prefill: frag[0]/[2] = row gid, frag[1]/[3] = row gid+8
     // cols kt*16 + tid4*2 + {0,1} / +{8,9}. pau[0]=cols c,c+1; pau[4]=c+8,c+9.
-    const int q_base = (batch * p.q_head + q_head0) * HEAD_DIM;
+    // Stride-based: Q is [batch, q_head, q_len=1, head_dim]
+    const int q_base = batch * p.q_stride_b + q_head0 * p.q_stride_h;
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
@@ -77,9 +78,9 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     for (int kt = 0; kt < KD; kt++) {
         int c = kt * 16 + tid4 * 2;
         const unsigned* pau = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qra * HEAD_DIM + c]);
+            &p.q[q_base + qra * p.q_stride_h + c * p.q_stride_d]);
         const unsigned* pbu = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qrb * HEAD_DIM + c]);
+            &p.q[q_base + qrb * p.q_stride_h + c * p.q_stride_d]);
         Qa[kt][0] = va ? pau[0] : 0u;
         Qa[kt][1] = vb ? pbu[0] : 0u;
         Qa[kt][2] = va ? pau[4] : 0u;
@@ -92,8 +93,9 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
 
-    const int kv_base = (batch * p.kv_head + kv_head) * p.kv_len * HEAD_DIM;
-    const int mask_base = batch * p.kv_len;
+    // KV: stride-based base — [batch, kv_head, kv_len, head_dim]
+    const int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
+    const int mask_batch_base = batch * p.mask_b_stride;
     const int tiles_total = (p.kv_len + BC - 1) / BC;
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
     const int ti_begin = split * tiles_per_split;
@@ -111,8 +113,10 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
             int kc = kv0 + r;
             bool valid = kc < p.kv_len;
             int off = r * LD + swiz_col(d, r, SWIZ_MASK);
-            cp_async_16_pred(&dK[off], &p.k[kv_base + kc * HEAD_DIM + d], valid);
-            cp_async_16_pred(&dV[off], &p.v[kv_base + kc * HEAD_DIM + d], valid);
+            // KV stride-based: contiguous within head_dim (stride_d == 1 typically)
+            int g_off = kv_base + kc * p.kv_stride_l + d * p.kv_stride_d;
+            cp_async_16_pred(&dK[off], &p.k[g_off], valid);
+            cp_async_16_pred(&dV[off], &p.v[g_off], valid);
         }
         cp_async_commit();
     };
@@ -148,9 +152,13 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
             Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
             Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
 
-        int maxc = p.is_causal ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
+        // Decode: q_len=1, so qrow0=qrow1=0, mask_q_stride irrelevant
+        int maxc = (p.causal_offset >= 0) ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
         mma_softmax_tile<NC8, DN8>(kv0, maxc, maxc,
-                                    mask_base, p.mask, has_mask,
+                                    0, 0,
+                                    mask_batch_base, 0,
+                                    batch,
+                                    p.mask, has_mask,
                                     Sacc, Oacc, m0, m1, l0, l1, lane);
 
         mma_pv_accumulate<DN8, KT2>(Sacc, bV, LD, SWIZ_MASK, lane, Oacc);

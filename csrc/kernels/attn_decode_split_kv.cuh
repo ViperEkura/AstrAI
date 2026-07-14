@@ -21,13 +21,16 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     int lane = threadIdx.x;
     int hd_per_thread = p.head_dim / 32;
 
+    // Q: [batch, q_head, q_len=1, head_dim] — stride-based
     float q_reg[8];
-    int q_off = ((batch * p.q_head + q_head) * 1) * p.head_dim + lane * hd_per_thread;
+    int q_off = batch * p.q_stride_b + q_head * p.q_stride_h
+              + lane * hd_per_thread * p.q_stride_d;
     for (int i = 0; i < hd_per_thread; i++)
-        q_reg[i] = __bfloat162float(p.q[q_off + i]);
+        q_reg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]);
 
-    int kv_base = ((batch * p.kv_head + kv_head) * p.kv_len) * p.head_dim;
-    int mask_base = batch * p.kv_len;
+    // KV: [batch, kv_head, kv_len, head_dim] — stride-based base
+    int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
+    int mask_base = batch * p.mask_b_stride;
 
     float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
 
@@ -43,9 +46,15 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
         int chunk_start = ci * DC_CHUNK;
         int this_chunk = min(DC_CHUNK, p.kv_len - chunk_start);
 
+        // Load K into shared memory (gather from strided global)
         int total = this_chunk * p.head_dim;
-        for (int i = threadIdx.y * 32 + lane; i < total; i += blockDim.x * blockDim.y)
-            k_smem[i] = p.k[kv_base + chunk_start * p.head_dim + i];
+        for (int i = threadIdx.y * 32 + lane; i < total; i += blockDim.x * blockDim.y) {
+            int s = i / p.head_dim;
+            int d_dim = i % p.head_dim;
+            int kv_idx = chunk_start + s;
+            int g_off = kv_base + kv_idx * p.kv_stride_l + d_dim * p.kv_stride_d;
+            k_smem[i] = p.k[g_off];
+        }
         __syncthreads();
 
         for (int s = 0; s < this_chunk; s++) {
@@ -54,9 +63,10 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
                 partial += q_reg[i] * __bfloat162float(k_smem[s * p.head_dim + lane * hd_per_thread + i]);
             partial = warp_reduce_sum(partial) * p.scale;
 
-            if (p.use_mask && p.mask && !p.mask[mask_base + chunk_start + s])
+            int kv_idx = chunk_start + s;
+            if (p.use_mask && p.mask && !p.mask[mask_base + kv_idx])
                 partial = -FLT_MAX;
-            if (p.is_causal && (chunk_start + s) > p.causal_offset)
+            if (p.causal_offset >= 0 && kv_idx > p.causal_offset)
                 partial = -FLT_MAX;
 
             float new_m = fmaxf(m, partial);
@@ -64,9 +74,10 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             float beta  = expf(partial - new_m);
             d = d * alpha + beta;
 
-            int v_off = kv_base + (chunk_start + s) * p.head_dim + lane * hd_per_thread;
+            // V: stride-based read
+            int v_off = kv_base + kv_idx * p.kv_stride_l + lane * hd_per_thread * p.kv_stride_d;
             for (int i = 0; i < hd_per_thread; i++)
-                acc_reg[i] = acc_reg[i] * alpha + __bfloat162float(p.v[v_off + i]) * beta;
+                acc_reg[i] = acc_reg[i] * alpha + __bfloat162float(p.v[v_off + i * p.kv_stride_d]) * beta;
             m = new_m;
         }
         __syncthreads();
@@ -94,6 +105,9 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     int d = threadIdx.x;
     if (d >= p.head_dim) return;
 
+    int batch = bh / p.q_head;
+    int q_head = bh % p.q_head;
+
     size_t split_base = (size_t)bh * p.num_splits;
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
@@ -112,5 +126,7 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     }
 
     float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
-    p.o[(size_t)bh * p.head_dim + d] = __float2bfloat16(acc * inv);
+    // Stride-based output write (q_len=1 for decode, so stride_l not needed)
+    int o_off = batch * p.q_stride_b + q_head * p.q_stride_h + d * p.q_stride_d;
+    p.o[o_off] = __float2bfloat16(acc * inv);
 }

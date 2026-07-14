@@ -98,8 +98,9 @@ static void bench() {
 
         AttentionParams<bf16> p;
         p.batch = B; p.q_head = Hq; p.kv_head = Hk; p.q_len = 1; p.kv_len = sl;
-        p.head_dim = D; p.use_mask = 0; p.is_causal = 0; p.causal_offset = 0;
+        p.head_dim = D; p.use_mask = 0; p.causal_offset = -1;
         p.scale = 1.0f / sqrtf((float)D);
+        set_default_strides(p);
         p.q = dQ; p.k = dK; p.v = dV; p.mask = nullptr; p.o = dO;
 
         DecodeScratch sc;
@@ -160,7 +161,7 @@ int main() {
 
         AttentionParams<bf16> p;
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
-        p.use_mask=0; p.is_causal=0; p.causal_offset=0;
+        p.use_mask=0; p.causal_offset=-1;
         p.scale=1.0f/sqrtf((float)D);
         p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
@@ -180,7 +181,7 @@ int main() {
         cudaMemcpy(hOut,dO,nQ*2,cudaMemcpyDeviceToHost);
 
         float* ref=new float[nQ];
-        cpu_attention_ref(hQ, hK, hV, hMask, ref, B, Hq, Hk, 1, sl, D, 0, 0);
+        cpu_attention_ref(hQ, hK, hV, hMask, ref, B, Hq, Hk, 1, sl, D, -1);
 
         float max_err=0;
         for (size_t i=0;i<nQ;i++){

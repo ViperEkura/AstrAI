@@ -22,11 +22,13 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
     int lane = threadIdx.x;
     int hd_per_thread = p.head_dim / 32;
 
+    // Q: stride-based [batch, q_head, q_len=1, head_dim]
     float q_reg[8];
-    int q_off = ((batch * p.q_head + q_head) * 1) * p.head_dim + lane * hd_per_thread;
+    int q_off = batch * p.q_stride_b + q_head * p.q_stride_h
+              + lane * hd_per_thread * p.q_stride_d;
     #pragma unroll
     for (int i = 0; i < hd_per_thread; i++)
-        q_reg[i] = __bfloat162float(p.q[q_off + i]);
+        q_reg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]);
 
     float m = -FLT_MAX, d = 0.0f, acc_reg[8] = {0.0f};
 
@@ -37,7 +39,7 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
     int ch_begin = split * chunks_per_split;
     int ch_end = min(chunks_total, ch_begin + chunks_per_split);
 
-    const int mask_base = batch * p.kv_len;
+    const int mask_base = batch * p.mask_b_stride;
 
     for (int ci = ch_begin; ci < ch_end; ci++) {
         int chunk_start = ci * PDC_CHUNK;
@@ -70,9 +72,10 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
                 partial += q_reg[i] * __bfloat162float(k_smem[s * p.head_dim + lane * hd_per_thread + i]);
             partial = paged_warp_reduce_sum(partial) * p.scale;
 
-            if (p.use_mask && p.mask && !p.mask[mask_base + chunk_start + s])
+            int kv_idx = chunk_start + s;
+            if (p.use_mask && p.mask && !p.mask[mask_base + kv_idx])
                 partial = -FLT_MAX;
-            if (p.is_causal && (chunk_start + s) > p.causal_offset)
+            if (p.causal_offset >= 0 && kv_idx > p.causal_offset)
                 partial = -FLT_MAX;
 
             float new_m = fmaxf(m, partial);
@@ -118,6 +121,9 @@ __global__ void paged_attn_decode_combine_kernel(PagedAttentionParams<bf16> p) {
     int d = threadIdx.x;
     if (d >= p.head_dim) return;
 
+    int batch = bh / p.q_head;
+    int q_head = bh % p.q_head;
+
     size_t split_base = (size_t)bh * p.num_splits;
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
@@ -136,5 +142,6 @@ __global__ void paged_attn_decode_combine_kernel(PagedAttentionParams<bf16> p) {
     }
 
     float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
-    p.o[(size_t)bh * p.head_dim + d] = __float2bfloat16(acc * inv);
+    int o_off = batch * p.q_stride_b + q_head * p.q_stride_h + d * p.q_stride_d;
+    p.o[o_off] = __float2bfloat16(acc * inv);
 }

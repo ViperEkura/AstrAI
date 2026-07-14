@@ -163,6 +163,7 @@ int main() {
         p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
         p.use_mask=0; p.causal_offset=-1;
         p.scale=1.0f/sqrtf((float)D);
+        set_default_strides(p);
         p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
         // Split-K scratch (max 32 splits), sized for the production MMA path.

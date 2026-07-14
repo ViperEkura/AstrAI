@@ -145,7 +145,7 @@ static int run_test(int B, int Hq, int Hkv, int kv_len, int page_size, int seed)
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv; p.q_len = 1;
     p.kv_len = kv_len; p.head_dim = HEAD_DIM;
     p.use_mask = 0; p.causal_offset = -1;
-    set_default_strides(p);
+    set_default_paged_strides(p);
     p.num_splits = 1; p.scale = scale_val;
     p.page_size = page_size; p.max_pages = max_pages;
     p.page_table = d_pt;

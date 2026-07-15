@@ -139,7 +139,10 @@ class CheckpointCallback(TrainCallback):
         self.interval = interval
         self.weight_only = weight_only
         self.save_extra_fn = save_extra_fn or CheckpointCallback.save_extra
-        self.last_ckpt_step = 0
+        self.last_ckpt_step = None
+
+    def on_train_begin(self, context: TrainContext):
+        self.last_ckpt_step = context.optimizer_step
 
     def _save_checkpoint(self, context: TrainContext):
         self.last_ckpt_step = context.optimizer_step
@@ -237,7 +240,7 @@ class MetricCallback(TrainCallback):
         metrics: List[str] = None,
         val_step: int = 0,
     ):
-        self.last_log_flush_step = 0
+        self.last_log_flush_step = None
         self.save_interval = save_interval
         self.metrics = metrics or ["loss", "lr"]
         self.val_step = val_step
@@ -298,6 +301,9 @@ class MetricCallback(TrainCallback):
         context.model.train()
         return avg_loss
 
+    def on_train_begin(self, context: TrainContext):
+        self.last_log_flush_step = context.optimizer_step
+
     @only_on_rank(0)
     def _flush(self, epoch, step):
         log_file = self.log_dir / f"epoch_{epoch}_step_{step}_metric.jsonl"
@@ -327,8 +333,12 @@ class MetricCallback(TrainCallback):
         self._append("epoch", context)
 
     def on_train_end(self, context):
-        if context.optimizer_step != self.last_log_flush_step:
+        if (
+            self.last_log_flush_step is None
+            or context.optimizer_step != self.last_log_flush_step
+        ):
             self._flush(context.epoch, context.optimizer_step)
+            self.last_log_flush_step = context.optimizer_step
 
     def on_error(self, context):
         self._flush(context.epoch, context.optimizer_step)

@@ -64,7 +64,6 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
 
     // KV: stride-based base — [batch, kv_head, kv_len, head_dim]
     const int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
-    const int mask_batch_base = batch * p.mask_b_stride;
     const int tiles_total = (p.kv_len + BC - 1) / BC;
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
     const int ti_begin = split * tiles_per_split;
@@ -125,7 +124,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         int maxc = (p.causal_offset >= 0) ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
         mma_softmax_tile<NC8, DN8>(kv0, maxc, maxc,
                                     0, 0,
-                                    mask_batch_base, 0,
+                                    p.mask_b_stride, 0,
                                     batch,
                                     p.mask, has_mask,
                                     Sacc, Oacc, m0, m1, l0, l1, lane);

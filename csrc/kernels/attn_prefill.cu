@@ -47,7 +47,7 @@ torch::Tensor attn_prefill(
     auto O_view = (layout == 1) ? O.transpose(1, 2) : O;
     p.o = (bf16*)O_view.data_ptr();
 
-    dispatch_head_dim(p.head_dim, [&]<int D>() { dispatch_prefill<D>(p); });
+    DISPATCH_HEAD_DIM(p.head_dim, dispatch_prefill, p);
     return O;
 }
 

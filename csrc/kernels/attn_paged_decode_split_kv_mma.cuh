@@ -51,7 +51,6 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
 
-    const int mask_batch_base = batch * p.mask_b_stride;
     const int tiles_total = (p.kv_len + BC - 1) / BC;
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
     const int ti_begin = split * tiles_per_split;
@@ -119,7 +118,7 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
         int maxc = (p.causal_offset >= 0) ? min(p.kv_len, p.causal_offset + 1) : p.kv_len;
         mma_softmax_tile<NC8, DN8>(kv0, maxc, maxc,
                                     0, 0,
-                                    mask_batch_base, 0,
+                                    p.mask_b_stride, 0,
                                     batch,
                                     p.mask, has_mask,
                                     Sacc, Oacc, m0, m1, l0, l1, lane);

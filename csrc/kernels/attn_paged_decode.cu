@@ -34,7 +34,7 @@ template <int HEAD_DIM>
 static void dispatch_paged_decode(PagedAttentionParams<bf16>& p) {
 #ifndef ASTRAI_NO_MMA
     int G = p.q_head / p.kv_head;
-    if (!p.use_mask && G >= 1 && G <= 16 && p.page_size >= 32) {
+    if (G >= 1 && G <= 16 && p.page_size >= 32) {
         launch_paged_mma_decode<HEAD_DIM, 32>(p);
         return;
     }
@@ -62,7 +62,7 @@ torch::Tensor attn_paged_decode(
     auto O_view = (layout == 1) ? O.transpose(1, 2) : O;
     p.o = (bf16*)O_view.data_ptr();
 
-    dispatch_head_dim(p.head_dim, [&]<int D>() { dispatch_paged_decode<D>(p); });
+    DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_decode, p);
     return O;
 }
 

@@ -94,7 +94,6 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int block_max_kv =
         blockIdx.x * WARPS * BR + WARPS * BR - 1 + p.causal_offset;
     const int has_mask = p.use_mask && p.mask;
-    const int mask_batch_base = batch * p.mask_b_stride;
 
     // Last active tile: block-level causal bound (all warps in the block share
     // the K/V load, so the prefetch range is the block max, not per-warp).
@@ -165,7 +164,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
                                         : p.kv_len;
         mma_softmax_tile<NC8, DN8>(kv0, maxc0, maxc1,
                                     qr0, qr1,
-                                    mask_batch_base, p.mask_q_stride,
+                                    p.mask_b_stride, p.mask_q_stride,
                                     batch,
                                     p.mask, has_mask,
                                     Sacc, Oacc, m0, m1, l0, l1, lane);

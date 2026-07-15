@@ -38,7 +38,7 @@ template <int HEAD_DIM>
 static void dispatch_decode(AttentionParams<bf16>& p) {
 #ifndef ASTRAI_NO_MMA
     int G = p.q_head / p.kv_head;
-    if (!p.use_mask && G >= 1 && G <= 16) {
+    if (G >= 1 && G <= 16) {
         launch_mma_decode<HEAD_DIM, 32>(p);
         return;
     }
@@ -65,7 +65,7 @@ torch::Tensor attn_decode(
     auto O_view = (layout == 1) ? O.transpose(1, 2) : O;
     p.o = (bf16*)O_view.data_ptr();
 
-    dispatch_head_dim(p.head_dim, [&]<int D>() { dispatch_decode<D>(p); });
+    DISPATCH_HEAD_DIM(p.head_dim, dispatch_decode, p);
     return O;
 }
 

@@ -99,7 +99,12 @@ class TrainContextBuilder:
                     context.model_config = checkpoint.config
                 context.epoch = checkpoint.epoch or cfg.start_epoch
                 if checkpoint.consumed_samples > 0:
-                    context.consumed_samples = checkpoint.consumed_samples
+                    per_step = (
+                        cfg.batch_per_device * context.world_size * cfg.grad_accum_steps
+                    )
+                    context.consumed_samples = (
+                        checkpoint.consumed_samples // per_step
+                    ) * per_step
                 else:
                     context.consumed_samples = cfg.start_samples * context.world_size
                 context.checkpoint = checkpoint

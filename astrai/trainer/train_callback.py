@@ -210,7 +210,7 @@ class ProgressBarCallback(TrainCallback):
     @only_on_rank(0)
     def on_optimizer_step(self, context: TrainContext):
         postfix = {
-            "step": context.optimizer_step,
+            "step": f"{context.optimizer_step:d}",
             "loss": f"{context.loss:.4f}",
             "lr": f"{context.optimizer.param_groups[-1]['lr']:.2e}",
         }

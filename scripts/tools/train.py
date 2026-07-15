@@ -90,6 +90,7 @@ class MuonMix(optim.Optimizer):
     def load_state_dict(self, state_dict: Dict[str, Any]):
         self.muon.load_state_dict(state_dict["muon"])
         self.adamw.load_state_dict(state_dict["adamw"])
+        self.param_groups = [*self.muon.param_groups, *self.adamw.param_groups]
 
 
 def parse_args() -> argparse.Namespace:

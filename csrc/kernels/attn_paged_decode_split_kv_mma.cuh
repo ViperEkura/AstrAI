@@ -11,14 +11,9 @@ using bf16 = __nv_bfloat16;
 // directly from the page pool through a page table, eliminating the gather
 // copy.  Each tile (BC=32) fits within a single page (page_size >= 32), so
 // the page-table lookup happens once per tile for cp.async.
-//
-// Optimizations mirror attn_decode_split_kv_mma_kernel:
-//   - Q loaded directly from global into mma A-operand registers (no sQ)
-//   - Double-buffered KV (STAGES=2) for D<=128, single-buffer for D=256
-//   - Predicated cp.async for unified full/partial tile path
+
 template <int HEAD_DIM, int BC, int STAGES = (HEAD_DIM <= 128) ? 2 : 1>
 __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16> p) {
-    constexpr int BR = 16;
     constexpr int KD = HEAD_DIM / 16;
     constexpr int NC8 = BC / 8;
     constexpr int KT2 = BC / 16;
@@ -32,34 +27,23 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     const int gid = lane >> 2;
     const int tid4 = lane & 3;
 
-    const int kv_head_idx = blockIdx.x;
+    const int kv_head = blockIdx.x;
     const int batch = blockIdx.y;
     const int split = blockIdx.z;
     const int G = p.q_head / p.kv_head;
-    const int q_head0 = kv_head_idx * G;
+    const int q_head0 = kv_head * G;
 
     __shared__ __align__(16) bf16 sK[STAGES * BC * LD];
     __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
 
     // ---- Load Q directly from global into mma A-operand registers ----
-    // Q stride-based: [batch, q_head, q_len=1, head_dim]
     const int q_base = batch * p.q_stride_b + q_head0 * p.q_stride_h;
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     unsigned Qa[KD][4];
-#pragma unroll
-    for (int kt = 0; kt < KD; kt++) {
-        int c = kt * 16 + tid4 * 2;
-        const unsigned* pau = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qra * p.q_stride_h + c * p.q_stride_d]);
-        const unsigned* pbu = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qrb * p.q_stride_h + c * p.q_stride_d]);
-        Qa[kt][0] = va ? pau[0] : 0u;
-        Qa[kt][1] = vb ? pbu[0] : 0u;
-        Qa[kt][2] = va ? pau[4] : 0u;
-        Qa[kt][3] = vb ? pbu[4] : 0u;
-    }
+    load_q_mma_frags<KD>(p.q + q_base, p.q_stride_h, p.q_stride_d,
+                          qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[DN8][4];
 #pragma unroll
@@ -77,7 +61,7 @@ __global__ void paged_attn_decode_split_kv_mma_kernel(PagedAttentionParams<bf16>
     // Paged strides (constant for the block)
     const int64_t page_stride = (int64_t)p.page_size * p.kv_head * HEAD_DIM;
     const int64_t pos_stride  = (int64_t)p.kv_head * HEAD_DIM;
-    const int64_t head_off    = (int64_t)kv_head_idx * HEAD_DIM;
+    const int64_t head_off    = (int64_t)kv_head * HEAD_DIM;
 
     // ---- Load tile lambda: predicated cp.async, paged addressing ----
     auto load_tile = [&](int ti, int buf) {

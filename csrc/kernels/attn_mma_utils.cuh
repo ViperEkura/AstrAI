@@ -109,6 +109,36 @@ __device__ __forceinline__ void cp_async_wait_group() {
 }
 
 // ---------------------------------------------------------------------------
+// Q-load: load query rows directly from global memory into mma A-operand
+// register layout. One call replaces ~15 duplicated lines in each MMA kernel.
+// stride_row is p.q_stride_h for decode (q_len=1, G heads) or
+//              p.q_stride_l for prefill (multi-q rows).
+// ---------------------------------------------------------------------------
+template <int KD>
+__device__ inline void load_q_mma_frags(
+    const bf16* __restrict__ q,
+    int stride_row,
+    int stride_d,
+    int qra, int qrb,
+    bool va, bool vb,
+    int tid4,
+    unsigned Qa[KD][4])
+{
+    #pragma unroll
+    for (int kt = 0; kt < KD; kt++) {
+        int c = kt * 16 + tid4 * 2;
+        const unsigned* pau = reinterpret_cast<const unsigned*>(
+            &q[qra * stride_row + c * stride_d]);
+        const unsigned* pbu = reinterpret_cast<const unsigned*>(
+            &q[qrb * stride_row + c * stride_d]);
+        Qa[kt][0] = va ? pau[0] : 0u;
+        Qa[kt][1] = vb ? pbu[0] : 0u;
+        Qa[kt][2] = va ? pau[4] : 0u;
+        Qa[kt][3] = vb ? pbu[4] : 0u;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared MMA compute functions — used by both decode and prefill MMA kernels.
 // Extracted because S=Q@K^T, online softmax, and P@V are structurally identical
 // between the two kernels; only the per-row causal/mask bounds differ.

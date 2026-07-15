@@ -8,39 +8,21 @@ using bf16 = __nv_bfloat16;
 
 // Split-K (FlashDecoding) tensor-core decode via GQA head-packing.
 //
-// Decode has q_len == 1, so S = q @ K^T is a GEMV per head — no tensor-core work
-// on its own. But GQA gives us G = q_head / kv_head query heads that all share
-// one kv_head. We pack those G heads into the M=16 rows of mma.sync.m16n8k16,
-// turning G independent GEMVs into a single GEMM that reuses each loaded K/V tile
-// across all G heads (K/V load is the decode bottleneck, so the reuse is the win,
-// not the flops). The KV sequence is partitioned across gridDim.z blocks so that
-// a decode with only batch*kv_head independent tasks can fill all SMs. Each
-// (batch, kv_head, split) block computes an UN-normalised partial (Oacc, m, l)
-// over its KV slice; the combine kernel below reduces across splits. Fixes the
-// "grid too small" bottleneck (0.04 waves/SM → many blocks) for long-context,
+// Decode has q_len == 1, so S = q @ K^T is a GEMV per head — no tensor-core
+// work on its own. But GQA gives us G = q_head / kv_head query heads that all
+// share one kv_head. We pack those G heads into the M=16 rows of
+// mma.sync.m16n8k16, turning G independent GEMVs into a single GEMM that
+// reuses each loaded K/V tile across all G heads (K/V load is the decode
+// bottleneck, so the reuse is the win, not the flops). The KV sequence is
+// partitioned across gridDim.z blocks so that a decode with only
+// batch*kv_head independent tasks can fill all SMs. Each (batch, kv_head,
+// split) block computes an UN-normalised partial (Oacc, m, l) over its KV
+// slice; the combine kernel below reduces across splits. Fixes the "grid too
+// small" bottleneck (0.04 waves/SM → many blocks) for long-context,
 // small-batch decode.
-//
-// Partial layout (float, contiguous):
-//   o_part : [batch, q_head, num_splits, HEAD_DIM]
-//   ml_part: [batch, q_head, num_splits, 2]  (m, l)
-//
-// Optimizations:
-//   - cp.async global→shared for K/V (bypasses registers, cuts instruction count)
-//   - XOR swizzle (swiz_col): LD=HEAD_DIM, zero waste, no bank conflicts
-//   - Q loaded directly from global into mma A-operand registers (no sQ staging,
-//     no prologue syncwarp) — frees shared memory for double-buffering
-//   - Double-buffered KV (STAGES=2): next tile's cp.async overlaps current
-//     tile's MMA compute — hides global load latency / boosts bandwidth
-//     utilization for small-batch (low-occupancy) decode
-//   - Predicated cp.async (cp_async_16_pred) for full AND partial tiles on one
-//     uniform path — eliminates the scalar fallback branch
-//
-// Smem footprint (BC=32): STAGES=2 → 2*(sK+sV) = 2*2*32*HEAD_DIM*2 bytes.
-//   D=128: 16 KB (fits 48 KB static cap).  D=256: 32 KB (also fits).
-// STAGES=1 fallback (4/8 KB) for smem-constrained configs.
+
 template <int HEAD_DIM, int BC, int STAGES = 2>
 __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
-    constexpr int BR = 16;
     constexpr int KD = HEAD_DIM / 16;
     constexpr int NC8 = BC / 8;
     constexpr int KT2 = BC / 16;
@@ -66,26 +48,13 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
 
     // ---- Load Q directly from global into mma A-operand registers ----
-    // Same layout as prefill: frag[0]/[2] = row gid, frag[1]/[3] = row gid+8
-    // cols kt*16 + tid4*2 + {0,1} / +{8,9}. pau[0]=cols c,c+1; pau[4]=c+8,c+9.
-    // Stride-based: Q is [batch, q_head, q_len=1, head_dim]
     const int q_base = batch * p.q_stride_b + q_head0 * p.q_stride_h;
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     unsigned Qa[KD][4];
-#pragma unroll
-    for (int kt = 0; kt < KD; kt++) {
-        int c = kt * 16 + tid4 * 2;
-        const unsigned* pau = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qra * p.q_stride_h + c * p.q_stride_d]);
-        const unsigned* pbu = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qrb * p.q_stride_h + c * p.q_stride_d]);
-        Qa[kt][0] = va ? pau[0] : 0u;
-        Qa[kt][1] = vb ? pbu[0] : 0u;
-        Qa[kt][2] = va ? pau[4] : 0u;
-        Qa[kt][3] = vb ? pbu[4] : 0u;
-    }
+    load_q_mma_frags<KD>(p.q + q_base, p.q_stride_h, p.q_stride_d,
+                          qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[DN8][4];
 #pragma unroll

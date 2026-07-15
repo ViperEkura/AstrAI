@@ -57,7 +57,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     const int kv_head = q_head / (p.q_head / p.kv_head);
     const int qrow0 = (blockIdx.x * WARPS + warp) * BR;
 
-    // Static shared memory — sized by template parameters at compile time.
+    // ---- Static shared memory: double-buffered K/V ----
     // K/V are double-buffered (STAGES=2): the next tile's cp.async load runs
     // while the current tile's tensor-core math executes, hiding global-load
     // latency (FA2-style software pipeline). No dynamic smem / carveout opt-in.
@@ -65,31 +65,16 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     __shared__ __align__(16) bf16 sK[STAGES * BC * LD];
     __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
 
-    // Load the Q fragments straight from global into the mma A-operand layout
-    // (m16n8k16, row-major): no sQ staging area and no serialized per-warp
-    // prologue barriers. Each lane reads exactly the 8 Q elements ldmatrix
-    // would have produced, pre-scaled by the attention scale. Kept resident in
-    // registers across the tile loop.
-    //   frag[0]/[2]: row = qrow0 + gid ;  frag[1]/[3]: row = qrow0 + gid + 8
-    //   frag[0]/[1]: cols kt*16 + tid4*2 + {0,1} ; frag[2]/[3]: + 8
-    // Q stride-based: [batch, q_head, q_len, head_dim]
+    // Load Q fragments straight from global into mma A-operand layout.
+    // stride_row = p.q_stride_l for prefill (multi-q rows across q_len).
+    // See attn_mma_utils.cuh for the shared template.
     const int q_base = batch * p.q_stride_b + q_head * p.q_stride_h;
     const int qra = qrow0 + gid;
     const int qrb = qrow0 + gid + 8;
     const bool va = qra < p.q_len, vb = qrb < p.q_len;
     unsigned Qa[KD][4];
-#pragma unroll
-    for (int kt = 0; kt < KD; kt++) {
-        int c = kt * 16 + tid4 * 2;
-        const unsigned* pau = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qra * p.q_stride_l + c * p.q_stride_d]);
-        const unsigned* pbu = reinterpret_cast<const unsigned*>(
-            &p.q[q_base + qrb * p.q_stride_l + c * p.q_stride_d]);
-        Qa[kt][0] = va ? pau[0] : 0u;
-        Qa[kt][1] = vb ? pbu[0] : 0u;
-        Qa[kt][2] = va ? pau[4] : 0u;
-        Qa[kt][3] = vb ? pbu[4] : 0u;
-    }
+    load_q_mma_frags<KD>(p.q + q_base, p.q_stride_l, p.q_stride_d,
+                          qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[DN8][4];
 #pragma unroll
@@ -122,6 +107,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     constexpr int VEC = 8;  // bf16 per cp.async unit (16 bytes)
     constexpr int TOTAL = BC * HEAD_DIM;
 
+    // ---- Load tile lambda: predicated cp.async ----
     // Issue cp.async loads for tile `ti` into shared buffer `buf`. Predicated
     // loads zero-fill rows past kv_len, so partial tiles need no scalar path.
     auto load_tile = [&](int ti, int buf) {
@@ -141,7 +127,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
         cp_async_commit();
     };
 
-    // Prologue: kick off the first tile's load.
+    // ---- Prologue: issue first tile load ----
     load_tile(0, 0);
 
     for (int ti = 0; ti <= t_end; ti++) {

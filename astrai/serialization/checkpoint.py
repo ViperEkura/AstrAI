@@ -2,7 +2,6 @@
 
 import io
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -178,6 +177,7 @@ class Checkpoint:
             epoch=meta.get("epoch", 0),
             consumed_samples=meta.get("consumed_samples", 0),
             extra=extra,
+            meta=meta,
             config=config,
         )
 

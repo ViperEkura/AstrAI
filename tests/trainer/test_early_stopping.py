@@ -46,7 +46,7 @@ def test_early_stopping_simulation(base_test_env, early_stopping_dataset):
     # Resume from latest checkpoint
     load_dir = os.path.join(base_test_env["test_dir"], "epoch_0_step_1")
     trainer = Trainer(train_config)
-    trainer.train(resume_dir=load_dir)
+    trainer.train(param_path=load_dir, resume=True)
 
     # Verify checkpoint was saved at expected step
     load_dir = os.path.join(base_test_env["test_dir"], "epoch_1_step_5")

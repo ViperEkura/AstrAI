@@ -52,9 +52,11 @@ class Trainer:
             if method:
                 method(context)
 
-    def _trainer_loop(self, resume_dir: Optional[str] = None):
+    def _trainer_loop(self, param_path: Optional[str] = None, resume: bool = False):
         context = (
-            TrainContextBuilder(self.train_config).with_resume_dir(resume_dir).build()
+            TrainContextBuilder(self.train_config)
+            .with_param_path(param_path, resume=resume)
+            .build()
         )
         executor = context.executor
         self._call_callbacks("on_train_begin", context)
@@ -95,7 +97,7 @@ class Trainer:
         finally:
             self._call_callbacks("on_train_end", context)
 
-    def train(self, resume_dir: Optional[str] = None):
+    def train(self, param_path: Optional[str] = None, resume: bool = False):
         cfg = self.train_config
         spawn_parallel_fn(
             self._trainer_loop,
@@ -105,5 +107,6 @@ class Trainer:
             master_port=cfg.master_port,
             device_type=cfg.device_type,
             start_method=cfg.start_method,
-            resume_dir=resume_dir,
+            param_path=param_path,
+            resume=resume,
         )

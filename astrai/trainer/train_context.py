@@ -54,10 +54,12 @@ class TrainContextBuilder:
         config: TrainConfig,
     ):
         self.config = config
-        self._resume_dir: Optional[str] = None
+        self._param_path: Optional[str] = None
+        self._resume: bool = False
 
-    def with_resume_dir(self, resume_dir: Optional[str]) -> Self:
-        self._resume_dir = resume_dir
+    def with_param_path(self, param_path: Optional[str], resume: bool = False) -> Self:
+        self._param_path = param_path
+        self._resume = resume
         return self
 
     def build(self) -> TrainContext:
@@ -74,8 +76,8 @@ class TrainContextBuilder:
         model = model.to(device=device)
 
         model_config = {}
-        if self._resume_dir:
-            config_path = Path(self._resume_dir) / "config.json"
+        if self._param_path:
+            config_path = Path(self._param_path) / "config.json"
             if config_path.exists():
                 model_config = load_json(config_path)
 
@@ -91,23 +93,29 @@ class TrainContextBuilder:
             executor=executor,
         )
 
-        if self._resume_dir:
-            checkpoint = Checkpoint.load_any(self._resume_dir)
+        if self._param_path:
+            checkpoint = Checkpoint.load_any(self._param_path)
             if checkpoint is not None:
                 model.load_state_dict(checkpoint.state_dict, strict=False)
                 if checkpoint.config:
                     context.model_config = checkpoint.config
-                context.epoch = checkpoint.epoch or cfg.start_epoch
-                if checkpoint.consumed_samples > 0:
-                    per_step = (
-                        cfg.batch_per_device * context.world_size * cfg.grad_accum_steps
-                    )
-                    context.consumed_samples = (
-                        checkpoint.consumed_samples // per_step
-                    ) * per_step
-                else:
-                    context.consumed_samples = cfg.start_samples * context.world_size
-                context.checkpoint = checkpoint
+
+                if self._resume:
+                    context.epoch = checkpoint.epoch or cfg.start_epoch
+                    if checkpoint.consumed_samples > 0:
+                        per_step = (
+                            cfg.batch_per_device
+                            * context.world_size
+                            * cfg.grad_accum_steps
+                        )
+                        context.consumed_samples = (
+                            checkpoint.consumed_samples // per_step
+                        ) * per_step
+                    else:
+                        context.consumed_samples = (
+                            cfg.start_samples * context.world_size
+                        )
+                    context.checkpoint = checkpoint
 
         if cfg.lora is not None:
             inject_lora(

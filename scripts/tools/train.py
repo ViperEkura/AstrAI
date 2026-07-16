@@ -116,6 +116,13 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to the model parameters or resume checkpoint.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume training from checkpoint at --param_path "
+        "(restore epoch, consumed_samples, optimizer & scheduler state).",
+    )
 
     parser.add_argument(
         "--n_epoch", type=int, default=1, help="Number of epochs to train."
@@ -385,6 +392,7 @@ def train(
     train_type: str,
     param_path: str,
     data_root_path: str,
+    resume: bool,
     n_epoch: int,
     batch_per_device: int,
     start_epoch: int,
@@ -531,7 +539,7 @@ def train(
     )
 
     trainer = Trainer(train_config)
-    trainer.train(resume_dir=param_path)
+    trainer.train(param_path=param_path, resume=resume)
 
 
 if __name__ == "__main__":

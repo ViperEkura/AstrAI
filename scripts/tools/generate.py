@@ -20,55 +20,62 @@ def processor(
     response_key: str,
     max_tokens: Optional[int],
     batch_size: int,
+    num_samples: int = 1,
 ):
-    # Load model and tokenizer
     model = AutoModel.from_pretrained(param_path)
     tokenizer = AutoTokenizer.from_pretrained(param_path)
     model.to(device="cuda", dtype=torch.bfloat16)
 
-    # Create inference engine
     engine = InferenceEngine(
-        model=model, tokenizer=tokenizer, max_batch_size=batch_size
+        model=model, tokenizer=tokenizer, max_batch_size=batch_size * num_samples
     )
 
     with open(input_json_file, "r", encoding="utf-8") as f:
         input_data = [json.loads(line) for line in f]
 
-    # Check input format: chat messages or raw text
     if input_data and "messages" in input_data[0]:
-        # Chat format: [{"messages": [...]}]
         prompts = [
             tokenizer.apply_chat_template(item["messages"], tokenize=False)
             for item in input_data
         ]
     else:
-        # Raw text format: [{"question": "..."}]
         prompts = [item[question_key] for item in input_data]
 
-    # Use provided max_tokens or default to model config max_len
     if max_tokens is None:
         max_tokens = model.config.max_len
 
-    # Generate responses (batch)
-    responses = engine.generate(
-        prompt=prompts,
-        stream=False,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-    )
+    if num_samples > 1:
+        prompts_expanded = [p for p in prompts for _ in range(num_samples)]
+        responses = engine.generate(
+            prompt=prompts_expanded,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+        responses = [
+            responses[i * num_samples : (i + 1) * num_samples]
+            for i in range(len(prompts))
+        ]
+    else:
+        responses = engine.generate(
+            prompt=prompts,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
 
-    # Write results
     with open(output_json_file, "w", encoding="utf-8") as f:
-        for prompt, response in zip(prompts, responses):
+        for i, prompt in enumerate(prompts):
             if input_data and "messages" in input_data[0]:
-                output_item = {"response": response}
+                output_item = {"response": responses[i]}
             else:
-                output_item = {question_key: prompt, response_key: response}
+                output_item = {question_key: prompt, response_key: responses[i]}
             f.write(json.dumps(output_item, ensure_ascii=False) + "\n")
 
-    # Cleanup
     engine.shutdown()
 
 
@@ -125,6 +132,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Batch size for generating responses (default: 1).",
+    )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=1,
+        help="Number of responses per prompt (expands batch internally, default: 1).",
     )
     parser.add_argument(
         "--max_tokens",

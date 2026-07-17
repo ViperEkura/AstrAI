@@ -119,3 +119,50 @@ class BFDPacking(PackingStrategy):
                 bin_lengths.append(seq_len)
 
         return bins
+
+
+@PackingStrategyFactory.register("bfd_split")
+class BFDSplitPacking(BFDPacking):
+    """BFD packing with over-length sequences split into chunks.
+
+    Sequences longer than *max_packed_len* are split into consecutive
+    chunks of at most *max_packed_len* tokens instead of being
+    truncated.  Each chunk becomes an independent sequence that enters
+    BFD planning.  All keys (``loss_mask``, ``position_ids``, …) are
+    split in lockstep so per-token alignment is preserved.
+
+    Note: because each chunk is treated as a separate document, the
+    second chunk of a split sequence loses the preceding context.
+    """
+
+    def apply(
+        self,
+        keys: Dict[str, List[List[int]]],
+        max_packed_len: int,
+        truncation_mode: str,
+    ) -> Dict[str, List[List[int]]]:
+        sequences = keys.get("sequence", [])
+        if not sequences:
+            return keys
+        if max_packed_len <= 0:
+            return super().apply(keys, max_packed_len, truncation_mode)
+
+        split_keys = self._split_all(keys, max_packed_len)
+        return super().apply(split_keys, max_packed_len, truncation_mode)
+
+    @staticmethod
+    def _split_all(
+        keys: Dict[str, List[List[int]]], max_packed_len: int
+    ) -> Dict[str, List[List[int]]]:
+        """Split every sequence exceeding *max_packed_len* into chunks,
+        applying the same chunk boundaries to all keys."""
+        sequences = keys["sequence"]
+        chunk_bounds = [list(range(0, len(s), max_packed_len)) for s in sequences]
+        result: Dict[str, List[List[int]]] = {}
+        for key, vals in keys.items():
+            split_vals: List[List[int]] = []
+            for val, starts in zip(vals, chunk_bounds):
+                for start in starts:
+                    split_vals.append(val[start : start + max_packed_len])
+            result[key] = split_vals
+        return result

@@ -7,6 +7,7 @@ from astrai.config.preprocess_config import (
     PipelineConfig,
     ProcessingConfig,
 )
+from astrai.preprocessing.packing import PackingStrategyFactory
 from astrai.preprocessing.pipeline import Pipeline, filter_by_length
 from tests.data.conftest import (
     _CHAT_SECTIONS,
@@ -262,3 +263,69 @@ def test_grpo_pipeline(temp_dir, tokenizer_dir):
     assert "masks" in meta
     assert "rewards" in meta
     assert "sequence" not in meta
+
+
+# ---------------------------------------------------------------------------
+# BFD split packing
+# ---------------------------------------------------------------------------
+
+_TRU = "keep_start"
+
+
+def _total_tokens(keys, key="sequence"):
+    return sum(len(s) for s in keys[key])
+
+
+def test_bfd_split_preserves_all_tokens():
+    """No tokens are lost — split chunks are kept, not truncated away."""
+    packer = PackingStrategyFactory.create("bfd_split")
+    max_len = 10
+    keys = {
+        "sequence": [list(range(25)), list(range(3))],
+        "loss_mask": [[1] * 25, [1] * 3],
+    }
+    result = packer.apply(keys, max_len, _TRU)
+
+    assert _total_tokens(result) == 28
+    for seq in result["sequence"]:
+        assert len(seq) <= max_len
+
+
+def test_bfd_split_chunk_alignment():
+    """loss_mask chunks must align with sequence chunks."""
+    packer = PackingStrategyFactory.create("bfd_split")
+    max_len = 10
+    keys = {
+        "sequence": [list(range(25))],
+        "loss_mask": [[0] * 5 + [1] * 20],
+    }
+    result = packer.apply(keys, max_len, _TRU)
+
+    for seq, mask in zip(result["sequence"], result["loss_mask"]):
+        assert len(seq) == len(mask)
+
+
+def test_bfd_split_short_unchanged():
+    """Sequences under max_packed_len should not be split."""
+    packer = PackingStrategyFactory.create("bfd_split")
+    max_len = 10
+    keys = {"sequence": [list(range(5))], "loss_mask": [[1] * 5]}
+    result = packer.apply(keys, max_len, _TRU)
+
+    assert _total_tokens(result) == 5
+    assert len(result["sequence"]) >= 1
+
+
+def test_bfd_split_vs_bfd():
+    """bfd loses tokens from over-length sequences; bfd_split does not."""
+    max_len = 10
+    keys = {
+        "sequence": [list(range(25)), list(range(8))],
+        "loss_mask": [[1] * 25, [1] * 8],
+    }
+
+    bfd = PackingStrategyFactory.create("bfd").apply(keys, max_len, _TRU)
+    split = PackingStrategyFactory.create("bfd_split").apply(keys, max_len, _TRU)
+
+    assert _total_tokens(bfd) < 33
+    assert _total_tokens(split) == 33

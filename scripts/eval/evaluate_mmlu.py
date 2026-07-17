@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import random
 from collections import defaultdict
 
 import torch
@@ -154,19 +155,22 @@ def build_prompt(question: str, choices: dict, subject: str) -> str:
 
 
 def apply_chat(
-    tokenizer, raw_prompt: str, n_shot: int, dev_data: list[dict] | None
+    tokenizer,
+    raw_prompt: str,
+    n_shot: int,
+    dev_data: list[dict] | None,
+    subject: str = "",
 ) -> str:
     """Wrap raw MMLU prompt in the model's chat template format.
 
-    For few-shot, prepend example Q&A pairs as a second user/assistant exchange.
+    For few-shot, prepend example Q&A pairs as user/assistant exchanges.
+    Few-shot examples use the same subject preamble as the test question to
+    keep the format consistent.
     """
     messages = []
     if n_shot > 0 and dev_data:
         for item in dev_data[:n_shot]:
-            q = f"Question: {item['question']}\n"
-            for k in ("A", "B", "C", "D"):
-                q += f"{k}. {item[k]}\n"
-            q += "Answer:"
+            q = build_prompt(item["question"], item, subject)
             messages.append({"role": "user", "content": q})
             messages.append({"role": "assistant", "content": item["answer"]})
     messages.append({"role": "user", "content": raw_prompt})
@@ -202,6 +206,25 @@ def choice_logprob(
     return score
 
 
+def _permute_choices(item: dict, rng: random.Random) -> tuple[dict, str]:
+    """Shuffle the option order of a question.
+
+    Returns ``(permuted_item, new_answer_letter)``. The question text and
+    the *content* of each choice are unchanged; only which letter (A/B/C/D)
+    maps to which content is shuffled. This neutralises the model's
+    positional bias (e.g. always picking B).
+    """
+    letters = ("A", "B", "C", "D")
+    contents = [item[k] for k in letters]
+    perm = list(letters)
+    rng.shuffle(perm)
+    permuted = {"question": item["question"]}
+    for new_letter, orig_letter in zip(letters, perm):
+        permuted[new_letter] = item[orig_letter]
+    new_answer = letters[perm.index(item["answer"])]
+    return permuted, new_answer
+
+
 def evaluate_subject(
     model,
     tokenizer,
@@ -210,18 +233,24 @@ def evaluate_subject(
     dev_data: list[dict] | None,
     device: str,
     n_shot: int,
+    seed: int = 0,
 ) -> tuple[float, int, int]:
+    rng = random.Random(seed) if seed >= 0 else None
     correct = 0
     total = 0
     for item in tqdm.tqdm(test_data, desc=f"{subject:40s}", leave=False):
-        raw_prompt = build_prompt(item["question"], item, subject)
-        context = apply_chat(tokenizer, raw_prompt, n_shot, dev_data or [])
+        if rng is not None:
+            permuted, answer = _permute_choices(item, rng)
+        else:
+            permuted, answer = item, item["answer"]
+        raw_prompt = build_prompt(permuted["question"], permuted, subject)
+        context = apply_chat(tokenizer, raw_prompt, n_shot, dev_data or [], subject)
         context_ids = tokenizer.encode(context)
         scores = {
             c: choice_logprob(model, tokenizer, context_ids, c, device)
             for c in ("A", "B", "C", "D")
         }
-        if max(scores, key=scores.get) == item["answer"]:
+        if max(scores, key=scores.get) == answer:
             correct += 1
         total += 1
     return correct / total, correct, total
@@ -256,6 +285,12 @@ def main():
         default="bfloat16" if torch.cuda.is_available() else "float32",
         help="Torch dtype",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Seed for option permutation (0 to enable, -1 to disable)",
+    )
     args = parser.parse_args()
 
     if args.download or not os.path.exists(args.data_dir):
@@ -287,7 +322,14 @@ def main():
         test_data = load_csv(test_path)
 
         acc, corr, tot = evaluate_subject(
-            model, tokenizer, subject, test_data, dev_data, device, args.n_shot
+            model,
+            tokenizer,
+            subject,
+            test_data,
+            dev_data,
+            device,
+            args.n_shot,
+            seed=args.seed,
         )
         results[subject] = {"accuracy": round(acc, 4), "correct": corr, "total": tot}
         total_correct += corr

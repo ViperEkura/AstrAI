@@ -43,6 +43,19 @@ def parse_args():
         help="Maximum tokens to generate",
     )
     parser.add_argument(
+        "--frequency_penalty",
+        type=float,
+        default=0.5,
+        help="Penalty per occurrence for repeated tokens (0.0 disables, "
+        "range -2.0~2.0, typical 0.3-1.0)",
+    )
+    parser.add_argument(
+        "--rep_window",
+        type=int,
+        default=64,
+        help="Number of recent prompt tokens to include in penalty history",
+    )
+    parser.add_argument(
         "--system_prompt",
         type=str,
         default="You are a helpful assistant.",
@@ -79,6 +92,8 @@ def chat():
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            frequency_penalty=args.frequency_penalty,
+            rep_window=args.rep_window,
         ):
             print(token, end="", flush=True)
             full_response += token

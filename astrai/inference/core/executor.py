@@ -75,6 +75,33 @@ class Executor:
         temperatures = torch.tensor([t.temperature for t in tasks], device=self.device)
         top_ks = torch.tensor([t.top_k for t in tasks], device=self.device)
         top_ps = torch.tensor([t.top_p for t in tasks], device=self.device)
+        freq_penalties = torch.tensor(
+            [t.frequency_penalty for t in tasks], device=self.device
+        )
+
+        history_lists = []
+        mask_lists = []
+        for t in tasks:
+            window = t.rep_window
+            prompt_part = t.prompt_ids[-window:]
+            ids = prompt_part + t.output_ids
+            history_lists.append(ids)
+            mask_lists.append([True] * len(ids))
+
+        max_len = max(len(h) for h in history_lists)
+        padded_ids = torch.zeros(
+            len(tasks), max_len, dtype=torch.long, device=self.device
+        )
+        padded_mask = torch.zeros(
+            len(tasks), max_len, dtype=torch.bool, device=self.device
+        )
+        for i, (h, m) in enumerate(zip(history_lists, mask_lists)):
+            padded_ids[i, : len(h)] = torch.tensor(
+                h, dtype=torch.long, device=self.device
+            )
+            padded_mask[i, : len(m)] = torch.tensor(
+                m, dtype=torch.bool, device=self.device
+            )
 
         with torch.inference_mode():
             outputs = self.model(
@@ -89,4 +116,7 @@ class Executor:
             temperature=temperatures,
             top_k=top_ks,
             top_p=top_ps,
+            frequency_penalty=freq_penalties,
+            input_ids=padded_ids,
+            input_mask=padded_mask,
         ).tolist()

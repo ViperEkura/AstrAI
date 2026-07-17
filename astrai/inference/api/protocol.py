@@ -125,6 +125,7 @@ class ProtocolHandler:
             temperature=self.request.temperature,
             top_p=self.request.top_p,
             top_k=self.request.top_k,
+            frequency_penalty=getattr(self.request, "frequency_penalty", 0.0),
         )
 
         if self.request.stream:

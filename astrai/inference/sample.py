@@ -1,15 +1,15 @@
 """Composable sampling strategies for logit transformation.
 
 Implements the Strategy pattern: each sampling technique
-(temperature, top-k, top-p) is a pluggable strategy that
-can be composed into a pipeline.
+(temperature, top-k, top-p, frequency penalty) is a pluggable
+strategy that can be composed into a pipeline.
 
 All strategies accept both scalar and per-sample tensor
 parameters, so a single pipeline works for any batch size.
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -19,12 +19,23 @@ class BaseSamplingStrategy(ABC):
     """Abstract base for a logit transformation strategy."""
 
     @abstractmethod
-    def apply(self, logits: Tensor, filter_value: float = -float("inf")) -> Tensor:
+    def apply(
+        self,
+        logits: Tensor,
+        filter_value: float = -float("inf"),
+        input_ids: Optional[Tensor] = None,
+        input_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """Applies the strategy to logits.
 
         Args:
             logits: Raw logits tensor (batch, vocab_size).
             filter_value: Value assigned to filtered-out positions.
+            input_ids: Previously generated token IDs ``[batch, seq_len]``,
+                padded with 0. Used by frequency penalty.
+            input_mask: Boolean mask ``[batch, seq_len]``, True for real
+                tokens, False for padding. Used to exclude padding from
+                penalty computation.
 
         Returns:
             Transformed logits tensor.
@@ -42,7 +53,13 @@ class TemperatureStrategy(BaseSamplingStrategy):
     def __init__(self, temperature: Union[float, Tensor] = 1.0):
         self.temperature = temperature
 
-    def apply(self, logits: Tensor, filter_value: float = -float("inf")) -> Tensor:
+    def apply(
+        self,
+        logits: Tensor,
+        filter_value: float = -float("inf"),
+        input_ids: Optional[Tensor] = None,
+        input_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         t = self.temperature
         if isinstance(t, Tensor):
             t = t.to(logits.device, non_blocking=True).view(-1, 1)
@@ -64,7 +81,13 @@ class TopKStrategy(BaseSamplingStrategy):
     def __init__(self, top_k: Union[int, Tensor] = 0):
         self.top_k = top_k
 
-    def apply(self, logits: Tensor, filter_value: float = -float("inf")) -> Tensor:
+    def apply(
+        self,
+        logits: Tensor,
+        filter_value: float = -float("inf"),
+        input_ids: Optional[Tensor] = None,
+        input_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         tk = self.top_k
         if isinstance(tk, Tensor):
             tk = tk.to(logits.device, non_blocking=True).long().clamp(min=0)
@@ -114,7 +137,13 @@ class TopPStrategy(BaseSamplingStrategy):
         logits[mask] = filter_value
         return logits
 
-    def apply(self, logits: Tensor, filter_value: float = -float("inf")) -> Tensor:
+    def apply(
+        self,
+        logits: Tensor,
+        filter_value: float = -float("inf"),
+        input_ids: Optional[Tensor] = None,
+        input_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         tp = self.top_p
         if isinstance(tp, Tensor):
             tp = tp.to(logits.device, non_blocking=True)
@@ -123,6 +152,84 @@ class TopPStrategy(BaseSamplingStrategy):
         elif tp < 1.0:
             logits = self._apply(logits, tp, filter_value)
         return logits
+
+
+class FrequencyPenaltyStrategy(BaseSamplingStrategy):
+    """Penalizes tokens based on how many times they appeared in history.
+
+    Subtracts ``penalty * count(token)`` from each token's logit, where
+    ``count(token)`` is the number of occurrences in the generation history
+    (prompt + output). A penalty of ``0.0`` disables the strategy.
+
+    Unlike repetition penalty (which only checks *presence*), frequency
+    penalty scales linearly with occurrence count: the first use is
+    penalized once, the third use three times. This allows natural
+    repetition of common words while suppressing degenerate loops.
+
+    Reference: OpenAI API ``frequency_penalty`` parameter.
+
+    Args:
+        penalty: Scalar or ``[batch]`` tensor (0.0 disables, range -2.0~2.0).
+    """
+
+    def __init__(self, penalty: Union[float, Tensor] = 0.0):
+        self.penalty = penalty
+
+    def apply(
+        self,
+        logits: Tensor,
+        filter_value: float = -float("inf"),
+        input_ids: Optional[Tensor] = None,
+        input_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        if input_ids is None:
+            return logits
+
+        p = self.penalty
+        if isinstance(p, Tensor):
+            p = p.to(logits.device, non_blocking=True).view(-1, 1)
+            if (p == 0.0).all():
+                return logits
+        elif p == 0.0:
+            return logits
+
+        input_ids = input_ids.to(logits.device, non_blocking=True)
+
+        if input_mask is not None:
+            input_mask = input_mask.to(logits.device, non_blocking=True)
+            masked_ids = input_ids.clone()
+            masked_ids[~input_mask] = -1
+        else:
+            masked_ids = input_ids
+
+        batch_sz, seq_len = masked_ids.shape
+        vocab_size = logits.size(-1)
+
+        if isinstance(p, Tensor):
+            penalty_per_row = p.expand(batch_sz, 1)
+        else:
+            penalty_per_row = torch.full(
+                (batch_sz, 1), float(p), device=logits.device, dtype=logits.dtype
+            )
+
+        counts = torch.zeros(
+            batch_sz, vocab_size, device=logits.device, dtype=logits.dtype
+        )
+        valid_mask = masked_ids >= 0
+        if valid_mask.any():
+            valid_ids = masked_ids[valid_mask]
+            row_indices = (
+                torch.arange(batch_sz, device=logits.device)
+                .unsqueeze(1)
+                .expand_as(masked_ids)[valid_mask]
+            )
+            counts.index_put_(
+                (row_indices, valid_ids),
+                torch.ones_like(valid_ids, dtype=logits.dtype),
+                accumulate=True,
+            )
+
+        return logits - penalty_per_row * counts
 
 
 class SamplingPipeline(BaseSamplingStrategy):
@@ -145,23 +252,39 @@ class SamplingPipeline(BaseSamplingStrategy):
     def __init__(self, strategies: List[BaseSamplingStrategy]):
         self.strategies = strategies
 
-    def apply(self, logits: Tensor, filter_value: float = -float("inf")) -> Tensor:
+    def apply(
+        self,
+        logits: Tensor,
+        filter_value: float = -float("inf"),
+        input_ids: Optional[Tensor] = None,
+        input_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         for strategy in self.strategies:
-            logits = strategy.apply(logits, filter_value)
+            logits = strategy.apply(logits, filter_value, input_ids, input_mask)
         return logits
 
-    @torch.no_grad()
-    def sample(self, logits: Tensor, filter_value: float = -float("inf")) -> Tensor:
+    @torch.inference_mode()
+    def sample(
+        self,
+        logits: Tensor,
+        filter_value: float = -float("inf"),
+        input_ids: Optional[Tensor] = None,
+        input_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """Apply strategies then sample (softmax + multinomial).
 
         Args:
             logits: Raw logits ``[batch, vocab_size]``.
+            input_ids: Previously generated token IDs ``[batch, seq_len]``.
+            input_mask: Boolean mask for ``input_ids`` padding.
 
         Returns:
             Sampled token IDs ``[batch]``.
         """
         return torch.multinomial(
-            torch.softmax(self.apply(logits, filter_value), dim=-1),
+            torch.softmax(
+                self.apply(logits, filter_value, input_ids, input_mask), dim=-1
+            ),
             num_samples=1,
         ).squeeze(-1)
 
@@ -172,6 +295,9 @@ def sample(
     temperature: Union[float, Tensor] = 1.0,
     top_k: Union[int, Tensor] = 0,
     top_p: Union[float, Tensor] = 1.0,
+    frequency_penalty: Union[float, Tensor] = 0.0,
+    input_ids: Optional[Tensor] = None,
+    input_mask: Optional[Tensor] = None,
     filter_value: float = -float("inf"),
 ) -> Tensor:
     """Apply sampling strategies then sample (softmax + multinomial).
@@ -180,6 +306,10 @@ def sample(
 
     Args:
         logits: Raw logits ``[batch, vocab_size]``.
+        frequency_penalty: Penalty per occurrence for repeated tokens
+            (0.0 disables, range -2.0~2.0).
+        input_ids: Previously generated token IDs ``[batch, seq_len]``.
+        input_mask: Boolean mask for ``input_ids`` padding.
 
     Returns:
         Sampled token IDs ``[batch]``.
@@ -189,5 +319,6 @@ def sample(
             TemperatureStrategy(temperature),
             TopKStrategy(top_k),
             TopPStrategy(top_p),
+            FrequencyPenaltyStrategy(frequency_penalty),
         ]
-    ).sample(logits, filter_value)
+    ).sample(logits, filter_value, input_ids, input_mask)

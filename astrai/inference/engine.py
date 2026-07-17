@@ -74,6 +74,8 @@ class GenerationRequest:
         top_p: float = 1.0,
         temperature: float = 1.0,
         max_tokens: Optional[int] = None,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
         stream: bool = False,
     ):
         if not (isinstance(top_k, int) and top_k >= 0):
@@ -82,12 +84,21 @@ class GenerationRequest:
             raise ValueError("top_p must be a float between 0.0 and 1.0")
         if not (isinstance(temperature, (int, float)) and temperature > 0):
             raise ValueError("temperature must be a positive number")
+        if not (
+            isinstance(frequency_penalty, (int, float))
+            and -2.0 <= frequency_penalty <= 2.0
+        ):
+            raise ValueError("frequency_penalty must be between -2.0 and 2.0")
+        if not (isinstance(rep_window, int) and rep_window > 0):
+            raise ValueError("rep_window must be a positive integer")
 
         self.messages = messages
         self.top_k = top_k
         self.top_p = top_p
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.frequency_penalty = frequency_penalty
+        self.rep_window = rep_window
         self.stream = stream
 
 
@@ -132,17 +143,33 @@ class InferenceEngine:
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = 50,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
     ) -> Union[Generator, str, List[str]]:
         is_batch = isinstance(prompt, list)
         prompts = prompt if is_batch else [prompt]
 
         if stream:
             return self._generate_streaming(
-                prompts, is_batch, max_tokens, temperature, top_p, top_k
+                prompts,
+                is_batch,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                frequency_penalty,
+                rep_window,
             )
         else:
             return self._generate_non_streaming(
-                prompts, is_batch, max_tokens, temperature, top_p, top_k
+                prompts,
+                is_batch,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                frequency_penalty,
+                rep_window,
             )
 
     def generate_async(
@@ -152,9 +179,18 @@ class InferenceEngine:
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = 50,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
     ) -> AsyncGenerator[str, None]:
         sync_gen = self._generate_streaming(
-            [prompt], False, max_tokens, temperature, top_p, top_k
+            [prompt],
+            False,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            rep_window,
         )
 
         async def _agen():
@@ -185,6 +221,8 @@ class InferenceEngine:
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
+            frequency_penalty=request.frequency_penalty,
+            rep_window=request.rep_window,
         )
 
     def _submit_tasks(
@@ -194,6 +232,8 @@ class InferenceEngine:
         temperature: float,
         top_p: float,
         top_k: int,
+        frequency_penalty: float,
+        rep_window: int,
     ) -> Tuple[GenerateResult, List[str]]:
         n = len(prompts)
         result = GenerateResult(count=n)
@@ -206,6 +246,8 @@ class InferenceEngine:
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                rep_window=rep_window,
                 stream_callback=cb,
             )
             task_ids.append(task_id)
@@ -226,9 +268,17 @@ class InferenceEngine:
         temperature: float,
         top_p: float,
         top_k: int,
+        frequency_penalty: float,
+        rep_window: int,
     ) -> Generator:
         result, task_ids = self._submit_tasks(
-            prompts, max_tokens, temperature, top_p, top_k
+            prompts,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            rep_window,
         )
         n = len(prompts)
         remaining = n
@@ -262,9 +312,17 @@ class InferenceEngine:
         temperature: float,
         top_p: float,
         top_k: int,
+        frequency_penalty: float,
+        rep_window: int,
     ) -> Union[str, List[str]]:
         result, task_ids = self._submit_tasks(
-            prompts, max_tokens, temperature, top_p, top_k
+            prompts,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            rep_window,
         )
 
         try:

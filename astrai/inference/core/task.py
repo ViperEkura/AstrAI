@@ -33,6 +33,8 @@ class Task:
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = 50,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
     ):
         self.task_id = task_id
         self.prompt_ids = prompt_ids
@@ -40,6 +42,8 @@ class Task:
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.frequency_penalty = frequency_penalty
+        self.rep_window = rep_window
 
         self.status = TaskStatus.PENDING
         self.output_ids: List[int] = []
@@ -92,6 +96,8 @@ class TaskManager:
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = 50,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
         task_id = f"task_{int(time.time())}_{uuid.uuid4().hex[:8]}"
@@ -116,6 +122,8 @@ class TaskManager:
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            rep_window=rep_window,
         )
 
         with self._lock:

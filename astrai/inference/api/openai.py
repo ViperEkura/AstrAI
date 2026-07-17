@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 _UNSUPPORTED_PARAMS = (
     "n",
     "presence_penalty",
-    "frequency_penalty",
     "logit_bias",
     "user",
 )

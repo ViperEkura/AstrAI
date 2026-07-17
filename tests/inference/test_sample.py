@@ -3,6 +3,7 @@
 import torch
 
 from astrai.inference.sample import (
+    FrequencyPenaltyStrategy,
     SamplingPipeline,
     TemperatureStrategy,
     TopKStrategy,
@@ -125,3 +126,108 @@ def test_module_sample_batch():
     assert tokens.shape == (2,)
     for t in tokens:
         assert 0 <= t < logits.size(-1)
+
+
+def test_frequency_penalty_noop_when_zero():
+    logits = torch.tensor([[1.0, 2.0, 3.0]])
+    input_ids = torch.tensor([[0, 2]])
+    s = FrequencyPenaltyStrategy(penalty=0.0)
+    result = s.apply(logits.clone(), input_ids=input_ids)
+    assert torch.equal(result, logits)
+
+
+def test_frequency_penalty_noop_when_no_input_ids():
+    logits = torch.tensor([[1.0, 2.0, 3.0]])
+    s = FrequencyPenaltyStrategy(penalty=0.5)
+    result = s.apply(logits.clone())
+    assert torch.equal(result, logits)
+
+
+def test_frequency_penalty_single_occurrence():
+    logits = torch.tensor([[4.0, 1.0, 2.0]])
+    input_ids = torch.tensor([[0, 2]])
+    input_mask = torch.tensor([[True, True]])
+    s = FrequencyPenaltyStrategy(penalty=0.5)
+    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
+    assert result[0, 0] == 3.5
+    assert result[0, 1] == 1.0
+    assert result[0, 2] == 1.5
+
+
+def test_frequency_penalty_multiple_occurrences():
+    logits = torch.tensor([[4.0, 1.0, 2.0]])
+    input_ids = torch.tensor([[0, 2, 0]])
+    input_mask = torch.tensor([[True, True, True]])
+    s = FrequencyPenaltyStrategy(penalty=0.5)
+    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
+    assert result[0, 0] == 3.0
+    assert result[0, 1] == 1.0
+    assert result[0, 2] == 1.5
+
+
+def test_frequency_penalty_respects_padding_mask():
+    logits = torch.tensor([[4.0, 1.0, 2.0]])
+    input_ids = torch.tensor([[0, 2, 0]])
+    input_mask = torch.tensor([[True, True, False]])
+    s = FrequencyPenaltyStrategy(penalty=0.5)
+    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
+    assert result[0, 0] == 3.5
+    assert result[0, 1] == 1.0
+    assert result[0, 2] == 1.5
+
+
+def test_frequency_penalty_batch_tensor():
+    logits = torch.tensor(
+        [
+            [4.0, 1.0, 2.0],
+            [3.0, 5.0, 1.0],
+        ]
+    )
+    input_ids = torch.tensor([[0, 2, 0], [1, 1, 0]])
+    input_mask = torch.tensor([[True, True, True], [True, True, False]])
+    s = FrequencyPenaltyStrategy(penalty=torch.tensor([0.5, 1.0]))
+    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
+    assert result[0, 0] == 3.0
+    assert result[0, 2] == 1.5
+    assert result[1, 1] == 3.0
+
+
+def test_frequency_penalty_negative_penalty_boosts_repeats():
+    logits = torch.tensor([[4.0, 1.0, 2.0]])
+    input_ids = torch.tensor([[0, 0]])
+    input_mask = torch.tensor([[True, True]])
+    s = FrequencyPenaltyStrategy(penalty=-0.5)
+    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
+    assert result[0, 0] == 5.0
+
+
+def test_frequency_penalty_in_pipeline():
+    logits = torch.tensor([[5.0, 1.0, 2.0, 3.0]])
+    input_ids = torch.tensor([[0, 2, 0]])
+    input_mask = torch.tensor([[True, True, True]])
+    pipeline = SamplingPipeline(
+        [
+            TemperatureStrategy(1.0),
+            FrequencyPenaltyStrategy(0.5),
+        ]
+    )
+    result = pipeline.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
+    assert result[0, 0] == 4.0
+    assert result[0, 2] == 1.5
+
+
+def test_sample_with_frequency_penalty():
+    logits = torch.tensor([[5.0, 1.0, 2.0, 3.0]])
+    input_ids = torch.tensor([[0, 2, 0]])
+    input_mask = torch.tensor([[True, True, True]])
+    tokens = sample(
+        logits,
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0,
+        frequency_penalty=0.5,
+        input_ids=input_ids,
+        input_mask=input_mask,
+    )
+    assert tokens.shape == (1,)
+    assert 0 <= tokens[0] < logits.size(-1)

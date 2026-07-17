@@ -6,7 +6,7 @@ Layers:
   - protocols/:   Response builders (OpenAI, Anthropic)
   - transport/:   SSE transport utilities
   - engine.py:    Facade (InferenceEngine), Value Object (GenerationRequest)
-  - sample.py:    Strategy pattern (TemperatureStrategy, TopKStrategy, TopPStrategy)
+  - sample.py:    Strategy pattern (TemperatureStrategy, TopKStrategy, TopPStrategy, FrequencyPenaltyStrategy)
 """
 
 from astrai.inference.api import (
@@ -50,6 +50,7 @@ from astrai.inference.core import (
 from astrai.inference.engine import GenerationRequest, InferenceEngine
 from astrai.inference.sample import (
     BaseSamplingStrategy,
+    FrequencyPenaltyStrategy,
     SamplingPipeline,
     TemperatureStrategy,
     TopKStrategy,
@@ -83,6 +84,7 @@ __all__ = [
     "TemperatureStrategy",
     "TopKStrategy",
     "TopPStrategy",
+    "FrequencyPenaltyStrategy",
     "SamplingPipeline",
     "ProtocolHandler",
     "StopChecker",

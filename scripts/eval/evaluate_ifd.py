@@ -16,7 +16,9 @@ v2 changelog:
 """
 
 import argparse
+import glob
 import json
+import os
 import statistics
 
 import torch
@@ -63,6 +65,29 @@ def _resolve_sentinel_ids(tokenizer, sentinel_text):
         if tid is not None:
             return [tid]
     return [0]
+
+
+def _collect_input_files(input_path: str) -> list:
+    """Resolve *input_path* to a list of JSONL/JSON files."""
+    if os.path.isdir(input_path):
+        files = []
+        for ext in ("*.jsonl", "*.json"):
+            files.extend(
+                sorted(glob.glob(os.path.join(input_path, "**", ext), recursive=True))
+            )
+        return files
+    return sorted(glob.glob(input_path))
+
+
+def _load_items(filepath: str) -> list:
+    """Load JSONL or JSON (array / single dict) into a list of dicts."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        if filepath.lower().endswith(".json"):
+            data = json.load(f)
+            if isinstance(data, dict):
+                return [data]
+            return data
+        return [json.loads(line) for line in f if line.strip()]
 
 
 @torch.inference_mode()
@@ -204,69 +229,9 @@ def _trim(context_ids, resp_ids, max_len):
     return context_ids[overflow:], resp_ids
 
 
-def score_plain(
+def process_file(
     model,
     tokenizer,
-    instruction,
-    response,
-    device,
-    max_len=2048,
-    sentinel_ids=None,
-    per_token=False,
-):
-    """Compute IFD for a single instruction-response pair (plain format)."""
-    ctx_ids = tokenizer.encode(instruction, add_special_tokens=False)
-    resp_ids = tokenizer.encode(response, add_special_tokens=False)
-    ctx_ids, resp_ids = _trim(ctx_ids, resp_ids, max_len)
-    if not ctx_ids or not resp_ids:
-        return {
-            "L_cond": None,
-            "L_uncond": None,
-            "ifd": None,
-            "skip_reason": "empty ctx or resp",
-        }
-    return _score_batch(
-        [(ctx_ids, resp_ids)],
-        model,
-        device,
-        max_len,
-        sentinel_ids=sentinel_ids,
-        per_token=per_token,
-    )[0]
-
-
-def score_messages(
-    model, tokenizer, messages, device, max_len=2048, sentinel_ids=None, per_token=False
-):
-    """Compute IFD for each assistant turn in a messages array."""
-    turns = []
-    for i, msg in enumerate(messages):
-        if msg.get("role") != "assistant":
-            continue
-        ctx_text = "\n\n".join(m["content"] for m in messages[:i])
-        ctx_ids = tokenizer.encode(ctx_text)
-        resp_ids = tokenizer.encode(msg["content"], add_special_tokens=False)
-        ctx_ids, resp_ids = _trim(ctx_ids, resp_ids, max_len)
-        if ctx_ids and resp_ids:
-            turns.append((ctx_ids, resp_ids))
-    if not turns:
-        return None
-    raw_scores = _score_batch(
-        turns, model, device, max_len, sentinel_ids=sentinel_ids, per_token=per_token
-    )
-    valid = [s for s in raw_scores if s is not None and s.get("ifd") is not None]
-    if not valid:
-        return {"ifd": None, "ifd_turns": raw_scores}
-    avg = sum(s["ifd"] for s in valid) / len(valid)
-    return {
-        "ifd": avg,
-        "ifd_detail": valid[0] if len(valid) == 1 else None,
-        "ifd_turns": raw_scores,
-    }
-
-
-def process_file(
-    param_path,
     input_file,
     output_file,
     instr_key,
@@ -275,28 +240,31 @@ def process_file(
     data_format="plain",
     batch_size=1,
     device=None,
-    sentinel_text="\n",
+    sentinel_ids=None,
     per_token=False,
+    max_samples=None,
 ):
+    """Score a single file, write per-sample JSONL, return summary stats."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
-    model = AutoModel.from_pretrained(param_path)
-    tokenizer = AutoTokenizer.from_pretrained(param_path)
-    model.to(device=device, dtype=dtype)
-    model.eval()
+    if sentinel_ids is None:
+        sentinel_ids = _resolve_sentinel_ids(tokenizer, "\n")
 
-    sentinel_ids = _resolve_sentinel_ids(tokenizer, sentinel_text)
+    data = _load_items(input_file)
 
-    with open(input_file, encoding="utf-8") as f:
-        data = [json.loads(line) for line in f if line.strip()]
+    if max_samples and len(data) > max_samples:
+        import random
+
+        data = random.sample(data, max_samples)
 
     results = []
     all_ifds = []
     buffer = []
 
-    for item in tqdm.tqdm(data, desc="Computing IFD", unit="sample"):
+    label = os.path.splitext(os.path.basename(input_file))[0]
+
+    for item in tqdm.tqdm(data, desc=f"  {label}", unit="sample", leave=False):
         if data_format == "messages":
             turns = []
             for i, msg in enumerate(item.get("messages", [])):
@@ -356,8 +324,22 @@ def process_file(
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     valid_ifd = [v for v in all_ifds if v is not None]
+    stats = {
+        "samples": len(data),
+        "valid_ifd": len(valid_ifd),
+        "skipped": len(data) - len(valid_ifd),
+    }
     if valid_ifd:
+        stats["mean_ifd"] = statistics.mean(valid_ifd)
+        stats["median_ifd"] = statistics.median(valid_ifd)
+        if len(valid_ifd) > 1:
+            stats["stdev_ifd"] = statistics.stdev(valid_ifd)
+        stats["min_ifd"] = min(valid_ifd)
+        stats["max_ifd"] = max(valid_ifd)
+
         print(f"\n{'=' * 50}")
+        print(f"  [{label}]")
+        print(f"{'=' * 50}")
         print(f"  Samples:       {len(data)}")
         print(f"  Valid IFD:     {len(valid_ifd)}")
         print(f"  Skipped:       {len(data) - len(valid_ifd)}")
@@ -368,7 +350,8 @@ def process_file(
         print(f"  Min IFD:       {min(valid_ifd):.4f}")
         print(f"  Max IFD:       {max(valid_ifd):.4f}")
         print(f"{'=' * 50}")
-    print(f"Results saved to {output_file}")
+    print(f"  Results saved to {output_file}")
+    return stats
 
 
 def _flush_buffer(
@@ -422,8 +405,18 @@ def main():
         description="Compute IFD scores for instruction-response data"
     )
     parser.add_argument("--param_path", type=str, required=True, help="Model directory")
-    parser.add_argument("--input", type=str, required=True, help="Input JSONL file")
-    parser.add_argument("--output", type=str, required=True, help="Output JSONL file")
+    parser.add_argument(
+        "--input_path",
+        type=str,
+        required=True,
+        help="Input file, glob pattern, or directory.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory for output files (summary.json + per-file JSONL).",
+    )
     parser.add_argument("--max_len", type=int, default=2048, help="Max token length")
     parser.add_argument(
         "--format",
@@ -443,6 +436,12 @@ def main():
     )
     parser.add_argument("--device", type=str, default=None, help="Device (e.g. cuda:0)")
     parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16" if torch.cuda.is_available() else "float32",
+        help="Torch dtype",
+    )
+    parser.add_argument(
         "--sentinel_text",
         type=str,
         default="\n",
@@ -453,21 +452,60 @@ def main():
         action="store_true",
         help="Include per-token IFD breakdown in output",
     )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples per file (random subsample). Default: all.",
+    )
     args = parser.parse_args()
 
-    process_file(
-        args.param_path,
-        args.input,
-        args.output,
-        args.instr_key,
-        args.resp_key,
-        args.max_len,
-        data_format=args.format,
-        batch_size=args.batch_size,
-        device=args.device,
-        sentinel_text=args.sentinel_text,
-        per_token=args.per_token,
-    )
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = getattr(torch, args.dtype)
+
+    print(f"Loading model from {args.param_path} ...")
+    model = AutoModel.from_pretrained(args.param_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.param_path)
+    model.to(device=args.device, dtype=dtype)
+    model.eval()
+
+    sentinel_ids = _resolve_sentinel_ids(tokenizer, args.sentinel_text)
+
+    input_files = _collect_input_files(args.input_path)
+    if not input_files:
+        print(f"No input files found at {args.input_path}")
+        return
+
+    print(f"Found {len(input_files)} file(s) to evaluate")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    all_stats = {}
+    for filepath in input_files:
+        label = os.path.splitext(os.path.basename(filepath))[0]
+        output_file = os.path.join(args.output_dir, f"{label}_ifd.jsonl")
+
+        stats = process_file(
+            model=model,
+            tokenizer=tokenizer,
+            input_file=filepath,
+            output_file=output_file,
+            instr_key=args.instr_key,
+            resp_key=args.resp_key,
+            max_len=args.max_len,
+            data_format=args.format,
+            batch_size=args.batch_size,
+            device=args.device,
+            sentinel_ids=sentinel_ids,
+            per_token=args.per_token,
+            max_samples=args.max_samples,
+        )
+        all_stats[label] = stats
+
+    summary_path = os.path.join(args.output_dir, "summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(all_stats, f, ensure_ascii=False, indent=2)
+    print(f"\nSummary saved to {summary_path}")
 
 
 if __name__ == "__main__":

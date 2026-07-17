@@ -139,17 +139,12 @@ def load_csv(path: str) -> list[dict]:
     return data
 
 
-def build_prompt(
-    question: str, choices: dict, subject: str, n_shot: int, dev_data: list[dict]
-) -> str:
-    prompt = ""
-    if n_shot > 0 and dev_data:
-        prompt = f"The following are multiple choice questions (with answers) about {subject}.\n\n"
-        for item in dev_data[:n_shot]:
-            prompt += f"Question: {item['question']}\n"
-            for k in ("A", "B", "C", "D"):
-                prompt += f"{k}. {item[k]}\n"
-            prompt += f"Answer: {item['answer']}\n\n"
+def build_prompt(question: str, choices: dict, subject: str) -> str:
+    """Build the raw question prompt (without few-shot examples).
+
+    Few-shot examples are handled by ``apply_chat`` to avoid duplication.
+    """
+    prompt = f"The following are multiple choice questions (with answers) about {subject}.\n\n"
     prompt += f"Question: {question}\n"
     for k in ("A", "B", "C", "D"):
         prompt += f"{k}. {choices[k]}\n"
@@ -218,9 +213,7 @@ def evaluate_subject(
     correct = 0
     total = 0
     for item in tqdm.tqdm(test_data, desc=f"{subject:40s}", leave=False):
-        raw_prompt = build_prompt(
-            item["question"], item, subject, n_shot, dev_data or []
-        )
+        raw_prompt = build_prompt(item["question"], item, subject)
         context = apply_chat(tokenizer, raw_prompt, n_shot, dev_data or [])
         context_ids = tokenizer.encode(context)
         scores = {

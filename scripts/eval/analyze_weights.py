@@ -117,7 +117,7 @@ def print_component_summary(results: dict[str, dict], title: str):
         r["er_99_norm"]
         for vs in matrix_groups.values()
         for r in vs
-        if "_norm" not in r or not r.get("is_1d")
+        if not r.get("is_1d")
     ]
     if all_er:
         m = sum(all_er) / len(all_er)
@@ -232,7 +232,15 @@ def main():
         action="store_true",
         help="Skip SVD analysis, only show weight statistics (mean/std/min/max).",
     )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Save results as JSON to this path.",
+    )
     args = parser.parse_args()
+
+    all_results = {}
 
     def analyze_one(ckpt_dir: str, label: str):
         ckpt_dir = Path(ckpt_dir)
@@ -294,13 +302,19 @@ def main():
             )
             print_layer_grid(results)
         print_weight_stats(results)
+        all_results[label] = results
         return results
 
     analyze_one(args.ckpt_dir, "Primary")
 
     if args.compare:
         for cdir in args.compare:
-            analyze_one(cdir, "Compare")
+            analyze_one(cdir, f"Compare_{cdir}")
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\nResults saved to {args.output}")
 
 
 if __name__ == "__main__":

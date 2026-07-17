@@ -5,7 +5,7 @@ Supports all IFEval constraint types except language detection.
 
 Usage::
 
-    python scripts/tools/evaluate_ifeval.py --param_path ./params \
+    python scripts/eval/evaluate_ifeval.py --param_path ./params \
         --data_path ifeval.jsonl --output results.json \
         --temperature 0.1 --max_tokens 512
 """

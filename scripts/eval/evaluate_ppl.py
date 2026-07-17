@@ -221,6 +221,7 @@ def process_file(
     max_samples: Optional[int],
     output_file: Optional[str],
     label: str,
+    device: str = "cuda",
 ) -> Dict:
     """Evaluate a single dataset (list of items), return summary stats.
 
@@ -252,8 +253,8 @@ def process_file(
         batch_texts = texts[i : i + batch_size]
         padded_ids, masks = _encode_batch(tokenizer, batch_texts, max_length)
 
-        input_ids = torch.tensor(padded_ids, device="cuda", dtype=torch.long)
-        attention_mask = torch.tensor(masks, device="cuda", dtype=torch.bool)
+        input_ids = torch.tensor(padded_ids, device=device, dtype=torch.long)
+        attention_mask = torch.tensor(masks, device=device, dtype=torch.bool)
 
         token_log_probs, valid = _compute_batch(model, input_ids, attention_mask)
 
@@ -333,11 +334,14 @@ def main(
     max_length: int,
     token_level: bool,
     max_samples: Optional[int],
+    device: str = "cuda",
+    dtype: str = "bfloat16",
 ):
     print(f"Loading model from {param_path} ...")
     model = AutoModel.from_pretrained(param_path)
     tokenizer = AutoTokenizer.from_pretrained(param_path)
-    model.to(device="cuda", dtype=torch.bfloat16)
+    torch_dtype = getattr(torch, dtype)
+    model.to(device=device, dtype=torch_dtype)
     model.eval()
 
     input_files = _collect_input_files(input_path)
@@ -371,6 +375,7 @@ def main(
             max_samples=max_samples,
             output_file=token_output,
             label=label,
+            device=device,
         )
         all_stats[label] = stats
         print_stats(label, stats)
@@ -430,6 +435,18 @@ if __name__ == "__main__":
         default=None,
         help="Maximum number of samples per file (random subsample). Default: all.",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device for model inference.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="bfloat16" if torch.cuda.is_available() else "float32",
+        help="Torch dtype for model weights.",
+    )
     args = parser.parse_args()
 
     with torch.inference_mode():
@@ -442,4 +459,6 @@ if __name__ == "__main__":
             max_length=args.max_length,
             token_level=args.token_level,
             max_samples=args.max_samples,
+            device=args.device,
+            dtype=args.dtype,
         )

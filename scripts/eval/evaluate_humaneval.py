@@ -8,7 +8,6 @@ Config is a single dataclass; side effects are isolated at pipeline boundaries.
 """
 
 import argparse
-import itertools
 import json
 import os
 import re
@@ -233,7 +232,7 @@ def execute_one(args: tuple) -> bool:
         return False
 
 
-def test_one(item: dict, cfg: EvalConfig) -> Tuple[str, int, int]:
+def test_one(item: dict, cfg: EvalConfig, pool=None) -> Tuple[str, int, int]:
     from concurrent.futures import ProcessPoolExecutor
 
     task_id = item["task_id"]
@@ -247,11 +246,16 @@ def test_one(item: dict, cfg: EvalConfig) -> Tuple[str, int, int]:
         for c in completions
     ]
     n = len(codes)
-    passed = 0
-    with ProcessPoolExecutor(max_workers=cfg.test_workers) as pool:
-        for ok in pool.map(execute_one, codes):
-            if ok:
-                passed += 1
+
+    def _run(p):
+        return sum(1 for ok in p.map(execute_one, codes) if ok)
+
+    if pool is not None:
+        passed = _run(pool)
+    else:
+        with ProcessPoolExecutor(max_workers=cfg.test_workers) as p:
+            passed = _run(p)
+
     return task_id, n, passed
 
 
@@ -259,8 +263,14 @@ def test_all(
     items: Sequence[dict],
     cfg: EvalConfig,
 ) -> Iterator[Tuple[str, int, int]]:
-    for item in tqdm.tqdm(items, desc="Testing", unit="problem"):
-        yield test_one(item, cfg)
+    from concurrent.futures import ProcessPoolExecutor
+
+    pool = ProcessPoolExecutor(max_workers=cfg.test_workers)
+    try:
+        for item in tqdm.tqdm(items, desc="Testing", unit="problem"):
+            yield test_one(item, cfg, pool)
+    finally:
+        pool.shutdown(wait=True)
 
 
 def pass_at_k(n: int, c: int, k: int) -> float:
@@ -273,26 +283,32 @@ def score_results(
     results: Iterator[Tuple[str, int, int]],
     k_values: Tuple[int, ...],
 ) -> Dict:
-    # filter to k <= n (peek first result to get n)
-    first = next(results)
-    results = itertools.chain([first], results)
-    n = first[1]
-    k_values = tuple(k for k in k_values if k <= n)
+    """Score pass@k for each problem.
 
+    k values are filtered per-problem: if a problem has n < k samples
+    (e.g. after deduplication), pass@k is not computed for that problem.
+    The summary averages only over problems where the k was computed.
+    """
     scores = {k: [] for k in k_values}
     output = {}
     for task_id, n, passed in results:
         entry = {"task_id": task_id, "n": n, "passed": passed}
         for k in k_values:
-            pk = round(pass_at_k(n, passed, k), 4)
-            entry[f"pass@{k}"] = pk
-            scores[k].append(pk)
+            if k <= n:
+                pk = round(pass_at_k(n, passed, k), 4)
+                entry[f"pass@{k}"] = pk
+                scores[k].append(pk)
+            else:
+                entry[f"pass@{k}"] = None
         output[task_id] = entry
 
     summary = {}
     for k in k_values:
         vals = scores[k]
-        summary[f"pass@{k}"] = round(float(np.mean(vals)), 4)
+        if vals:
+            summary[f"pass@{k}"] = round(float(np.mean(vals)), 4)
+        else:
+            summary[f"pass@{k}"] = None
     output["_summary"] = summary
     return output
 
@@ -375,7 +391,10 @@ def report(scored: Dict):
     summary = scored.pop("_summary", {})
     print(f"\n{'=' * 60}")
     for k, v in summary.items():
-        print(f"  {k}: {v:.2%}")
+        if v is not None:
+            print(f"  {k}: {v:.2%}")
+        else:
+            print(f"  {k}: N/A")
     print(f"{'=' * 60}")
     scored["_summary"] = summary
 

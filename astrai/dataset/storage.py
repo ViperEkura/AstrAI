@@ -81,6 +81,11 @@ def detect_format(load_path: str) -> str:
     ]
     if jsonl_files:
         return "jsonl"
+    json_files = [
+        Path(p) for p in glob.glob(str(root / "**" / "*.json"), recursive=True)
+    ]
+    if json_files:
+        return "jsonl"
     raise FileNotFoundError(f"No supported data files found at {load_path}")
 
 
@@ -245,12 +250,7 @@ class JsonlStore(Store):
         with open(config_path, "r", encoding="utf-8") as f:
             raw_config = json.load(f)
 
-        tokenizer_path = raw_config.pop("tokenizer_path", None)
-        if tokenizer_path is None:
-            raise ValueError(
-                f"JSONL dataset config must specify 'tokenizer_path': {config_path}"
-            )
-
+        tokenizer_path = raw_config.pop("tokenizer_path", None) or str(root)
         self.config = PipelineConfig.from_dict(raw_config)
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         mask_builder = MaskBuilderFactory.create("sectioned")
@@ -260,6 +260,21 @@ class JsonlStore(Store):
 
         raw: Dict[str, List[Tensor]] = {}
         doc_sequences: List[List[int]] = []
+
+        def _process_item(item: dict) -> None:
+            nonlocal raw, doc_sequences
+            result = mask_builder.build(item, self.config, tokenizer)
+            if result is None:
+                return
+            result.pop("domain", None)
+            primary_ids = self._primary_ids(result)
+            if not primary_ids:
+                return
+            doc_sequences.append(primary_ids)
+            for key, ids in result.items():
+                if key not in raw:
+                    raw[key] = []
+                raw[key].append(torch.tensor(ids, dtype=self._infer_dtype(ids)))
 
         for jsonl_path in sorted(root.glob("*.jsonl")):
             with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -274,21 +289,22 @@ class JsonlStore(Store):
                             "Failed to parse JSON line in %s, skipping", jsonl_path
                         )
                         continue
+                    _process_item(item)
 
-                    result = mask_builder.build(item, self.config, tokenizer)
-                    if result is None:
-                        continue
-
-                    result.pop("domain", None)
-                    primary_ids = self._primary_ids(result)
-                    if not primary_ids:
-                        continue
-
-                    doc_sequences.append(primary_ids)
-                    for key, ids in result.items():
-                        if key not in raw:
-                            raw[key] = []
-                        raw[key].append(torch.tensor(ids, dtype=self._infer_dtype(ids)))
+        for json_path in sorted(root.glob("*.json")):
+            if json_path.name == self.CONFIG_NAME:
+                continue
+            with open(json_path, "r", encoding="utf-8") as f:
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse JSON file %s, skipping", json_path)
+                    continue
+            if isinstance(data, list):
+                for item in data:
+                    _process_item(item)
+            elif isinstance(data, dict):
+                _process_item(data)
 
         pos_ids = position_strategy.generate(doc_sequences)
         if pos_ids:

@@ -149,11 +149,18 @@ class Pipeline:
     def _iter_items(self):
         for path in self.paths:
             with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    yield json.loads(line)
+                if path.endswith(".json"):
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        yield data
+                    elif isinstance(data, list):
+                        yield from data
+                else:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        yield json.loads(line)
 
     def _flush(self, domains, shard_idx):
         for domain, keys in domains.items():

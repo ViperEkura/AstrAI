@@ -411,6 +411,32 @@ def test_dataset_load_explicit_storage_type(base_test_env):
     assert dataset.count == 200
 
 
+def _write_json_dataset(test_dir, tokenizer_path, records, config_overrides=None):
+    """Write JSON (not JSONL) dataset — array of objects."""
+    data_dir = os.path.join(test_dir, "json_data")
+    os.makedirs(data_dir, exist_ok=True)
+
+    with open(os.path.join(data_dir, "data.json"), "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False)
+
+    config = {
+        "tokenizer_path": tokenizer_path,
+        "version": 1,
+        "input": {"sections": [{"field": "text", "action": "train"}]},
+        "preprocessing": {"max_seq_len": 128, "min_chars": 0},
+        "output": {"position_ids_mode": "continuous"},
+    }
+    if config_overrides:
+        config.update(config_overrides)
+
+    with open(
+        os.path.join(data_dir, "dataset_config.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    return data_dir
+
+
 def test_detect_format_jsonl_dir(base_test_env):
     test_dir = base_test_env["test_dir"]
     tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
@@ -420,6 +446,89 @@ def test_detect_format_jsonl_dir(base_test_env):
         [{"text": "hello world"}, {"text": "foo bar baz"}],
     )
     assert detect_format(data_dir) == "jsonl"
+
+
+def test_detect_format_json_dir(base_test_env):
+    """detect_format returns 'jsonl' for directory with .json files."""
+    test_dir = base_test_env["test_dir"]
+    tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
+    data_dir = _write_json_dataset(
+        test_dir,
+        tokenizer_path,
+        [{"text": "hello world"}, {"text": "foo bar baz qux"}],
+    )
+    assert detect_format(data_dir) == "jsonl"
+
+
+def test_json_store_seq(base_test_env):
+    """JsonlStore loads .json array correctly."""
+    test_dir = base_test_env["test_dir"]
+    tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
+    data_dir = _write_json_dataset(
+        test_dir,
+        tokenizer_path,
+        [{"text": "hello world"}, {"text": "foo bar baz qux"}],
+    )
+
+    store = StoreFactory.create("jsonl")
+    store.load(data_dir)
+    assert len(store) > 0
+    assert "sequence" in store.keys
+
+    dataset = DatasetFactory.load("seq", data_dir, window_size=8)
+    assert len(dataset) > 0
+    item = dataset[0]
+    assert "input_ids" in item
+    assert "target_ids" in item
+
+
+def test_json_store_no_tokenizer_path(base_test_env):
+    """JsonlStore uses dataset dir as tokenizer_path when omitted."""
+    test_dir = base_test_env["test_dir"]
+    tokenizer = base_test_env["tokenizer"]
+    tokenizer.set_chat_template(
+        "{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}\n{% endfor %}"
+    )
+
+    data_dir = os.path.join(test_dir, "self_contained")
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Save tokenizer files directly in the dataset directory
+    tokenizer.save_pretrained(data_dir)
+
+    # Write .json data
+    records = [
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ]
+        }
+    ]
+    with open(os.path.join(data_dir, "data.json"), "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False)
+
+    # dataset_config.json WITHOUT tokenizer_path
+    config = {
+        "version": 1,
+        "input": {
+            "sections": [{"field": "messages", "action": "$role", "template": True}]
+        },
+        "mask": {"user": "mask", "assistant": "train"},
+        "mask_default": "mask",
+        "preprocessing": {"max_seq_len": 128, "min_chars": 0},
+        "output": {"position_ids_mode": "continuous"},
+    }
+    with open(
+        os.path.join(data_dir, "dataset_config.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    store = StoreFactory.create("jsonl")
+    store.load(data_dir)
+    assert len(store) > 0
+    assert "sequence" in store.keys
+    assert "loss_mask" in store.keys
 
 
 def test_jsonl_store_seq(base_test_env):

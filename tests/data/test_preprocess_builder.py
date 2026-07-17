@@ -349,7 +349,17 @@ def test_grpo_basic(chat_tokenizer, builder):
     assert "responses" in result
     assert "masks" in result
     assert "rewards" in result
-    assert len(result["responses"]) == len(result["masks"])
+
+    # responses is List[List[int]] — one per response
+    assert len(result["responses"]) == 4
+    assert all(isinstance(r, list) for r in result["responses"])
+    assert all(isinstance(r[0], int) for r in result["responses"])
+
+    # masks is List[List[int]] — one per response, matching length
+    assert len(result["masks"]) == 4
+    for i in range(4):
+        assert len(result["masks"][i]) == len(result["responses"][i])
+
     assert result["rewards"] == [1.0, 0.5, 0.8, 0.2]
 
 
@@ -362,8 +372,11 @@ def test_grpo_response_tokens_all_trained(chat_tokenizer, builder):
     }
     result = builder.build(item, config, chat_tokenizer)
     masks = result["masks"]
-    assert all(m == 1 for m in masks)
-    assert len(masks) == len(result["responses"])
+    # masks is List[List[int]] — each response's mask should be all 1s
+    assert len(masks) == 2
+    for m in masks:
+        assert all(v == 1 for v in m)
+        assert len(m) == len(result["responses"][masks.index(m)])
 
 
 def test_grpo_single_reward(chat_tokenizer, builder):

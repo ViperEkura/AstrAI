@@ -95,8 +95,15 @@ class SectionRenderer:
         return all_ids, loss_mask
 
     def process_list_field(self, item: dict, sections: list, config, tokenizer):
-        all_ids: list[int] = []
-        loss_mask: list[int] = []
+        """Tokenize a list-valued field, preserving per-element boundaries.
+
+        Returns ``(list_of_id_lists, list_of_mask_lists)`` where each
+        inner list corresponds to one element of the source list.  This
+        is critical for GRPO where each response must stay a separate
+        sequence so the strategy can form a ``[G, R]`` tensor.
+        """
+        per_item_ids: list[list[int]] = []
+        per_item_masks: list[list[int]] = []
 
         for sec in sections:
             field = sec["field"]
@@ -108,17 +115,13 @@ class SectionRenderer:
                 continue
 
             for val in values:
+                ids: list[int] = []
+                mask: list[int] = []
                 if use_template:
                     if isinstance(val, list):
                         wrapper = {field: val}
                         self._append_template(
-                            wrapper,
-                            field,
-                            action,
-                            tokenizer,
-                            config,
-                            all_ids,
-                            loss_mask,
+                            wrapper, field, action, tokenizer, config, ids, mask
                         )
                 else:
                     wrapper = {field: str(val)}
@@ -130,17 +133,19 @@ class SectionRenderer:
                         False,
                         False,
                         config,
-                        all_ids,
-                        loss_mask,
+                        ids,
+                        mask,
                     )
+                if ids:
+                    max_len = config.preprocessing.max_seq_len
+                    ids = ids[:max_len]
+                    mask = mask[: len(ids)]
+                    per_item_ids.append(ids)
+                    per_item_masks.append(mask)
 
-        max_len = config.preprocessing.max_seq_len
-        all_ids = all_ids[:max_len]
-        loss_mask = loss_mask[: len(all_ids)]
-
-        if not all_ids:
+        if not per_item_ids:
             return None, None
-        return all_ids, loss_mask
+        return per_item_ids, per_item_masks
 
     @staticmethod
     def is_value_section(sections: list) -> bool:
@@ -282,10 +287,18 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
                 ids, mask = self.renderer.process_list_field(
                     item, sections, config, tokenizer
                 )
-            else:
-                ids, mask = self.renderer.process_sections(
-                    item, sections, config, tokenizer, is_top_level=True
-                )
+                if ids is None:
+                    continue
+                # ids is List[List[int]] — preserve per-response structure
+                result[output_key] = ids
+                if mask is not None:
+                    result[mask_key] = mask
+                any_output = True
+                continue
+
+            ids, mask = self.renderer.process_sections(
+                item, sections, config, tokenizer, is_top_level=True
+            )
 
             if ids is None:
                 continue

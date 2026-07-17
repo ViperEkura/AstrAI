@@ -1,6 +1,7 @@
 from astrai.dataset.dataset import (
     BaseDataset,
     DatasetFactory,
+    grpo_collate_fn,
 )
 from astrai.dataset.sampler import ResumableDistributedSampler
 from astrai.dataset.storage import (
@@ -21,6 +22,7 @@ from astrai.serialization import (
 __all__ = [
     "BaseDataset",
     "DatasetFactory",
+    "grpo_collate_fn",
     "Store",
     "StoreFactory",
     "H5Store",

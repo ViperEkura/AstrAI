@@ -180,9 +180,24 @@ class Pipeline:
                 dt = _STR_TO_DTYPE.get(
                     self.config.output.dtype.get(key, "int32"), torch.int32
                 )
-                tensors[key] = [
-                    torch.tensor(list(chain.from_iterable(ids_list)), dtype=dt)
-                ]
+                # GRPO multi-response keys store List[List[int]] per record
+                # (responses/masks).  Rewards store List[float] per record.
+                # Both produce List[Tensor] (one tensor per record), but
+                # responses need inner flattening while rewards do not.
+                if ids_list and isinstance(ids_list[0], list):
+                    tensors[key] = [
+                        torch.tensor(
+                            list(chain.from_iterable(ids))
+                            if ids and isinstance(ids[0], list)
+                            else ids,
+                            dtype=dt,
+                        )
+                        for ids in ids_list
+                    ]
+                else:
+                    tensors[key] = [
+                        torch.tensor(list(chain.from_iterable(ids_list)), dtype=dt)
+                    ]
 
             if mode == "continuous" and original_sequences:
                 pos_ids = self._position_id.generate(keys.get("sequence", []))

@@ -148,26 +148,37 @@ class Store(ABC):
 
         return results[0] if len(results) == 1 else torch.cat(results, dim=0)
 
-    def _normalize(self, raw: Dict[str, List[Tensor]]):
+    def _normalize(self, raw: Dict[str, list]):
         """Register segments and pre-compute cumulative lengths.
 
         Does NOT concatenate — segments are kept as-is to avoid OOM on
         large datasets.  Sets ``self._length`` to the minimum total
-        element count across all keys.
+        element count across all flat-tensor keys.
+
+        For GRPO multi-response keys, values may be ``List[List[Tensor]]``
+        (one list of G tensors per record).  These are stored as-is and
+        excluded from the cumulative-length bookkeeping since they are
+        accessed record-by-record via ``_data`` rather than via ``fetch``.
         """
+        flat_lengths = []
         for key, tensors in raw.items():
             self._data[key] = tensors
+            if not tensors:
+                self._cum[key] = []
+                flat_lengths.append(0)
+                continue
+            # Skip nested lists (GRPO responses/masks) — record-level access
+            if isinstance(tensors[0], list):
+                self._cum[key] = []
+                continue
             cum = []
             total = 0
             for t in tensors:
                 total += t.shape[0]
                 cum.append(total)
             self._cum[key] = cum
-        self._length = (
-            min((cum[-1] if cum else 0) for cum in self._cum.values())
-            if self._cum
-            else 0
-        )
+            flat_lengths.append(cum[-1] if cum else 0)
+        self._length = min(flat_lengths) if flat_lengths else 0
 
 
 class StoreFactory(BaseFactory["Store"]):
@@ -274,7 +285,13 @@ class JsonlStore(Store):
             for key, ids in result.items():
                 if key not in raw:
                     raw[key] = []
-                raw[key].append(torch.tensor(ids, dtype=self._infer_dtype(ids)))
+                if ids and isinstance(ids[0], list):
+                    # GRPO multi-response: List[List[int]] → List[Tensor]
+                    raw[key].append(
+                        [torch.tensor(sub, dtype=self._infer_dtype(sub)) for sub in ids]
+                    )
+                else:
+                    raw[key].append(torch.tensor(ids, dtype=self._infer_dtype(ids)))
 
         for jsonl_path in sorted(root.glob("*.jsonl")):
             with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -314,7 +331,7 @@ class JsonlStore(Store):
 
     @staticmethod
     def _primary_ids(result: dict) -> List[int]:
-        """Return the first integer list in *result* as the primary id sequence."""
+        """Return the first flat integer list in *result* as the primary id sequence."""
         for val in result.values():
             if isinstance(val, list) and val and isinstance(val[0], int):
                 return val

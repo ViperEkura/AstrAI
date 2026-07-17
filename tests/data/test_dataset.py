@@ -327,43 +327,82 @@ def test_normalize_mixed_empty_key():
 
 
 def test_grpo_dataset_dtype(base_test_env):
+    """GRPO dataset returns correct dtypes for per-record structured data."""
+    from astrai.dataset.dataset import GRPODataset
+
     test_dir = base_test_env["test_dir"]
-    dummy_data = {
-        "prompts": [torch.randint(0, 100, (100,), dtype=torch.int32)],
-        "responses": [torch.randint(0, 100, (100,), dtype=torch.int32)],
-        "masks": [torch.ones(100, dtype=torch.int32)],
-        "rewards": [torch.ones(100, dtype=torch.float32)],
-    }
-    dataset = _make_seq_dataset(
-        test_dir, "grpo_dtype", train_type="grpo", data=dummy_data, window_size=32
-    )
+    G = 4
+    dataset = GRPODataset()
+    dataset.storage = type(
+        "FakeStore",
+        (),
+        {
+            "keys": ["prompts", "responses", "masks", "rewards"],
+            "_data": {
+                "prompts": [torch.randint(0, 100, (10,), dtype=torch.int32)],
+                "responses": [
+                    [torch.randint(0, 100, (5,), dtype=torch.int32) for _ in range(G)]
+                ],
+                "masks": [[torch.ones(5, dtype=torch.int32) for _ in range(G)]],
+                "rewards": [torch.rand(G, dtype=torch.float32)],
+            },
+        },
+    )()
+    dataset._build_records()
     item = dataset[0]
 
     assert item["prompts"].dtype == torch.long
-    assert item["responses"].dtype == torch.long
-    assert item["masks"].dtype == torch.bool
+    assert all(r.dtype == torch.long for r in item["responses"])
+    assert all(m.dtype == torch.bool for m in item["masks"])
     assert item["rewards"].dtype == torch.float32
 
 
 def test_grpo_dataset_load(base_test_env):
+    """GRPO dataset loads record-structured data with per-response boundaries."""
+    from astrai.dataset.dataset import GRPODataset
+
     test_dir = base_test_env["test_dir"]
-    dummy_data = {
-        "prompts": [_rand_seq(200)],
-        "responses": [_rand_seq(200)],
-        "masks": [torch.ones(200, dtype=torch.int64)],
-        "rewards": [torch.rand(200, dtype=torch.float32)],
-    }
-    dataset = _make_seq_dataset(
-        test_dir, "grpo_test", train_type="grpo", data=dummy_data
-    )
-    assert len(dataset) > 0
+    G = 3
+    prompt_len = 8
+    resp_lens = [5, 7, 4]
+    dataset = GRPODataset()
+    dataset.storage = type(
+        "FakeStore",
+        (),
+        {
+            "keys": ["prompts", "responses", "masks", "rewards"],
+            "_data": {
+                "prompts": [torch.randint(0, 100, (prompt_len,))],
+                "responses": [[torch.randint(0, 100, (rl,)) for rl in resp_lens]],
+                "masks": [[torch.ones(rl, dtype=torch.int64) for rl in resp_lens]],
+                "rewards": [torch.tensor([0.9, 0.3, 0.7], dtype=torch.float32)],
+            },
+        },
+    )()
+    dataset._build_records()
+
+    assert len(dataset) == 1
     item = dataset[0]
     assert "prompts" in item
     assert "responses" in item
     assert "masks" in item
     assert "rewards" in item
-    assert item["prompts"].shape[0] == 64
-    assert item["responses"].shape[0] == 64
+
+    # Prompts is 1-D
+    assert item["prompts"].shape == (prompt_len,)
+
+    # Responses is a list of G tensors with correct lengths
+    assert len(item["responses"]) == G
+    for i, r in enumerate(item["responses"]):
+        assert r.shape == (resp_lens[i],)
+
+    # Masks align with responses
+    assert len(item["masks"]) == G
+    for i, m in enumerate(item["masks"]):
+        assert m.shape == (resp_lens[i],)
+
+    # Rewards has G elements
+    assert item["rewards"].shape == (G,)
 
 
 def test_detect_format_bin_dir(base_test_env):
@@ -621,3 +660,231 @@ def test_jsonl_store_pipeline_config_roundtrip(base_test_env):
     config = PipelineConfig.from_dict(raw)
     assert config.output.position_ids_mode == "doc_reset"
     assert config.preprocessing.max_seq_len == 64
+
+
+# ---------------------------------------------------------------------------
+# GRPO end-to-end: builder → JsonlStore → GRPODataset → collate_fn
+# ---------------------------------------------------------------------------
+
+
+def _write_grpo_jsonl(test_dir, tokenizer_path, records):
+    """Write a GRPO JSONL dataset directory with config."""
+    data_dir = os.path.join(test_dir, "grpo_jsonl")
+    os.makedirs(data_dir, exist_ok=True)
+
+    with open(os.path.join(data_dir, "data.jsonl"), "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    config = {
+        "tokenizer_path": tokenizer_path,
+        "version": 1,
+        "input": {
+            "sources": {
+                "prompts": {
+                    "sections": [
+                        {
+                            "field": "prompt",
+                            "action": "mask",
+                            "add_special_tokens": True,
+                        }
+                    ]
+                },
+                "responses": {
+                    "sections": [{"field": "responses", "action": "train"}],
+                    "list_field": True,
+                    "mask_key": "masks",
+                },
+                "rewards": {
+                    "sections": [{"field": "rewards", "action": "value"}],
+                },
+            }
+        },
+        "mask": {"user": "mask", "assistant": "train"},
+        "mask_default": "mask",
+        "preprocessing": {"max_seq_len": 128},
+        "output": {"position_ids_mode": "none"},
+    }
+
+    with open(
+        os.path.join(data_dir, "dataset_config.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    return data_dir
+
+
+def test_grpo_builder_preserves_response_boundaries(base_test_env):
+    """MultiOutputMaskBuilder with list_field returns List[List[int]] for responses."""
+    from astrai.preprocessing.builder import SectionedMaskBuilder
+    from tests.data.conftest import make_grpo_no_template_config
+
+    tokenizer = base_test_env["tokenizer"]
+    tokenizer_path = _save_test_tokenizer(base_test_env["test_dir"], tokenizer)
+
+    builder = SectionedMaskBuilder()
+    config = make_grpo_no_template_config()
+    config.preprocessing.max_seq_len = 128
+
+    item = {
+        "prompt": "What is 2+2?",
+        "responses": ["4", "four", "2+2=4"],
+        "rewards": [0.9, 0.1, 0.5],
+    }
+
+    result = builder.build(item, config, tokenizer)
+    assert result is not None
+
+    # prompts should be flat list of ints
+    assert isinstance(result["prompts"], list)
+    assert isinstance(result["prompts"][0], int)
+
+    # responses should be list of lists (one per response)
+    assert isinstance(result["responses"], list)
+    assert isinstance(result["responses"][0], list)
+    assert isinstance(result["responses"][0][0], int)
+    assert len(result["responses"]) == 3
+
+    # masks should match responses structure
+    assert isinstance(result["masks"], list)
+    assert len(result["masks"]) == 3
+    for i in range(3):
+        assert len(result["masks"][i]) == len(result["responses"][i])
+
+    # rewards should be flat list of floats
+    assert isinstance(result["rewards"], list)
+    assert all(isinstance(r, float) for r in result["rewards"])
+    assert len(result["rewards"]) == 3
+
+
+def test_grpo_end_to_end_jsonl(base_test_env):
+    """Full GRPO pipeline: JSONL → JsonlStore → GRPODataset → collate_fn."""
+    from astrai.dataset.dataset import grpo_collate_fn
+
+    test_dir = base_test_env["test_dir"]
+    tokenizer = base_test_env["tokenizer"]
+    tokenizer_path = _save_test_tokenizer(test_dir, tokenizer)
+
+    records = [
+        {
+            "prompt": "What is 2+2?",
+            "responses": ["4", "four", "The answer is 4"],
+            "rewards": [0.9, 0.1, 0.5],
+        },
+        {
+            "prompt": "Write a haiku",
+            "responses": ["Leaves fall", "Cherry blossoms bloom in spring"],
+            "rewards": [0.3, 0.8],
+        },
+    ]
+
+    data_dir = _write_grpo_jsonl(test_dir, tokenizer_path, records)
+
+    dataset = DatasetFactory.load("grpo", data_dir, window_size=0)
+    assert len(dataset) == 2
+
+    # Item 0: 3 responses
+    item0 = dataset[0]
+    assert item0["prompts"].ndim == 1
+    assert len(item0["responses"]) == 3
+    assert len(item0["masks"]) == 3
+    assert item0["rewards"].shape == (3,)
+    for r, m in zip(item0["responses"], item0["masks"]):
+        assert r.shape == m.shape
+
+    # Item 1: 2 responses (different group size)
+    item1 = dataset[1]
+    assert len(item1["responses"]) == 2
+    assert item1["rewards"].shape == (2,)
+
+    # Collate: batch records with same G (item0 has G=3)
+    batch = grpo_collate_fn([item0, item0])
+    assert batch["prompts"].shape[0] == 2
+    assert batch["responses"].ndim == 3
+    assert batch["responses"].shape[0] == 2
+    assert batch["responses"].shape[1] == 3  # G=3
+    assert batch["masks"].shape == batch["responses"].shape
+    assert batch["rewards"].shape == (2, 3)
+
+
+def test_grpo_collate_variable_lengths():
+    """collate_fn pads variable-length responses to [B, G, R_max]."""
+    from astrai.dataset.dataset import grpo_collate_fn
+
+    batch = [
+        {
+            "prompts": torch.tensor([1, 2, 3]),
+            "responses": [torch.tensor([4, 5]), torch.tensor([6, 7, 8, 9])],
+            "masks": [torch.tensor([1, 1]), torch.tensor([1, 1, 1, 1])],
+            "rewards": torch.tensor([0.9, 0.1]),
+        },
+        {
+            "prompts": torch.tensor([10, 11]),
+            "responses": [torch.tensor([12]), torch.tensor([13, 14, 15])],
+            "masks": [torch.tensor([1]), torch.tensor([1, 1, 1])],
+            "rewards": torch.tensor([0.5, 0.5]),
+        },
+    ]
+
+    result = grpo_collate_fn(batch)
+
+    assert result["prompts"].shape == (2, 3)  # B=2, P_max=3
+    assert result["responses"].shape == (2, 2, 4)  # B=2, G=2, R_max=4
+    assert result["masks"].shape == (2, 2, 4)
+    assert result["rewards"].shape == (2, 2)
+
+    # Check padding: item 1 prompt is length 2, padded to 3
+    assert result["prompts"][1, 2] == 0
+
+    # Check response content: item 0, response 0 is [4,5] padded to 4
+    assert result["responses"][0, 0, 0] == 4
+    assert result["responses"][0, 0, 1] == 5
+    assert result["responses"][0, 0, 2] == 0  # padded
+    assert result["masks"][0, 0, 2] == False  # padded
+
+    # Check response content: item 0, response 1 is [6,7,8,9] no padding
+    assert result["responses"][0, 1, 3] == 9
+    assert result["masks"][0, 1, 3] == True
+
+
+def test_grpo_multiple_records(base_test_env):
+    """GRPODataset loads multiple records with correct structure."""
+    from astrai.dataset.dataset import GRPODataset
+
+    G = 4
+    n_records = 5
+
+    dummy_responses = [
+        [torch.randint(0, 100, (np.random.randint(3, 8),)) for _ in range(G)]
+        for _ in range(n_records)
+    ]
+    dataset = GRPODataset()
+    dataset.storage = type(
+        "FakeStore",
+        (),
+        {
+            "keys": ["prompts", "responses", "masks", "rewards"],
+            "_data": {
+                "prompts": [torch.randint(0, 100, (10,)) for _ in range(n_records)],
+                "responses": dummy_responses,
+                "masks": [
+                    [torch.ones(r.shape[0], dtype=torch.int64) for r in resps]
+                    for resps in dummy_responses
+                ],
+                "rewards": [
+                    torch.rand(G, dtype=torch.float32) for _ in range(n_records)
+                ],
+            },
+        },
+    )()
+    dataset._build_records()
+
+    assert len(dataset) == n_records
+
+    for i in range(n_records):
+        item = dataset[i]
+        assert len(item["responses"]) == G
+        assert len(item["masks"]) == G
+        assert item["rewards"].shape == (G,)
+        for g in range(G):
+            assert item["responses"][g].shape == item["masks"][g].shape

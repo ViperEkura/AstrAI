@@ -20,6 +20,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import tqdm
+from datasets import load_dataset
 
 from astrai.inference import InferenceEngine
 from astrai.model import AutoModel
@@ -29,9 +30,7 @@ from astrai.tokenize import AutoTokenizer
 # Config
 # ---------------------------------------------------------------------------
 
-HUMANEVAL_URL = (
-    "https://github.com/openai/human-eval/raw/master/data/HumanEval.jsonl.gz"
-)
+HUMANEVAL_HF_DATASET = "openai/openai_humaneval"
 
 STOP_SEQUENCES = [
     "\nclass ",
@@ -64,21 +63,16 @@ class EvalConfig:
     problem_indices: Optional[List[int]] = None
 
 
-def download(url: str, path: str):
+def download(path: str):
     if os.path.exists(path):
         return
-    import gzip
-    import urllib.request
-
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    print(f"Downloading {url} ...")
-    tmp = path + ".tmp"
-    urllib.request.urlretrieve(url, tmp)
-    with gzip.open(tmp, "rb") as f_in:
-        with open(path, "wb") as f_out:
-            f_out.write(f_in.read())
-    os.remove(tmp)
-    print(f"  saved to {path}")
+    print(f"Downloading HumanEval from HuggingFace ({HUMANEVAL_HF_DATASET}) ...")
+    ds = load_dataset(HUMANEVAL_HF_DATASET, split="test")
+    with open(path, "w", encoding="utf-8") as f:
+        for item in ds:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    print(f"  saved {len(ds)} problems to {path}")
 
 
 def load_jsonl(path: str) -> List[dict]:
@@ -318,7 +312,7 @@ def run_pipeline(cfg: EvalConfig) -> Dict:
         with open(cfg.test_only, encoding="utf-8") as f:
             generated = json.load(f)
     else:
-        download(HUMANEVAL_URL, cfg.data_path)
+        download(cfg.data_path)
 
         problems = load_jsonl(cfg.data_path)
         if cfg.problem_indices:

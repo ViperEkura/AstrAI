@@ -4,18 +4,17 @@ import argparse
 import csv
 import json
 import os
-import shutil
-import tarfile
+from collections import defaultdict
 
-import requests
 import torch
 import torch.nn.functional as F
 import tqdm
+from datasets import load_dataset
 
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
-MMLU_URL = "https://people.eecs.berkeley.edu/~hendrycks/data.tar"
+MMLU_HF_DATASET = "cais/mmlu"
 MMLU_SUBJECTS = [
     "abstract_algebra",
     "anatomy",
@@ -77,38 +76,40 @@ MMLU_SUBJECTS = [
 ]
 
 
-def _download_and_extract(url: str, data_dir: str):
-    tar_path = os.path.join(data_dir, "data.tar")
-    os.makedirs(data_dir, exist_ok=True)
-    print(f"Downloading MMLU data from {url}...")
-    resp = requests.get(url, stream=True, timeout=300)
-    resp.raise_for_status()
-    total = int(resp.headers.get("content-length", 0))
-    with tqdm.tqdm(total=total, unit="B", unit_scale=True, desc="  Download") as bar:
-        with open(tar_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                bar.update(len(chunk))
-    print("Extracting...")
-    with tarfile.open(tar_path, "r") as tf:
-        tf.extractall(data_dir)
-    os.remove(tar_path)
+def _write_subject_csv(data_dir: str, split: str, subject: str, rows: list[dict]):
+    split_dir = os.path.join(data_dir, split)
+    os.makedirs(split_dir, exist_ok=True)
+    path = os.path.join(split_dir, f"{subject}_{split}.csv")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        for row in rows:
+            writer.writerow(row)
 
 
 def download_mmlu(data_dir: str):
-    _download_and_extract(MMLU_URL, data_dir)
-    src = os.path.join(data_dir, "data")
-    if os.path.exists(src):
-        for item in os.listdir(src):
-            src_item = os.path.join(src, item)
-            dst_item = os.path.join(data_dir, item)
-            if os.path.exists(dst_item):
-                if os.path.isdir(dst_item):
-                    shutil.rmtree(dst_item)
-                else:
-                    os.remove(dst_item)
-            os.rename(src_item, dst_item)
-        os.rmdir(src)
+    print(f"Downloading MMLU from HuggingFace ({MMLU_HF_DATASET}) ...")
+    letters = ("A", "B", "C", "D")
+    split_map = {"dev": "dev", "val": "validation", "test": "test"}
+    for local_split, hf_split in split_map.items():
+        ds = load_dataset(MMLU_HF_DATASET, "all", split=hf_split)
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for item in tqdm.tqdm(ds, desc=f"  {local_split}", leave=False):
+            subject = item["subject"]
+            choices = item["choices"]
+            ans_letter = letters[item["answer"]]
+            grouped[subject].append(
+                [
+                    item["question"],
+                    f"A){choices[0]}",
+                    f"B){choices[1]}",
+                    f"C){choices[2]}",
+                    f"D){choices[3]}",
+                    ans_letter,
+                ]
+            )
+        for subject, rows in grouped.items():
+            _write_subject_csv(data_dir, local_split, subject, rows)
+        print(f"  {local_split}: {len(ds)} items, {len(grouped)} subjects")
     print(f"MMLU data saved to {data_dir}")
 
 

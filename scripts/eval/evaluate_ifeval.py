@@ -14,21 +14,17 @@ import argparse
 import json
 import os
 import re
-import urllib.request
 from typing import Callable, Dict, List, Optional
 
 import torch
 import tqdm
+from datasets import load_dataset
 
 from astrai.inference import InferenceEngine
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
-IFEVAL_URL = (
-    "https://raw.githubusercontent.com/google-research/"
-    "google-research/master/instruction_following_eval/data/input_data.jsonl"
-)
-
+IFEVAL_HF_DATASET = "google/IFEval"
 CONSTRAINT_VERIFIERS: Dict[str, Callable[[str, dict], bool]] = {}
 
 
@@ -310,15 +306,12 @@ def download_ifeval(data_path: str):
     if os.path.exists(data_path):
         return
     os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
-    print(f"Downloading IFEval from {IFEVAL_URL} ...")
-    tmp = data_path + ".tmp"
-    urllib.request.urlretrieve(IFEVAL_URL, tmp)
-    with open(tmp, "rb") as f_in:
-        content = f_in.read()
-    with open(data_path, "wb") as f_out:
-        f_out.write(content)
-    os.remove(tmp)
-    print(f"  saved to {data_path}")
+    print(f"Downloading IFEval from HuggingFace ({IFEVAL_HF_DATASET}) ...")
+    ds = load_dataset(IFEVAL_HF_DATASET, split="train")
+    with open(data_path, "w", encoding="utf-8") as f:
+        for item in ds:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    print(f"  saved {len(ds)} items to {data_path}")
 
 
 def load_problems(data_path: str) -> List[dict]:

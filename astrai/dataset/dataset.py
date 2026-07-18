@@ -365,34 +365,50 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
     def load(
         cls,
         train_type: str,
-        load_path: str,
-        window_size: int,
+        load_path: Optional[str] = None,
+        window_size: int = 0,
         stride: Optional[int] = None,
         storage_type: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
         max_len: int = 2048,
+        store: Optional[Store] = None,
         **kwargs,
     ) -> "BaseDataset":
         """Create and load a dataset in one step.
 
+        Two entry points:
+
+        - **store given**: bind it directly — the caller fully controls
+          Store construction and processor setup.  *load_path*,
+          *storage_type*, *tokenizer_path* are ignored.
+        - **store is None**: build a Store from *load_path*, auto-detecting
+          format and constructing a processor when *tokenizer_path* is
+          given for a record dataset on JSONL.
+
         Args:
             train_type: Type of training dataset
-            load_path: Path to the data file
+            load_path: Path to the data file (ignored if *store* given)
             window_size: Window size for data sampling
             stride: Stride between consecutive samples (default: same as window_size)
             storage_type: Storage type ("h5", "bin", "jsonl") or None for auto-detection
-            tokenizer_path: Path to tokenizer. Used to build an on-the-fly
-                processor when loading raw JSONL with a record dataset
-                (DPO/GRPO).  Ignored for pre-tokenised backends (H5/bin)
-                and for stream datasets (SEQ/SFT).
-            max_len: Max sequence length for the processor.
-            **kwargs: Extra arguments forwarded to ``dataset.load()``.
+            tokenizer_path: Path to tokenizer for lazy JSONL tokenisation
+            max_len: Max sequence length for the processor
+            store: Pre-built, already-loaded Store instance
+            **kwargs: Extra arguments forwarded to ``dataset.load()``
 
         Returns:
             Loaded dataset instance
         """
         if stride is None:
             stride = window_size
+
+        if store is not None:
+            dataset = cls.create(train_type, window_size, stride)
+            dataset.storage = store
+            return dataset
+
+        if load_path is None:
+            raise ValueError("Either load_path or store must be provided")
 
         if storage_type is None:
             storage_type = detect_format(load_path)
@@ -404,25 +420,6 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
         dataset = cls.create(train_type, window_size, stride, processor=processor)
         dataset.load(load_path, storage_type=storage_type, **kwargs)
 
-        return dataset
-
-    @classmethod
-    def from_store(
-        cls,
-        train_type: str,
-        store: Store,
-        window_size: int = 0,
-        stride: Optional[int] = None,
-    ) -> "BaseDataset":
-        """Create a dataset bound to an already-loaded store.
-
-        The caller is responsible for constructing and loading the store
-        (including any processor).  The dataset simply wraps it.
-        """
-        if stride is None:
-            stride = window_size
-        dataset = cls.create(train_type, window_size, stride)
-        dataset.storage = store
         return dataset
 
     @staticmethod

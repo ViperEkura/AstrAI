@@ -1,4 +1,22 @@
-"""Dataset implementations with factory pattern for training."""
+"""Dataset implementations with factory pattern for training.
+
+Class hierarchy:
+
+    BaseDataset (ABC)           — load/validate, owns a Store
+    ├── SEQDataset              — stream, next-token prediction (PT)
+    ├── SFTDataset              — stream, loss-mask + position_ids
+    └── RecordDataset           — record access, optional processor
+        ├── DPODataset          — chosen/rejected pairs
+        └── GRPODataset         — prompt + response group
+
+``RecordDataset`` holds an optional *processor* (pure
+``record -> Dict[str, Tensor]`` function).  When the backing Store is
+a lazy JsonlStore, the processor tokenises on the fly; otherwise it
+is ignored and ``fetch_record`` reads pre-tokenised tensors.
+
+``__len__`` returns the sample count (stream: windows, record:
+records) so DataLoader and progress bars work uniformly.
+"""
 
 from abc import ABC, abstractmethod
 from functools import partial
@@ -9,22 +27,12 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from astrai.dataset.storage import (
-    RecordStore,
     Store,
     StoreFactory,
-    StreamStore,
     detect_format,
 )
 from astrai.factory import BaseFactory
 from astrai.tokenize import AutoTokenizer
-
-
-def _to_tensor(value: list, dtype: Optional[torch.dtype] = None) -> Tensor:
-    if dtype is not None:
-        return torch.tensor(value, dtype=dtype)
-    if value and isinstance(value[0], bool):
-        return torch.tensor(value, dtype=torch.bool)
-    return torch.tensor(value, dtype=torch.int32)
 
 
 def dpo_tokenize(

@@ -1,24 +1,37 @@
 """Storage backends for different data formats.
 
-Two access modes are reflected in the class hierarchy:
+Architecture (mixin composition, no diamond inheritance):
 
-- :class:`StreamStore` — ``fetch(begin, end, key)`` slices across
-  concatenated segments.  Used by PT/SFT where data is a long token
-  stream.  ``len(store)`` returns the total token count.
-- :class:`RecordStore` — ``fetch_record(i, key)`` returns the *i*-th
-  record without cross-record concatenation.  Used by DPO/GRPO where
-  each record is an independent training unit.  ``num_records`` returns
+    Store (ABC)              — shared _data/_cum/_offsets bookkeeping
+                               + _normalize() for registering segments
+    Streamable (mixin)       — fetch(begin, end, key) for stream access
+    Recordable (mixin)       — fetch_record(i, key) for record access
+
+    H5Store(Store, Streamable, Recordable)
+    MmapStore(Store, Streamable, Recordable)
+    JsonlStore(Store, Streamable, Recordable)
+
+Each mixin is a stateless trait that relies on ``self._data`` etc.
+provided by :class:`Store`.  Concrete stores mix in whichever access
+modes they support — ``Store`` is the sole base class, so there is no
+diamond inheritance or MRO ambiguity.
+
+Access-mode semantics:
+
+- **Stream** (SEQ/SFT): ``fetch(begin, end, key)`` slices across
+  concatenated segments.  ``len(store)`` returns the total token count.
+- **Record** (DPO/GRPO): ``fetch_record(i, key)`` returns the *i*-th
+  record without cross-record concatenation.  ``num_records`` returns
   the record count.
 
-Both share ``_data`` / ``_cum`` / ``_offsets`` bookkeeping via the
-common :class:`Store` base, which also owns ``_normalize`` for
-registering segments.  Subclasses pick the access mode by inheriting
-from the appropriate base.
+``segments_are_records`` (class attribute on each Store subclass)
+tells ``_normalize`` whether segments are inherently per-record (H5/
+JSONL) or opaque shards (bin).  Record access for bin relies on
+``_offsets`` instead.
 
-:class:`ProcessedStore` composes a :class:`JsonlSource` (raw record
-reader) with a pure ``record -> dict_of_tensors`` processor so that
-DPO/GRPO can tokenise raw JSONL on the fly without a pre-tokenised
-H5/bin file.  This keeps the tokenizer out of the Store base.
+:class:`JsonlStore` supports a lazy mode (``processor=fn``) that keeps
+raw records and defers tokenisation to ``fetch_record`` — used by DPO
+to train directly from a ``.jsonl`` file without a pre-tokenised copy.
 """
 
 import bisect
@@ -112,6 +125,14 @@ class Store(ABC):
     def keys(self) -> List[str]:
         return list(self._data.keys())
 
+    def __len__(self) -> int:
+        """Default: token count (stream semantics).
+
+        Subclasses that are record-only (e.g. lazy JsonlStore) override
+        to return ``self._num_records``.
+        """
+        return self._length
+
     def _normalize(
         self,
         raw: Dict[str, list],
@@ -181,11 +202,13 @@ class Store(ABC):
             self._num_records = 0
 
 
-class StreamStore(Store):
-    """Store exposing stream access: ``fetch(begin, end, key)``."""
+class Streamable:
+    """Mixin: stream access ``fetch(begin, end, key)``.
 
-    def __len__(self) -> int:
-        return self._length
+    No base class — relies on ``self._data``, ``self._cum``,
+    ``self._length`` provided by :class:`Store`.  Used by SEQ/SFT
+    where data is a long token stream.
+    """
 
     def fetch(
         self,
@@ -200,10 +223,10 @@ class StreamStore(Store):
                 f"Index out of bounds: begin={begin}, end={end}, length={self._length}"
             )
         if isinstance(keys, str):
-            return self._fetch_key(keys, begin, end)
-        return {k: self._fetch_key(k, begin, end) for k in keys}
+            return self._fetch_stream_key(keys, begin, end)
+        return {k: self._fetch_stream_key(k, begin, end) for k in keys}
 
-    def _fetch_key(self, key: str, begin: int, end: int) -> Tensor:
+    def _fetch_stream_key(self, key: str, begin: int, end: int) -> Tensor:
         segments = self._data[key]
         cum = self._cum[key]
         seg_start = bisect.bisect_right(cum, begin)
@@ -219,11 +242,12 @@ class StreamStore(Store):
         return results[0] if len(results) == 1 else torch.cat(results, dim=0)
 
 
-class RecordStore(Store):
-    """Mixin exposing record access: ``fetch_record(i, key)``.
+class Recordable:
+    """Mixin: record access ``fetch_record(i, key)``.
 
-    ``__len__`` is **not** overridden — subclasses decide whether
-    ``len()`` returns token count (stream) or record count (record-only).
+    No base class — relies on ``self._data``, ``self._offsets``,
+    ``self._num_records`` provided by :class:`Store`.  Used by
+    DPO/GRPO where each record is an independent training unit.
     """
 
     segments_are_records = True
@@ -237,7 +261,7 @@ class RecordStore(Store):
         index: int,
         keys: Union[str, List[str]],
     ):
-        if not self._data:
+        if not self._data and self._num_records == 0:
             raise RuntimeError("Store not loaded")
         if not 0 <= index < self._num_records:
             raise ValueError(
@@ -265,7 +289,7 @@ class StoreFactory(BaseFactory["Store"]):
 
 
 @StoreFactory.register("h5")
-class H5Store(StreamStore, RecordStore):
+class H5Store(Store, Streamable, Recordable):
     """HDF5-based storage backend (pre-tokenized data).
 
     Each key is stored as a group of per-record datasets (``data_0``,
@@ -281,12 +305,14 @@ class H5Store(StreamStore, RecordStore):
     ``store.num_records`` instead.
     """
 
+    segments_are_records = True
+
     def load(self, path: str, **kwargs):
         self._normalize(load_h5(path))
 
 
 @StoreFactory.register("bin")
-class MmapStore(StreamStore, RecordStore):
+class MmapStore(Store, Streamable, Recordable):
     """Memory-mapped binary storage backend.
 
     Each key is a single .bin file backed by ``np.memmap(mode="r")``.
@@ -301,8 +327,12 @@ class MmapStore(StreamStore, RecordStore):
       ``save_bin(..., record_keys=...)``).  Legacy bin files without
       offsets have ``num_records == 0``.
 
-    ``len(store)`` returns the **token count** (stream semantics).
+    ``segments_are_records`` is ``False`` here (bin segments are
+    contiguous streams, not per-record) — record access is driven
+    purely by ``_offsets``.
     """
+
+    segments_are_records = False
 
     def load(self, path: str, **kwargs):
         self._mmap_refs = []
@@ -375,7 +405,7 @@ class JsonlSource:
 
 
 @StoreFactory.register("jsonl")
-class JsonlStore(StreamStore, RecordStore):
+class JsonlStore(Store, Streamable, Recordable):
     """JSONL reader with two tokenisation modes.
 
     A JSONL dataset is a ``.jsonl`` file or a directory of ``*.jsonl``
@@ -399,6 +429,7 @@ class JsonlStore(StreamStore, RecordStore):
     """
 
     CONFIG_NAME = "dataset_config.json"
+    segments_are_records = True
 
     def __init__(self):
         super().__init__()

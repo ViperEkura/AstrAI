@@ -9,10 +9,10 @@ from astrai.dataset.storage import (
     H5Store,
     JsonlStore,
     MmapStore,
-    RecordStore,
+    Recordable,
     Store,
     StoreFactory,
-    StreamStore,
+    Streamable,
     detect_format,
 )
 from astrai.serialization import (
@@ -28,8 +28,8 @@ __all__ = [
     "dpo_collate_fn",
     "grpo_collate_fn",
     "Store",
-    "StreamStore",
-    "RecordStore",
+    "Streamable",
+    "Recordable",
     "StoreFactory",
     "H5Store",
     "MmapStore",

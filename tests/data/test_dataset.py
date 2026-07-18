@@ -1,14 +1,16 @@
 import json
 import os
+import tempfile
 
 import numpy as np
 import pytest
 import torch
 
 from astrai.config.preprocess_config import PipelineConfig
-from astrai.dataset.dataset import DatasetFactory, SEQDataset
+from astrai.dataset.dataset import DatasetFactory, SEQDataset, dpo_tokenize
 from astrai.dataset.storage import (
     H5Store,
+    JsonlStore,
     StoreFactory,
     detect_format,
 )
@@ -900,3 +902,166 @@ def test_grpo_multiple_records(base_test_env):
         assert item["rewards"].shape == (G,)
         for g in range(G):
             assert item["responses"][g].shape == item["masks"][g].shape
+
+
+def _write_dpo_jsonl(test_dir, records):
+    """Write a raw DPO JSONL file (no dataset_config.json)."""
+    path = os.path.join(test_dir, "dpo.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return path
+
+
+def test_dpo_tokenize_pure_function():
+    """dpo_tokenize returns flat lists with correct mask alignment."""
+
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=True):
+            return [len(text)] if add_special_tokens else [len(text) + 1]
+
+    record = {"input": "ab", "chosen": "xyz", "rejected": "w"}
+    result = dpo_tokenize(record, FakeTokenizer(), max_len=64, pad_id=0)
+
+    assert set(result.keys()) == {"chosen", "rejected", "chosen_mask", "rejected_mask"}
+    assert len(result["chosen"]) == len(result["chosen_mask"])
+    assert len(result["rejected"]) == len(result["rejected_mask"])
+    assert len(result["chosen"]) == len(result["rejected"])
+
+    assert result["chosen_mask"][0] == 0
+    assert any(m == 1 for m in result["chosen_mask"])
+    assert result["rejected_mask"][0] == 0
+
+
+def test_dpo_tokenize_malformed_record():
+    """dpo_tokenize returns None for missing fields."""
+
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=True):
+            return [1]
+
+    assert dpo_tokenize({}, FakeTokenizer()) is None
+    assert dpo_tokenize({"input": "a"}, FakeTokenizer()) is None
+    assert dpo_tokenize({"input": "a", "chosen": "b"}, FakeTokenizer()) is None
+
+
+def test_dpo_jsonl_lazy_load(base_test_env):
+    """DPODataset loads raw JSONL with tokenizer_path → lazy processor."""
+    test_dir = base_test_env["test_dir"]
+    tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
+
+    records = [
+        {"input": "Hello", "chosen": "world", "rejected": "earth"},
+        {"input": "Foo", "chosen": "bar", "rejected": "baz"},
+    ]
+    path = _write_dpo_jsonl(test_dir, records)
+
+    ds = DatasetFactory.load(
+        train_type="dpo",
+        load_path=path,
+        window_size=0,
+        tokenizer_path=tokenizer_path,
+    )
+
+    assert len(ds) == 2
+    assert ds.storage.num_records == 2
+    assert ds.storage._processor is not None
+
+    item = ds[0]
+    assert set(item.keys()) == {"chosen", "rejected", "chosen_mask", "rejected_mask"}
+    assert item["chosen"].dtype == torch.long
+    assert item["chosen_mask"].dtype == torch.bool
+    assert item["chosen"].shape == item["chosen_mask"].shape
+    assert item["chosen"].shape == item["rejected"].shape
+
+
+def test_dpo_jsonl_lazy_no_tokenizer():
+    """DPODataset on jsonl without tokenizer_path falls back to eager
+    (which requires dataset_config.json, so it should raise)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "dpo.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"input": "a", "chosen": "b", "rejected": "c"}) + "\n")
+
+        with pytest.raises(FileNotFoundError, match="dataset_config.json"):
+            DatasetFactory.load(
+                train_type="dpo",
+                load_path=path,
+                window_size=0,
+            )
+
+
+def test_jsonl_store_lazy_len_returns_record_count(base_test_env):
+    """JsonlStore in lazy mode: len() returns record count, not tokens."""
+    test_dir = base_test_env["test_dir"]
+    records = [{"input": str(i), "chosen": "c", "rejected": "r"} for i in range(5)]
+    path = _write_dpo_jsonl(test_dir, records)
+
+    store = JsonlStore()
+    store.load(path, processor=lambda r: {"chosen": torch.tensor([1, 2])})
+
+    assert len(store) == 5
+    assert store.num_records == 5
+
+
+def test_jsonl_store_eager_len_returns_token_count(base_test_env):
+    """JsonlStore in eager mode: num_records reflects per-record count."""
+    test_dir = base_test_env["test_dir"]
+    tokenizer_path = _save_test_tokenizer(test_dir, base_test_env["tokenizer"])
+    data_dir = _write_jsonl_dataset(
+        test_dir,
+        tokenizer_path,
+        [{"text": "hello world"}, {"text": "foo bar"}],
+        config_overrides={
+            "preprocessing": {"max_seq_len": 128, "min_chars": 0},
+            "output": {"position_ids_mode": "none"},
+        },
+    )
+
+    store = JsonlStore()
+    store.load(data_dir)
+
+    assert store.num_records == 2
+    assert len(store.keys) > 0
+
+
+def test_h5_store_dual_mode(base_test_env):
+    """H5Store supports both fetch (stream) and fetch_record (record)."""
+    test_dir = base_test_env["test_dir"]
+
+    seq_length = 64
+    dummy_data = {
+        "chosen": [_rand_seq(seq_length), _rand_seq(seq_length)],
+        "rejected": [_rand_seq(seq_length), _rand_seq(seq_length)],
+    }
+    save_h5(test_dir, "dpo_data", dummy_data)
+
+    store = H5Store()
+    store.load(test_dir)
+
+    assert len(store) == seq_length * 2
+    assert store.num_records == 2
+
+    rec0 = store.fetch_record(0, "chosen")
+    assert rec0.shape == (seq_length,)
+
+    stream = store.fetch(0, 10, "chosen")
+    assert stream.shape == (10,)
+
+
+def test_mmap_store_stream_only_no_offsets(base_test_env):
+    """MmapStore without offsets: num_records == 0, stream works."""
+    test_dir = base_test_env["test_dir"]
+
+    seq_length = 128
+    dummy_data = {"sequence": [_rand_seq(seq_length)]}
+    save_bin(test_dir, dummy_data)
+
+    store = StoreFactory.create("bin")
+    store.load(test_dir)
+
+    assert len(store) == seq_length
+    assert store.num_records == 0
+
+    chunk = store.fetch(0, 32, "sequence")
+    assert chunk.shape == (32,)

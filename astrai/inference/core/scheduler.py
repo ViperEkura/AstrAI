@@ -154,13 +154,15 @@ class InferenceScheduler:
                     for t, ntok in zip(valid, next_tokens):
                         t.output_ids.append(ntok)
                         t.output_tokens += 1
-                        self._task_mgr.invoke_callback(
-                            t.task_id,
-                            self._task_mgr.tokenizer.decode([ntok]),
-                        )
+                        new_text = t.decode_new_token(self._task_mgr.tokenizer)
+                        if new_text:
+                            self._task_mgr.invoke_callback(t.task_id, new_text)
 
                     for t in valid:
                         if t.is_finished(stop_ids):
+                            remaining = t.flush_remaining(self._task_mgr.tokenizer)
+                            if remaining:
+                                self._task_mgr.invoke_callback(t.task_id, remaining)
                             self._task_mgr.invoke_callback(t.task_id, STOP)
 
         except Exception as e:

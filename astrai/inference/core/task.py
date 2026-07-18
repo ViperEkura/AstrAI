@@ -13,6 +13,40 @@ logger = logging.getLogger(__name__)
 STOP = object()
 
 
+class StreamDecoder:
+    """Incremental decoder for byte-level BPE streaming.
+
+    Byte-level BPE may split a single Unicode character (e.g. em-dash,
+    smart quotes) across multiple tokens. Decoding such a token in
+    isolation produces U+FFFD (replacement char). This decoder
+    accumulates token IDs and only emits text once the trailing
+    characters are complete, buffering incomplete multi-byte sequences
+    until the next token arrives.
+    """
+
+    __slots__ = ("_tokenizer", "_ids", "_emitted")
+
+    def __init__(self, tokenizer: AutoTokenizer):
+        self._tokenizer = tokenizer
+        self._ids: List[int] = []
+        self._emitted: str = ""
+
+    def push(self, token_id: int) -> str:
+        """Append a token ID and return newly completed text.
+
+        Returns "" while a multi-byte character is still incomplete.
+        """
+        self._ids.append(token_id)
+        full = self._tokenizer.decode(self._ids, skip_special_tokens=True)
+        if full.endswith("\ufffd"):
+            return ""
+        if len(full) > len(self._emitted):
+            diff = full[len(self._emitted) :]
+            self._emitted = full
+            return diff
+        return ""
+
+
 class TaskStatus(Enum):
     """Task lifecycle states."""
 
@@ -51,6 +85,34 @@ class Task:
         self.output_tokens: int = 0
         self.arrival_time = time.time()
         self.finish_time: Optional[float] = None
+        self._decoder: Optional[StreamDecoder] = None
+
+    def decode_new_token(self, tokenizer: AutoTokenizer) -> str:
+        """Decode the last appended output token, buffering incomplete
+        multi-byte sequences across calls.
+
+        Lazily creates a :class:`StreamDecoder` on first use.
+        """
+        if self._decoder is None:
+            self._decoder = StreamDecoder(tokenizer)
+        return self._decoder.push(self.output_ids[-1])
+
+    def flush_remaining(self, tokenizer: AutoTokenizer) -> str:
+        """Emit any text still buffered in the decoder.
+
+        Called when generation terminates (max_tokens reached, stop
+        sequence, or external removal) to avoid dropping a final
+        incomplete-looking fragment that is actually complete when
+        adjacent to the stop token.
+        """
+        if self._decoder is None or not self.output_ids:
+            return ""
+        full = tokenizer.decode(self.output_ids, skip_special_tokens=True)
+        if len(full) > len(self._decoder._emitted):
+            diff = full[len(self._decoder._emitted) :]
+            self._decoder._emitted = full
+            return diff
+        return ""
 
     @property
     def next_pos(self) -> int:

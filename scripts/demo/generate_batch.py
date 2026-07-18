@@ -26,11 +26,9 @@ def batch_generate():
 
     prompts = [
         tokenizer.apply_chat_template(
-            [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": q},
-            ],
+            [{"role": "user", "content": q}],
             tokenize=False,
+            add_generation_prompt=True,
         )
         for q in inputs
     ]

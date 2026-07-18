@@ -99,7 +99,8 @@ def processor(
 
             for i, prompt in enumerate(chunk):
                 if input_data and "messages" in input_data[0]:
-                    output_item = {"response": resp_chunk[i]}
+                    orig = input_data[chunk_start + i]
+                    output_item = {**orig, response_key: resp_chunk[i]}
                 else:
                     output_item = {
                         question_key: prompt,

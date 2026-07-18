@@ -58,8 +58,8 @@ def parse_args():
     parser.add_argument(
         "--system_prompt",
         type=str,
-        default="You are a helpful assistant.",
-        help="Optional system prompt",
+        default="",
+        help="Optional system prompt (default: empty, model not SFT-trained on system role)",
     )
     return parser.parse_args()
 
@@ -73,18 +73,20 @@ def chat():
     model.to(device="cuda", dtype=torch.bfloat16)
     engine = InferenceEngine(model=model, tokenizer=tokenizer)
 
-    messages = [{"role": "system", "content": args.system_prompt}]
-
     while True:
         query = input(">> ")
         if query == "!exit":
             break
 
-        messages.append({"role": "user", "content": query})
+        msgs = []
+        if args.system_prompt:
+            msgs.append({"role": "system", "content": args.system_prompt})
+        msgs.append({"role": "user", "content": query})
+        prompt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True
+        )
 
         full_response = ""
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-
         for token in engine.generate(
             prompt=prompt,
             stream=True,
@@ -99,7 +101,6 @@ def chat():
             full_response += token
 
         print()
-        messages.append({"role": "assistant", "content": full_response.strip()})
 
 
 if __name__ == "__main__":

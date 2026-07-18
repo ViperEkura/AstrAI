@@ -14,6 +14,7 @@ from astrai.preprocessing.position_id import (
     PositionIdStrategy,
     PositionIdStrategyFactory,
 )
+from astrai.preprocessing.transform import TokenizeTransform
 from astrai.preprocessing.writer import (
     StoreWriter,
     StoreWriterFactory,
@@ -32,5 +33,6 @@ __all__ = [
     "SingleOutputMaskBuilder",
     "StoreWriter",
     "StoreWriterFactory",
+    "TokenizeTransform",
     "filter_by_length",
 ]

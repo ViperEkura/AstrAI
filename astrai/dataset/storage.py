@@ -28,16 +28,13 @@ from typing import Dict, List, Optional, Union
 import torch
 from torch import Tensor
 
-from astrai.config.preprocess_config import PipelineConfig
 from astrai.factory import BaseFactory
-from astrai.preprocessing.builder import MaskBuilderFactory
-from astrai.preprocessing.position_id import PositionIdStrategyFactory
+from astrai.preprocessing.transform import TokenizeTransform
 from astrai.serialization import (
     load_bin,
     load_bin_offsets,
     load_h5,
 )
-from astrai.tokenize import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -104,9 +101,12 @@ class Store(ABC):
         count.  Backed by either per-record segment lists (H5/JSONL) or
         a single concatenated segment plus per-record offsets (bin).
 
-    Subclasses fill ``self._data`` and ``self._cum`` during ``load()``
-    via ``_normalize()``.
+    Subclasses declare ``segments_are_records`` to indicate whether their
+    segments are inherently per-record (H5/JSONL) or opaque shards (bin).
+    This is a format-level property, not a per-call decision.
     """
+
+    segments_are_records: bool = False
 
     def __init__(self):
         self._data: Dict[str, List[Tensor]] = {}
@@ -208,7 +208,6 @@ class Store(ABC):
         self,
         raw: Dict[str, list],
         offsets: Optional[Dict[str, List[int]]] = None,
-        per_record: bool = False,
     ):
         """Register segments and pre-compute indices for both access modes.
 
@@ -217,8 +216,9 @@ class Store(ABC):
 
         Record mode: if *offsets* is provided (bin layout), ``_offsets[key]``
         stores cumulative per-record offsets into the single concatenated
-        segment.  Otherwise (h5/jsonl layout), ``_data[key]`` is already a
-        per-record list and ``fetch_record`` indexes it directly.
+        segment.  Otherwise, when ``segments_are_records`` is True
+        (H5/JSONL), ``_data[key]`` is a per-record list and
+        ``fetch_record`` indexes it directly.
 
         Nested keys (GRPO ``responses``/``masks`` as ``List[List[Tensor]]``)
         are stored as-is and excluded from both cumulative bookkeepings —
@@ -265,10 +265,7 @@ class Store(ABC):
         if valid_offsets:
             record_counts = [len(v) - 1 for v in valid_offsets.values()]
             self._num_records = min(record_counts) if record_counts else 0
-        elif per_record:
-            # H5/JSONL layout: _data[key] is a per-record list where each
-            # segment is one record.  Even a single segment counts as one
-            # record.
+        elif self.segments_are_records:
             per_record_counts = []
             for key, tensors in self._data.items():
                 if not tensors or isinstance(tensors[0], list):
@@ -276,8 +273,6 @@ class Store(ABC):
                 per_record_counts.append(len(tensors))
             self._num_records = min(per_record_counts) if per_record_counts else 0
         else:
-            # bin layout without offsets: _data[key] is [concatenated_stream].
-            # Cannot determine record boundaries — stream mode only.
             self._num_records = 0
 
 
@@ -301,8 +296,10 @@ class H5Store(Store):
     Stream mode concatenates across records via ``_cum``.
     """
 
+    segments_are_records = True
+
     def load(self, path: str):
-        self._normalize(load_h5(path), per_record=True)
+        self._normalize(load_h5(path))
 
 
 @StoreFactory.register("bin")
@@ -353,62 +350,46 @@ class MmapStore(Store):
 
 @StoreFactory.register("jsonl")
 class JsonlStore(Store):
-    """On-the-fly tokenization store for raw JSONL files.
+    """JSONL reader with pluggable tokenization transform.
 
     A JSONL dataset directory contains ``*.jsonl`` files plus a
-    ``dataset_config.json`` file that follows the same schema as
-    :class:`PipelineConfig` with an additional ``tokenizer_path`` field.
-    Records are tokenized when the store is loaded and concatenated into
-    segmented tensors matching the key layout expected by the dataset
-    classes (``sequence``, ``loss_mask``, ``position_ids``, ...).
+    ``dataset_config.json`` describing the tokenization pipeline.
+
+    Responsibilities are split across two layers:
+
+    - **Reader** (this class): reads raw JSON records from disk.
+    - **Transform** (:class:`~astrai.preprocessing.transform.TokenizeTransform`):
+      tokenizes records into per-key tensors.  When not supplied explicitly,
+      a default transform is built from ``dataset_config.json`` so that
+      existing callers keep working without changes.
+
+    The Store itself never imports the tokenizer — the dependency lives
+    in the Transform layer.
     """
 
     CONFIG_NAME = "dataset_config.json"
+    segments_are_records = True
 
-    def load(self, path: str):
+    def load(self, path: str, transform=None, **kwargs):
         root = Path(path)
-        config_path = root / self.CONFIG_NAME
-        if not config_path.exists():
-            raise FileNotFoundError(
-                f"JSONL dataset config not found: {config_path}. "
-                f"Expected {self.CONFIG_NAME} alongside *.jsonl files."
-            )
+        records = self._read_records(root)
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            raw_config = json.load(f)
+        if transform is None:
+            config_path = root / self.CONFIG_NAME
+            if not config_path.exists():
+                raise FileNotFoundError(
+                    f"JSONL dataset config not found: {config_path}. "
+                    f"Expected {self.CONFIG_NAME} alongside *.jsonl files, "
+                    f"or pass an explicit transform."
+                )
+            transform = TokenizeTransform.from_config_file(str(config_path))
 
-        tokenizer_path = raw_config.pop("tokenizer_path", None) or str(root)
-        self.config = PipelineConfig.from_dict(raw_config)
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        mask_builder = MaskBuilderFactory.create("sectioned")
-        position_strategy = PositionIdStrategyFactory.create(
-            self.config.output.position_ids_mode
-        )
+        raw = transform.apply(records)
+        self._normalize(raw)
 
-        raw: Dict[str, List[Tensor]] = {}
-        doc_sequences: List[List[int]] = []
-
-        def _process_item(item: dict) -> None:
-            nonlocal raw, doc_sequences
-            result = mask_builder.build(item, self.config, tokenizer)
-            if result is None:
-                return
-            result.pop("domain", None)
-            primary_ids = self._primary_ids(result)
-            if not primary_ids:
-                return
-            doc_sequences.append(primary_ids)
-            for key, ids in result.items():
-                if key not in raw:
-                    raw[key] = []
-                if ids and isinstance(ids[0], list):
-                    # GRPO multi-response: List[List[int]] → List[Tensor]
-                    raw[key].append(
-                        [torch.tensor(sub, dtype=self._infer_dtype(sub)) for sub in ids]
-                    )
-                else:
-                    raw[key].append(torch.tensor(ids, dtype=self._infer_dtype(ids)))
-
+    @staticmethod
+    def _read_records(root: Path) -> List[dict]:
+        records: List[dict] = []
         for jsonl_path in sorted(root.glob("*.jsonl")):
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -416,16 +397,13 @@ class JsonlStore(Store):
                     if not line:
                         continue
                     try:
-                        item = json.loads(line)
+                        records.append(json.loads(line))
                     except json.JSONDecodeError:
                         logger.warning(
                             "Failed to parse JSON line in %s, skipping", jsonl_path
                         )
-                        continue
-                    _process_item(item)
-
         for json_path in sorted(root.glob("*.json")):
-            if json_path.name == self.CONFIG_NAME:
+            if json_path.name == JsonlStore.CONFIG_NAME:
                 continue
             with open(json_path, "r", encoding="utf-8") as f:
                 try:
@@ -434,28 +412,7 @@ class JsonlStore(Store):
                     logger.warning("Failed to parse JSON file %s, skipping", json_path)
                     continue
             if isinstance(data, list):
-                for item in data:
-                    _process_item(item)
+                records.extend(data)
             elif isinstance(data, dict):
-                _process_item(data)
-
-        pos_ids = position_strategy.generate(doc_sequences)
-        if pos_ids:
-            raw["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
-
-        self._normalize(raw, per_record=True)
-
-    @staticmethod
-    def _primary_ids(result: dict) -> List[int]:
-        """Return the first flat integer list in *result* as the primary id sequence."""
-        for val in result.values():
-            if isinstance(val, list) and val and isinstance(val[0], int):
-                return val
-        return []
-
-    @staticmethod
-    def _infer_dtype(ids: List) -> torch.dtype:
-        """Infer tensor dtype from the first element of a token/value list."""
-        if ids and isinstance(ids[0], float):
-            return torch.float32
-        return torch.int32
+                records.append(data)
+        return records

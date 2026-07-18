@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 
 from astrai.config.train_config import TrainConfig
-from astrai.dataset import ResumableDistributedSampler
+from astrai.dataset import RDSampler
 from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import BaseExecutor, ExecutorFactory
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
@@ -141,7 +141,7 @@ class TrainContextBuilder:
             )
 
         sampler_offset = context.consumed_samples // context.world_size
-        sampler = ResumableDistributedSampler(
+        sampler = RDSampler(
             data_source=train_dataset,
             start_epoch=context.epoch,
             start_iter=sampler_offset,
@@ -154,10 +154,11 @@ class TrainContextBuilder:
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
             prefetch_factor=cfg.prefetch_factor,
+            collate_fn=cfg.collate_fn,
         )
 
         if val_dataset is not None:
-            val_sampler = ResumableDistributedSampler(
+            val_sampler = RDSampler(
                 data_source=val_dataset,
                 start_epoch=0,
                 start_iter=0,
@@ -171,6 +172,7 @@ class TrainContextBuilder:
                 num_workers=cfg.num_workers,
                 pin_memory=cfg.pin_memory,
                 prefetch_factor=cfg.prefetch_factor,
+                collate_fn=cfg.collate_fn,
             )
 
         context.model, context.optimizer, context.dataloader, context.scheduler = (

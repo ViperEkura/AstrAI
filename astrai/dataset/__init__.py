@@ -1,9 +1,10 @@
 from astrai.dataset.dataset import (
     BaseDataset,
     DatasetFactory,
+    dpo_collate_fn,
     grpo_collate_fn,
 )
-from astrai.dataset.sampler import ResumableDistributedSampler
+from astrai.dataset.sampler import RDSampler
 from astrai.dataset.storage import (
     H5Store,
     JsonlStore,
@@ -22,6 +23,7 @@ from astrai.serialization import (
 __all__ = [
     "BaseDataset",
     "DatasetFactory",
+    "dpo_collate_fn",
     "grpo_collate_fn",
     "Store",
     "StoreFactory",
@@ -33,5 +35,5 @@ __all__ = [
     "load_h5",
     "save_bin",
     "load_bin",
-    "ResumableDistributedSampler",
+    "RDSampler",
 ]

@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch import Tensor, nn
 
 from astrai.config import AutoRegressiveLMConfig, TrainConfig
-from astrai.dataset import DatasetFactory
+from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.trainer import SchedulerFactory, Trainer
@@ -504,6 +504,12 @@ def train(
 
     grad_ckpt_modules = [DecoderBlock] if gradient_checkpointing else []
 
+    collate_fn = None
+    if train_type == "dpo":
+        collate_fn = dpo_collate_fn
+    elif train_type == "grpo":
+        collate_fn = grpo_collate_fn
+
     train_config = TrainConfig(
         model_fn=model_fn,
         strategy=train_type,
@@ -536,6 +542,7 @@ def train(
         executor_kwargs=executor_kwargs,
         extra_kwargs=strategy_kwargs,
         neftune_alpha=neftune_alpha,
+        collate_fn=collate_fn,
     )
 
     trainer = Trainer(train_config)

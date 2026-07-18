@@ -56,6 +56,13 @@ def _write_jsonl_dataset(test_dir, tokenizer_path, records, config_overrides=Non
     return data_dir
 
 
+def _fake_fetch_record(self, idx, keys):
+    """FakeStore.fetch_record matching real Store semantics."""
+    if isinstance(keys, str):
+        return self._data[keys][idx]
+    return {k: self._data[k][idx] for k in keys}
+
+
 def _make_seq_dataset(
     test_dir, name="data", seq_length=200, train_type="seq", data=None, **load_kwargs
 ):
@@ -338,6 +345,7 @@ def test_grpo_dataset_dtype(base_test_env):
         (),
         {
             "keys": ["prompts", "responses", "masks", "rewards"],
+            "num_records": 1,
             "_data": {
                 "prompts": [torch.randint(0, 100, (10,), dtype=torch.int32)],
                 "responses": [
@@ -346,9 +354,9 @@ def test_grpo_dataset_dtype(base_test_env):
                 "masks": [[torch.ones(5, dtype=torch.int32) for _ in range(G)]],
                 "rewards": [torch.rand(G, dtype=torch.float32)],
             },
+            "fetch_record": _fake_fetch_record,
         },
     )()
-    dataset._build_records()
     item = dataset[0]
 
     assert item["prompts"].dtype == torch.long
@@ -371,15 +379,16 @@ def test_grpo_dataset_load(base_test_env):
         (),
         {
             "keys": ["prompts", "responses", "masks", "rewards"],
+            "num_records": 1,
             "_data": {
                 "prompts": [torch.randint(0, 100, (prompt_len,))],
                 "responses": [[torch.randint(0, 100, (rl,)) for rl in resp_lens]],
                 "masks": [[torch.ones(rl, dtype=torch.int64) for rl in resp_lens]],
                 "rewards": [torch.tensor([0.9, 0.3, 0.7], dtype=torch.float32)],
             },
+            "fetch_record": _fake_fetch_record,
         },
     )()
-    dataset._build_records()
 
     assert len(dataset) == 1
     item = dataset[0]
@@ -864,6 +873,7 @@ def test_grpo_multiple_records(base_test_env):
         (),
         {
             "keys": ["prompts", "responses", "masks", "rewards"],
+            "num_records": n_records,
             "_data": {
                 "prompts": [torch.randint(0, 100, (10,)) for _ in range(n_records)],
                 "responses": dummy_responses,
@@ -875,9 +885,9 @@ def test_grpo_multiple_records(base_test_env):
                     torch.rand(G, dtype=torch.float32) for _ in range(n_records)
                 ],
             },
+            "fetch_record": _fake_fetch_record,
         },
     )()
-    dataset._build_records()
 
     assert len(dataset) == n_records
 

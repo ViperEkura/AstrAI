@@ -12,7 +12,7 @@ from astrai.config import (
 from astrai.dataset import (
     BaseDataset,
     DatasetFactory,
-    ResumableDistributedSampler,
+    RDSampler,
     Store,
     StoreFactory,
 )
@@ -77,7 +77,7 @@ __all__ = [
     "Pipeline",
     "PipelineConfig",
     "ProtocolHandler",
-    "ResumableDistributedSampler",
+    "RDSampler",
     "SamplingPipeline",
     "SchedulerFactory",
     "Store",

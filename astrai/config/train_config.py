@@ -87,6 +87,10 @@ class TrainConfig(BaseConfig):
     pin_memory: bool = field(
         default=False, metadata={"help": "Pin memory for dataloader."}
     )
+    collate_fn: Optional[Callable[[List[Any]], Any]] = field(
+        default=None,
+        metadata={"help": "Collate function for dataloader (e.g. dpo_collate_fn)."},
+    )
 
     # distributed training
     nprocs: int = field(

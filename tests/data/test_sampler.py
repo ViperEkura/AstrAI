@@ -1,4 +1,4 @@
-from astrai.dataset import ResumableDistributedSampler
+from astrai.dataset import RDSampler
 
 
 def test_random_sampler_consistency(random_dataset):
@@ -6,8 +6,8 @@ def test_random_sampler_consistency(random_dataset):
     dataset = random_dataset
 
     # Create two samplers with same seed
-    sampler1 = ResumableDistributedSampler(dataset, seed=42)
-    sampler2 = ResumableDistributedSampler(dataset, seed=42)
+    sampler1 = RDSampler(dataset, seed=42)
+    sampler2 = RDSampler(dataset, seed=42)
 
     indices1 = list(iter(sampler1))
     indices2 = list(iter(sampler2))
@@ -20,8 +20,8 @@ def test_random_sampler_different_seeds(random_dataset):
     dataset = random_dataset
 
     # Create two samplers with different seeds
-    sampler1 = ResumableDistributedSampler(dataset, seed=42)
-    sampler2 = ResumableDistributedSampler(dataset, seed=123)
+    sampler1 = RDSampler(dataset, seed=42)
+    sampler2 = RDSampler(dataset, seed=123)
 
     indices1 = list(iter(sampler1))
     indices2 = list(iter(sampler2))
@@ -35,7 +35,7 @@ def test_sampler_across_epochs(random_dataset):
     dataset = random_dataset
     n = len(dataset)
 
-    sampler = ResumableDistributedSampler(dataset, seed=42)
+    sampler = RDSampler(dataset, seed=42)
 
     # Get indices for first epoch
     epoch1_indices = list(iter(sampler))

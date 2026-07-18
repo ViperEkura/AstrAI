@@ -5,7 +5,15 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, Sampler
 
 
-class ResumableDistributedSampler(Sampler[int]):
+class RDSampler(Sampler[int]):
+    """Resumable Distributed Sampler.
+
+    A distributed sampler that supports checkpoint-based resume: iteration
+    state (epoch, position) is tracked so training can continue from the
+    exact sample after a restart.  Shards the dataset across
+    ``dist.world_size`` replicas with optional shuffling.
+    """
+
     def __init__(
         self,
         data_source: Dataset,

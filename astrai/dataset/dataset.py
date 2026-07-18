@@ -15,6 +15,46 @@ from astrai.dataset.storage import (
 from astrai.factory import BaseFactory
 
 
+def dpo_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+    """Collate variable-length DPO samples into padded 2-D tensors.
+
+    Input: list of dicts, each with:
+      - chosen:        [C_i]
+      - rejected:      [R_i]
+      - chosen_mask:   [C_i]
+      - rejected_mask: [R_i]
+
+    Output (padded to the max length across chosen/rejected within the batch):
+      - chosen:        [B, S_max]
+      - rejected:      [B, S_max]
+      - chosen_mask:   [B, S_max]
+      - rejected_mask: [B, S_max]
+    """
+    B = len(batch)
+    S_max = max(b["chosen"].size(0) for b in batch)
+    S_max = max(S_max, max(b["rejected"].size(0) for b in batch))
+
+    chosen = torch.zeros(B, S_max, dtype=torch.long)
+    rejected = torch.zeros(B, S_max, dtype=torch.long)
+    chosen_mask = torch.zeros(B, S_max, dtype=torch.bool)
+    rejected_mask = torch.zeros(B, S_max, dtype=torch.bool)
+
+    for i, b in enumerate(batch):
+        c_len = b["chosen"].size(0)
+        r_len = b["rejected"].size(0)
+        chosen[i, :c_len] = b["chosen"]
+        rejected[i, :r_len] = b["rejected"]
+        chosen_mask[i, :c_len] = b["chosen_mask"]
+        rejected_mask[i, :r_len] = b["rejected_mask"]
+
+    return {
+        "chosen": chosen,
+        "rejected": rejected,
+        "chosen_mask": chosen_mask,
+        "rejected_mask": rejected_mask,
+    }
+
+
 def grpo_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
     """Collate variable-length GRPO samples into padded 3-D tensors.
 
@@ -262,32 +302,61 @@ class SFTDataset(BaseDataset):
 
 @DatasetFactory.register("dpo")
 class DPODataset(BaseDataset):
-    """Dataset for Direct Preference Optimization training."""
+    """Record-structured dataset for Direct Preference Optimization.
+
+    Each sample is one preference pair (chosen + rejected) and is an
+    independent training unit — no windowing, stride, or cross-record
+    concatenation.  This keeps each sequence self-contained so attention
+    never leaks across preference pairs.
+
+    Delegates record access to ``Store.fetch_record``, which works with
+    any storage backend (H5 per-record datasets, bin+offsets memmap, or
+    JSONL on-the-fly tokenization).
+    """
+
+    def __init__(self, window_size: int = 0, stride: int = 0, **kwargs):
+        super().__init__(window_size=window_size, stride=stride or window_size)
 
     @property
     def required_keys(self) -> List[str]:
         return ["chosen", "rejected", "chosen_mask", "rejected_mask"]
 
-    def _fetch_data(self, begin_idx: int, end_idx: int, key: str) -> Tensor:
-        return self.storage.fetch(begin_idx, end_idx, key)
+    def load(self, load_path: str, storage_type: Optional[str] = None, **kwargs):
+        if storage_type is None:
+            storage_type = detect_format(load_path)
+        self.storage = StoreFactory.create(storage_type, **kwargs)
+        self._load_path = load_path
+        self.storage.load(load_path, **kwargs)
+        self._validate_keys()
 
-    def __getitem__(self, index: int):
-        begin_idx, end_idx = self.get_index(index)
+    def _validate_keys(self):
+        actual_keys = set(self.storage.keys)
+        missing = [k for k in self.required_keys if k not in actual_keys]
+        if missing:
+            raise KeyError(
+                f"DPODataset requires keys {self.required_keys}, "
+                f"but storage only has {sorted(actual_keys)}. Missing: {missing}"
+            )
 
-        chosen = self._fetch_data(begin_idx, end_idx, "chosen").to(dtype=torch.long)
-        rejected = self._fetch_data(begin_idx, end_idx, "rejected").to(dtype=torch.long)
-        chosen_mask = self._fetch_data(begin_idx, end_idx, "chosen_mask").to(
-            dtype=torch.bool
-        )
-        rejected_mask = self._fetch_data(begin_idx, end_idx, "rejected_mask").to(
-            dtype=torch.bool
-        )
+    @property
+    def count(self) -> int:
+        return self.storage.num_records
 
+    def __len__(self) -> int:
+        return self.storage.num_records
+
+    def __getitem__(self, index: int) -> Dict[str, Tensor]:
         return {
-            "chosen": chosen,
-            "rejected": rejected,
-            "chosen_mask": chosen_mask,
-            "rejected_mask": rejected_mask,
+            "chosen": self.storage.fetch_record(index, "chosen").to(dtype=torch.long),
+            "rejected": self.storage.fetch_record(index, "rejected").to(
+                dtype=torch.long
+            ),
+            "chosen_mask": self.storage.fetch_record(index, "chosen_mask").to(
+                dtype=torch.bool
+            ),
+            "rejected_mask": self.storage.fetch_record(index, "rejected_mask").to(
+                dtype=torch.bool
+            ),
         }
 
 
@@ -310,7 +379,6 @@ class GRPODataset(BaseDataset):
 
     def __init__(self, window_size: int = 0, stride: int = 0, **kwargs):
         super().__init__(window_size=window_size, stride=stride or window_size)
-        self._records: List[dict] = []
 
     @property
     def required_keys(self) -> List[str]:
@@ -323,7 +391,6 @@ class GRPODataset(BaseDataset):
         self._load_path = load_path
         self.storage.load(load_path, **kwargs)
         self._validate_keys()
-        self._build_records()
 
     def _validate_keys(self):
         actual_keys = set(self.storage.keys)
@@ -334,44 +401,21 @@ class GRPODataset(BaseDataset):
                 f"but storage only has {sorted(actual_keys)}. Missing: {missing}"
             )
 
-    def _build_records(self):
-        """Unfold segmented storage into per-record lists.
-
-        ``prompts`` is a flat list of 1-D tensors (one per record).
-        ``responses`` / ``masks`` are nested lists (G tensors per record).
-        ``rewards`` is a flat list of 1-D tensors (len G per record).
-        """
-        prompt_segs = self.storage._data.get("prompts", [])
-        response_segs = self.storage._data.get("responses", [])
-        mask_segs = self.storage._data.get("masks", [])
-        reward_segs = self.storage._data.get("rewards", [])
-
-        n_records = len(prompt_segs)
-        self._records = []
-        for i in range(n_records):
-            self._records.append(
-                {
-                    "prompts": prompt_segs[i],
-                    "responses": response_segs[i] if i < len(response_segs) else [],
-                    "masks": mask_segs[i] if i < len(mask_segs) else [],
-                    "rewards": reward_segs[i]
-                    if i < len(reward_segs)
-                    else torch.tensor([]),
-                }
-            )
-
     @property
     def count(self) -> int:
-        return len(self._records)
+        return self.storage.num_records
 
     def __len__(self) -> int:
-        return len(self._records)
+        return self.storage.num_records
 
     def __getitem__(self, index: int) -> Dict[str, Tensor]:
-        rec = self._records[index]
+        prompts = self.storage.fetch_record(index, "prompts")
+        responses = self.storage.fetch_record(index, "responses")
+        masks = self.storage.fetch_record(index, "masks")
+        rewards = self.storage.fetch_record(index, "rewards")
         return {
-            "prompts": rec["prompts"].to(dtype=torch.long),
-            "responses": [r.to(dtype=torch.long) for r in rec["responses"]],
-            "masks": [m.to(dtype=torch.bool) for m in rec["masks"]],
-            "rewards": rec["rewards"].to(dtype=torch.float32),
+            "prompts": prompts.to(dtype=torch.long),
+            "responses": [r.to(dtype=torch.long) for r in responses],
+            "masks": [m.to(dtype=torch.bool) for m in masks],
+            "rewards": rewards.to(dtype=torch.float32),
         }

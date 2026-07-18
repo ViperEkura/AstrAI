@@ -917,16 +917,23 @@ def test_dpo_tokenize_pure_function():
     """dpo_tokenize returns flat lists with correct mask alignment."""
 
     class FakeTokenizer:
-        def encode(self, text, add_special_tokens=True):
-            return [len(text)] if add_special_tokens else [len(text) + 1]
+        def apply_chat_template(
+            self, messages, tokenize=True, add_generation_prompt=True
+        ):
+            ids = []
+            for m in messages:
+                ids.append(len(m["content"]))
+                ids.append(-1)
+            if add_generation_prompt:
+                ids.append(99)
+            return ids
 
-    record = {"input": "ab", "chosen": "xyz", "rejected": "w"}
-    result = dpo_tokenize(record, FakeTokenizer(), max_len=64, pad_id=0)
+    record = {"prompt": "ab", "chosen": "xyz", "rejected": "w"}
+    result = dpo_tokenize(record, FakeTokenizer(), max_len=64)
 
     assert set(result.keys()) == {"chosen", "rejected", "chosen_mask", "rejected_mask"}
     assert len(result["chosen"]) == len(result["chosen_mask"])
     assert len(result["rejected"]) == len(result["rejected_mask"])
-    assert len(result["chosen"]) == len(result["rejected"])
 
     assert result["chosen_mask"][0] == 0
     assert any(m == 1 for m in result["chosen_mask"])
@@ -937,12 +944,14 @@ def test_dpo_tokenize_malformed_record():
     """dpo_tokenize returns None for missing fields."""
 
     class FakeTokenizer:
-        def encode(self, text, add_special_tokens=True):
+        def apply_chat_template(
+            self, messages, tokenize=True, add_generation_prompt=True
+        ):
             return [1]
 
     assert dpo_tokenize({}, FakeTokenizer()) is None
-    assert dpo_tokenize({"input": "a"}, FakeTokenizer()) is None
-    assert dpo_tokenize({"input": "a", "chosen": "b"}, FakeTokenizer()) is None
+    assert dpo_tokenize({"prompt": "a"}, FakeTokenizer()) is None
+    assert dpo_tokenize({"prompt": "a", "chosen": "b"}, FakeTokenizer()) is None
 
 
 def test_dpo_jsonl_lazy_load(base_test_env):

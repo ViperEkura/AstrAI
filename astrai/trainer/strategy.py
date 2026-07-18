@@ -225,7 +225,7 @@ class DPOStrategy(BaseStrategy):
         device: str,
         ref_model: nn.Module,
         beta: float = 0.1,
-        reduction: str = "mean",
+        reduction: str = "sum",
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)

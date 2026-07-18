@@ -106,7 +106,12 @@ class Executor:
         with torch.inference_mode():
             outputs = self.model(
                 input_ids.unsqueeze(1),
-                paged_cache=self.kv_cache.bind_tasks(task_ids, total_len, self.device),
+                paged_cache=self.kv_cache.bind_tasks(
+                    task_ids,
+                    total_len,
+                    self.device,
+                    write_positions=position_ids,
+                ),
                 position_ids=position_ids.unsqueeze(1),
             )
             logits = outputs["logits"][:, -1, :]

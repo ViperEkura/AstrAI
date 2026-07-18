@@ -138,35 +138,30 @@ class InferenceScheduler:
                                 t.task_id, t.prompt_ids, start_logical_page
                             )
 
-                pos_groups: Dict[int, List[Task]] = {}
-                for t in self._task_mgr.get_active_tasks():
-                    pos_groups.setdefault(t.next_pos, []).append(t)
+                decode_tasks = self._task_mgr.get_active_tasks()
 
-                for next_pos in sorted(pos_groups.keys()):
-                    group = sorted(pos_groups[next_pos], key=lambda t: t.task_id)
+                valid: List[Task] = []
+                for t in sorted(decode_tasks, key=lambda t: t.task_id):
+                    if cache.task_extend(t.task_id, t.next_pos):
+                        valid.append(t)
+                    else:
+                        t.status = TaskStatus.ABORTED
+                        self._task_mgr.invoke_callback(t.task_id, STOP)
 
-                    valid: List[Task] = []
-                    for t in group:
-                        if cache.task_extend(t.task_id, t.next_pos):
-                            valid.append(t)
-                        else:
-                            t.status = TaskStatus.ABORTED
+                if valid:
+                    next_tokens = self._executor.execute_decode(valid)
+
+                    for t, ntok in zip(valid, next_tokens):
+                        t.output_ids.append(ntok)
+                        t.output_tokens += 1
+                        self._task_mgr.invoke_callback(
+                            t.task_id,
+                            self._task_mgr.tokenizer.decode([ntok]),
+                        )
+
+                    for t in valid:
+                        if t.is_finished(stop_ids):
                             self._task_mgr.invoke_callback(t.task_id, STOP)
-
-                    if valid:
-                        next_tokens = self._executor.execute_decode(valid)
-
-                        for t, ntok in zip(valid, next_tokens):
-                            t.output_ids.append(ntok)
-                            t.output_tokens += 1
-                            self._task_mgr.invoke_callback(
-                                t.task_id,
-                                self._task_mgr.tokenizer.decode([ntok]),
-                            )
-
-                        for t in valid:
-                            if t.is_finished(stop_ids):
-                                self._task_mgr.invoke_callback(t.task_id, STOP)
 
         except Exception as e:
             self._stop_event.set()

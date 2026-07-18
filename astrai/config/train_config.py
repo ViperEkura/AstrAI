@@ -37,8 +37,9 @@ class TrainConfig(BaseConfig):
     grad_accum_steps: int = field(
         default=1, metadata={"help": "Number of iterations between steps."}
     )
-    max_grad_norm: float = field(
-        default=1.0, metadata={"help": "Maximum gradient norm."}
+    max_grad_norm: Optional[float] = field(
+        default=None,
+        metadata={"help": "Maximum gradient norm. None disables clipping."},
     )
     gradient_checkpointing_modules: List[str] = field(
         default_factory=list,

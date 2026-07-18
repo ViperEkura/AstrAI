@@ -1,20 +1,24 @@
 """Storage backends for different data formats.
 
-Layers:
-  - I/O layer:       save_* / load_* functions, read/write raw files (HDF5/bin)
-                      return Dict[str, List[Tensor]] — format-specific, no state
-  - Store (ABC):     central abstraction, normalizes multi-segment into
-                      Dict[str, List[Tensor]] per key via _normalize(),
-                      fetch() uses bisect across segments — no forced concat
-  - Dataset layer:   BaseDataset owns a Store, only calls store.fetch(begin, end, key)
+Two access modes are reflected in the class hierarchy:
 
-Key properties:
-  - Multi-segment:   segments kept as-is, no forced concatenation — safe for
-                      datasets larger than RAM
-  - Explicit length: _length = min(total elements across keys), set at load,
-                      __len__ returns O(1)
-  - Zero-copy mmap:  MmapStore wraps np.memmap(mode="r"), all DataLoader
-                       workers share OS page-cache pages
+- :class:`StreamStore` — ``fetch(begin, end, key)`` slices across
+  concatenated segments.  Used by PT/SFT where data is a long token
+  stream.  ``len(store)`` returns the total token count.
+- :class:`RecordStore` — ``fetch_record(i, key)`` returns the *i*-th
+  record without cross-record concatenation.  Used by DPO/GRPO where
+  each record is an independent training unit.  ``num_records`` returns
+  the record count.
+
+Both share ``_data`` / ``_cum`` / ``_offsets`` bookkeeping via the
+common :class:`Store` base, which also owns ``_normalize`` for
+registering segments.  Subclasses pick the access mode by inheriting
+from the appropriate base.
+
+:class:`ProcessedStore` composes a :class:`JsonlSource` (raw record
+reader) with a pure ``record -> dict_of_tensors`` processor so that
+DPO/GRPO can tokenise raw JSONL on the fly without a pre-tokenised
+H5/bin file.  This keeps the tokenizer out of the Store base.
 """
 
 import bisect
@@ -23,7 +27,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -46,7 +50,7 @@ def detect_format(load_path: str) -> str:
         load_path: Directory or file path
 
     Returns:
-        Format string ("h5", "bin", or "jsonl")
+        Format string ("h5", "bin", "jsonl", or "processed")
 
     Raises:
         FileNotFoundError: If no supported data files are found
@@ -79,31 +83,16 @@ def detect_format(load_path: str) -> str:
     ]
     if jsonl_files:
         return "jsonl"
-    json_files = [
-        Path(p) for p in glob.glob(str(root / "**" / "*.json"), recursive=True)
-    ]
-    if json_files:
-        return "jsonl"
     raise FileNotFoundError(f"No supported data files found at {load_path}")
 
 
 class Store(ABC):
-    """String keys -> segmented tensors with two access modes.
+    """Common base for all storage backends.
 
-    Stream mode (SEQ/SFT):
-        ``fetch(begin, end, keys)`` slices across concatenated segments,
-        transparently ``torch.cat``-ing across segment boundaries.
-        ``len(store)`` returns total token count.
-
-    Record mode (DPO/GRPO):
-        ``fetch_record(index, keys)`` returns the i-th record without
-        cross-record concatenation.  ``num_records`` returns the record
-        count.  Backed by either per-record segment lists (H5/JSONL) or
-        a single concatenated segment plus per-record offsets (bin).
-
-    Subclasses declare ``segments_are_records`` to indicate whether their
-    segments are inherently per-record (H5/JSONL) or opaque shards (bin).
-    This is a format-level property, not a per-call decision.
+    Owns the shared ``_data`` / ``_cum`` / ``_offsets`` bookkeeping and
+    the ``_normalize`` entry point used by tensor-backed subclasses.
+    Does **not** expose an access API — that is the job of
+    :class:`StreamStore` and :class:`RecordStore`.
     """
 
     segments_are_records: bool = False
@@ -116,93 +105,12 @@ class Store(ABC):
         self._num_records: int = 0
 
     @abstractmethod
-    def load(self, path: str) -> None:
+    def load(self, path: str, **kwargs) -> None:
         raise NotImplementedError
 
     @property
     def keys(self) -> List[str]:
         return list(self._data.keys())
-
-    def __len__(self) -> int:
-        return self._length
-
-    def fetch(
-        self,
-        begin: int,
-        end: int,
-        keys: Union[str, List[str]],
-    ):
-        if not self._data:
-            raise RuntimeError("Store not loaded")
-        if not (0 <= begin < self._length and 0 <= end <= self._length):
-            raise ValueError(
-                f"Index out of bounds: begin={begin}, end={end}, length={self._length}"
-            )
-        if isinstance(keys, str):
-            return self._fetch_key(keys, begin, end)
-        return {k: self._fetch_key(k, begin, end) for k in keys}
-
-    def _fetch_key(self, key: str, begin: int, end: int) -> Tensor:
-        """Fetch slice [begin, end) across potentially multiple segments."""
-        segments = self._data[key]
-        cum = self._cum[key]
-        seg_start = bisect.bisect_right(cum, begin)
-        seg_end = bisect.bisect_left(cum, end)
-
-        results = []
-        for i in range(seg_start, seg_end + 1):
-            prev = cum[i - 1] if i > 0 else 0
-            s = max(begin - prev, 0)
-            e = min(end - prev, segments[i].shape[0])
-            results.append(segments[i][s:e])
-
-        return results[0] if len(results) == 1 else torch.cat(results, dim=0)
-
-    @property
-    def num_records(self) -> int:
-        return self._num_records
-
-    def fetch_record(
-        self,
-        index: int,
-        keys: Union[str, List[str]],
-    ):
-        """Fetch the *index*-th record without cross-record concatenation.
-
-        Returns a tensor (flat key) or ``List[Tensor]`` (nested key such as
-        GRPO ``responses``).
-        """
-        if not self._data:
-            raise RuntimeError("Store not loaded")
-        if not 0 <= index < self._num_records:
-            raise ValueError(
-                f"Record index out of bounds: {index}, num_records={self._num_records}"
-            )
-        if isinstance(keys, str):
-            return self._fetch_record_key(keys, index)
-        return {k: self._fetch_record_key(k, index) for k in keys}
-
-    def _fetch_record_key(self, key: str, index: int):
-        """Return the *index*-th record for *key*.
-
-        Two storage layouts are supported:
-
-        - **bin + offsets**: ``_data[key]`` is ``[single_long_segment]``;
-          ``_offsets[key]`` holds cumulative per-record offsets.  The record
-          is sliced as ``segment[offsets[i]:offsets[i+1]]``.
-        - **h5 / jsonl**: ``_data[key]`` is ``[t0, t1, ...]`` with one tensor
-          (or nested list of tensors for GRPO) per record.  Direct indexing.
-        """
-        offsets = self._offsets.get(key)
-        if offsets:
-            start = offsets[index]
-            end = (
-                offsets[index + 1]
-                if index + 1 < len(offsets)
-                else self._data[key][0].shape[0]
-            )
-            return self._data[key][0][start:end]
-        return self._data[key][index]
 
     def _normalize(
         self,
@@ -212,17 +120,18 @@ class Store(ABC):
         """Register segments and pre-compute indices for both access modes.
 
         Stream mode: ``_cum[key]`` accumulates per-segment lengths so
-        ``_fetch_key`` can bisect across segments without concatenation.
+        ``StreamStore._fetch_key`` can bisect across segments without
+        concatenation.
 
-        Record mode: if *offsets* is provided (bin layout), ``_offsets[key]``
-        stores cumulative per-record offsets into the single concatenated
-        segment.  Otherwise, when ``segments_are_records`` is True
-        (H5/JSONL), ``_data[key]`` is a per-record list and
-        ``fetch_record`` indexes it directly.
+        Record mode: if *offsets* is provided (bin layout),
+        ``_offsets[key]`` stores cumulative per-record offsets into the
+        single concatenated segment.  Otherwise, when
+        ``segments_are_records`` is True (H5/JSONL), ``_data[key]`` is a
+        per-record list and ``fetch_record`` indexes it directly.
 
-        Nested keys (GRPO ``responses``/``masks`` as ``List[List[Tensor]]``)
-        are stored as-is and excluded from both cumulative bookkeepings —
-        they are only accessed record-by-record.
+        Nested keys (GRPO ``responses``/``masks`` as
+        ``List[List[Tensor]]``) are stored as-is and excluded from both
+        cumulative bookkeepings — they are only accessed record-by-record.
         """
         flat_lengths = []
         for key, tensors in raw.items():
@@ -231,7 +140,6 @@ class Store(ABC):
                 self._cum[key] = []
                 flat_lengths.append(0)
                 continue
-            # Skip nested lists (GRPO responses/masks) — record-level access
             if isinstance(tensors[0], list):
                 self._cum[key] = []
                 continue
@@ -244,9 +152,6 @@ class Store(ABC):
             flat_lengths.append(cum[-1] if cum else 0)
         self._length = min(flat_lengths) if flat_lengths else 0
 
-        # Record-mode offsets (bin layout).  Only valid when each key is a
-        # single concatenated segment — multi-shard bin + offsets is not
-        # supported (merge shards or use H5/JSONL instead).
         valid_offsets: Dict[str, List[int]] = {}
         if offsets:
             for key, off in offsets.items():
@@ -276,53 +181,130 @@ class Store(ABC):
             self._num_records = 0
 
 
-class StoreFactory(BaseFactory["Store"]):
-    """Factory for creating Store instances by type name.
+class StreamStore(Store):
+    """Store exposing stream access: ``fetch(begin, end, key)``."""
 
-    Example::
+    def __len__(self) -> int:
+        return self._length
 
-        @StoreFactory.register("custom")
-        class CustomStore(Store):
-            ...
-    """
+    def fetch(
+        self,
+        begin: int,
+        end: int,
+        keys: Union[str, List[str]],
+    ):
+        if not self._data:
+            raise RuntimeError("Store not loaded")
+        if not (0 <= begin < self._length and 0 <= end <= self._length):
+            raise ValueError(
+                f"Index out of bounds: begin={begin}, end={end}, length={self._length}"
+            )
+        if isinstance(keys, str):
+            return self._fetch_key(keys, begin, end)
+        return {k: self._fetch_key(k, begin, end) for k in keys}
+
+    def _fetch_key(self, key: str, begin: int, end: int) -> Tensor:
+        segments = self._data[key]
+        cum = self._cum[key]
+        seg_start = bisect.bisect_right(cum, begin)
+        seg_end = bisect.bisect_left(cum, end)
+
+        results = []
+        for i in range(seg_start, seg_end + 1):
+            prev = cum[i - 1] if i > 0 else 0
+            s = max(begin - prev, 0)
+            e = min(end - prev, segments[i].shape[0])
+            results.append(segments[i][s:e])
+
+        return results[0] if len(results) == 1 else torch.cat(results, dim=0)
 
 
-@StoreFactory.register("h5")
-class H5Store(Store):
-    """HDF5-based storage backend (pre-tokenized data).
+class RecordStore(Store):
+    """Mixin exposing record access: ``fetch_record(i, key)``.
 
-    Each key is stored as a group of per-record datasets (``data_0``,
-    ``data_1``, …), so record mode indexes ``_data[key]`` directly.
-    Stream mode concatenates across records via ``_cum``.
+    ``__len__`` is **not** overridden — subclasses decide whether
+    ``len()`` returns token count (stream) or record count (record-only).
     """
 
     segments_are_records = True
 
-    def load(self, path: str):
+    @property
+    def num_records(self) -> int:
+        return self._num_records
+
+    def fetch_record(
+        self,
+        index: int,
+        keys: Union[str, List[str]],
+    ):
+        if not self._data:
+            raise RuntimeError("Store not loaded")
+        if not 0 <= index < self._num_records:
+            raise ValueError(
+                f"Record index out of bounds: {index}, num_records={self._num_records}"
+            )
+        if isinstance(keys, str):
+            return self._fetch_record_key(keys, index)
+        return {k: self._fetch_record_key(k, index) for k in keys}
+
+    def _fetch_record_key(self, key: str, index: int):
+        offsets = self._offsets.get(key)
+        if offsets:
+            start = offsets[index]
+            end = (
+                offsets[index + 1]
+                if index + 1 < len(offsets)
+                else self._data[key][0].shape[0]
+            )
+            return self._data[key][0][start:end]
+        return self._data[key][index]
+
+
+class StoreFactory(BaseFactory["Store"]):
+    """Factory for creating Store instances by type name."""
+
+
+@StoreFactory.register("h5")
+class H5Store(StreamStore, RecordStore):
+    """HDF5-based storage backend (pre-tokenized data).
+
+    Each key is stored as a group of per-record datasets (``data_0``,
+    ``data_1``, …).  Supports both access modes:
+
+    - **Stream** (``fetch(begin, end, key)``): concatenates across
+      records via ``_cum`` — used by SEQ/SFT where data is a token stream.
+    - **Record** (``fetch_record(i, key)``): indexes ``_data[key]``
+      directly — used by DPO/GRPO where each record is independent.
+
+    ``len(store)`` returns the **token count** (stream semantics) so
+    SEQ/SFT windowing works.  Record-only code uses
+    ``store.num_records`` instead.
+    """
+
+    def load(self, path: str, **kwargs):
         self._normalize(load_h5(path))
 
 
 @StoreFactory.register("bin")
-class MmapStore(Store):
+class MmapStore(StreamStore, RecordStore):
     """Memory-mapped binary storage backend.
 
     Each key is a single .bin file backed by ``np.memmap(mode="r")``.
     No per-process memory duplication — all DataLoader workers share the
     same OS page-cache pages.
 
-    When ``meta.json`` contains per-record ``offsets`` for a key (written
-    via ``save_bin(..., record_keys=...)``), record-mode access slices
-    individual records from the concatenated memmap.  Legacy bin files
-    without offsets only support stream mode.
+    Supports both access modes:
 
-    Format on disk::
+    - **Stream** (``fetch(begin, end, key)``): always available.
+    - **Record** (``fetch_record(i, key)``): only when ``meta.json``
+      contains per-record ``offsets`` (written via
+      ``save_bin(..., record_keys=...)``).  Legacy bin files without
+      offsets have ``num_records == 0``.
 
-        data_root/
-          meta.json          # {key: {shape, dtype, offsets?}, ...}
-          <key>.bin          # raw numpy array, one per key
+    ``len(store)`` returns the **token count** (stream semantics).
     """
 
-    def load(self, path: str):
+    def load(self, path: str, **kwargs):
         self._mmap_refs = []
         root = Path(path)
         all_raw: Dict[str, List[Tensor]] = {}
@@ -348,71 +330,130 @@ class MmapStore(Store):
             self._mmap_refs.extend(tensors)
 
 
+class JsonlSource:
+    """Read raw JSON records from a ``.jsonl`` file or directory.
+
+    A thin reader used by :class:`JsonlStore` in processor mode — holds
+    no tokenizer, performs no tokenisation, just yields dicts.
+    """
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._records: Optional[List[dict]] = None
+
+    def load(self) -> List[dict]:
+        if self._records is None:
+            self._records = self._read(self.path)
+        return self._records
+
+    @staticmethod
+    def _read(root: Path) -> List[dict]:
+        if root.is_file():
+            return JsonlSource._read_file(root)
+        return JsonlSource._read_dir(root)
+
+    @staticmethod
+    def _read_file(path: Path) -> List[dict]:
+        records: List[dict] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse JSON line in %s, skipping", path)
+        return records
+
+    @staticmethod
+    def _read_dir(root: Path) -> List[dict]:
+        records: List[dict] = []
+        for jsonl_path in sorted(root.glob("*.jsonl")):
+            records.extend(JsonlSource._read_file(jsonl_path))
+        return records
+
+
 @StoreFactory.register("jsonl")
-class JsonlStore(Store):
-    """JSONL reader with pluggable tokenization transform.
+class JsonlStore(StreamStore, RecordStore):
+    """JSONL reader with two tokenisation modes.
 
-    A JSONL dataset directory contains ``*.jsonl`` files plus a
-    ``dataset_config.json`` describing the tokenization pipeline.
+    A JSONL dataset is a ``.jsonl`` file or a directory of ``*.jsonl``
+    files plus (optionally) a ``dataset_config.json`` describing the
+    tokenization pipeline.
 
-    Responsibilities are split across two layers:
+    Two modes, selected at :meth:`load` time:
 
-    - **Reader** (this class): reads raw JSON records from disk.
-    - **Transform** (:class:`~astrai.preprocessing.transform.TokenizeTransform`):
-      tokenizes records into per-key tensors.  When not supplied explicitly,
-      a default transform is built from ``dataset_config.json`` so that
-      existing callers keep working without changes.
+    - **Eager** (default): applies a :class:`TokenizeTransform` to every
+      record at load time and registers per-key tensors via
+      ``_normalize``.  Both stream (``fetch``) and record
+      (``fetch_record``) access work — stream concatenates across
+      records via ``_cum``, record indexes directly.
+    - **Lazy** (``processor=fn`` given): keeps raw records and defers
+      tokenisation to ``fetch_record``.  Only record access works.
+      Used by DPO/GRPO where each record is independent.
 
-    The Store itself never imports the tokenizer — the dependency lives
-    in the Transform layer.
+    ``len(store)`` returns the **token count** (stream semantics) in
+    eager mode so SEQ/SFT windowing works; returns the **record count**
+    in lazy mode where stream access is unavailable.
     """
 
     CONFIG_NAME = "dataset_config.json"
-    segments_are_records = True
 
-    def load(self, path: str, transform=None, **kwargs):
-        root = Path(path)
-        records = self._read_records(root)
+    def __init__(self):
+        super().__init__()
+        self._source: Optional[JsonlSource] = None
+        self._processor: Optional[Callable[[dict], Dict[str, Tensor]]] = None
+        self._keys_cache: Optional[List[str]] = None
+
+    def __len__(self) -> int:
+        if self._processor is not None:
+            return self._num_records
+        return self._length
+
+    def load(self, path: str, transform=None, processor=None, **kwargs):
+        self._source = JsonlSource(path)
+        records = self._source.load()
+
+        if processor is not None:
+            self._processor = processor
+            self._num_records = len(records)
+            return
 
         if transform is None:
-            config_path = root / self.CONFIG_NAME
-            if not config_path.exists():
+            root = Path(path)
+            config_path = root / self.CONFIG_NAME if root.is_dir() else None
+            if config_path is None or not config_path.exists():
                 raise FileNotFoundError(
-                    f"JSONL dataset config not found: {config_path}. "
-                    f"Expected {self.CONFIG_NAME} alongside *.jsonl files, "
-                    f"or pass an explicit transform."
+                    f"JSONL dataset config not found. Expected "
+                    f"{self.CONFIG_NAME} alongside *.jsonl files, pass an "
+                    f"explicit transform, or pass processor= for lazy "
+                    f"on-the-fly tokenisation."
                 )
             transform = TokenizeTransform.from_config_file(str(config_path))
 
-        raw = transform.apply(records)
-        self._normalize(raw)
+        transformed = transform.apply(records)
+        self._normalize(transformed)
 
-    @staticmethod
-    def _read_records(root: Path) -> List[dict]:
-        records: List[dict] = []
-        for jsonl_path in sorted(root.glob("*.jsonl")):
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            "Failed to parse JSON line in %s, skipping", jsonl_path
-                        )
-        for json_path in sorted(root.glob("*.json")):
-            if json_path.name == JsonlStore.CONFIG_NAME:
-                continue
-            with open(json_path, "r", encoding="utf-8") as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse JSON file %s, skipping", json_path)
-                    continue
-            if isinstance(data, list):
-                records.extend(data)
-            elif isinstance(data, dict):
-                records.append(data)
-        return records
+    @property
+    def keys(self) -> List[str]:
+        if self._processor is not None:
+            if self._keys_cache is None and self._num_records > 0:
+                sample = self._processor(self._source.load()[0])
+                self._keys_cache = list(sample.keys())
+            return self._keys_cache or []
+        return list(self._data.keys())
+
+    def fetch_record(self, index: int, keys: Union[str, List[str]]):
+        if self._processor is not None:
+            if not 0 <= index < self._num_records:
+                raise ValueError(
+                    f"Record index out of bounds: {index}, "
+                    f"num_records={self._num_records}"
+                )
+            record = self._source.load()[index]
+            data = self._processor(record)
+            if isinstance(keys, str):
+                return data[keys]
+            return {k: data[k] for k in keys}
+        return super().fetch_record(index, keys)

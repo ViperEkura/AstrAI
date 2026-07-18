@@ -460,12 +460,13 @@ def test_dataset_load_explicit_storage_type(base_test_env):
 
 
 def _write_json_dataset(test_dir, tokenizer_path, records, config_overrides=None):
-    """Write JSON (not JSONL) dataset — array of objects."""
+    """Write JSONL dataset — one JSON object per line."""
     data_dir = os.path.join(test_dir, "json_data")
     os.makedirs(data_dir, exist_ok=True)
 
-    with open(os.path.join(data_dir, "data.json"), "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False)
+    with open(os.path.join(data_dir, "data.jsonl"), "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     config = {
         "tokenizer_path": tokenizer_path,
@@ -544,7 +545,7 @@ def test_json_store_no_tokenizer_path(base_test_env):
     # Save tokenizer files directly in the dataset directory
     tokenizer.save_pretrained(data_dir)
 
-    # Write .json data
+    # Write .jsonl data
     records = [
         {
             "messages": [
@@ -553,8 +554,9 @@ def test_json_store_no_tokenizer_path(base_test_env):
             ]
         }
     ]
-    with open(os.path.join(data_dir, "data.json"), "w", encoding="utf-8") as f:
-        json.dump(records, f, ensure_ascii=False)
+    with open(os.path.join(data_dir, "data.jsonl"), "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     # dataset_config.json WITHOUT tokenizer_path
     config = {

@@ -460,6 +460,7 @@ def train(
         load_path=data_root_path,
         window_size=window_size,
         stride=stride,
+        tokenizer_path=param_path,
     )
 
     optimizer_fn = partial(

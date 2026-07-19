@@ -4,7 +4,7 @@ import contextlib
 import logging
 import os
 from contextlib import contextmanager
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -14,7 +14,6 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from torch.utils.data import DataLoader
 
 from astrai.factory import BaseFactory
 from astrai.parallel.setup import get_rank, get_world_size
@@ -81,24 +80,30 @@ class AccumScheduler:
 
 
 class BaseExecutor:
-    def __init__(self, grad_accum_steps: int = 1):
+    def __init__(self, grad_accum_steps: int = 1, **_extra):
         self.gradient_state = GradientState(grad_accum_steps)
 
     def prepare(
         self,
-        model: nn.Module,
-        optimizer: Optional[Optimizer] = None,
-        dataloader: Optional[DataLoader] = None,
-        scheduler: Optional[LRScheduler] = None,
-    ) -> Tuple[
-        nn.Module, Optional[Optimizer], Optional[DataLoader], Optional[LRScheduler]
-    ]:
+        model_fn: Callable[[], nn.Module],
+        optimizer_fn: Optional[Callable[[nn.Module], Optimizer]] = None,
+        scheduler_fn: Optional[Callable[[Optimizer], LRScheduler]] = None,
+        before_wrap: Optional[Callable[[nn.Module], nn.Module]] = None,
+    ) -> Tuple[nn.Module, Optional[Optimizer], Optional[LRScheduler]]:
+        model = model_fn()
+        if before_wrap is not None:
+            model = before_wrap(model)
         model = self._prepare_model(model)
-        if optimizer is not None:
+        optimizer = None
+        scheduler = None
+        if optimizer_fn is not None:
+            optimizer = optimizer_fn(model)
+            if scheduler_fn is not None:
+                scheduler = scheduler_fn(optimizer)
             optimizer = AccumOptimizer(optimizer, self.gradient_state)
-        if scheduler is not None:
-            scheduler = AccumScheduler(scheduler, self.gradient_state)
-        return model, optimizer, dataloader, scheduler
+            if scheduler is not None:
+                scheduler = AccumScheduler(scheduler, self.gradient_state)
+        return model, optimizer, scheduler
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         return model
@@ -243,6 +248,7 @@ class FSDPExecutor(BaseExecutor):
         limit_all_gathers: bool = True,
         ignored_states=None,
         device_mesh=None,
+        **_ddp_only_kwargs,
     ):
         super().__init__(grad_accum_steps=grad_accum_steps)
         self._fsdp_kwargs = {

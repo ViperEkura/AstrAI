@@ -72,61 +72,70 @@ class TrainContextBuilder:
             **cfg.executor_kwargs,
         )
 
-        model = cfg.model_fn()
-        model = model.to(device=device)
-
         model_config = {}
         if self._param_path:
             config_path = Path(self._param_path) / "config.json"
             if config_path.exists():
                 model_config = load_json(config_path)
 
-        if not model_config and hasattr(model, "config"):
-            model_config = model.config.to_dict()
+        preloaded_state_dict = None
+        preloaded_epoch = cfg.start_epoch
+        preloaded_consumed = cfg.start_samples * get_world_size()
+        preloaded_checkpoint = None
+        if self._param_path:
+            checkpoint = Checkpoint.load_any(self._param_path)
+            if checkpoint is not None:
+                preloaded_state_dict = checkpoint.state_dict
+                if checkpoint.config:
+                    model_config = checkpoint.config
+                if self._resume:
+                    preloaded_epoch = checkpoint.epoch or cfg.start_epoch
+                    if checkpoint.consumed_samples > 0:
+                        per_step = (
+                            cfg.batch_per_device
+                            * get_world_size()
+                            * cfg.grad_accum_steps
+                        )
+                        preloaded_consumed = (
+                            checkpoint.consumed_samples // per_step
+                        ) * per_step
+                    else:
+                        preloaded_consumed = cfg.start_samples * get_world_size()
+                    preloaded_checkpoint = checkpoint
+
+        if not model_config and hasattr(cfg.model_fn(), "config"):
+            model_config = cfg.model_fn().config.to_dict()
+
+        def _before_wrap(m):
+            m = m.to(device=device)
+            if preloaded_state_dict is not None:
+                m.load_state_dict(preloaded_state_dict, strict=False)
+            if cfg.lora is not None:
+                inject_lora(
+                    m,
+                    r=cfg.lora.r,
+                    alpha=cfg.lora.alpha,
+                    target_modules=set(cfg.lora.target_modules),
+                )
+            return m
 
         context = TrainContext(
-            model=model,
             world_size=get_world_size(),
             rank=get_rank(),
             config=cfg,
             model_config=model_config,
             executor=executor,
+            epoch=preloaded_epoch,
+            consumed_samples=preloaded_consumed,
+            checkpoint=preloaded_checkpoint,
         )
 
-        if self._param_path:
-            checkpoint = Checkpoint.load_any(self._param_path)
-            if checkpoint is not None:
-                model.load_state_dict(checkpoint.state_dict, strict=False)
-                if checkpoint.config:
-                    context.model_config = checkpoint.config
-
-                if self._resume:
-                    context.epoch = checkpoint.epoch or cfg.start_epoch
-                    if checkpoint.consumed_samples > 0:
-                        per_step = (
-                            cfg.batch_per_device
-                            * context.world_size
-                            * cfg.grad_accum_steps
-                        )
-                        context.consumed_samples = (
-                            checkpoint.consumed_samples // per_step
-                        ) * per_step
-                    else:
-                        context.consumed_samples = (
-                            cfg.start_samples * context.world_size
-                        )
-                    context.checkpoint = checkpoint
-
-        if cfg.lora is not None:
-            inject_lora(
-                model,
-                r=cfg.lora.r,
-                alpha=cfg.lora.alpha,
-                target_modules=set(cfg.lora.target_modules),
-            )
-
-        context.optimizer = cfg.optimizer_fn(model)
-        context.scheduler = cfg.scheduler_fn(context.optimizer)
+        context.model, context.optimizer, context.scheduler = executor.prepare(
+            cfg.model_fn,
+            cfg.optimizer_fn,
+            cfg.scheduler_fn,
+            before_wrap=_before_wrap,
+        )
 
         train_dataset = cfg.dataset
         val_dataset = cfg.val_dataset
@@ -174,15 +183,6 @@ class TrainContextBuilder:
                 prefetch_factor=cfg.prefetch_factor,
                 collate_fn=cfg.collate_fn,
             )
-
-        context.model, context.optimizer, context.dataloader, context.scheduler = (
-            executor.prepare(
-                model,
-                context.optimizer,
-                context.dataloader,
-                context.scheduler,
-            )
-        )
 
         if context.checkpoint and context.checkpoint.extra:
             extra = context.checkpoint.extra

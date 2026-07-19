@@ -138,6 +138,32 @@ class TrainConfig(BaseConfig):
         metadata={"help": "NEFTune noise alpha (0=disabled, typical: 5.0)."},
     )
 
+    # online rollout
+    rollout_interval: int = field(
+        default=512,
+        metadata={"help": "Number of optimizer steps between online rollouts."},
+    )
+    rollout_temperature: float = field(
+        default=0.7, metadata={"help": "Sampling temperature for online rollout."}
+    )
+    rollout_top_k: int = field(
+        default=0, metadata={"help": "Top-k filtering for online rollout (0=disable)."}
+    )
+    rollout_top_p: float = field(
+        default=0.9,
+        metadata={"help": "Top-p (nucleus) filtering for online rollout."},
+    )
+    rollout_max_tokens: int = field(
+        default=1024,
+        metadata={"help": "Maximum generated tokens per response in rollout."},
+    )
+    reward_model_fn: Optional[Callable] = field(
+        default=None,
+        metadata={
+            "help": "Factory for reward model (required for online RL strategies)."
+        },
+    )
+
     executor_kwargs: Dict[str, Any] = field(
         default_factory=dict,
         metadata={"help": "Extra kwargs passed to ExecutorFactory.create()."},

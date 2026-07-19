@@ -1,7 +1,7 @@
 import argparse
 import os
 from functools import partial
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 import torch
 import torch.optim as optim
@@ -12,6 +12,7 @@ from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.trainer import SchedulerFactory, Trainer
+from astrai.trainer.rollout import BaseRewardModel
 
 
 class MuonMix(optim.Optimizer):
@@ -101,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         "--train_type",
         type=str,
         required=True,
-        choices=["seq", "sft", "dpo", "grpo"],
+        choices=["seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"],
         help="Train type.",
     )
     parser.add_argument(
@@ -217,6 +218,39 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="cross_entropy function label smoothing parameter",
     )
+
+    # online rollout
+    parser.add_argument(
+        "--rollout_interval",
+        type=int,
+        default=512,
+        help="Number of optimizer steps between online rollouts.",
+    )
+    parser.add_argument(
+        "--rollout_temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature for online rollout.",
+    )
+    parser.add_argument(
+        "--rollout_top_k",
+        type=int,
+        default=0,
+        help="Top-k filtering for online rollout (0=disable).",
+    )
+    parser.add_argument(
+        "--rollout_top_p",
+        type=float,
+        default=0.9,
+        help="Top-p (nucleus) filtering for online rollout.",
+    )
+    parser.add_argument(
+        "--rollout_max_tokens",
+        type=int,
+        default=1024,
+        help="Maximum generated tokens per response in rollout.",
+    )
+
     parser.add_argument(
         "--gradient_checkpointing",
         action=argparse.BooleanOptionalAction,
@@ -428,7 +462,14 @@ def train(
     decay_steps: int,
     **kwargs,
 ):
-    assert train_type in ["seq", "sft", "dpo", "grpo"]
+    assert train_type in [
+        "seq",
+        "sft",
+        "dpo",
+        "grpo",
+        "online_grpo",
+        "online_dpo",
+    ]
     assert os.path.exists(param_path)
     if nprocs > 1 and parallel_mode == "none":
         raise ValueError("--nprocs > 1 requires --parallel_mode to be 'ddp' or 'fsdp'")
@@ -448,6 +489,13 @@ def train(
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
     }
+
+    rollout_interval = kwargs.pop("rollout_interval", 512)
+    rollout_temperature = kwargs.pop("rollout_temperature", 0.7)
+    rollout_top_k = kwargs.pop("rollout_top_k", 0)
+    rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
+    rollout_max_tokens = kwargs.pop("rollout_max_tokens", 1024)
+    reward_model_fn: Optional[Callable[[], BaseRewardModel]] = None
 
     executor_kwargs = {}
     if parallel_mode == "ddp":
@@ -512,6 +560,8 @@ def train(
         collate_fn = dpo_collate_fn
     elif train_type == "grpo":
         collate_fn = grpo_collate_fn
+    elif train_type in ("online_grpo", "online_dpo"):
+        collate_fn = None
 
     train_config = TrainConfig(
         model_fn=model_fn,
@@ -546,6 +596,12 @@ def train(
         extra_kwargs=strategy_kwargs,
         neftune_alpha=neftune_alpha,
         collate_fn=collate_fn,
+        rollout_interval=rollout_interval,
+        rollout_temperature=rollout_temperature,
+        rollout_top_k=rollout_top_k,
+        rollout_top_p=rollout_top_p,
+        rollout_max_tokens=rollout_max_tokens,
+        reward_model_fn=reward_model_fn,
     )
 
     trainer = Trainer(train_config)

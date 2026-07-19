@@ -8,11 +8,19 @@ from torch.utils.data import DataLoader, random_split
 
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
+from astrai.inference.sample import (
+    SamplingPipeline,
+    TemperatureStrategy,
+    TopKStrategy,
+    TopPStrategy,
+)
 from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import BaseExecutor, ExecutorFactory
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import Checkpoint, load_json
+from astrai.tokenize import AutoTokenizer
+from astrai.trainer.rollout import RolloutRunner
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory, create_ref_model
 
 
@@ -27,7 +35,6 @@ class TrainContext:
     config: TrainConfig = field(default=None)
     model_config: dict = field(default_factory=dict)
     executor: BaseExecutor = field(default=None)
-
     epoch: int = field(default=0)
     consumed_samples: int = field(default=0)
     loss: float = field(default=0.0)
@@ -194,13 +201,22 @@ class TrainContextBuilder:
 
         strategy_kwargs = dict(cfg.extra_kwargs)
 
-        if cfg.strategy in ("dpo", "grpo"):
+        needs_ref = cfg.strategy in (
+            "dpo",
+            "grpo",
+            "online_grpo",
+            "online_dpo",
+        )
+        needs_old = cfg.strategy in ("grpo", "online_grpo")
+
+        if needs_ref:
             ref_model = create_ref_model(
                 cfg.model_fn, executor.unwrap_model(context.model)
             ).to(device=device)
             strategy_kwargs["ref_model"] = ref_model
 
-        if cfg.strategy == "grpo":
+        old_model = None
+        if needs_old:
             old_model = create_ref_model(
                 cfg.model_fn, executor.unwrap_model(context.model)
             ).to(device=device)
@@ -213,5 +229,38 @@ class TrainContextBuilder:
             executor=executor,
             **strategy_kwargs,
         )
+
+        # Enable online rollout when the train_type is an ``online_*`` variant.
+        is_online = cfg.strategy.startswith("online_")
+        if is_online:
+            if not context.strategy.supports_online():
+                raise ValueError(
+                    f"Strategy '{cfg.strategy}' does not support online rollout"
+                )
+            if cfg.reward_model_fn is None:
+                raise ValueError("reward_model_fn is required for online RL strategies")
+
+            tokenizer = AutoTokenizer.from_pretrained(self._param_path)
+            reward_model = cfg.reward_model_fn()
+
+            pipeline = SamplingPipeline(
+                [
+                    TemperatureStrategy(cfg.rollout_temperature),
+                    TopKStrategy(cfg.rollout_top_k),
+                    TopPStrategy(cfg.rollout_top_p),
+                ]
+            )
+
+            runner = RolloutRunner(
+                policy_model=context.model,
+                old_model=old_model,
+                tokenizer=tokenizer,
+                reward_model=reward_model,
+                sampling_pipeline=pipeline,
+                max_tokens=cfg.rollout_max_tokens,
+                group_size=strategy_kwargs.get("group_size", 8),
+                rollout_interval=cfg.rollout_interval,
+            )
+            context.strategy.set_rollout_runner(runner)
 
         return context

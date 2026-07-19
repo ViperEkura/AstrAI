@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.factory import BaseFactory
+from astrai.trainer.rollout import RolloutResult
 
 
 def create_ref_model(
@@ -87,7 +88,15 @@ def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
 
 
 class BaseStrategy(ABC):
-    """Abstract base class for training strategies."""
+    """Abstract base class for training strategies.
+
+    When a :class:`~astrai.trainer.rollout.RolloutRunner` is injected via
+    :meth:`set_rollout_runner`, the strategy transparently switches to
+    online mode: each ``__call__`` produces a :class:`RolloutResult`,
+    converts it to a training batch via :meth:`prepare_from_rollout`, and
+    then computes the loss.  Without a runner the strategy runs in
+    offline mode and consumes the batch directly.
+    """
 
     def __init__(
         self,
@@ -99,6 +108,8 @@ class BaseStrategy(ABC):
         self.device = device
         self.executor = kwargs.pop("executor", None)
         self.extra_kwargs = kwargs
+        self._rollout_runner = None
+        self._prev_rollout_result = None
 
     @abstractmethod
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
@@ -112,9 +123,51 @@ class BaseStrategy(ABC):
         """
         raise NotImplementedError
 
+    def supports_online(self) -> bool:
+        """Whether this strategy can operate with a rollout runner.
+
+        Base implementation returns ``False``; strategies that implement
+        :meth:`prepare_from_rollout` should override to return ``True``.
+        """
+        return False
+
+    def set_rollout_runner(self, runner):
+        """Inject a :class:`RolloutRunner` to enable online rollout mode."""
+        self._rollout_runner = runner
+
+    def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
+        """Map a :class:`RolloutResult` to the batch layout expected by
+        :meth:`compute_loss`.
+
+        Strategies that return ``True`` from :meth:`supports_online` must
+        override this.  Default raises :class:`NotImplementedError`.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support online rollout"
+        )
+
+    def _on_rollout_refresh(self):
+        """Hook fired when a fresh rollout result is produced.
+
+        Override to refresh stale state (e.g. syncing the behaviour
+        policy).  Default is a no-op.
+        """
+        pass
+
     def __call__(self, batch: Dict[str, Tensor]) -> Tensor:
-        """Allow calling strategy directly as a callable."""
-        return self.compute_loss(batch)
+        """Run offline or online forward depending on runner injection."""
+        if self._rollout_runner is None:
+            return self.compute_loss(batch)
+
+        result = self._rollout_runner(batch)
+        if result is not self._prev_rollout_result:
+            self._on_rollout_refresh()
+            self._prev_rollout_result = result
+            if self.executor and self.executor.sync_gradients:
+                self._rollout_runner.step()
+
+        train_batch = self.prepare_from_rollout(result)
+        return self.compute_loss(train_batch)
 
 
 class StrategyFactory(BaseFactory["BaseStrategy"]):
@@ -260,6 +313,29 @@ class DPOStrategy(BaseStrategy):
 
         return dpo_loss
 
+    def supports_online(self) -> bool:
+        return True
+
+    def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
+        """Pick best/worst response per prompt by reward as chosen/rejected."""
+        rewards = result.rewards
+        responses = result.responses
+        masks = result.response_mask
+        best = rewards.argmax(dim=-1)
+        worst = rewards.argmin(dim=-1)
+        B = responses.shape[0]
+        idx = torch.arange(B, device=responses.device)
+        chosen = responses[idx, best]
+        chosen_mask = masks[idx, best].float()
+        rejected = responses[idx, worst]
+        rejected_mask = masks[idx, worst].float()
+        return {
+            "chosen": chosen,
+            "chosen_mask": chosen_mask,
+            "rejected": rejected,
+            "rejected_mask": rejected_mask,
+        }
+
 
 @StrategyFactory.register("grpo")
 class GRPOStrategy(BaseStrategy):
@@ -371,3 +447,25 @@ class GRPOStrategy(BaseStrategy):
         total_loss = policy_loss + kl_penalty
 
         return total_loss
+
+    def supports_online(self) -> bool:
+        return True
+
+    def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
+        return {
+            "prompts": result.prompts,
+            "responses": result.responses,
+            "masks": result.response_mask,
+            "rewards": result.rewards,
+        }
+
+    def _on_rollout_refresh(self):
+        """Sync the behaviour policy whenever a fresh rollout arrives."""
+        self.sync_old_model()
+
+
+# Factory aliases: online variants use the same strategy class; the
+# ``RolloutRunner`` is injected by ``TrainContextBuilder`` to enable
+# online mode, so no separate subclass is needed.
+StrategyFactory._entries["online_grpo"] = GRPOStrategy
+StrategyFactory._entries["online_dpo"] = DPOStrategy

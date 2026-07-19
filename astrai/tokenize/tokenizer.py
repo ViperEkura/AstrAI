@@ -164,7 +164,14 @@ class AutoTokenizer:
           - tokenizer.bos_token   → returns string
           - tokenizer.bos_token_id → returns corresponding integer ID
           - tokenizer.stop_ids → returns list of corresponding integer IDs for all special tokens
+
+        Internal/private attrs are not intercepted: during unpickle
+        ``__dict__`` is empty, so probing ``self._special_token_map``
+        would recurse infinitely.
         """
+        if key.startswith("_"):
+            raise AttributeError(key)
+
         # Handle stop_ids - return IDs for all special tokens
         if key == "stop_ids":
             stop_ids = []

@@ -1,3 +1,4 @@
+from functools import cached_property
 from typing import Any, Dict, List, Optional
 
 from jinja2 import Template
@@ -29,7 +30,19 @@ class ChatTemplate:
         self.description = description
         self.default_variables = default_variables or {}
         self.special_tokens = special_tokens or {}
-        self._compiled: Template = Template(template_str)
+
+    @cached_property
+    def _compiled(self) -> Template:
+        """Lazy-compiled Jinja2 template, cached on first access.
+
+        The compiled :class:`~jinja2.Template` holds a dynamically-generated
+        ``root`` render function whose ``__module__`` is ``None``; under
+        ``pickle`` it falls back to ``__main__`` and breaks ``spawn``-based
+        multiprocessing.  By deferring compilation to first access, the
+        default pickle protocol serialises only ``template_str``; each
+        worker rebuilds the cache on first render.
+        """
+        return Template(self.template_str)
 
     @classmethod
     def from_string(

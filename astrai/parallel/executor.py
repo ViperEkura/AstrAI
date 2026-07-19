@@ -231,13 +231,6 @@ class DDPExecutor(BaseExecutor):
             return model.module.state_dict()
         return model.state_dict()
 
-    def _gather_state_dict(self, model: nn.Module):
-        if not self.use_distributed:
-            return self.unwrap_model(model)
-        if get_rank() != 0:
-            return None
-        return self.unwrap_model(model)
-
 
 @ExecutorFactory.register("fsdp")
 class FSDPExecutor(BaseExecutor):
@@ -298,12 +291,7 @@ class FSDPExecutor(BaseExecutor):
 
     def clip_grad_norm(self, model: nn.Module, max_norm: Optional[float]) -> float:
         if max_norm is None:
-            total_norm = torch.norm(
-                torch.stack(
-                    [p.grad.norm(2) for p in model.parameters() if p.grad is not None]
-                )
-            )
-            return total_norm.item()
+            return super().clip_grad_norm(model, max_norm)
         if isinstance(model, FSDP) and self.use_distributed:
             total_norm = model.clip_grad_norm_(max_norm)
             if isinstance(total_norm, torch.Tensor):

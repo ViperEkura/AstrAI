@@ -98,7 +98,6 @@ class BaseStrategy(ABC):
         self.model = model
         self.device = device
         self.executor = kwargs.pop("executor", None)
-        self.model_fn = kwargs.pop("model_fn", None)
         self.extra_kwargs = kwargs
 
     @abstractmethod

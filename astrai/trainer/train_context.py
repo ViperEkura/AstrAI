@@ -211,7 +211,6 @@ class TrainContextBuilder:
             model=context.model,
             device=device,
             executor=executor,
-            model_fn=cfg.model_fn,
             **strategy_kwargs,
         )
 

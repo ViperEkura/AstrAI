@@ -148,14 +148,7 @@ class BaseExecutor:
     def grad_accum_steps(self) -> int:
         return self.gradient_state.num_steps
 
-    def clip_grad_norm(self, model: nn.Module, max_norm: Optional[float]) -> float:
-        if max_norm is None:
-            total_norm = torch.norm(
-                torch.stack(
-                    [p.grad.norm(2) for p in model.parameters() if p.grad is not None]
-                )
-            )
-            return total_norm.item()
+    def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         if isinstance(total_norm, torch.Tensor):
             return total_norm.item()
@@ -289,9 +282,7 @@ class FSDPExecutor(BaseExecutor):
             return model.no_sync()
         return contextlib.nullcontext()
 
-    def clip_grad_norm(self, model: nn.Module, max_norm: Optional[float]) -> float:
-        if max_norm is None:
-            return super().clip_grad_norm(model, max_norm)
+    def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
         if isinstance(model, FSDP) and self.use_distributed:
             total_norm = model.clip_grad_norm_(max_norm)
             if isinstance(total_norm, torch.Tensor):

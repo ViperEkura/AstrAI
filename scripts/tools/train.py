@@ -148,7 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_grad_norm",
         type=float,
-        default=None,
+        default=1.0,
         help="Max gradient norm for clipping. None disables clipping.",
     )
     parser.add_argument(

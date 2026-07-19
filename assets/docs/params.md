@@ -26,7 +26,7 @@
 |-----------|-------------|---------|
 | `--warmup_ratio` | Fraction of total steps used for LR warmup | 0.05 |
 | `--max_lr` | Maximum learning rate (cosine decay after warmup) | 3e-4 |
-| `--max_grad_norm` | Maximum gradient norm for clipping (None disables) | None |
+| `--max_grad_norm` | Maximum gradient norm for clipping (None disables) | 1.0 |
 
 ### Optimizer (MuonMix)
 

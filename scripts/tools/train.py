@@ -449,10 +449,12 @@ def train(
         "group_size": kwargs.pop("group_size"),
     }
 
-    executor_kwargs = {
-        "gradient_as_bucket_view": True,
-        "broadcast_buffers": False,
-    }
+    executor_kwargs = {}
+    if parallel_mode == "ddp":
+        executor_kwargs.update(
+            gradient_as_bucket_view=True,
+            broadcast_buffers=False,
+        )
 
     model_fn = partial(create_model, config)
     dataset = DatasetFactory.load(

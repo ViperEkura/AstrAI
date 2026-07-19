@@ -4,13 +4,19 @@ import contextlib
 import logging
 import os
 from contextlib import contextmanager
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import (
+    FSDPModule,
+    FullStateDictConfig,
+    StateDictType,
+    fully_shard,
+)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -80,7 +86,7 @@ class AccumScheduler:
 
 
 class BaseExecutor:
-    def __init__(self, grad_accum_steps: int = 1, **_extra):
+    def __init__(self, grad_accum_steps: int = 1):
         self.gradient_state = GradientState(grad_accum_steps)
 
     def prepare(
@@ -248,7 +254,6 @@ class FSDPExecutor(BaseExecutor):
         limit_all_gathers: bool = True,
         ignored_states=None,
         device_mesh=None,
-        **_ddp_only_kwargs,
     ):
         super().__init__(grad_accum_steps=grad_accum_steps)
         self._fsdp_kwargs = {
@@ -306,3 +311,80 @@ class FSDPExecutor(BaseExecutor):
                 return model.state_dict()
 
         return model.state_dict()
+
+
+@ExecutorFactory.register("fsdp2")
+class FSDP2Executor(BaseExecutor):
+    """FSDP2 executor using `torch.distributed.fsdp.fully_shard` (per-module API).
+
+    Unlike FSDP1's `FSDP(model, ...)` wrapper, FSDP2 wraps each submodule
+    individually via `fully_shard(module)`. Original `Parameter` objects are
+    preserved (as DTensors) — no `FlatParameter`, no `use_orig_params=True` hack.
+    """
+
+    def __init__(
+        self,
+        grad_accum_steps: int = 1,
+        mesh: Optional[Any] = None,
+        mp_policy: Optional[Any] = None,
+        reshard_after_forward: bool = True,
+    ):
+        super().__init__(grad_accum_steps=grad_accum_steps)
+        self._mesh = mesh
+        self._mp_policy = mp_policy
+        self._reshard_after_forward = reshard_after_forward
+
+    def _prepare_model(self, model: nn.Module) -> nn.Module:
+        if not self.use_distributed:
+            logger.warning("FSDP2 backend selected but world_size=1, model not wrapped")
+            return model
+
+        kwargs = dict(
+            mesh=self._mesh,
+            mp_policy=self._mp_policy,
+            reshard_after_forward=self._reshard_after_forward,
+        )
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+
+        model = fully_shard(model, **kwargs)
+        logger.info("Model wrapped with FSDP2 (world_size=%d)", get_world_size())
+        return model
+
+    @contextmanager
+    def _no_sync(self, model: nn.Module):
+        if isinstance(model, FSDPModule):
+            model.set_requires_gradient_sync(False, recurse=True)
+            try:
+                yield
+            finally:
+                model.set_requires_gradient_sync(True, recurse=True)
+        else:
+            yield
+
+    def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
+        if isinstance(model, FSDPModule) and self.use_distributed:
+            for module in model.modules():
+                if isinstance(module, FSDPModule):
+                    module.unshard()
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            if isinstance(total_norm, torch.Tensor):
+                return total_norm.item()
+            return total_norm
+        return super().clip_grad_norm(model, max_norm)
+
+    def unwrap_model(self, model: nn.Module):
+        if not self.use_distributed or not isinstance(model, FSDPModule):
+            return model.state_dict()
+
+        if get_rank() != 0:
+            return None
+
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.unshard()
+
+        state_dict = model.state_dict()
+        return {
+            k: (v.full_tensor() if isinstance(v, DTensor) else v)
+            for k, v in state_dict.items()
+        }

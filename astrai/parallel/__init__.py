@@ -4,6 +4,7 @@ from astrai.parallel.executor import (
     BaseExecutor,
     DDPExecutor,
     ExecutorFactory,
+    FSDP2Executor,
     FSDPExecutor,
     GradientState,
     NoneExecutor,
@@ -35,4 +36,5 @@ __all__ = [
     "NoneExecutor",
     "DDPExecutor",
     "FSDPExecutor",
+    "FSDP2Executor",
 ]

@@ -20,7 +20,7 @@
   <a href="assets/docs/README-zh-CN.md">中文</a> •
   <a href="https://github.com/ViperEkura/AstrAI/issues">Issue Tracker</a> •
   <a href="https://github.com/ViperEkura/AstrAI/discussions">Discussions</a> •
-  <a href="https://huggingface.co/ViperEk/">HuggingFace</a>
+  <a href="https://huggingface.co/ViperEkura">HuggingFace</a>
 </div>
 
 <br>
@@ -241,7 +241,7 @@ For major changes, please open an issue first to discuss what you would like to 
 
 - **GitHub Issues**: [Issue Tracker](https://github.com/ViperEkura/AstrAI/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/ViperEkura/AstrAI/discussions)
-- **HuggingFace**: [Model Hub](https://huggingface.co/ViperEk)
+- **HuggingFace**: [Model Hub](https://huggingface.co/ViperEkura)
 
 ### License
 

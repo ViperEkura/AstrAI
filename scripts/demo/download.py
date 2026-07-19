@@ -5,7 +5,7 @@ from huggingface_hub import snapshot_download
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOCAL_DIR = Path(PROJECT_ROOT, "params")
-DEFAULT_REPO_ID = "ViperEk/KHAOSZ"
+DEFAULT_REPO_ID = "ViperEkura/AstrAI-V1-instruct"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

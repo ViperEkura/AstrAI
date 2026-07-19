@@ -27,7 +27,7 @@
   <a href="#chinese">中文</a> •
   <a href="https://github.com/ViperEkura/AstrAI/issues">问题追踪</a> •
   <a href="https://github.com/ViperEkura/AstrAI/discussions">讨论区</a> •
-  <a href="https://huggingface.co/ViperEk">HuggingFace</a>
+  <a href="https://huggingface.co/ViperEkura">HuggingFace</a>
 </div>
 <br>
 
@@ -247,7 +247,7 @@ SSE 流式格式、错误码和统计端点详见[推理文档](./inference.md)�
 
 - **GitHub Issues**: [问题追踪](https://github.com/ViperEkura/AstrAI/issues)
 - **Discussions**: [GitHub 讨论区](https://github.com/ViperEkura/AstrAI/discussions)
-- **HuggingFace**: [模型中心](https://huggingface.co/ViperEk)
+- **HuggingFace**: [模型中心](https://huggingface.co/ViperEkura)
 
 ### 许可证
 

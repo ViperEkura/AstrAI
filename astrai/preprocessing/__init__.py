@@ -8,6 +8,7 @@ from astrai.preprocessing.builder import (
 from astrai.preprocessing.packing import (
     PackingStrategy,
     PackingStrategyFactory,
+    plan_bfd,
 )
 from astrai.preprocessing.pipeline import Pipeline, filter_by_length
 from astrai.preprocessing.position_id import (
@@ -35,4 +36,5 @@ __all__ = [
     "StoreWriterFactory",
     "TokenizeTransform",
     "filter_by_length",
+    "plan_bfd",
 ]

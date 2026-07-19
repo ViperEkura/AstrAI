@@ -19,6 +19,43 @@ def _truncate(seq: List[int], max_len: int, mode: str) -> List[int]:
     return seq[:max_len]
 
 
+def plan_bfd(
+    sequences: List[List[int]], max_packed_len: int, truncation_mode: str = "keep_start"
+) -> List[List[int]]:
+    """Best-Fit Decreasing bin packing of *sequences* into bins.
+
+    Returns a list of bins, each bin a list of original indices into
+    *sequences*.  Bin capacities are respected on the *truncated*
+    length of each sequence (so a sequence longer than
+    *max_packed_len* counts at *max_packed_len*).
+
+    Pure index-based so callers can apply the same plan to any
+    aligned key (``loss_mask``, ``position_ids``…).
+    """
+    n = len(sequences)
+    order = sorted(range(n), key=lambda i: len(sequences[i]), reverse=True)
+    bins: List[List[int]] = []
+    bin_lengths: List[int] = []
+
+    for orig_idx in order:
+        seq_len = len(_truncate(sequences[orig_idx], max_packed_len, truncation_mode))
+        best_bin = None
+        best_remain = max_packed_len + 1
+        for i, bl in enumerate(bin_lengths):
+            remain = max_packed_len - bl
+            if seq_len <= remain < best_remain:
+                best_remain = remain
+                best_bin = i
+        if best_bin is not None:
+            bins[best_bin].append(orig_idx)
+            bin_lengths[best_bin] += seq_len
+        else:
+            bins.append([orig_idx])
+            bin_lengths.append(seq_len)
+
+    return bins
+
+
 class PackingStrategy(ABC):
     """Reorder and truncate sequences within a shard."""
 
@@ -70,7 +107,7 @@ class BFDPacking(PackingStrategy):
         sequences = keys.get("sequence", [])
         if not sequences:
             return keys
-        bins = self._plan(sequences, max_packed_len, truncation_mode)
+        bins = plan_bfd(sequences, max_packed_len, truncation_mode)
 
         packed: Dict[str, List[List[int]]] = {}
         for k, vals in keys.items():
@@ -90,35 +127,6 @@ class BFDPacking(PackingStrategy):
         for i in indices:
             result.extend(vals[i])
         return result
-
-    @staticmethod
-    def _plan(
-        sequences: List[List[int]], max_packed_len: int, truncation_mode: str
-    ) -> List[List[int]]:
-        n = len(sequences)
-        order = sorted(range(n), key=lambda i: len(sequences[i]), reverse=True)
-        bins: List[List[int]] = []
-        bin_lengths: List[int] = []
-
-        for orig_idx in order:
-            seq_len = len(
-                _truncate(sequences[orig_idx], max_packed_len, truncation_mode)
-            )
-            best_bin = None
-            best_remain = max_packed_len + 1
-            for i, bl in enumerate(bin_lengths):
-                remain = max_packed_len - bl
-                if seq_len <= remain < best_remain:
-                    best_remain = remain
-                    best_bin = i
-            if best_bin is not None:
-                bins[best_bin].append(orig_idx)
-                bin_lengths[best_bin] += seq_len
-            else:
-                bins.append([orig_idx])
-                bin_lengths.append(seq_len)
-
-        return bins
 
 
 @PackingStrategyFactory.register("bfd_split")

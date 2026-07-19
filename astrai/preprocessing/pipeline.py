@@ -4,6 +4,10 @@ Composes a :class:`BaseMaskBuilder` (selected by ``input.type``) with
 sharding and flush to ``.h5`` / ``.bin`` storage.  Packing, position-id
 generation and storage writing are each delegated to pluggable strategies,
 dispatched by configuration keys.
+
+Record iteration, mask building, primary-id extraction and per-key
+accumulation are shared with :class:`TokenizeTransform` via the
+:mod:`astrai.preprocessing.core` helpers.
 """
 
 import json
@@ -17,11 +21,13 @@ import torch
 import tqdm
 
 from astrai.config.preprocess_config import PipelineConfig
-from astrai.preprocessing.builder import MaskBuilderFactory
+from astrai.preprocessing.core import (
+    build_preprocessing_components,
+    iter_raw_records,
+    primary_ids,
+)
 from astrai.preprocessing.packing import PackingStrategyFactory
-from astrai.preprocessing.position_id import PositionIdStrategyFactory
 from astrai.preprocessing.writer import StoreWriterFactory
-from astrai.tokenize import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -64,20 +70,18 @@ class Pipeline:
         self.output_dir = output_dir
         self.tokenizer_path = tokenizer_path
 
-        self.mask_builder = MaskBuilderFactory.create("sectioned")
+        self.tokenizer, self.mask_builder, self._position_id = (
+            build_preprocessing_components(config, tokenizer_path)
+        )
         self._packer = PackingStrategyFactory.create(
             config.preprocessing.packing_strategy
-        )
-        self._position_id = PositionIdStrategyFactory.create(
-            config.output.position_ids_mode
         )
         self._writer = StoreWriterFactory.create(config.output.storage_format)
 
     def transform(self, item: dict) -> Optional[dict]:
-        return self.mask_builder.build(item, self.config, self._tokenizer)
+        return self.mask_builder.build(item, self.config, self.tokenizer)
 
     def run(self):
-        self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path)
         domains: dict = defaultdict(lambda: defaultdict(list))
         total_tokens = 0
         shard_idx: dict[str, int] = defaultdict(int)
@@ -102,14 +106,7 @@ class Pipeline:
                 continue
 
             domain = result.pop("domain", "__default__")
-
-            is_multi = bool(getattr(self.config.input, "sources", None))
-            if is_multi:
-                ids = self._primary_ids(result)
-            else:
-                ids = result.pop("sequence")
-                result["sequence"] = ids
-
+            ids = primary_ids(result)
             if not ids:
                 continue
 
@@ -128,15 +125,6 @@ class Pipeline:
 
         if total_tokens > 0:
             self._flush(domains, shard_idx)
-
-    @staticmethod
-    def _primary_ids(result: dict) -> list:
-        """Return the first list-valued entry in *result* as the primary id
-        sequence for token counting."""
-        for val in result.values():
-            if isinstance(val, list) and val and isinstance(val[0], int):
-                return val
-        return []
 
     @staticmethod
     def _align_bucket(bucket: dict, result: dict, ids: list):
@@ -170,39 +158,12 @@ class Pipeline:
             original_sequences = keys.get("sequence", [])
             mode = self.config.output.position_ids_mode
 
-            if mode == "doc_reset" and original_sequences:
-                keys["position_ids"] = [list(range(len(s))) for s in original_sequences]
-
+            keys = self._inject_doc_reset_position_ids(keys, mode, original_sequences)
             keys = self._packer.apply(dict(keys), pp.max_packed_len, pp.truncation_mode)
-
-            tensors: Dict[str, List[torch.Tensor]] = {}
-            for key, ids_list in keys.items():
-                dt = _STR_TO_DTYPE.get(
-                    self.config.output.dtype.get(key, "int32"), torch.int32
-                )
-                # GRPO multi-response keys store List[List[int]] per record
-                # (responses/masks).  Rewards store List[float] per record.
-                # Both produce List[Tensor] (one tensor per record), but
-                # responses need inner flattening while rewards do not.
-                if ids_list and isinstance(ids_list[0], list):
-                    tensors[key] = [
-                        torch.tensor(
-                            list(chain.from_iterable(ids))
-                            if ids and isinstance(ids[0], list)
-                            else ids,
-                            dtype=dt,
-                        )
-                        for ids in ids_list
-                    ]
-                else:
-                    tensors[key] = [
-                        torch.tensor(list(chain.from_iterable(ids_list)), dtype=dt)
-                    ]
-
-            if mode == "continuous" and original_sequences:
-                pos_ids = self._position_id.generate(keys.get("sequence", []))
-                if pos_ids:
-                    tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
+            tensors = self._to_tensors(keys)
+            tensors = self._inject_continuous_position_ids(
+                tensors, mode, keys.get("sequence", [])
+            )
 
             self._writer.save(self.output_dir, domain, idx, tensors)
             shard_idx[domain] = idx + 1
@@ -212,3 +173,76 @@ class Pipeline:
                 f"  saved {domain}/shard_{idx:04d}  "
                 f"({tensors[first_key][0].numel():,} tokens)"
             )
+
+    def _inject_doc_reset_position_ids(
+        self,
+        keys: Dict[str, list],
+        mode: str,
+        original_sequences: List[List[int]],
+    ) -> Dict[str, list]:
+        """Attach per-document position_ids before packing (``doc_reset``).
+
+        ``doc_reset`` position ids must enter the packer so that each
+        packed bin concatenates the per-doc ranges in bin order.  The
+        per-record structure ``[range(len(s)) for s in seqs]`` is required
+        by the packer (it concatenates per-record lists per bin); the
+        ``PositionIdStrategy.generate`` flattens, so it cannot be used
+        directly here — it is only consulted for the ``continuous``
+        post-packing path.
+        """
+        if mode != "doc_reset" or not original_sequences:
+            return keys
+        keys["position_ids"] = [list(range(len(s))) for s in original_sequences]
+        return keys
+
+    def _inject_continuous_position_ids(
+        self,
+        tensors: Dict[str, List[torch.Tensor]],
+        mode: str,
+        packed_sequences: List[List[int]],
+    ) -> Dict[str, List[torch.Tensor]]:
+        """Attach a single continuous position_ids tensor after packing.
+
+        ``continuous`` mode spans the whole shard (post-packing), so it
+        cannot participate in bin packing — it is computed from the
+        packed sequences and appended directly to the tensor dict.
+        """
+        if mode != "continuous" or not packed_sequences:
+            return tensors
+        pos_ids = self._position_id.generate(packed_sequences)
+        if pos_ids:
+            tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
+        return tensors
+
+    def _to_tensors(self, keys: Dict[str, list]) -> Dict[str, List[torch.Tensor]]:
+        """Convert packed per-key id lists to tensors.
+
+        Honours ``config.output.dtype`` overrides per key; falls back to
+        ``int32``.  Handles three shapes (see
+        :func:`astrai.preprocessing.core.to_per_record_tensors` for the
+        equivalent online-path helper):
+        - ``List[int]`` per record → one tensor per record.
+        - ``List[List[int]]`` per record (GRPO responses/masks) → one tensor
+          per record, inner lists flattened.
+        - ``List[int]`` for the whole shard (pre-packed keys) → single tensor.
+        """
+        tensors: Dict[str, List[torch.Tensor]] = {}
+        for key, ids_list in keys.items():
+            dt = _STR_TO_DTYPE.get(
+                self.config.output.dtype.get(key, "int32"), torch.int32
+            )
+            if ids_list and isinstance(ids_list[0], list):
+                tensors[key] = [
+                    torch.tensor(
+                        list(chain.from_iterable(ids))
+                        if ids and isinstance(ids[0], list)
+                        else ids,
+                        dtype=dt,
+                    )
+                    for ids in ids_list
+                ]
+            else:
+                tensors[key] = [
+                    torch.tensor(list(chain.from_iterable(ids_list)), dtype=dt)
+                ]
+        return tensors

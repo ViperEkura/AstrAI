@@ -4,6 +4,11 @@ Bridges the Reader layer (``JsonlStore`` reads raw JSON records) and the
 Dataset layer (expects per-record tensors).  Holds the tokenizer,
 mask-builder and position-id strategy together so that I/O code stays
 free of model dependencies.
+
+The record-processing core (mask building, primary-id extraction,
+per-key tensorisation, position-id generation) is shared with
+:class:`astrai.preprocessing.pipeline.Pipeline` via the
+:mod:`astrai.preprocessing.core` helpers.
 """
 
 import json
@@ -13,9 +18,12 @@ from typing import Dict, List
 import torch
 
 from astrai.config.preprocess_config import PipelineConfig
-from astrai.preprocessing.builder import MaskBuilderFactory
-from astrai.preprocessing.position_id import PositionIdStrategyFactory
-from astrai.tokenize import AutoTokenizer
+from astrai.preprocessing.core import (
+    build_position_ids,
+    build_preprocessing_components,
+    iter_raw_records,
+    to_per_record_tensors,
+)
 
 
 class TokenizeTransform:
@@ -33,10 +41,8 @@ class TokenizeTransform:
 
     def __init__(self, config: PipelineConfig, tokenizer_path: str):
         self.config = config
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self.mask_builder = MaskBuilderFactory.create("sectioned")
-        self.position_strategy = PositionIdStrategyFactory.create(
-            config.output.position_ids_mode
+        self.tokenizer, self.mask_builder, self.position_strategy = (
+            build_preprocessing_components(config, tokenizer_path)
         )
 
     @classmethod
@@ -64,40 +70,23 @@ class TokenizeTransform:
         raw: Dict[str, list] = {}
         doc_sequences: List[List[int]] = []
 
-        for item in records:
-            result = self.mask_builder.build(item, self.config, self.tokenizer)
-            if result is None:
-                continue
-            result.pop("domain", None)
-            primary_ids = self._primary_ids(result)
-            if not primary_ids:
-                continue
-            doc_sequences.append(primary_ids)
+        for result in iter_raw_records(
+            records, self.mask_builder, self.config, self.tokenizer
+        ):
+            primary = None
+            for val in result.values():
+                if isinstance(val, list) and val and isinstance(val[0], int):
+                    primary = val
+                    break
+            if primary is not None:
+                doc_sequences.append(primary)
             for key, ids in result.items():
-                if key not in raw:
-                    raw[key] = []
-                if ids and isinstance(ids[0], list):
-                    raw[key].append(
-                        [torch.tensor(sub, dtype=self._infer_dtype(sub)) for sub in ids]
-                    )
-                else:
-                    raw[key].append(torch.tensor(ids, dtype=self._infer_dtype(ids)))
+                raw.setdefault(key, []).append(ids)
 
-        pos_ids = self.position_strategy.generate(doc_sequences)
-        if pos_ids:
-            raw["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
+        tensors = to_per_record_tensors(raw)
 
-        return raw
+        pos_ids = build_position_ids(doc_sequences, self.position_strategy)
+        if pos_ids is not None:
+            tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
 
-    @staticmethod
-    def _primary_ids(result: dict) -> List[int]:
-        for val in result.values():
-            if isinstance(val, list) and val and isinstance(val[0], int):
-                return val
-        return []
-
-    @staticmethod
-    def _infer_dtype(ids: List) -> torch.dtype:
-        if ids and isinstance(ids[0], float):
-            return torch.float32
-        return torch.int32
+        return tensors

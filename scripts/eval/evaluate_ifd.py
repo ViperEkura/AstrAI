@@ -26,28 +26,22 @@ import torch.nn.functional as F
 import tqdm
 
 from astrai.model import AutoModel
+from astrai.preprocessing.packing import plan_bfd
 from astrai.tokenize import AutoTokenizer
 
 
 def _pack_bins(pairs, max_len):
-    """BFD bin packing: pack (c+r) into bins of max total length."""
-    indexed = sorted(enumerate(pairs), key=lambda x: -(len(x[1][0]) + len(x[1][1])))
-    bins = []
-    lengths = []
-    for orig_idx, (c, r) in indexed:
-        size = len(c) + len(r)
-        best_bin = -1
-        for bi, rem in enumerate(lengths):
-            if rem >= size:
-                if best_bin < 0 or rem < lengths[best_bin]:
-                    best_bin = bi
-        if best_bin >= 0:
-            bins[best_bin].append((orig_idx, c, r))
-            lengths[best_bin] -= size
-        else:
-            bins.append([(orig_idx, c, r)])
-            lengths.append(max_len - size)
-    return bins
+    """BFD bin packing: pack (c+r) into bins of max total length.
+
+    Reuses :func:`plan_bfd` so the BFD heuristic stays single-sourced.
+    """
+    # Treat each pair as a single sequence of length len(c)+len(r) for
+    # planning purposes; plan_bfd works on pure lengths.
+    fake_sequences = [[0] * (len(c) + len(r)) for c, r in pairs]
+    plan = plan_bfd(fake_sequences, max_len)
+    return [
+        [(i, pairs[i][0], pairs[i][1]) for i in bin_indices] for bin_indices in plan
+    ]
 
 
 def _resolve_sentinel_ids(tokenizer, sentinel_text):

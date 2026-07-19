@@ -1,21 +1,26 @@
-"""Dataset implementations with factory pattern for training.
+"""Dataset implementations for training.
+
+Composition over inheritance — every dataset is a thin wrapper that
+binds a :class:`Store` to a particular train-type's key mapping.  All
+sample-id → token/record indexing lives on the Store; datasets never
+know about window/stride math or segment layouts.
 
 Class hierarchy:
 
-    BaseDataset (ABC)           — load/validate, owns a Store
-    ├── SEQDataset              — stream, next-token prediction (PT)
-    ├── SFTDataset              — stream, loss-mask + position_ids
-    └── RecordDataset           — record access, optional processor
-        ├── DPODataset          — chosen/rejected pairs
-        └── GRPODataset         — prompt + response group
+    BaseDataset (ABC)         — holds a Store, exposes __len__/keys,
+                                 overrides __getitem__
+    ├── SEQDataset            — next-token prediction (stream)
+    ├── SFTDataset            — loss-mask + position_ids (stream)
+    ├── DPODataset            — chosen/rejected pairs (record)
+    └── GRPODataset           — prompt + response group (record)
 
-``RecordDataset`` holds an optional *processor* (pure
-``record -> Dict[str, Tensor]`` function).  When the backing Store is
-a lazy JsonlStore, the processor tokenises on the fly; otherwise it
-is ignored and ``fetch_record`` reads pre-tokenised tensors.
+``DatasetFactory.load(train_type, load_path, window_size, stride, …)``
+builds the Store (auto-detecting format) before constructing the
+matching dataset.  Passing ``store=`` skips Store construction.
 
-``__len__`` returns the sample count (stream: windows, record:
-records) so DataLoader and progress bars work uniformly.
+When a record dataset (DPO) reads from raw JSONL, a *processor*
+function (pure ``record -> Dict[str, Tensor]``) is forwarded to
+:class:`JsonlStore` so tokenisation happens on the fly.
 """
 
 from abc import ABC, abstractmethod
@@ -218,184 +223,57 @@ def grpo_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
     }
 
 
-class BaseDataset(Dataset, ABC):
-    """Abstract base class for all dataset types.
+def validate_keys(store: Store, required: List[str]) -> None:
+    """Raise ``KeyError`` if *store* is missing any *required* key."""
+    if not required:
+        return
+    actual = set(store.keys)
+    missing = [k for k in required if k not in actual]
+    if missing:
+        raise KeyError(
+            f"Store at {getattr(store, '_load_path', '?')} is missing required "
+            f"keys {missing}; available keys are {sorted(actual)}."
+        )
 
-    Implements common functionality for window-based data fetching.
-    Uses a storage abstraction for format-agnostic data loading.
+
+class BaseDataset(Dataset, ABC):
+    """Abstract base class for dataset types.
+
+    Holds a :class:`Store`.  All sample-id indexing is delegated to the
+    store — this class exposes ``__len__`` as ``len(store)`` and the
+    ``keys`` property as ``store.keys``.  Subclasses implement
+    ``__getitem__`` with the train-type-specific key mapping and any
+    training-only index arithmetic (e.g. the next-token ``+1`` shift).
     """
 
-    def __init__(self, window_size: int, stride: int):
+    required_keys: List[str] = []
+
+    def __init__(self, store: Store):
         super().__init__()
-        self.window_size = window_size
-        self.stride = stride
-        self.storage: Optional[Store] = None
+        self.store: Store = store
+        validate_keys(store, self.required_keys)
 
-    @property
-    def required_keys(self) -> List[str]:
-        """Return required storage keys for this dataset type.
-
-        Subclasses should override to specify expected keys.
-        """
-        return []
-
-    def _validate_keys(self):
-        if not self.required_keys:
-            return
-        actual_keys = set(self.storage.keys)
-        missing = [k for k in self.required_keys if k not in actual_keys]
-        if missing:
-            raise KeyError(
-                f"Dataset {type(self).__name__} requires keys {self.required_keys}, "
-                f"but storage at {self._load_path} only has {sorted(actual_keys)}. "
-                f"Missing: {missing}"
-            )
-
-    def load(self, load_path: str, storage_type: Optional[str] = None, **kwargs):
-        """Load dataset from the given path.
-
-        Auto-detects the storage format if not specified.
-
-        Args:
-            load_path: Path to the data directory or file
-            storage_type: Force a specific storage type ("h5", "bin", "jsonl"),
-                          or None for auto-detection
-            **kwargs: Extra arguments forwarded to the store constructor and
-                      to ``store.load()``.
-
-        Raises:
-            KeyError: If the loaded storage is missing required keys.
-        """
-        if storage_type is None:
-            storage_type = detect_format(load_path)
-        self.storage = StoreFactory.create(storage_type, **kwargs)
-        self._load_path = load_path
-        self.storage.load(load_path, **kwargs)
-        self._validate_keys()
-
-    @property
-    def count(self) -> int:
-        """Return the total number of raw elements (tokens) in the dataset."""
-        if self.storage is None:
-            return 0
-        return len(self.storage)
+    def __len__(self) -> int:
+        return len(self.store)
 
     @property
     def keys(self) -> List[str]:
-        """Return the available data keys."""
-        if self.storage is None:
-            return []
-        return self.storage.keys
+        return self.store.keys
 
-    def get_index(self, index: int) -> tuple:
-        """Calculate begin and end indices for a sample.
-
-        Args:
-            index: Sample index
-
-        Returns:
-            Tuple of (begin_idx, end_idx)
-        """
-        if self.storage is None:
-            raise RuntimeError("Dataset not loaded, call load() first")
-        total = len(self.storage)
-        if total <= self.window_size:
-            raise ValueError(
-                f"Data too short: {total} tokens <= window_size {self.window_size}"
-            )
-
-        begin_idx = min(index * self.stride, total - 1 - self.window_size)
-        end_idx = min(begin_idx + self.window_size, total - 1)
-
-        return begin_idx, end_idx
+    @property
+    def token_count(self) -> int:
+        return self.store.token_count
 
     @abstractmethod
     def __getitem__(self, index: int) -> Dict[str, Tensor]:
-        """Get a single sample by index.
-
-        Must be implemented by subclasses.
-        """
         raise NotImplementedError
-
-    def __len__(self) -> int:
-        if self.storage is None:
-            return 0
-        total = len(self.storage)
-        if total <= self.window_size:
-            return 0
-        return (total - 1 - self.window_size) // self.stride + 1
-
-
-class RecordDataset(BaseDataset):
-    """Base class for record-structured datasets (DPO/GRPO).
-
-    Each sample is an independent record — no windowing, stride, or
-    cross-record concatenation.  ``__len__`` returns the record count
-    so progress bars advance per-record.
-
-    A *processor* (pure ``record -> Dict[str, Tensor]`` function) may be
-    supplied for lazy on-the-fly tokenisation of raw JSONL.  The
-    processor is forwarded to ``JsonlStore`` and applied per access;
-    pre-tokenised backends (H5/bin) ignore it.
-    """
-
-    def __init__(
-        self,
-        window_size: int = 0,
-        stride: int = 0,
-        processor: Optional[Callable[[dict], Dict[str, Tensor]]] = None,
-        **kwargs,
-    ):
-        super().__init__(window_size=window_size, stride=stride or window_size)
-        self.processor = processor
-
-    def load(self, load_path: str, storage_type: Optional[str] = None, **kwargs):
-        """Load data from *load_path*.
-
-        Args:
-            load_path: Path to data file or directory.
-            storage_type: Force backend ("h5"/"bin"/"jsonl") or None for
-                auto-detection.
-            **kwargs: Forwarded to ``store.load()``.  When the backend is
-                JSONL and a processor was set, it is passed as
-                ``processor=`` for lazy tokenisation.
-        """
-        if storage_type is None:
-            storage_type = detect_format(load_path)
-        self.storage = StoreFactory.create(storage_type, **kwargs)
-        self._load_path = load_path
-
-        if self.processor is not None:
-            self.storage.load(load_path, processor=self.processor, **kwargs)
-        else:
-            self.storage.load(load_path, **kwargs)
-            self._validate_keys()
-
-    def __len__(self) -> int:
-        if self.storage is None:
-            return 0
-        return self.storage.num_records
-
-    @property
-    def count(self) -> int:
-        if self.storage is None:
-            return 0
-        return self.storage.num_records
 
 
 class DatasetFactory(BaseFactory["BaseDataset"]):
-    """Factory class for creating dataset instances.
+    """Factory for creating dataset instances by train-type.
 
-    Supports decorator-based registration for extensible dataset types.
-    All default dataset types (seq, sft, dpo, grpo) are registered automatically
-    when their classes are defined with the decorator.
-
-    Example usage:
-        @DatasetFactory.register("custom")
-        class CustomDataset(BaseDataset):
-            ...
-
-        dataset = DatasetFactory.create("custom", window_size, stride)
+    Use :meth:`DatasetFactory.register("custom")` to register new
+    dataset classes; they must inherit from :class:`BaseDataset`.
     """
 
     @classmethod
@@ -417,32 +295,34 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
 
         - **store given**: bind it directly — the caller fully controls
           Store construction and processor setup.  *load_path*,
-          *storage_type*, *tokenizer_path* are ignored.
+          *storage_type*, *tokenizer_path*, *window_size*, *stride* are
+          ignored.
         - **store is None**: build a Store from *load_path*, auto-detecting
           format and constructing a processor when *tokenizer_path* is
           given for a record dataset on JSONL.
 
         Args:
-            train_type: Type of training dataset
-            load_path: Path to the data file (ignored if *store* given)
-            window_size: Window size for data sampling
-            stride: Stride between consecutive samples (default: same as window_size)
-            storage_type: Storage type ("h5", "bin", "jsonl") or None for auto-detection
-            tokenizer_path: Path to tokenizer for lazy JSONL tokenisation
-            max_len: Max sequence length for the processor
-            store: Pre-built, already-loaded Store instance
-            **kwargs: Extra arguments forwarded to ``dataset.load()``
+            train_type: Registered dataset name ("seq", "sft", "dpo",
+                "grpo", …).
+            load_path: Path to the data file or directory (ignored if
+                *store* is given).
+            window_size: Stream window length — only meaningful for
+                stream datasets (SEQ/SFT).  Record datasets ignore it.
+            stride: Stride between consecutive stream samples
+                (default: same as *window_size*).
+            storage_type: Storage backend ("h5", "bin", "jsonl") or
+                None for auto-detection.
+            tokenizer_path: Path to tokenizer for lazy JSONL
+                tokenisation (record datasets only).
+            max_len: Max sequence length forwarded to processors.
+            store: Pre-built, already-loaded Store instance.
+            **kwargs: Extra arguments forwarded to ``store.load()``.
 
         Returns:
-            Loaded dataset instance
+            Loaded dataset instance.
         """
-        if stride is None:
-            stride = window_size
-
         if store is not None:
-            dataset = cls.create(train_type, window_size, stride)
-            dataset.storage = store
-            return dataset
+            return cls.create(train_type, store=store)
 
         if load_path is None:
             raise ValueError("Either load_path or store must be provided")
@@ -450,14 +330,37 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
         if storage_type is None:
             storage_type = detect_format(load_path)
 
+        if stride is None:
+            stride = window_size
+
         processor = cls._maybe_build_processor(
             train_type, storage_type, tokenizer_path, max_len
         )
 
-        dataset = cls.create(train_type, window_size, stride, processor=processor)
-        dataset.load(load_path, storage_type=storage_type, **kwargs)
+        store_window = cls._store_window_for(train_type, window_size)
+        store = StoreFactory.create(
+            storage_type,
+            window_size=store_window,
+            stride=stride if stride else store_window,
+        )
+        if processor is not None:
+            store.load(load_path, processor=processor, **kwargs)
+        else:
+            store.load(load_path, **kwargs)
 
-        return dataset
+        return cls.create(train_type, store=store)
+
+    @staticmethod
+    def _store_window_for(train_type: str, window_size: int) -> int:
+        """Stream datasets consume ``window_size``; record datasets ignore it.
+
+        Record datasets (dpo/grpo) treat each record as an independent
+        training unit and never window, so the store is built with
+        ``window_size=0`` and ``len(store)`` returns the record count.
+        """
+        if train_type in ("seq", "sft"):
+            return window_size
+        return 0
 
     @staticmethod
     def _maybe_build_processor(
@@ -482,43 +385,41 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
 
 @DatasetFactory.register("seq")
 class SEQDataset(BaseDataset):
-    """Dataset for sequential next-token prediction training."""
+    """Dataset for sequential next-token prediction training.
 
-    @property
-    def required_keys(self) -> List[str]:
-        return ["sequence"]
+    Stream mode: ``store.fetch(begin, end, "sequence")`` returns the
+    input window; the +1 shifted call returns the next-token target.
+    """
 
-    def _fetch_data(self, begin_idx: int, end_idx: int) -> Tensor:
-        return self.storage.fetch(begin_idx, end_idx, "sequence")
+    required_keys = ["sequence"]
 
-    def __getitem__(self, index):
-        begin_idx, end_idx = self.get_index(index)
-
-        x = self._fetch_data(begin_idx, end_idx).to(dtype=torch.long)
-        y = self._fetch_data(begin_idx + 1, end_idx + 1).to(dtype=torch.long)
-
-        return {"input_ids": x, "target_ids": y}
+    def __getitem__(self, index: int):
+        begin, end = self.store.sample_window(index)
+        x = self.store.fetch(begin, end, "sequence")
+        y = self.store.fetch(begin + 1, end + 1, "sequence")
+        return {
+            "input_ids": x.to(dtype=torch.long),
+            "target_ids": y.to(dtype=torch.long),
+        }
 
 
 @DatasetFactory.register("sft")
 class SFTDataset(BaseDataset):
-    """Dataset for supervised fine-tuning with loss masking."""
+    """Dataset for supervised fine-tuning with loss masking.
 
-    @property
-    def required_keys(self) -> List[str]:
-        return ["sequence", "loss_mask", "position_ids"]
+    Stream mode: ``sequence``/``loss_mask``/``position_ids`` are sliced
+    to the window.  ``loss_mask`` and ``target_ids`` use the +1 shifted
+    slice so they align with the predicted positions.
+    """
 
-    def _fetch_data(self, begin_idx: int, end_idx: int, key: str) -> Tensor:
-        return self.storage.fetch(begin_idx, end_idx, key)
+    required_keys = ["sequence", "loss_mask", "position_ids"]
 
-    def __getitem__(self, index):
-        begin_idx, end_idx = self.get_index(index)
-
-        x = self._fetch_data(begin_idx, end_idx, "sequence")
-        y = self._fetch_data(begin_idx + 1, end_idx + 1, "sequence")
-        position_ids = self._fetch_data(begin_idx, end_idx, "position_ids")
-        loss_mask = self._fetch_data(begin_idx + 1, end_idx + 1, "loss_mask")
-
+    def __getitem__(self, index: int):
+        begin, end = self.store.sample_window(index)
+        x = self.store.fetch(begin, end, "sequence")
+        y = self.store.fetch(begin + 1, end + 1, "sequence")
+        position_ids = self.store.fetch(begin, end, "position_ids")
+        loss_mask = self.store.fetch(begin + 1, end + 1, "loss_mask")
         return {
             "input_ids": x.to(dtype=torch.long),
             "target_ids": y.to(dtype=torch.long),
@@ -528,7 +429,7 @@ class SFTDataset(BaseDataset):
 
 
 @DatasetFactory.register("dpo")
-class DPODataset(RecordDataset):
+class DPODataset(BaseDataset):
     """Record-structured dataset for Direct Preference Optimization.
 
     Each sample is one preference pair (chosen + rejected) and is an
@@ -536,39 +437,35 @@ class DPODataset(RecordDataset):
     concatenation.  This keeps each sequence self-contained so attention
     never leaks across preference pairs.
 
-    Two loading paths (handled by :class:`RecordDataset`):
+    Two loading paths (handled by :class:`DatasetFactory`):
 
-    - **Pre-tokenized** (H5/bin): ``load(path)`` reads per-record tensors,
-      ``__getitem__`` returns them directly.
-    - **Raw JSONL** (``tokenizer_path=...``): builds a lazy processor via
-      :func:`dpo_processor` that tokenises on the fly — no packing, no
-      ``position_ids``.
+    - **Pre-tokenized** (H5/bin): ``store.load(path)`` reads per-record
+      tensors; ``__getitem__`` returns them directly.
+    - **Raw JSONL** (``tokenizer_path=...``): builds a lazy processor
+      via :func:`dpo_processor` that tokenises on the fly — no packing,
+      no ``position_ids``.
     """
 
-    @property
-    def required_keys(self) -> List[str]:
-        return ["chosen", "rejected", "chosen_mask", "rejected_mask"]
+    required_keys = ["chosen", "rejected", "chosen_mask", "rejected_mask"]
 
     def make_processor(self, tokenizer, max_len: int):
         return partial(dpo_processor, tokenizer=tokenizer, max_len=max_len)
 
     def __getitem__(self, index: int) -> Dict[str, Tensor]:
         return {
-            "chosen": self.storage.fetch_record(index, "chosen").to(dtype=torch.long),
-            "rejected": self.storage.fetch_record(index, "rejected").to(
-                dtype=torch.long
-            ),
-            "chosen_mask": self.storage.fetch_record(index, "chosen_mask").to(
+            "chosen": self.store.fetch_record(index, "chosen").to(dtype=torch.long),
+            "rejected": self.store.fetch_record(index, "rejected").to(dtype=torch.long),
+            "chosen_mask": self.store.fetch_record(index, "chosen_mask").to(
                 dtype=torch.bool
             ),
-            "rejected_mask": self.storage.fetch_record(index, "rejected_mask").to(
+            "rejected_mask": self.store.fetch_record(index, "rejected_mask").to(
                 dtype=torch.bool
             ),
         }
 
 
 @DatasetFactory.register("grpo")
-class GRPODataset(RecordDataset):
+class GRPODataset(BaseDataset):
     """Dataset for offline Group Relative Policy Optimization.
 
     Each sample is one prompt with its group of responses and scalar
@@ -582,15 +479,13 @@ class GRPODataset(RecordDataset):
     - ``rewards``:   List[Tensor]  — one 1-D float tensor (len G) per record
     """
 
-    @property
-    def required_keys(self) -> List[str]:
-        return ["prompts", "responses", "masks", "rewards"]
+    required_keys = ["prompts", "responses", "masks", "rewards"]
 
     def __getitem__(self, index: int) -> Dict[str, Tensor]:
-        prompts = self.storage.fetch_record(index, "prompts")
-        responses = self.storage.fetch_record(index, "responses")
-        masks = self.storage.fetch_record(index, "masks")
-        rewards = self.storage.fetch_record(index, "rewards")
+        prompts = self.store.fetch_record(index, "prompts")
+        responses = self.store.fetch_record(index, "responses")
+        masks = self.store.fetch_record(index, "masks")
+        rewards = self.store.fetch_record(index, "rewards")
         return {
             "prompts": prompts.to(dtype=torch.long),
             "responses": [r.to(dtype=torch.long) for r in responses],

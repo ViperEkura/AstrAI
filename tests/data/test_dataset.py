@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from astrai.config.preprocess_config import PipelineConfig
-from astrai.dataset.dataset import DatasetFactory, SEQDataset, dpo_tokenize
+from astrai.dataset.dataset import DatasetFactory, dpo_tokenize
 from astrai.dataset.storage import (
     H5Store,
     JsonlStore,
@@ -118,7 +118,7 @@ def test_dpo_strategy_with_random_data(base_test_env):
     )
 
     assert dpo_dataset is not None
-    assert dpo_dataset.storage is not None
+    assert dpo_dataset.store is not None
     assert len(dpo_dataset) > 0
 
     # Test that we can get DPO items without errors
@@ -147,7 +147,7 @@ def test_sft_dataset_with_random_data(base_test_env):
     )
 
     assert sft_dataset is not None
-    assert sft_dataset.storage is not None
+    assert sft_dataset.store is not None
     assert len(sft_dataset) > 0
 
     # Test that we can get SFT items without errors
@@ -178,39 +178,37 @@ def test_dataset_with_custom_stride(base_test_env):
     assert len(dataset) > len(default_stride_dataset)
 
 
-def test_dataset_count_property(base_test_env):
+def test_dataset_token_count_property(base_test_env):
+    """dataset.token_count exposes the raw stream token length."""
     test_dir = base_test_env["test_dir"]
     dataset = _make_seq_dataset(test_dir, "count_test_data")
-    assert dataset.count == 200
-    assert dataset.count > len(dataset)
+    assert dataset.token_count == 200
+    assert dataset.token_count > len(dataset)
     assert len(dataset) == (200 - 1 - 64) // 64 + 1
-
-
-def test_empty_dataset_count():
-    """Test count returns 0 when no data is loaded"""
-    dataset = SEQDataset(window_size=64, stride=32)
-    assert dataset.count == 0
-    assert dataset.keys == []
 
 
 def test_dataset_too_short_for_window(base_test_env):
     test_dir = base_test_env["test_dir"]
     dataset = _make_seq_dataset(test_dir, "short", seq_length=30)
     assert len(dataset) == 0
-    assert dataset.count == 30
+    assert dataset.token_count == 30
 
 
-def test_unloaded_dataset_getitem_raises():
-    """__getitem__ without load() should fail clearly"""
-    dataset = SEQDataset(window_size=64, stride=32)
-    with pytest.raises(RuntimeError, match="not loaded"):
-        dataset.get_index(0)
+def test_unloaded_sample_window_raises():
+    """Store.sample_window before load raises RuntimeError."""
+    from astrai.dataset.storage import H5Store
+
+    store = H5Store(window_size=64, stride=64)
+    with pytest.raises(IndexError, match="Data too short"):
+        store.sample_window(0)
 
 
 def test_unloaded_dataset_len():
-    """__len__ without load() returns 0"""
-    dataset = SEQDataset(window_size=64, stride=32)
-    assert len(dataset) == 0
+    """__len__ on a store with no data returns 0."""
+    from astrai.dataset.storage import H5Store
+
+    store = H5Store(window_size=64, stride=64)
+    assert len(store) == 0
 
 
 def test_store_unloaded_len():
@@ -223,7 +221,7 @@ def test_store_unloaded_len():
 def test_store_fetch_begin_equals_end(base_test_env):
     test_dir = base_test_env["test_dir"]
     dataset = _make_seq_dataset(test_dir, "empty_fetch", seq_length=100, window_size=32)
-    result = dataset.storage.fetch(10, 10, "sequence")
+    result = dataset.store.fetch(10, 10, "sequence")
     assert result.numel() == 0
 
 
@@ -273,7 +271,7 @@ def test_store_multi_segment_concat(base_test_env):
 
     store = StoreFactory.create("h5")
     store.load(data_dir)
-    assert len(store) == 9
+    assert store.token_count == 9
     result = store.fetch(2, 7, "sequence")
     assert result.tolist() == [3, 4, 5, 6, 7]
 
@@ -302,7 +300,9 @@ def test_mmap_store_load_and_fetch(base_test_env):
 
     store = StoreFactory.create("bin")
     store.load(test_dir)
-    assert len(store) == 200
+    assert store.token_count == 200
+    assert store.num_records == 0
+    assert len(store) == 0  # no window configured, no records → 0 samples
     assert "sequence" in store.keys
 
     result = store.fetch(10, 20, "sequence")
@@ -315,23 +315,26 @@ def test_mmap_dataset_load(base_test_env):
     save_bin(test_dir, data)
     dataset = DatasetFactory.load("seq", test_dir, window_size=64)
     assert len(dataset) > 0
-    assert dataset.count == 200
+    assert dataset.token_count == 200
     assert dataset[0]["input_ids"].shape[0] == 64
 
 
 def test_normalize_empty_key():
-    """_normalize with empty tensor list does not crash"""
+    """_normalize with empty tensor list does not crash."""
     store = H5Store()
     store._normalize({"sequence": []})
     assert len(store) == 0
+    assert store.num_records == 0  # empty key forces num_records=0
     assert store.keys == ["sequence"]
 
 
 def test_normalize_mixed_empty_key():
-    """_normalize with empty + non-empty keys returns min=0"""
+    """_normalize with empty + non-empty keys returns min=0 records."""
     store = H5Store()
     store._normalize({"sequence": [torch.tensor([1, 2, 3])], "loss_mask": []})
     assert len(store) == 0
+    assert store.num_records == 0
+    assert store.token_count == 0  # min() over keys
     assert set(store.keys) == {"sequence", "loss_mask"}
 
 
@@ -339,15 +342,14 @@ def test_grpo_dataset_dtype(base_test_env):
     """GRPO dataset returns correct dtypes for per-record structured data."""
     from astrai.dataset.dataset import GRPODataset
 
-    test_dir = base_test_env["test_dir"]
     G = 4
-    dataset = GRPODataset()
-    dataset.storage = type(
+    store = type(
         "FakeStore",
         (),
         {
             "keys": ["prompts", "responses", "masks", "rewards"],
             "num_records": 1,
+            "token_count": 0,
             "_data": {
                 "prompts": [torch.randint(0, 100, (10,), dtype=torch.int32)],
                 "responses": [
@@ -357,8 +359,10 @@ def test_grpo_dataset_dtype(base_test_env):
                 "rewards": [torch.rand(G, dtype=torch.float32)],
             },
             "fetch_record": _fake_fetch_record,
+            "__len__": lambda self: self.num_records,
         },
     )()
+    dataset = GRPODataset(store=store)
     item = dataset[0]
 
     assert item["prompts"].dtype == torch.long
@@ -371,17 +375,16 @@ def test_grpo_dataset_load(base_test_env):
     """GRPO dataset loads record-structured data with per-response boundaries."""
     from astrai.dataset.dataset import GRPODataset
 
-    test_dir = base_test_env["test_dir"]
     G = 3
     prompt_len = 8
     resp_lens = [5, 7, 4]
-    dataset = GRPODataset()
-    dataset.storage = type(
+    store = type(
         "FakeStore",
         (),
         {
             "keys": ["prompts", "responses", "masks", "rewards"],
             "num_records": 1,
+            "token_count": 0,
             "_data": {
                 "prompts": [torch.randint(0, 100, (prompt_len,))],
                 "responses": [[torch.randint(0, 100, (rl,)) for rl in resp_lens]],
@@ -389,8 +392,10 @@ def test_grpo_dataset_load(base_test_env):
                 "rewards": [torch.tensor([0.9, 0.3, 0.7], dtype=torch.float32)],
             },
             "fetch_record": _fake_fetch_record,
+            "__len__": lambda self: self.num_records,
         },
     )()
+    dataset = GRPODataset(store=store)
 
     assert len(dataset) == 1
     item = dataset[0]
@@ -458,7 +463,7 @@ def test_dataset_load_explicit_storage_type(base_test_env):
     test_dir = base_test_env["test_dir"]
     dataset = _make_seq_dataset(test_dir, "explicit", storage_type="h5")
     assert len(dataset) > 0
-    assert dataset.count == 200
+    assert dataset.token_count == 200
 
 
 def _write_json_dataset(test_dir, tokenizer_path, records, config_overrides=None):
@@ -853,11 +858,11 @@ def test_grpo_collate_variable_lengths():
     assert result["responses"][0, 0, 0] == 4
     assert result["responses"][0, 0, 1] == 5
     assert result["responses"][0, 0, 2] == 0  # padded
-    assert result["masks"][0, 0, 2] == False  # padded
+    assert not result["masks"][0, 0, 2]  # padded
 
     # Check response content: item 0, response 1 is [6,7,8,9] no padding
     assert result["responses"][0, 1, 3] == 9
-    assert result["masks"][0, 1, 3] == True
+    assert result["masks"][0, 1, 3]
 
 
 def test_grpo_multiple_records(base_test_env):
@@ -871,13 +876,13 @@ def test_grpo_multiple_records(base_test_env):
         [torch.randint(0, 100, (np.random.randint(3, 8),)) for _ in range(G)]
         for _ in range(n_records)
     ]
-    dataset = GRPODataset()
-    dataset.storage = type(
+    store = type(
         "FakeStore",
         (),
         {
             "keys": ["prompts", "responses", "masks", "rewards"],
             "num_records": n_records,
+            "token_count": 0,
             "_data": {
                 "prompts": [torch.randint(0, 100, (10,)) for _ in range(n_records)],
                 "responses": dummy_responses,
@@ -890,8 +895,10 @@ def test_grpo_multiple_records(base_test_env):
                 ],
             },
             "fetch_record": _fake_fetch_record,
+            "__len__": lambda self: self.num_records,
         },
     )()
+    dataset = GRPODataset(store=store)
 
     assert len(dataset) == n_records
 
@@ -973,8 +980,8 @@ def test_dpo_jsonl_lazy_load(base_test_env):
     )
 
     assert len(ds) == 2
-    assert ds.storage.num_records == 2
-    assert ds.storage._processor is not None
+    assert ds.store.num_records == 2
+    assert ds.store._processor is not None
 
     item = ds[0]
     assert set(item.keys()) == {"chosen", "rejected", "chosen_mask", "rejected_mask"}
@@ -1035,7 +1042,13 @@ def test_jsonl_store_eager_len_returns_token_count(base_test_env):
 
 
 def test_h5_store_dual_mode(base_test_env):
-    """H5Store supports both fetch (stream) and fetch_record (record)."""
+    """H5Store supports both fetch (stream) and fetch_record (record).
+
+    No window configured → ``len(store)`` reflects the record count
+    (2).  ``token_count`` retains the legacy stream length (128), and
+    token-stream access via :meth:`fetch` is still available for
+    callers that want explicit begin/end control.
+    """
     test_dir = base_test_env["test_dir"]
 
     seq_length = 64
@@ -1048,8 +1061,9 @@ def test_h5_store_dual_mode(base_test_env):
     store = H5Store()
     store.load(test_dir)
 
-    assert len(store) == seq_length * 2
+    assert store.token_count == seq_length * 2
     assert store.num_records == 2
+    assert len(store) == 2  # no window configured → record count
 
     rec0 = store.fetch_record(0, "chosen")
     assert rec0.shape == (seq_length,)
@@ -1057,9 +1071,20 @@ def test_h5_store_dual_mode(base_test_env):
     stream = store.fetch(0, 10, "chosen")
     assert stream.shape == (10,)
 
+    # Window-configured view of the same data uses stream sample count:
+    #   token_count=128, window_size=64 → num_samples = (128-1-64)//64 + 1 = 1
+    stream_view = H5Store(window_size=seq_length, stride=seq_length)
+    stream_view.load(test_dir)
+    assert len(stream_view) == 1
+
 
 def test_mmap_store_stream_only_no_offsets(base_test_env):
-    """MmapStore without offsets: num_records == 0, stream works."""
+    """MmapStore without offsets: num_records == 0, stream works.
+
+    No window configured → ``len(store)`` is 0 (no iterate units).
+    ``token_count`` remains 128 for raw token slicing, and ``fetch``
+    provides direct token-range access.
+    """
     test_dir = base_test_env["test_dir"]
 
     seq_length = 128
@@ -1069,8 +1094,9 @@ def test_mmap_store_stream_only_no_offsets(base_test_env):
     store = StoreFactory.create("bin")
     store.load(test_dir)
 
-    assert len(store) == seq_length
+    assert store.token_count == seq_length
     assert store.num_records == 0
+    assert len(store) == 0
 
     chunk = store.fetch(0, 32, "sequence")
     assert chunk.shape == (32,)

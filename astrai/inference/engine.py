@@ -82,8 +82,8 @@ class GenerationRequest:
             raise ValueError("top_k must be a non-negative integer")
         if not (0.0 <= top_p <= 1.0):
             raise ValueError("top_p must be a float between 0.0 and 1.0")
-        if not (isinstance(temperature, (int, float)) and temperature > 0):
-            raise ValueError("temperature must be a positive number")
+        if not (isinstance(temperature, (int, float)) and temperature >= 0):
+            raise ValueError("temperature must be a non-negative number")
         if not (
             isinstance(frequency_penalty, (int, float))
             and -2.0 <= frequency_penalty <= 2.0

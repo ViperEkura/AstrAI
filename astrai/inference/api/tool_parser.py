@@ -7,6 +7,7 @@ Subclasses may optionally consume ``token_ids`` for token-level parsing
 (e.g. Harmony / VLM-style parsers).
 """
 
+import json
 import re
 import uuid
 from abc import ABC, abstractmethod
@@ -117,6 +118,29 @@ def _parse_tool_call_json(json_str: str, complete: bool):
 
     Returns ``(name, args, valid)``.
     """
+    if complete:
+        try:
+            obj = json.loads(json_str)
+        except json.JSONDecodeError:
+            return None, "", False
+        name = obj.get("name")
+        if not isinstance(name, str) or not name:
+            return None, "", False
+        args = obj.get("arguments")
+        if isinstance(args, dict):
+            if not args:
+                args = ""
+            else:
+                args = json.dumps(args, ensure_ascii=False)
+                args = args[1:-1].rstrip()
+        elif isinstance(args, list):
+            args = json.dumps(args, ensure_ascii=False) if args else ""
+        elif isinstance(args, str):
+            pass
+        else:
+            args = str(args) if args is not None else ""
+        return name, args, True
+
     name_match = re.search(r'"name"\s*:\s*"([^"]*)"', json_str)
     if not name_match:
         return None, "", False
@@ -127,8 +151,6 @@ def _parse_tool_call_json(json_str: str, complete: bool):
         return name, "", True
 
     raw = args_match.group(1).rstrip()
-    if complete and raw.endswith("}"):
-        raw = raw[:-1].rstrip()
     if raw.startswith("{"):
         inner = raw[1:].rstrip()
         if inner.endswith("}"):
@@ -156,9 +178,6 @@ def _find_tool_calls(text: str, start_pos: int = 0):
             break
 
         json_str = text[brace:end]
-        if not _TOOL_CALL_HEAD_RE.search(json_str):
-            pos = end
-            continue
 
         name, args, valid = _parse_tool_call_json(json_str, complete=True)
         if not valid or name is None:
@@ -186,7 +205,7 @@ def _find_partial_tool_call(text: str, start_pos: int = 0):
         return None
 
     json_str = text[brace:]
-    if not _TOOL_CALL_HEAD_RE.search(json_str):
+    if '"name"' not in json_str:
         return None
 
     name, args, valid = _parse_tool_call_json(json_str, complete=False)

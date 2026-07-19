@@ -263,6 +263,12 @@ class SamplingPipeline(BaseSamplingStrategy):
             logits = strategy.apply(logits, filter_value, input_ids, input_mask)
         return logits
 
+    @staticmethod
+    def _is_greedy(temperature: Union[float, Tensor]) -> bool:
+        if isinstance(temperature, Tensor):
+            return temperature.numel() == 1 and temperature.item() == 0
+        return temperature == 0
+
     @torch.inference_mode()
     def sample(
         self,
@@ -273,6 +279,9 @@ class SamplingPipeline(BaseSamplingStrategy):
     ) -> Tensor:
         """Apply strategies then sample (softmax + multinomial).
 
+        Short-circuits to ``argmax`` when temperature is exactly 0
+        (deterministic / greedy decode).
+
         Args:
             logits: Raw logits ``[batch, vocab_size]``.
             input_ids: Previously generated token IDs ``[batch, seq_len]``.
@@ -281,6 +290,11 @@ class SamplingPipeline(BaseSamplingStrategy):
         Returns:
             Sampled token IDs ``[batch]``.
         """
+        for s in self.strategies:
+            if isinstance(s, TemperatureStrategy) and self._is_greedy(s.temperature):
+                return logits.argmax(dim=-1)
+            break
+
         return torch.multinomial(
             torch.softmax(
                 self.apply(logits, filter_value, input_ids, input_mask), dim=-1
@@ -304,6 +318,9 @@ def sample(
 
     Shortcut for ``SamplingPipeline(...).sample(logits)``.
 
+    When **temperature** is exactly 0 (scalar or single-element tensor)
+    the function short-circuits to ``argmax`` for deterministic decode.
+
     Args:
         logits: Raw logits ``[batch, vocab_size]``.
         frequency_penalty: Penalty per occurrence for repeated tokens
@@ -314,6 +331,8 @@ def sample(
     Returns:
         Sampled token IDs ``[batch]``.
     """
+    if SamplingPipeline._is_greedy(temperature):
+        return logits.argmax(dim=-1)
     return SamplingPipeline(
         [
             TemperatureStrategy(temperature),

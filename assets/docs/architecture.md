@@ -117,7 +117,7 @@ classDiagram
             +int n_epoch
             +int batch_per_device
             +int grad_accum_steps
-            +float max_grad_norm
+            +Optional[float] max_grad_norm
             +list gradient_checkpointing_modules
             +int start_epoch
             +int start_samples
@@ -166,6 +166,13 @@ classDiagram
             +__getitem__(index) Dict
         }
 
+        class RecordDataset {
+            +Optional[Callable] processor
+            +load(load_path, storage_type)
+            +__getitem__(index)
+            +__len__()
+        }
+
         class DPODataset {
             +__getitem__(index) Dict
         }
@@ -177,13 +184,26 @@ classDiagram
         class Store {
             +Dict[str, List[Tensor]] _data
             +Dict[str, List[int]] _cum
+            +Dict[str, List[int]] _offsets
             +int _length
+            +int _num_records
             +keys (property)
             +load(path)
-            +fetch(begin, end, keys)
             +__len__()
-            -_fetch_key(key, begin, end) Tensor
-            -_normalize(raw)
+            -_normalize(raw, offsets)
+        }
+
+        class Streamable {
+            <<mixin>>
+            +fetch(begin, end, keys)
+            -_fetch_stream_key(key, begin, end) Tensor
+        }
+
+        class Recordable {
+            <<mixin>>
+            +num_records (property)
+            +fetch_record(index, keys)
+            -_fetch_record_key(key, index) Tensor
         }
 
         class H5Store {
@@ -193,6 +213,13 @@ classDiagram
         class MmapStore {
             +List _mmap_refs
             +load(path)
+        }
+
+        class JsonlStore {
+            +JsonlSource _source
+            +Callable _processor
+            +load(path, transform, processor)
+            +fetch_record(index, keys)
         }
 
         class ResumableDistributedSampler {
@@ -210,7 +237,7 @@ classDiagram
             +Dict _entries
             +register(name) decorator
             +create(train_type, window_size, stride) BaseDataset
-            +load(train_type, load_path, window_size, stride, storage_type) BaseDataset
+            +load(train_type, load_path, window_size, stride, storage_type, tokenizer_path, max_len, store) BaseDataset
         }
     }
 
@@ -378,6 +405,7 @@ classDiagram
             +List[str] paths
             +str output_dir
             +str tokenizer_path
+            +AutoTokenizer tokenizer
             +BaseMaskBuilder mask_builder
             +PackingStrategy _packer
             +PositionIdStrategy _position_id
@@ -385,6 +413,18 @@ classDiagram
             +transform(item) Optional[dict]
             +run()
             +_flush(domains, shard_idx)
+            +_inject_doc_reset_position_ids(keys, mode, seqs) Dict
+            +_inject_continuous_position_ids(tensors, mode, seqs) Dict
+            +_to_tensors(keys) Dict
+        }
+
+        class TokenizeTransform {
+            +PipelineConfig config
+            +AutoTokenizer tokenizer
+            +BaseMaskBuilder mask_builder
+            +PositionIdStrategy position_strategy
+            +from_config_file(path) TokenizeTransform
+            +apply(records) Dict[str, list]
         }
     }
 
@@ -495,13 +535,13 @@ classDiagram
         }
 
         class GRPOStrategy {
+            +nn.Module old_model
             +nn.Module ref_model
             +float clip_eps
             +float kl_coef
             +int group_size
-            +int sync_interval
             +compute_loss(batch) Tensor
-            +sync_ref_model()
+            +sync_old_model()
         }
 
         class BaseScheduler {
@@ -551,7 +591,7 @@ classDiagram
         }
 
         class GradientClippingCallback {
-            +float max_grad_norm
+            +Optional[float] max_grad_norm
             +on_optimizer_step(context)
         }
 
@@ -1064,11 +1104,18 @@ classDiagram
     TrainCallback <|-- MetricCallback
     BaseDataset <|-- SEQDataset
     BaseDataset <|-- SFTDataset
-    BaseDataset <|-- DPODataset
-    BaseDataset <|-- GRPODataset
+    BaseDataset <|-- RecordDataset
+    RecordDataset <|-- DPODataset
+    RecordDataset <|-- GRPODataset
     Store <|-- H5Store
     Store <|-- MmapStore
     Store <|-- JsonlStore
+    H5Store --|> Streamable
+    H5Store --|> Recordable
+    MmapStore --|> Streamable
+    MmapStore --|> Recordable
+    JsonlStore --|> Streamable
+    JsonlStore --|> Recordable
     BaseSamplingStrategy <|-- TemperatureStrategy
     BaseSamplingStrategy <|-- TopKStrategy
     BaseSamplingStrategy <|-- TopPStrategy
@@ -1143,6 +1190,9 @@ classDiagram
     BaseDataset o-- Store
     Pipeline o-- PipelineConfig
     Pipeline o-- BaseMaskBuilder
+    Pipeline o-- AutoTokenizer
+    TokenizeTransform o-- AutoTokenizer
+    TokenizeTransform o-- BaseMaskBuilder
 
     %% --- Dependency (uses temporarily) ---
     TrainConfig ..> BaseStrategy : selects
@@ -1186,7 +1236,7 @@ classDiagram
     %% --- Association (general usage) ---
     Trainer --> TrainConfig
     DPOStrategy --> AutoModel
-    GRPOStrategy --> AutoModel
+    GRPOStrategy --> AutoModel : policy/old/ref
     InferenceScheduler --> Task
     InferenceScheduler --> TaskStatus
     Task --> TaskStatus
@@ -1203,8 +1253,8 @@ classDiagram
 | Module | Components | Description |
 |--------|------------|-------------|
 | **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
-| **astrai.preprocessing** | BaseMaskBuilder, MaskBuilderFactory, SectionedMaskBuilder, Pipeline, filter_by_length, PackingStrategy, PackingStrategyFactory, PositionIdStrategy, PositionIdStrategyFactory, StoreWriter, StoreWriterFactory | Declarative JSON-driven data preprocessing |
-| **astrai.dataset** | BaseDataset–GRPODataset, Store–JsonlStore/MmapStore/H5Store, StoreFactory, ResumableDistributedSampler, DatasetFactory | Dataset loading and management |
+| **astrai.preprocessing** | BaseMaskBuilder, MaskBuilderFactory, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, filter_by_length, PackingStrategy, PackingStrategyFactory, plan_bfd, PositionIdStrategy, PositionIdStrategyFactory, StoreWriter, StoreWriterFactory, core (shared helpers) | Declarative JSON-driven data preprocessing |
+| **astrai.dataset** | BaseDataset–RecordDataset–DPO/GRPODataset, SEQDataset, SFTDataset, Store, Streamable, Recordable, H5Store, MmapStore, JsonlStore, StoreFactory, ResumableDistributedSampler, DatasetFactory | Dataset loading and management |
 | **astrai.serialization** | Checkpoint | Model serialization |
 | **astrai.model** | AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
@@ -1246,4 +1296,4 @@ classDiagram
 10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
 11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` — structural subtyping for `AccumOptimizer` / `AccumScheduler` wrappers
 
-> Document Update Time: 2026-07-09
+> Document Update Time: 2026-07-19

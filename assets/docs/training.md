@@ -86,7 +86,7 @@ on_train_end
 | `on_error` | On exception during training | `CheckpointCallback`, `MetricCallback` |
 | `on_train_end` | Training ends (always via finally) | `CheckpointCallback`, `MetricCallback`, `GradientCheckpointingCallback` |
 
-Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm), `gradient_clipping`.
+Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm), `gradient_clipping` (always registered; computes grad norm, clips only when `max_grad_norm` is not `None`).
 
 ## Strategies
 
@@ -118,7 +118,7 @@ $$
 L_{\text{DPO}} = -\mathbb{E}\left[\log\sigma\left(\beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)} - \beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\right)\right]
 $$
 
-Parameters: `beta=0.1`, `reduction="mean"`. Keys: `chosen`, `rejected`, `chosen_mask`, `rejected_mask`.
+Parameters: `beta=0.1`, `reduction="sum"`. Keys: `chosen`, `rejected`, `chosen_mask`, `rejected_mask`.
 
 ### GRPO (Group Relative Policy Optimization)
 
@@ -135,10 +135,14 @@ $$
 L_{\text{GRPO}} = -\mathbb{E}_t\left[\min\left(\rho_t A,\; \text{clip}\left(\rho_t, 1-\epsilon, 1+\epsilon\right)A\right)\right] + \lambda \cdot \mathbb{E}_t\left[\frac{\pi_{\text{ref}}}{\pi_\theta} - \log\frac{\pi_{\text{ref}}}{\pi_\theta} - 1\right]
 $$
 
-where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{ref}}(a_t|s_t)$ is the
-per-token probability ratio and the expectations are over valid response tokens.
+where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the
+per-token importance sampling ratio against the behaviour policy
+(`old_model`, synced externally between data-generation rounds) and the
+expectations are over valid response tokens. The KL term regularises
+$\pi_\theta$ towards a frozen reference model (`ref_model`, typically
+the SFT checkpoint).
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`, `sync_interval=200`.
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. External sync of `old_model` weights via `sync_old_model()` between data-generation rounds.
 
 Keys: `prompts`, `responses`, `masks`, `rewards`.
 
@@ -218,4 +222,4 @@ nohup python scripts/tools/train.py \
 
 Full parameter reference at [params.md](params.md).
 
-> Document Update Time: 2026-07-09
+> Document Update Time: 2026-07-19

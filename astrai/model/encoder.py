@@ -59,10 +59,10 @@ class EmbeddingEncoder(AutoModel):
         x = self.embed_tokens(input_ids)
 
         rotary_emb = self.rotary_embedding(x, position_ids)
-        attn_mask = process_attention_mask(x, position_ids, input_mask, is_causal=False)
+        attn_mask = process_attention_mask(input_mask)
 
         for layer in self.layers:
-            x = layer(x, rotary_emb, attn_mask, paged_cache=None)
+            x = layer(x, rotary_emb, attn_mask)
 
         hidden_states = self.norm(x)
 

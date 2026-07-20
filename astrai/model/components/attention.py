@@ -76,9 +76,8 @@ class GQA(nn.Module):
         rotary_emb: Tensor,
         attn_mask: Tensor = None,
         paged_cache: Optional[CacheView] = None,
+        is_causal: bool = False,
     ) -> Tensor:
-        is_causal = attn_mask is None
-
         q = self._split_heads(self.q_proj(x), self.n_heads)
         k = self._split_heads(self.k_proj(x), self.n_kv_heads)
         v = self._split_heads(self.v_proj(x), self.n_kv_heads)
@@ -163,9 +162,9 @@ class MLA(nn.Module):
         rotary_emb: Tensor,
         attn_mask: Tensor = None,
         paged_cache: Optional[CacheView] = None,
+        is_causal: bool = False,
     ) -> Tensor:
         bsz, seq_len, _ = x.size()
-        is_causal = attn_mask is None
 
         q = self.q_proj(x)
         q = q.view(bsz, seq_len, self.n_heads, self.head_dim)

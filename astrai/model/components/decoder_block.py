@@ -26,12 +26,14 @@ class DecoderBlock(nn.Module):
         rotary_emb: Tensor,
         attention_mask: Optional[Tensor] = None,
         paged_cache: Optional[CacheView] = None,
+        is_causal: bool = False,
     ) -> Tensor:
         attn_output = self.attention(
             self.input_norm(x),
             rotary_emb,
             attention_mask,
             paged_cache,
+            is_causal,
         )
         x = attn_output + x
         x = self.mlp(self.post_attention_norm(x)) + x

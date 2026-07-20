@@ -395,7 +395,9 @@ class GRPOStrategy(BaseStrategy):
         # response tokens.  get_logprobs shifts the mask by one position, so
         # the first response token's logprob (predicted from the last prompt
         # token) is correctly included.
-        full_masks = torch.cat([torch.zeros_like(prompt_expanded), masks_flat], dim=-1)
+        full_masks = torch.cat(
+            [torch.zeros_like(prompt_expanded, dtype=torch.bool), masks_flat], dim=-1
+        )
 
         # get_logprobs returns [B*G, S-1] (S = prompt_len + response_len).
         # Response token logprobs occupy the last ``response_len`` positions

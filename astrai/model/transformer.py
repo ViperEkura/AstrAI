@@ -15,32 +15,15 @@ from astrai.model.components.rope import RotaryEmbedding
 
 
 def process_attention_mask(
-    input_tensor: Tensor,
-    position_ids: Optional[Tensor],
-    input_mask: Optional[Tensor] = None,
-    is_causal: bool = False,
+    input_mask: Optional[Tensor],
 ) -> Optional[Tensor]:
-    if position_ids is None:
-        return None
-    if input_mask is not None and input_mask.dim() > 2:
-        return input_mask
-
-    device = input_tensor.device
-    B = input_tensor.size(0)
-    T = position_ids.max().item() + 1
-
     if input_mask is None:
-        if position_ids.min().item() == 0 and is_causal:
-            return None
-        attend = torch.ones(B, 1, T, dtype=torch.bool, device=device)
-    else:
-        attend = input_mask[:, :T].to(device=device, dtype=torch.bool).unsqueeze(1)
-
-    if is_causal:
-        causal = position_ids.unsqueeze(-1) >= torch.arange(T, device=device)
-        attend = attend & causal
-
-    return attend.unsqueeze(1)
+        return None
+    if input_mask.dim() == 2:
+        return input_mask[:, None, None, :]
+    if input_mask.dim() == 3:
+        return input_mask[:, None, :, :]
+    return input_mask
 
 
 @AutoModel.register("autoregressive_lm")
@@ -119,10 +102,11 @@ class AutoRegressiveLM(AutoModel):
 
         x = self.embed_tokens(input_ids)
         rotary_emb = self.rotary_embedding(x, position_ids)
-        attn_mask = process_attention_mask(x, position_ids, input_mask, is_causal=True)
+        attn_mask = process_attention_mask(input_mask)
+        use_sdpa_causal_mask = attn_mask is None
 
         for layer in self.layers:
-            x = layer(x, rotary_emb, attn_mask, paged_cache)
+            x = layer(x, rotary_emb, attn_mask, paged_cache, use_sdpa_causal_mask)
 
         hidden_states = self.norm(x)
         logits = self.lm_head(hidden_states)

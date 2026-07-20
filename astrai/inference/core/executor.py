@@ -43,15 +43,20 @@ class Executor:
         )
 
         task_ids = [t.task_id for t in tasks]
+        position_ids = (
+            torch.arange(start_pos, prompt_len, dtype=torch.long, device=self.device)
+            .unsqueeze(0)
+            .expand(batch_sz, -1)
+        )
+        input_mask = position_ids.unsqueeze(-1) >= torch.arange(
+            prompt_len, device=self.device
+        )
 
         with torch.inference_mode():
             self.model(
                 input_ids,
-                position_ids=torch.arange(
-                    start_pos, prompt_len, dtype=torch.long, device=self.device
-                )
-                .unsqueeze(0)
-                .expand(batch_sz, -1),
+                input_mask=input_mask,
+                position_ids=position_ids,
                 paged_cache=self.kv_cache.bind_tasks(task_ids, prompt_len, self.device),
             )
 
@@ -84,7 +89,10 @@ class Executor:
         position_ids = torch.tensor(
             [t.next_pos for t in tasks], dtype=torch.long, device=self.device
         )
-        total_len = position_ids.max().item() + 1
+        total_len = max(t.next_pos for t in tasks) + 1
+        input_mask = position_ids[:, None, None] >= torch.arange(
+            total_len, device=self.device
+        )
 
         task_ids = [t.task_id for t in tasks]
 
@@ -122,6 +130,7 @@ class Executor:
         with torch.inference_mode():
             outputs = self.model(
                 input_ids.unsqueeze(1),
+                input_mask=input_mask,
                 paged_cache=self.kv_cache.bind_tasks(
                     task_ids,
                     total_len,

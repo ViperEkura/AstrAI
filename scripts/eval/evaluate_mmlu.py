@@ -185,7 +185,7 @@ def choice_logprob(
     choice_text = choice_letter
     choice_ids = tokenizer.encode(choice_text, add_special_tokens=False)
     input_ids = context_ids + choice_ids
-    max_len = model.config.max_len
+    max_len = model.config.max_position_embeddings
     if len(input_ids) > max_len:
         overflow = len(input_ids) - max_len
         input_ids = input_ids[overflow:]

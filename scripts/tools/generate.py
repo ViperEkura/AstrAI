@@ -56,7 +56,7 @@ def processor(
     print(f"  {len(prompts)} prompts loaded\n")
 
     if max_tokens is None:
-        max_tokens = model.config.max_len
+        max_tokens = model.config.max_position_embeddings
 
     chunk_size = max(1, batch_size)
 
@@ -185,7 +185,10 @@ if __name__ == "__main__":
         "--max_tokens",
         type=int,
         default=None,
-        help="Maximum tokens to generate (default: model config max_len).",
+        help=(
+            "Maximum tokens to generate "
+            "(default: model config max_position_embeddings)."
+        ),
     )
     parser.add_argument(
         "--cache_len",

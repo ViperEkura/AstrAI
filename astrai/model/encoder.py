@@ -18,20 +18,28 @@ class EmbeddingEncoder(AutoModel):
     def __init__(self, config: EncoderConfig):
         super().__init__(config)
         self.config = config
-        rope_dim = config.dim // config.n_heads
+        rope_dim = config.hidden_size // config.num_attention_heads
         rope_base = config.rope_theta if config.rope_theta is not None else 10000
         self.rotary_embedding = RotaryEmbedding(
-            rope_dim, config.max_len, rope_base, rope_scaling=config.rope_scaling
+            rope_dim,
+            config.max_position_embeddings,
+            rope_base,
+            rope_scaling=config.rope_scaling,
         )
         self.embed_tokens = Embedding(
-            config.vocab_size, config.dim, neftune_alpha=config.neftune_alpha
+            config.vocab_size,
+            config.hidden_size,
+            neftune_alpha=config.neftune_alpha,
         )
 
         self.layers = nn.ModuleList(
-            [DecoderBlock(config, layer_id) for layer_id in range(config.n_layers)]
+            [
+                DecoderBlock(config, layer_id)
+                for layer_id in range(config.num_hidden_layers)
+            ]
         )
 
-        self.norm = RMSNorm(config.dim, config.norm_eps)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
         self.pooling_type = config.pooling_type or "mean"
         self.normalize_embeddings = config.normalize_embeddings or False

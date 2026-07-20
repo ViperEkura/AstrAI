@@ -6,13 +6,13 @@ from astrai.model.transformer import AutoRegressiveLM
 
 TINY_CONFIG = dict(
     vocab_size=128,
-    dim=8,
-    n_heads=2,
-    n_kv_heads=1,
-    dim_ffn=16,
-    max_len=64,
-    n_layers=2,
-    norm_eps=1e-5,
+    hidden_size=8,
+    num_attention_heads=2,
+    num_key_value_heads=1,
+    intermediate_size=16,
+    max_position_embeddings=64,
+    num_hidden_layers=2,
+    rms_norm_eps=1e-5,
 )
 
 
@@ -58,8 +58,13 @@ CONFIGS = [
         id="gqa_qk_norm",
     ),
     pytest.param(
-        {**TINY_CONFIG, "attn_type": "gqa", "ffn_type": "mlp", "tie_weight": True},
-        id="gqa_tie_weight",
+        {
+            **TINY_CONFIG,
+            "attn_type": "gqa",
+            "ffn_type": "mlp",
+            "tie_word_embeddings": True,
+        },
+        id="gqa_tie_word_embeddings",
     ),
 ]
 
@@ -82,7 +87,11 @@ def test_model_forward(config_kwargs):
     assert "logits" in output
     assert "hidden_states" in output
     assert output["logits"].shape == (batch_size, seq_len, config.vocab_size)
-    assert output["hidden_states"].shape == (batch_size, seq_len, config.dim)
+    assert output["hidden_states"].shape == (
+        batch_size,
+        seq_len,
+        config.hidden_size,
+    )
     assert not torch.isnan(output["logits"]).any()
     assert not torch.isnan(output["hidden_states"]).any()
 

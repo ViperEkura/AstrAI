@@ -119,15 +119,15 @@ class GenerationBenchmark:
                 dtype=torch.long,
             )
 
-            head_dim = self.config.dim // self.config.n_heads
+            head_dim = self.config.hidden_size // self.config.num_attention_heads
             max_seq = prompt_length + gen_length
 
             if self.cache_type == "contiguous":
                 cache = ContiguousCache(
-                    self.config.n_layers,
+                    self.config.num_hidden_layers,
                     batch_size,
                     max_seq,
-                    self.config.n_kv_heads,
+                    self.config.num_key_value_heads,
                     head_dim,
                     self.device,
                     self.dtype,
@@ -136,10 +136,10 @@ class GenerationBenchmark:
                 page_size = 128
                 n_pages = (max_seq + page_size - 1) // page_size * batch_size
                 cache = PageCache(
-                    self.config.n_layers,
+                    self.config.num_hidden_layers,
                     n_pages,
                     page_size,
-                    self.config.n_kv_heads,
+                    self.config.num_key_value_heads,
                     head_dim,
                     self.device,
                     self.dtype,
@@ -262,13 +262,13 @@ if __name__ == "__main__":
 
     config = AutoRegressiveLMConfig(
         vocab_size=10000,
-        dim=1536,
-        n_heads=24,
-        n_kv_heads=4,
-        dim_ffn=6912,
-        max_len=2048,
-        n_layers=24,
-        norm_eps=1e-5,
+        hidden_size=1536,
+        num_attention_heads=24,
+        num_key_value_heads=4,
+        intermediate_size=6912,
+        max_position_embeddings=2048,
+        num_hidden_layers=24,
+        rms_norm_eps=1e-5,
     )
 
     benchmark = GenerationBenchmark(

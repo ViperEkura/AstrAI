@@ -32,7 +32,7 @@ ContiguousCache (simple contiguous per-slot cache)
   ├── ContiguousCacheView  bundles k/v tensors + slot indices for attention layers
 ```
 
-Created by default when no cache is passed to `InferenceScheduler`. Each task occupies a fixed slot of `[max_seq_len, n_kv_heads, head_dim]`. Simple and efficient for small-to-medium batch sizes.
+Created by default when no cache is passed to `InferenceScheduler`. Each task occupies a fixed slot of `[max_seq_len, num_key_value_heads, head_dim]`. Simple and efficient for small-to-medium batch sizes.
 
 ### PageCache (paged with prefix sharing)
 
@@ -42,7 +42,7 @@ PageCache (paged KV cache with prefix sharing, alternative)
   │     ├── Allocator         bitmask-based page allocator + ref-count + LRU
   │     └── PrefixCache       hash-based prefix matching (page_hash via polynomial hash)
   ├── TaskTable              maps task_id → page_table + cached token count
-  ├── Storage                k_cache / v_cache tensors (n_layers × n_pages × page_size × n_kv_heads × head_dim)
+  ├── Storage                k_cache / v_cache tensors (num_hidden_layers × n_pages × page_size × num_key_value_heads × head_dim)
   └── PageCacheView          bundles Storage + page_table + total_len for attention layers
 ```
 

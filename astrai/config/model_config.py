@@ -29,19 +29,19 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     """Configuration for autoregressive language model."""
 
     vocab_size: Optional[int] = None
-    dim: Optional[int] = None
-    n_layers: Optional[int] = None
-    norm_eps: Optional[float] = None
-    dim_ffn: Optional[int] = None
-    tie_weight: Optional[bool] = None
+    hidden_size: Optional[int] = None
+    num_hidden_layers: Optional[int] = None
+    rms_norm_eps: Optional[float] = None
+    intermediate_size: Optional[int] = None
+    tie_word_embeddings: Optional[bool] = None
 
-    max_len: Optional[int] = None
+    max_position_embeddings: Optional[int] = None
     rope_theta: Optional[float] = None
     rope_scaling: Optional[dict] = None
 
     attn_type: str = "gqa"
-    n_heads: Optional[int] = None
-    n_kv_heads: Optional[int] = None
+    num_attention_heads: Optional[int] = None
+    num_key_value_heads: Optional[int] = None
     use_qk_norm: Optional[bool] = None
     use_gated_attention: Optional[bool] = None
 
@@ -62,18 +62,18 @@ class EncoderConfig(BaseModelConfig):
     """Configuration for embedding encoder model."""
 
     vocab_size: Optional[int] = None
-    dim: Optional[int] = None
-    n_layers: Optional[int] = None
-    norm_eps: Optional[float] = None
-    dim_ffn: Optional[int] = None
+    hidden_size: Optional[int] = None
+    num_hidden_layers: Optional[int] = None
+    rms_norm_eps: Optional[float] = None
+    intermediate_size: Optional[int] = None
 
-    max_len: Optional[int] = None
+    max_position_embeddings: Optional[int] = None
     rope_theta: Optional[float] = None
     rope_scaling: Optional[dict] = None
 
     attn_type: str = "gqa"
-    n_heads: Optional[int] = None
-    n_kv_heads: Optional[int] = None
+    num_attention_heads: Optional[int] = None
+    num_key_value_heads: Optional[int] = None
     use_qk_norm: Optional[bool] = None
     use_gated_attention: Optional[bool] = None
 

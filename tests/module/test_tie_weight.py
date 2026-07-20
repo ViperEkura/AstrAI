@@ -17,13 +17,13 @@ def transformer_test_env():
 
     config = {
         "vocab_size": 1000,
-        "dim": 8,
-        "n_heads": 2,
-        "n_kv_heads": 1,
-        "dim_ffn": 16,
-        "max_len": 64,
-        "n_layers": 2,
-        "norm_eps": 1e-5,
+        "hidden_size": 8,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "intermediate_size": 16,
+        "max_position_embeddings": 64,
+        "num_hidden_layers": 2,
+        "rms_norm_eps": 1e-5,
     }
 
     with open(config_path, "w") as f:
@@ -45,7 +45,7 @@ def test_tie_weight_init(transformer_test_env):
     config_data = transformer_test_env["config"].copy()
 
     # case 1: tie weight
-    config_data["tie_weight"] = True
+    config_data["tie_word_embeddings"] = True
 
     with open(config_path, "w") as f:
         json.dump(config_data, f)
@@ -63,7 +63,7 @@ def test_tie_weight_init(transformer_test_env):
     assert not torch.equal(model.lm_head.weight, original_weight)
 
     # case 2: not tie weight
-    config_data["tie_weight"] = False
+    config_data["tie_word_embeddings"] = False
 
     with open(config_path, "w") as f:
         json.dump(config_data, f)
@@ -88,7 +88,7 @@ def test_model_save_load_with_tie_weight(transformer_test_env):
     config_data = transformer_test_env["config"].copy()
 
     # case 1: tie weight
-    config_data["tie_weight"] = True
+    config_data["tie_word_embeddings"] = True
     config_path = os.path.join(test_dir, "config.json")
 
     with open(config_path, "w") as f:
@@ -108,7 +108,7 @@ def test_model_save_load_with_tie_weight(transformer_test_env):
     assert "lm_head.weight" not in model.state_dict()
 
     # case 2: not tie weight (form tie-weight state dict load)
-    config_data["tie_weight"] = False
+    config_data["tie_word_embeddings"] = False
     with open(config_path, "w") as f:
         json.dump(config_data, f)
 

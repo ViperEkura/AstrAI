@@ -19,13 +19,13 @@ from astrai.model.components.lora import (
 
 MODEL_KWARGS = dict(
     vocab_size=1000,
-    dim=64,
-    n_heads=4,
-    n_kv_heads=2,
-    dim_ffn=128,
-    n_layers=2,
-    max_len=32,
-    norm_eps=1e-5,
+    hidden_size=64,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    intermediate_size=128,
+    num_hidden_layers=2,
+    max_position_embeddings=32,
+    rms_norm_eps=1e-5,
 )
 
 
@@ -192,7 +192,7 @@ def test_inject_lora_on_moe_model():
         n_routed_experts=4,
         n_shared_experts=1,
         n_activated_experts=2,
-        dim_ffn=32,
+        intermediate_size=32,
     )
     inject_lora(model, r=4, alpha=8, target_modules={"up", "gate", "down"})
     assert _get_lora_count(model) > 0

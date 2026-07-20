@@ -71,16 +71,16 @@ class ConstantRewardModel(BaseRewardModel):
         return torch.full((B, G), float(self.value))
 
 
-def _make_config(vocab_size=200, max_len=128):
+def _make_config(vocab_size=200, max_position_embeddings=128):
     return AutoRegressiveLMConfig(
         vocab_size=vocab_size,
-        dim=16,
-        n_heads=2,
-        n_kv_heads=1,
-        dim_ffn=32,
-        max_len=max_len,
-        n_layers=2,
-        norm_eps=1e-5,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        max_position_embeddings=max_position_embeddings,
+        num_hidden_layers=2,
+        rms_norm_eps=1e-5,
     )
 
 
@@ -158,7 +158,7 @@ def _make_generator(device, **kw):
         model,
         tokenizer,
         max_batch_size=kw.get("max_batch_size", 8),
-        max_len=kw.get("max_len", 128),
+        max_len=kw.get("max_position_embeddings", 128),
     )
     generator = RolloutGenerator(
         scheduler=scheduler,
@@ -254,7 +254,7 @@ def _make_runner(device, **kw):
         group_size=kw.get("group_size", 2),
         max_tokens=kw.get("max_tokens", 8),
         max_batch_size=kw.get("max_batch_size", 8),
-        max_len=kw.get("max_len", 128),
+        max_len=kw.get("max_position_embeddings", 128),
     )
     rm = ConstantRewardModel(1.0)
     return (

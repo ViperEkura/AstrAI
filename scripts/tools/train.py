@@ -480,7 +480,7 @@ def train(
     config.neftune_alpha = neftune_alpha
 
     if window_size is None:
-        window_size = config.max_len
+        window_size = config.max_position_embeddings
 
     strategy_kwargs = {
         "beta": kwargs.pop("dpo_beta"),

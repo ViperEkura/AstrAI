@@ -14,10 +14,18 @@ class DecoderBlock(nn.Module):
     def __init__(self, config, layer_id: int):
         super().__init__()
         cfg = asdict(config)
-        cfg["down_init_std"] = 0.02 / (2 * config.n_layers) ** 0.5
+        cfg.update(
+            dim=config.hidden_size,
+            dim_ffn=config.intermediate_size,
+            n_layers=config.num_hidden_layers,
+            n_heads=config.num_attention_heads,
+            n_kv_heads=config.num_key_value_heads,
+            norm_eps=config.rms_norm_eps,
+            down_init_std=0.02 / (2 * config.num_hidden_layers) ** 0.5,
+        )
         self.attention = AttnFactory.create(config.attn_type, **cfg, layer_id=layer_id)
-        self.input_norm = RMSNorm(config.dim, config.norm_eps)
-        self.post_attention_norm = RMSNorm(config.dim, config.norm_eps)
+        self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = FFNFactory.create(config.ffn_type, **cfg)
 
     def forward(

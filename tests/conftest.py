@@ -107,13 +107,13 @@ def test_model():
     """Session-scoped small AutoRegressiveLM model, created once."""
     config = AutoRegressiveLMConfig(
         vocab_size=1000,
-        dim=8,
-        n_heads=2,
-        n_kv_heads=1,
-        dim_ffn=16,
-        max_len=64,
-        n_layers=2,
-        norm_eps=1e-5,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=16,
+        max_position_embeddings=64,
+        num_hidden_layers=2,
+        rms_norm_eps=1e-5,
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoRegressiveLM(config).to(device=device)
@@ -137,13 +137,13 @@ def base_test_env(test_model, test_tokenizer):
         json.dump(
             {
                 "vocab_size": 1000,
-                "dim": 8,
-                "n_heads": 2,
-                "n_kv_heads": 1,
-                "dim_ffn": 16,
-                "max_len": 64,
-                "n_layers": 2,
-                "norm_eps": 1e-5,
+                "hidden_size": 8,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "intermediate_size": 16,
+                "max_position_embeddings": 64,
+                "num_hidden_layers": 2,
+                "rms_norm_eps": 1e-5,
             },
             f,
         )

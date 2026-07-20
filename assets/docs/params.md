@@ -44,7 +44,7 @@ Combined optimizer: matrix parameters via **Muon**, non-matrix via **AdamW** (`f
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--window_size` | Max input sequence length | model config `max_len` |
+| `--window_size` | Max input sequence length | model config `max_position_embeddings` |
 | `--stride` | Stride for sliding window over sequences | None |
 | `--random_seed` | Random seed for reproducibility | 3407 |
 | `--num_workers` | DataLoader worker processes | 4 |
@@ -186,7 +186,7 @@ See [Inference Guide](inference.md) for HTTP API documentation.
 | `--top_k` | int | `30` | Top-k filtering |
 | `--top_p` | float | `0.95` | Nucleus sampling threshold |
 | `--batch_size` | int | `1` | Batch size for generation |
-| `--max_tokens` | int | model config `max_len` | Maximum tokens to generate |
+| `--max_tokens` | int | model config `max_position_embeddings` | Maximum tokens to generate |
 
 Usage:
 ```bash

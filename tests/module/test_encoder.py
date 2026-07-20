@@ -12,13 +12,13 @@ from astrai.model.encoder import EmbeddingEncoder
 
 TINY_CONFIG = dict(
     vocab_size=128,
-    dim=8,
-    n_heads=2,
-    n_kv_heads=1,
-    dim_ffn=16,
-    max_len=64,
-    n_layers=2,
-    norm_eps=1e-5,
+    hidden_size=8,
+    num_attention_heads=2,
+    num_key_value_heads=1,
+    intermediate_size=16,
+    max_position_embeddings=64,
+    num_hidden_layers=2,
+    rms_norm_eps=1e-5,
 )
 
 _device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -42,7 +42,7 @@ def test_encoder_forward_pooling(pooling_type):
     with torch.no_grad():
         output = model(input_ids)
 
-    assert output.shape == (batch_size, TINY_CONFIG["dim"])
+    assert output.shape == (batch_size, TINY_CONFIG["hidden_size"])
     assert not torch.isnan(output).any()
 
 
@@ -60,7 +60,7 @@ def test_encoder_forward_with_padding():
     with torch.no_grad():
         output = model(input_ids, input_mask=input_mask)
 
-    assert output.shape == (batch_size, TINY_CONFIG["dim"])
+    assert output.shape == (batch_size, TINY_CONFIG["hidden_size"])
     assert not torch.isnan(output).any()
 
 
@@ -90,7 +90,7 @@ def test_encoder_from_transformer_checkpoint():
     model = _make_model()
     state_dict = model.state_dict()
     state_dict["lm_head.weight"] = torch.randn(
-        TINY_CONFIG["vocab_size"], TINY_CONFIG["dim"], device=_device
+        TINY_CONFIG["vocab_size"], TINY_CONFIG["hidden_size"], device=_device
     )
 
     new_model = _make_model()

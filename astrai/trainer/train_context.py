@@ -240,7 +240,7 @@ class TrainContextBuilder:
 
             group_size = strategy_kwargs.get("group_size", 1)
             rollout_batch_size = group_size * max(1, cfg.batch_per_device)
-            max_seq_len = getattr(context.model.config, "max_len", None)
+            max_seq_len = getattr(context.model.config, "max_position_embeddings", None)
 
             scheduler = InferenceScheduler(
                 model=context.model,

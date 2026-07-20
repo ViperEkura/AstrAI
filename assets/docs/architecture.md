@@ -28,17 +28,17 @@ classDiagram
 
         class AutoRegressiveLMConfig {
             +Optional[int] vocab_size
-            +Optional[int] dim
-            +Optional[int] n_layers
-            +Optional[float] norm_eps
-            +Optional[int] dim_ffn
-            +Optional[bool] tie_weight
+            +Optional[int] hidden_size
+            +Optional[int] num_hidden_layers
+            +Optional[float] rms_norm_eps
+            +Optional[int] intermediate_size
+            +Optional[bool] tie_word_embeddings
             +Optional[dict] rope_scaling
-            +Optional[int] max_len
+            +Optional[int] max_position_embeddings
             +Optional[float] rope_theta
             +str attn_type
-            +Optional[int] n_heads
-            +Optional[int] n_kv_heads
+            +Optional[int] num_attention_heads
+            +Optional[int] num_key_value_heads
             +Optional[bool] use_qk_norm
             +Optional[bool] use_gated_attention
             +Optional[int] kv_lora_rank
@@ -53,15 +53,15 @@ classDiagram
 
         class EncoderConfig {
             +Optional[int] vocab_size
-            +Optional[int] dim
-            +Optional[int] n_layers
-            +Optional[float] norm_eps
-            +Optional[int] dim_ffn
-            +Optional[int] max_len
+            +Optional[int] hidden_size
+            +Optional[int] num_hidden_layers
+            +Optional[float] rms_norm_eps
+            +Optional[int] intermediate_size
+            +Optional[int] max_position_embeddings
             +Optional[float] rope_theta
             +str attn_type
-            +Optional[int] n_heads
-            +Optional[int] n_kv_heads
+            +Optional[int] num_attention_heads
+            +Optional[int] num_key_value_heads
             +Optional[bool] use_qk_norm
             +str ffn_type
             +Optional[dict] rope_scaling

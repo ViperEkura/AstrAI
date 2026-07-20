@@ -85,7 +85,7 @@ All backends normalise tensors into `Store._data[Dict[str, List[Tensor]]]` + `St
 ```
 DatasetFactory.load(train_type, load_path, window_size, stride=None,
                     storage_type=None, tokenizer_path=None,
-                    max_len=2048, store=None)
+                    max_position_embeddings=2048, store=None)
   → BaseDataset.load(load_path, storage_type=None)
     → detect_format(load_path)
     → StoreFactory.create(storage_type)

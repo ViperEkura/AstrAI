@@ -14,11 +14,11 @@ def mock_model_and_tokenizer():
     """Create mock model and tokenizer."""
     mock_model = MagicMock()
     mock_model.config = MagicMock()
-    mock_model.config.n_kv_heads = 8
-    mock_model.config.n_heads = 8
-    mock_model.config.dim = 128
-    mock_model.config.n_layers = 2
-    mock_model.config.max_len = 100
+    mock_model.config.num_key_value_heads = 8
+    mock_model.config.num_attention_heads = 8
+    mock_model.config.hidden_size = 128
+    mock_model.config.num_hidden_layers = 2
+    mock_model.config.max_position_embeddings = 100
     mock_model.parameters.return_value = iter(
         [MagicMock(dtype=torch.float32, device=torch.device("cpu"))]
     )
@@ -213,13 +213,13 @@ def _make_real_scheduler(device):
 
     cfg = AutoRegressiveLMConfig(
         vocab_size=200,
-        dim=16,
-        n_heads=2,
-        n_kv_heads=1,
-        dim_ffn=32,
-        max_len=64,
-        n_layers=2,
-        norm_eps=1e-5,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        max_position_embeddings=64,
+        num_hidden_layers=2,
+        rms_norm_eps=1e-5,
     )
     model = AutoRegressiveLM(cfg).to(device=device).eval()
     tokenizer = _Tok()

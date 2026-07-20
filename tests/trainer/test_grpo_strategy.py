@@ -13,16 +13,16 @@ class _FakeExecutor:
         return model.state_dict()
 
 
-def _make_config(vocab_size=200, max_len=64):
+def _make_config(vocab_size=200, max_position_embeddings=64):
     return AutoRegressiveLMConfig(
         vocab_size=vocab_size,
-        dim=16,
-        n_heads=2,
-        n_kv_heads=1,
-        dim_ffn=32,
-        max_len=max_len,
-        n_layers=2,
-        norm_eps=1e-5,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=32,
+        max_position_embeddings=max_position_embeddings,
+        num_hidden_layers=2,
+        rms_norm_eps=1e-5,
     )
 
 

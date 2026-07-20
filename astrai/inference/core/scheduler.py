@@ -32,26 +32,26 @@ class InferenceScheduler:
 
         if max_seq_len is not None:
             self.max_seq_len = max_seq_len
-        elif config.max_len is not None:
-            self.max_seq_len = config.max_len
+        elif config.max_position_embeddings is not None:
+            self.max_seq_len = config.max_position_embeddings
         else:
             raise ValueError(
                 "max_seq_len must be provided either as argument "
-                "or in model config (config.max_len)"
+                "or in model config (config.max_position_embeddings)"
             )
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
 
-        head_dim = config.dim // config.n_heads
+        head_dim = config.hidden_size // config.num_attention_heads
 
         if cache is not None:
             self._cache = cache
         else:
             self._cache = ContiguousCache(
-                config.n_layers,
+                config.num_hidden_layers,
                 max_batch_size,
                 self.max_seq_len,
-                config.n_kv_heads,
+                config.num_key_value_heads,
                 head_dim,
                 self.device,
                 self.dtype,

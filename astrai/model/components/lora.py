@@ -41,8 +41,10 @@ class LoRALinear(nn.Module):
         self.scaling = alpha / r
         device = self.weight.device
         dtype = self.weight.dtype
-        self.lora_A = nn.Parameter(torch.randn(r, self.weight.shape[1], device=device, dtype=dtype) / r)
-        self.lora_B = nn.Parameter(torch.zeros(self.weight.shape[0], r, device=device, dtype=dtype))
+        lora_a = torch.randn(r, self.weight.shape[1], device=device, dtype=dtype) / r
+        lora_b = torch.zeros(self.weight.shape[0], r, device=device, dtype=dtype)
+        self.lora_A = nn.Parameter(lora_a)
+        self.lora_B = nn.Parameter(lora_b)
         self._merged = False
 
     def forward(self, x):

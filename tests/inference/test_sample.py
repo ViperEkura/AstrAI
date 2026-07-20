@@ -231,3 +231,54 @@ def test_sample_with_frequency_penalty():
     )
     assert tokens.shape == (1,)
     assert 0 <= tokens[0] < logits.size(-1)
+
+
+def test_sample_return_logprobs_shape():
+    """``return_logprobs=True`` returns ``[batch]`` logprobs aligned to tokens."""
+    logits = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
+    out = sample(logits, temperature=1.0, return_logprobs=True)
+    tokens, logprobs = out
+    assert tokens.shape == (2,)
+    assert logprobs.shape == (2,)
+
+
+def test_sample_return_logprobs_nonpositive():
+    """Probabilities never exceed 1, so logprobs are always ≤ 0."""
+    torch.manual_seed(0)
+    logits = torch.randn(4, 50)
+    _, logprobs = sample(
+        logits, temperature=0.8, top_k=20, top_p=0.9, return_logprobs=True
+    )
+    assert torch.all(logprobs <= 1e-5)
+
+
+def test_sample_return_logprobs_greedy_path():
+    """Greedy decode (temperature 0) also returns logprobs."""
+    logits = torch.tensor([[1.0, 5.0, 2.0]])
+    tokens, logprobs = sample(logits, temperature=0.0, return_logprobs=True)
+    assert tokens[0].item() == 1
+    # log p(token=1) should equal log_softmax(logits)[1]
+    expected = torch.log_softmax(logits.float(), dim=-1)[0, 1]
+    assert torch.allclose(logprobs[0], expected, atol=1e-5)
+
+
+def test_sample_return_logprobs_matches_manual_computation():
+    """Returned logprob equals log_softmax(transformed_logits)[token]."""
+    torch.manual_seed(1)
+    logits = torch.randn(2, 30)
+    tokens, logprobs = sample(logits, temperature=0.7, top_p=0.95, return_logprobs=True)
+    # Recompute with the same pipeline
+    from astrai.inference.sample import (
+        SamplingPipeline,
+        TemperatureStrategy,
+        TopPStrategy,
+    )
+
+    pipeline = SamplingPipeline([TemperatureStrategy(0.7), TopPStrategy(0.95)])
+    transformed = pipeline.apply(logits.clone())
+    expected = torch.gather(
+        torch.log_softmax(transformed.float(), dim=-1),
+        -1,
+        tokens.unsqueeze(-1),
+    ).squeeze(-1)
+    assert torch.allclose(logprobs, expected, atol=1e-5)

@@ -71,22 +71,31 @@ def _make_rollout_result(B=2, G=4, P=6, R=8, device="cpu"):
 
 
 class _RecordingRunner:
-    """Fake RolloutRunner that returns a fixed result and tracks calls."""
+    """Fake RolloutRunner returning a fixed result with freshness tracking.
+
+    Freshness is ``True`` on the first call after construction or after
+    :meth:`swap_result`; ``False`` on subsequent cached calls — mirroring
+    the real ``RolloutRunner`` contract without invoking generation.
+    """
 
     def __init__(self, result):
         self.result = result
         self.calls = 0
         self.step_calls = 0
+        self._fresh = True
 
     def __call__(self, batch):
         self.calls += 1
-        return self.result
+        fresh = self._fresh
+        self._fresh = False
+        return self.result, fresh
 
     def step(self):
         self.step_calls += 1
 
     def swap_result(self, result):
         self.result = result
+        self._fresh = True
 
 
 @pytest.fixture

@@ -1,26 +1,35 @@
 """Online rollout runner for RL training.
 
 Provides:
-- :class:`RolloutResult` — universal data container for online sampling
+- :class:`RawRollout` — generation output container (no reward yet)
+- :class:`RolloutResult` — a :class:`RawRollout` with rewards attached
 - :class:`BaseRewardModel` — pluggable reward interface
-- :class:`RolloutRunner` — generates + scores batches for any RL strategy
+- :class:`RolloutGenerator` — KV-cache-backed generation of grouped
+  responses + decoding (no reward); delegates the generation loop to
+  :class:`~astrai.inference.core.scheduler.InferenceScheduler.run_batch`
+  so rollout and the production inference server share one code path
+- :class:`RolloutRunner` — orchestrates generation + scoring with a
+  step-driven cache; its ``__call__`` returns ``(RolloutResult, is_fresh)``
+  so callers do not need to rely on object identity to detect refreshes.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.inference.sample import SamplingPipeline
+from astrai.inference.core.scheduler import InferenceScheduler
 
 
-@dataclass
-class RolloutResult:
-    """Universal container produced by :class:`RolloutRunner`.
+@dataclass(kw_only=True)
+class RawRollout:
+    """Generation output before reward scoring.
+
+    Produced by :class:`RolloutGenerator`; consumed by :class:`RolloutRunner`
+    to assemble a :class:`RolloutResult` once rewards are attached.
 
     Fields are designed to cover all common RL algorithms:
     GRPO, PPO, Online DPO, Rejection Sampling, etc.
@@ -35,9 +44,6 @@ class RolloutResult:
     response_mask: Tensor
     """Boolean mask for real (non-pad) response tokens, shape ``[B, G, R_max]``."""
 
-    rewards: Tensor
-    """Reward per response, shape ``[B, G]``."""
-
     logprobs_old: Tensor
     """Per-token log-probs under the behaviour policy, shape ``[B, G, R_max]``."""
 
@@ -46,6 +52,18 @@ class RolloutResult:
 
     response_texts: List[List[str]] = field(default_factory=list)
     """Decoded response strings, shape ``[B, G]`` (for reward models)."""
+
+
+@dataclass(kw_only=True)
+class RolloutResult(RawRollout):
+    """A :class:`RawRollout` with reward scoring attached.
+
+    Produced by :class:`RolloutRunner` once the :class:`BaseRewardModel`
+    has scored the decoded responses.
+    """
+
+    rewards: Tensor
+    """Reward per response, shape ``[B, G]``."""
 
 
 class BaseRewardModel(ABC):
@@ -72,115 +90,142 @@ class BaseRewardModel(ABC):
         ...
 
 
-def generate_responses(
-    model: nn.Module,
-    input_ids: Tensor,
-    attention_mask: Tensor,
-    max_new_tokens: int,
-    sampling_pipeline: SamplingPipeline,
-    stop_ids: List[int],
-) -> Dict[str, Tensor]:
-    """Autoregressive generation with log-prob tracking.
+_PAD = 0
 
-    Args:
-        model: Policy model (``forward`` returns ``{"logits": ...}``).
-        input_ids: ``[B, P_len]`` prompt token IDs.
-        attention_mask: ``[B, P_len]`` boolean mask.
-        max_new_tokens: Maximum tokens to generate.
-        sampling_pipeline: Composed sampling strategies.
-        stop_ids: Token IDs that stop generation (eos, etc.).
 
-    Returns:
-        ``dict`` with keys:
-        - ``generated_ids``: ``[B, max_new_tokens]`` (padded to same length)
-        - ``generated_mask``: ``[B, max_new_tokens]``
-        - ``logprobs``: ``[B, max_new_tokens]`` per-token log-probs
+class RolloutGenerator:
+    """Pure generation + decoding for a group of responses per prompt.
+
+    Delegates the prefill/decode loop to
+    :meth:`~astrai.inference.core.scheduler.InferenceScheduler.run_batch`,
+    which uses a real KV cache (no O(n²) recompute).  Has no dependency
+    on any reward model; can be reused in isolation for offline
+    generation, qualitative sampling, or eval pipelines.
     """
-    _PAD = 0
-    B, P_len = input_ids.shape
-    device = input_ids.device
-    stop_ids_set = set(stop_ids)
-    done = torch.zeros(B, dtype=torch.bool, device=device)
-    all_ids = input_ids.clone()
-    all_mask = attention_mask.clone()
-    logprob_list: List[Tensor] = []
 
-    for _ in range(max_new_tokens):
-        outputs = model(input_ids=all_ids, input_mask=all_mask)
-        logits = outputs["logits"][:, -1, :].float()
-        log_probs = F.log_softmax(logits, dim=-1)
+    def __init__(
+        self,
+        scheduler: InferenceScheduler,
+        tokenizer,
+        max_tokens: int = 1024,
+        group_size: int = 8,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
+    ):
+        self.scheduler = scheduler
+        self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
+        self.group_size = group_size
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+        self.frequency_penalty = frequency_penalty
+        self.rep_window = rep_window
 
-        logits = sampling_pipeline.apply(logits, input_ids=all_ids, input_mask=all_mask)
-        probs = torch.softmax(logits, dim=-1)
-        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-        next_tokens[done] = _PAD
-        chosen_logprobs = torch.gather(log_probs, -1, next_tokens.unsqueeze(-1))
-        logprob_list.append(chosen_logprobs)
-
-        all_ids = torch.cat([all_ids, next_tokens.unsqueeze(1)], dim=-1)
-        all_mask = torch.cat([all_mask, (~done).unsqueeze(1)], dim=-1)
-
-        done = done | torch.tensor(
-            [t.item() in stop_ids_set for t in next_tokens],
-            device=device,
+    @torch.no_grad()
+    def generate(self, batch: Dict[str, Tensor]) -> RawRollout:
+        """Expand prompts by ``group_size`` and generate one response each."""
+        prompt_ids = batch["input_ids"] if "input_ids" in batch else batch["prompts"]
+        prompt_mask = (
+            batch["attention_mask"] if "attention_mask" in batch else (prompt_ids != 0)
         )
-        if done.all():
-            break
+        B, _ = prompt_ids.shape
+        G = self.group_size
 
-    logprobs = torch.cat(logprob_list, dim=-1)
-    if logprobs.size(1) < max_new_tokens:
-        pad_len = max_new_tokens - logprobs.size(1)
-        logprobs = F.pad(logprobs, (0, pad_len), value=0.0)
+        prompt_texts: List[str] = []
+        flat_prompt_ids: List[List[int]] = []
+        for i in range(B):
+            ids = prompt_ids[i, prompt_mask[i]].tolist()
+            text = self.tokenizer.decode(ids, skip_special_tokens=True)
+            for _ in range(G):
+                flat_prompt_ids.append(list(ids))
+            prompt_texts.append(text)
 
-    generated_ids = all_ids[:, P_len:]
-    if generated_ids.size(1) < max_new_tokens:
-        pad_len = max_new_tokens - generated_ids.size(1)
-        generated_ids = F.pad(generated_ids, (0, pad_len), value=_PAD)
+        results = self.scheduler.run_batch(
+            flat_prompt_ids,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            frequency_penalty=self.frequency_penalty,
+            rep_window=self.rep_window,
+            return_logprobs=True,
+        )
 
-    generated_mask = generated_ids != _PAD
+        # Each element is (token_ids, logprobs); pad to max length.
+        max_len = 0
+        for token_ids, _lp in results:
+            max_len = max(max_len, len(token_ids))
+        max_len = max(max_len, 1)
 
-    return {
-        "generated_ids": generated_ids,
-        "generated_mask": generated_mask,
-        "logprobs": logprobs,
-    }
+        device = prompt_ids.device
+        responses = torch.full((B, G, max_len), _PAD, dtype=torch.long, device=device)
+        response_mask = torch.zeros((B, G, max_len), dtype=torch.bool, device=device)
+        logprobs_old = torch.zeros((B, G, max_len), dtype=torch.float, device=device)
+
+        flat_idx = 0
+        response_texts: List[List[str]] = [[] for _ in range(B)]
+        for i in range(B):
+            for g in range(G):
+                token_ids, lps = results[flat_idx]
+                flat_idx += 1
+                n = len(token_ids)
+                if n:
+                    responses[i, g, :n] = torch.tensor(
+                        token_ids, dtype=torch.long, device=device
+                    )
+                    response_mask[i, g, :n] = True
+                    logprobs_old[i, g, :n] = torch.tensor(
+                        lps, dtype=torch.float, device=device
+                    )
+                response_texts[i].append(
+                    self.tokenizer.decode(token_ids, skip_special_tokens=True)
+                )
+
+        return RawRollout(
+            prompts=prompt_ids,
+            responses=responses,
+            response_mask=response_mask,
+            logprobs_old=logprobs_old,
+            prompt_texts=prompt_texts,
+            response_texts=response_texts,
+        )
 
 
 class RolloutRunner:
     """Produces :class:`RolloutResult` from a prompt batch.
 
-    Maintains an internal cache so the same batch prompt can be replayed
-    for multiple gradient steps.  A new rollout is triggered every
-    ``rollout_interval`` calls to :meth:`step`.
+    Composes a :class:`RolloutGenerator` (generation + decoding) with a
+    :class:`BaseRewardModel` (scoring).  Maintains an internal cache so
+    the same batch prompt can be replayed for multiple gradient steps.
+    A new rollout is triggered every ``rollout_interval`` calls to
+    :meth:`step` (or after :meth:`clear_cache`).
+
+    The ``__call__`` contract returns a ``(RolloutResult, is_fresh)``
+    tuple — callers must use the boolean to detect a refreshed rollout
+    rather than relying on object identity.
 
     Usage::
 
-        runner = RolloutRunner(policy, old_policy, tokenizer,
-                               reward_model, sampling_pipeline, config)
-        result = runner(prompt_batch)
+        generator = RolloutGenerator(policy, tokenizer, pipeline, ...)
+        runner = RolloutRunner(generator, reward_model, rollout_interval=512)
+        result, is_fresh = runner(prompt_batch)
+        if is_fresh:
+            ...  # e.g. sync behaviour policy
     """
 
     def __init__(
         self,
-        policy_model: nn.Module,
-        old_model: Optional[nn.Module],
-        tokenizer,
+        generator: RolloutGenerator,
         reward_model: BaseRewardModel,
-        sampling_pipeline: SamplingPipeline,
-        max_tokens: int = 1024,
-        group_size: int = 8,
         rollout_interval: int = 512,
     ):
-        self.policy_model = policy_model
-        self.old_model = old_model
-        self.tokenizer = tokenizer
+        self.generator = generator
         self.reward_model = reward_model
-        self.sampling_pipeline = sampling_pipeline
-        self.max_tokens = max_tokens
-        self.group_size = group_size
         self.rollout_interval = rollout_interval
-        self.stop_ids = getattr(tokenizer, "stop_ids", []) or []
 
         self._cache: Optional[RolloutResult] = None
         self._steps_since_rollout: int = 0
@@ -193,80 +238,28 @@ class RolloutRunner:
         """Force next call to re-run rollout."""
         self._cache = None
 
-    def _tokenize_prompts(self, raw_texts: List[str]) -> Dict[str, Tensor]:
-        ids_list = self.tokenizer.encode(raw_texts, out_ids=True)
-        B = len(ids_list)
-        P_max = max(len(ids) for ids in ids_list) if ids_list else 0
-        input_ids = torch.zeros(B, P_max, dtype=torch.long)
-        for i, ids in enumerate(ids_list):
-            input_ids[i, : len(ids)] = torch.tensor(ids[:P_max], dtype=torch.long)
-        attention_mask = input_ids != 0
-        return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-    def _decode(self, token_ids: Tensor, mask: Tensor) -> List[List[str]]:
-        B, G, _ = token_ids.shape
-        texts = []
-        for i in range(B):
-            group_texts = []
-            for g in range(G):
-                ids = token_ids[i, g, mask[i, g]].tolist()
-                group_texts.append(self.tokenizer.decode(ids, skip_special_tokens=True))
-            texts.append(group_texts)
-        return texts
-
-    @torch.no_grad()
-    def _run(self, batch: Dict[str, Tensor]) -> RolloutResult:
-        """Execute the actual generation + reward scoring."""
-        prompt_ids = batch["input_ids"] if "input_ids" in batch else batch["prompts"]
-        prompt_mask = (
-            batch["attention_mask"] if "attention_mask" in batch else (prompt_ids != 0)
-        )
-        B, P_len = prompt_ids.shape
-        G = self.group_size
-        device = prompt_ids.device
-
-        prompt_texts: List[str] = []
-        for i in range(B):
-            ids = prompt_ids[i, prompt_mask[i]].tolist()
-            prompt_texts.append(self.tokenizer.decode(ids, skip_special_tokens=True))
-
-        expanded_ids = prompt_ids.unsqueeze(1).expand(-1, G, -1).reshape(B * G, P_len)
-        expanded_mask = prompt_mask.unsqueeze(1).expand(-1, G, -1).reshape(B * G, P_len)
-
-        gen_out = generate_responses(
-            model=self.policy_model,
-            input_ids=expanded_ids,
-            attention_mask=expanded_mask,
-            max_new_tokens=self.max_tokens,
-            sampling_pipeline=self.sampling_pipeline,
-            stop_ids=self.stop_ids,
-        )
-
-        gen_ids = gen_out["generated_ids"].reshape(B, G, -1)
-        gen_mask = gen_out["generated_mask"].reshape(B, G, -1)
-        gen_logprobs = gen_out["logprobs"].reshape(B, G, -1)
-
-        response_texts = self._decode(gen_ids, gen_mask)
-        reward_tensor = self.reward_model.score(prompt_texts, response_texts)
-        rewards = reward_tensor.to(device=device)
-
+    def _score(self, raw: RawRollout) -> RolloutResult:
+        rewards = self.reward_model.score(raw.prompt_texts, raw.response_texts)
+        device = raw.prompts.device
         return RolloutResult(
-            prompts=prompt_ids,
-            responses=gen_ids,
-            response_mask=gen_mask,
-            rewards=rewards,
-            logprobs_old=gen_logprobs,
-            prompt_texts=prompt_texts,
-            response_texts=response_texts,
+            prompts=raw.prompts,
+            responses=raw.responses,
+            response_mask=raw.response_mask,
+            rewards=rewards.to(device=device),
+            logprobs_old=raw.logprobs_old,
+            prompt_texts=raw.prompt_texts,
+            response_texts=raw.response_texts,
         )
 
-    def __call__(self, batch: Dict[str, Tensor]) -> RolloutResult:
-        """Return cached or fresh :class:`RolloutResult`.
+    def __call__(self, batch: Dict[str, Tensor]) -> Tuple[RolloutResult, bool]:
+        """Return ``(cached or fresh) RolloutResult`` plus an ``is_fresh`` flag.
 
         Triggers a new rollout when ``_steps_since_rollout >= rollout_interval``
         or when the cache is empty.
         """
         if self._cache is None or self._steps_since_rollout >= self.rollout_interval:
-            self._cache = self._run(batch)
+            raw = self.generator.generate(batch)
+            self._cache = self._score(raw)
             self._steps_since_rollout = 0
-        return self._cache
+            return self._cache, True
+        return self._cache, False

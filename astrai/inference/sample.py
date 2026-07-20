@@ -313,7 +313,8 @@ def sample(
     input_ids: Optional[Tensor] = None,
     input_mask: Optional[Tensor] = None,
     filter_value: float = -float("inf"),
-) -> Tensor:
+    return_logprobs: bool = False,
+):
     """Apply sampling strategies then sample (softmax + multinomial).
 
     Shortcut for ``SamplingPipeline(...).sample(logits)``.
@@ -327,17 +328,39 @@ def sample(
             (0.0 disables, range -2.0~2.0).
         input_ids: Previously generated token IDs ``[batch, seq_len]``.
         input_mask: Boolean mask for ``input_ids`` padding.
+        return_logprobs: If ``True``, also return the log-probability
+            of each sampled token under the (post-strategy) sampling
+            distribution.  Useful for RL rollout: the returned logprob
+            is the behaviour policy's log-prob used in PPO/GRPO
+            importance ratios.
 
     Returns:
-        Sampled token IDs ``[batch]``.
+        Sampled token IDs ``[batch]``, or — when ``return_logprobs`` is
+        ``True`` — a ``(token_ids, chosen_logprobs)`` tuple where
+        ``chosen_logprobs`` has shape ``[batch]``.
     """
     if SamplingPipeline._is_greedy(temperature):
-        return logits.argmax(dim=-1)
-    return SamplingPipeline(
+        tokens = logits.argmax(dim=-1)
+        if not return_logprobs:
+            return tokens
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+        return tokens, chosen
+
+    pipeline = SamplingPipeline(
         [
             TemperatureStrategy(temperature),
             TopKStrategy(top_k),
             TopPStrategy(top_p),
             FrequencyPenaltyStrategy(frequency_penalty),
         ]
-    ).sample(logits, filter_value, input_ids, input_mask)
+    )
+    if not return_logprobs:
+        return pipeline.sample(logits, filter_value, input_ids, input_mask)
+
+    transformed = pipeline.apply(logits, filter_value, input_ids, input_mask)
+    log_probs = torch.log_softmax(transformed.float(), dim=-1)
+    probs = torch.softmax(transformed, dim=-1)
+    tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+    return tokens, chosen

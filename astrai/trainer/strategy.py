@@ -109,7 +109,6 @@ class BaseStrategy(ABC):
         self.executor = kwargs.pop("executor", None)
         self.extra_kwargs = kwargs
         self._rollout_runner = None
-        self._prev_rollout_result = None
 
     @abstractmethod
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
@@ -159,10 +158,9 @@ class BaseStrategy(ABC):
         if self._rollout_runner is None:
             return self.compute_loss(batch)
 
-        result = self._rollout_runner(batch)
-        if result is not self._prev_rollout_result:
+        result, is_fresh = self._rollout_runner(batch)
+        if is_fresh:
             self._on_rollout_refresh()
-            self._prev_rollout_result = result
             if self.executor and self.executor.sync_gradients:
                 self._rollout_runner.step()
 

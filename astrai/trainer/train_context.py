@@ -8,19 +8,14 @@ from torch.utils.data import DataLoader, random_split
 
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
-from astrai.inference.sample import (
-    SamplingPipeline,
-    TemperatureStrategy,
-    TopKStrategy,
-    TopPStrategy,
-)
+from astrai.inference.core.scheduler import InferenceScheduler
 from astrai.model.components.lora import inject_lora
 from astrai.parallel.executor import BaseExecutor, ExecutorFactory
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import Checkpoint, load_json
 from astrai.tokenize import AutoTokenizer
-from astrai.trainer.rollout import RolloutRunner
+from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory, create_ref_model
 
 
@@ -243,22 +238,27 @@ class TrainContextBuilder:
             tokenizer = AutoTokenizer.from_pretrained(self._param_path)
             reward_model = cfg.reward_model_fn()
 
-            pipeline = SamplingPipeline(
-                [
-                    TemperatureStrategy(cfg.rollout_temperature),
-                    TopKStrategy(cfg.rollout_top_k),
-                    TopPStrategy(cfg.rollout_top_p),
-                ]
+            scheduler = InferenceScheduler(
+                model=context.model,
+                tokenizer=tokenizer,
+                max_batch_size=strategy_kwargs.get("group_size", 8)
+                * max(1, cfg.batch_size or 1),
+                max_seq_len=getattr(context.model.config, "max_len", None),
+                max_prompt_len=getattr(context.model.config, "max_len", 4096),
             )
 
-            runner = RolloutRunner(
-                policy_model=context.model,
-                old_model=old_model,
+            generator = RolloutGenerator(
+                scheduler=scheduler,
                 tokenizer=tokenizer,
-                reward_model=reward_model,
-                sampling_pipeline=pipeline,
                 max_tokens=cfg.rollout_max_tokens,
                 group_size=strategy_kwargs.get("group_size", 8),
+                temperature=cfg.rollout_temperature,
+                top_k=cfg.rollout_top_k,
+                top_p=cfg.rollout_top_p,
+            )
+            runner = RolloutRunner(
+                generator=generator,
+                reward_model=reward_model,
                 rollout_interval=cfg.rollout_interval,
             )
             context.strategy.set_rollout_runner(runner)

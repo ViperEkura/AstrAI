@@ -1,8 +1,10 @@
 import logging
 import threading
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from torch import Tensor
 
 from astrai.inference.core.cache import ContiguousCache, KVCache
 from astrai.inference.core.executor import Executor
@@ -194,6 +196,117 @@ class InferenceScheduler:
             self._cache.task_free(task.task_id)
         for task in self._task_mgr.get_waiting_tasks():
             self._task_mgr.invoke_callback(task.task_id, STOP)
+            self._cache.task_free(task.task_id)
         self._task_mgr.clear_queues()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def run_batch(
+        self,
+        prompt_ids_list: List[List[int]],
+        *,
+        max_tokens: Optional[int] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
+        return_logprobs: bool = False,
+    ) -> List[List[int]]:
+        """Synchronous batch generation without the scheduler thread.
+
+        Accepts already-tokenized prompts (no string round-trip) and runs
+        prefill + decode to completion on the calling thread.  Designed for
+        RL rollout, where logprobs of the behaviour policy must be collected
+        alongside generated tokens.
+
+        Args:
+            prompt_ids_list: ``B`` prompts, each a list of token IDs.
+            max_tokens: Maximum tokens to generate per prompt.  ``None``
+                uses ``self.max_seq_len - len(prompt_ids)``.
+            temperature/top_p/top_k/frequency_penalty/rep_window: Sampling
+                parameters (uniform across the batch).
+            return_logprobs: If ``True``, return ``(token_ids, logprobs)``
+                tuples per prompt (logprobs aligned 1-to-1 with token_ids).
+
+        Returns:
+            ``List[List[int]]`` of generated token IDs per prompt, or —
+            when ``return_logprobs`` is ``True`` —
+            ``List[Tuple[List[int], List[float]]]``.
+        """
+        stop_ids = self._task_mgr.tokenizer.stop_ids
+        cache = self._cache
+        seq_cap = self.max_seq_len
+
+        tasks: List[Task] = []
+        for ids in prompt_ids_list:
+            if len(ids) >= seq_cap:
+                tasks.append(None)
+                continue
+            t_max = max_tokens
+            if t_max is None:
+                t_max = seq_cap - len(ids)
+            else:
+                t_max = min(t_max, seq_cap - len(ids))
+            task = Task(
+                task_id=f"batch_{uuid.uuid4().hex[:8]}",
+                prompt_ids=list(ids),
+                max_tokens=t_max,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                rep_window=rep_window,
+            )
+            if not cache.task_alloc(task.task_id, task.prompt_ids):
+                tasks.append(None)
+                continue
+            task.input_tokens = len(task.prompt_ids)
+            tasks.append(task)
+
+        try:
+            live = [t for t in tasks if t is not None]
+            prefill_groups: Dict[Tuple[int, int], List[Task]] = {}
+            for t in live:
+                key = (len(t.prompt_ids), cache.task_cached(t.task_id))
+                prefill_groups.setdefault(key, []).append(t)
+            for (prompt_len, start_pos), group in prefill_groups.items():
+                self._executor.execute_prefill(group, prompt_len, start_pos)
+
+            while live:
+                valid: List[Task] = []
+                for t in sorted(live, key=lambda x: x.task_id):
+                    if cache.task_extend(t.task_id, t.next_pos):
+                        valid.append(t)
+                    else:
+                        t.status = TaskStatus.ABORTED
+                if not valid:
+                    break
+
+                step_out = self._executor.execute_decode(
+                    valid, return_logprobs=return_logprobs
+                )
+                if return_logprobs:
+                    for t, (ntok, _lp) in zip(valid, step_out):
+                        t.output_ids.append(ntok)
+                        t.output_tokens += 1
+                else:
+                    for t, ntok in zip(valid, step_out):
+                        t.output_ids.append(ntok)
+                        t.output_tokens += 1
+
+                live = [t for t in valid if not t.is_finished(stop_ids)]
+        finally:
+            for t in tasks:
+                if t is not None:
+                    cache.task_free(t.task_id)
+
+        results: List[Any] = []
+        for t in tasks:
+            if t is None:
+                results.append(([], []) if return_logprobs else [])
+            elif return_logprobs:
+                results.append((list(t.output_ids), list(t.output_logprobs)))
+            else:
+                results.append(list(t.output_ids))
+        return results

@@ -81,6 +81,7 @@ class Task:
 
         self.status = TaskStatus.PENDING
         self.output_ids: List[int] = []
+        self.output_logprobs: List[float] = []
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.arrival_time = time.time()

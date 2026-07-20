@@ -1,26 +1,23 @@
 """Unit tests for the online rollout module.
 
-Covers :class:`RolloutResult`, :class:`BaseRewardModel`,
-:func:`generate_responses`, and :class:`RolloutRunner` including
-its internal cache and rollout-interval trigger logic.
+Covers :class:`RolloutResult` / :class:`RawRollout`, :class:`BaseRewardModel`,
+:class:`RolloutGenerator` (KV-cache-backed via :class:`InferenceScheduler.run_batch`)
+and :class:`RolloutRunner` including its internal cache and rollout-interval
+trigger logic.
 """
 
 import pytest
 import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.inference.sample import (
-    SamplingPipeline,
-    TemperatureStrategy,
-    TopKStrategy,
-    TopPStrategy,
-)
+from astrai.inference.core.scheduler import InferenceScheduler
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.rollout import (
     BaseRewardModel,
+    RawRollout,
+    RolloutGenerator,
     RolloutResult,
     RolloutRunner,
-    generate_responses,
 )
 
 
@@ -57,10 +54,6 @@ class ConstantRewardModel(BaseRewardModel):
         return torch.full((B, G), float(self.value))
 
 
-class _FakeOldModel:
-    """Placeholder old-model; RolloutRunner stores but never calls it."""
-
-
 def _make_config(vocab_size=200, max_len=128):
     return AutoRegressiveLMConfig(
         vocab_size=vocab_size,
@@ -81,9 +74,13 @@ def _make_model(device):
     return m, cfg
 
 
-def _make_pipeline():
-    return SamplingPipeline(
-        [TemperatureStrategy(1.0), TopKStrategy(0), TopPStrategy(1.0)]
+def _make_scheduler(model, tokenizer, max_batch_size=8, max_len=128):
+    return InferenceScheduler(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_len,
+        max_prompt_len=max_len,
     )
 
 
@@ -93,14 +90,28 @@ def _make_prompt_batch(batch_size=2, prompt_len=6, device="cpu"):
     return {"input_ids": ids, "attention_mask": mask}
 
 
-def test_rollout_result_fields():
+def test_raw_rollout_fields():
+    r = RawRollout(
+        prompts=torch.zeros(2, 4, dtype=torch.long),
+        responses=torch.zeros(2, 3, 5, dtype=torch.long),
+        response_mask=torch.ones(2, 3, 5, dtype=torch.bool),
+        logprobs_old=torch.zeros(2, 3, 5),
+    )
+    assert r.prompts.shape == (2, 4)
+    assert r.responses.shape == (2, 3, 5)
+    assert r.prompt_texts == []
+    assert r.response_texts == []
+
+
+def test_rollout_result_inherits_raw_rollout_fields():
     r = RolloutResult(
         prompts=torch.zeros(2, 4, dtype=torch.long),
         responses=torch.zeros(2, 3, 5, dtype=torch.long),
         response_mask=torch.ones(2, 3, 5, dtype=torch.bool),
-        rewards=torch.zeros(2, 3),
         logprobs_old=torch.zeros(2, 3, 5),
+        rewards=torch.zeros(2, 3),
     )
+    assert r.rewards.shape == (2, 3)
     assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
     assert r.prompt_texts == []
@@ -119,94 +130,96 @@ def test_constant_reward_model_shape():
     assert torch.all(out == 0.5)
 
 
-def test_generate_responses_shapes():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+@pytest.fixture
+def device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _make_generator(device, **kw):
     model, _ = _make_model(device)
-    pipeline = _make_pipeline()
-    ids = torch.randint(3, 200, (2, 4), device=device)
-    mask = torch.ones(2, 4, dtype=torch.bool, device=device)
-
-    out = generate_responses(
-        model=model,
-        input_ids=ids,
-        attention_mask=mask,
-        max_new_tokens=8,
-        sampling_pipeline=pipeline,
-        stop_ids=[],
+    tokenizer = FakeTokenizer()
+    scheduler = _make_scheduler(
+        model,
+        tokenizer,
+        max_batch_size=kw.get("max_batch_size", 8),
+        max_len=kw.get("max_len", 128),
     )
-    assert out["generated_ids"].shape == (2, 8)
-    assert out["generated_mask"].shape == (2, 8)
-    assert out["logprobs"].shape == (2, 8)
-
-
-def test_generate_responses_stops_on_stop_id():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _ = _make_model(device)
-    pipeline = _make_pipeline()
-    ids = torch.randint(3, 200, (1, 3), device=device)
-    mask = torch.ones(1, 3, dtype=torch.bool, device=device)
-
-    out = generate_responses(
-        model=model,
-        input_ids=ids,
-        attention_mask=mask,
-        max_new_tokens=16,
-        sampling_pipeline=pipeline,
-        stop_ids=[7],
+    generator = RolloutGenerator(
+        scheduler=scheduler,
+        tokenizer=tokenizer,
+        max_tokens=kw.get("max_tokens", 8),
+        group_size=kw.get("group_size", 2),
+        temperature=kw.get("temperature", 1.0),
+        top_k=kw.get("top_k", 0),
+        top_p=kw.get("top_p", 1.0),
     )
-    gen = out["generated_ids"][0]
-    mask = out["generated_mask"][0]
-    # If a 7 appeared, all tokens after it must be pad (mask False).
-    nonzero_stop = (gen == 7).nonzero()
-    if nonzero_stop.numel():
-        first = nonzero_stop[0].item()
-        assert mask[first + 1 :].sum() == 0
+    return generator, model
 
 
-def test_generate_responses_logprobs_match_tokens():
-    """logprobs[i] must be the logprob of generated_ids[i]."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _ = _make_model(device)
-    pipeline = _make_pipeline()
-    ids = torch.randint(3, 200, (1, 2), device=device)
-    mask = torch.ones(1, 2, dtype=torch.bool, device=device)
+def test_rollout_generator_shapes(device):
+    gen, _ = _make_generator(device, group_size=3, max_tokens=5)
+    batch = _make_prompt_batch(batch_size=2, prompt_len=4, device=device)
+    r = gen.generate(batch)
+    assert r.prompts.shape == (2, 4)
+    assert r.responses.shape == (2, 3, 5)
+    assert r.response_mask.shape == (2, 3, 5)
+    assert r.logprobs_old.shape == (2, 3, 5)
+    assert len(r.prompt_texts) == 2
+    assert len(r.response_texts) == 2
+    assert len(r.response_texts[0]) == 3
 
-    out = generate_responses(
-        model=model,
-        input_ids=ids,
-        attention_mask=mask,
-        max_new_tokens=4,
-        sampling_pipeline=pipeline,
-        stop_ids=[],
-    )
-    gen = out["generated_ids"][0]
-    lp = out["logprobs"][0]
-    for i in range(4):
-        if gen[i] == 0 and not out["generated_mask"][0, i]:
-            continue
-        assert lp[i] <= 0.0
+
+def test_rollout_generator_mask_matches_responses(device):
+    """Positions beyond a response's length are pad (mask False)."""
+    gen, _ = _make_generator(device, group_size=2, max_tokens=6)
+    batch = _make_prompt_batch(batch_size=2, prompt_len=4, device=device)
+    r = gen.generate(batch)
+    for i in range(2):
+        for g in range(2):
+            real = r.response_mask[i, g].sum().item()
+            # Pad positions should be 0
+            assert r.responses[i, g, real:].sum() == 0
+            # logprobs after the real tokens are 0 (padding)
+            if real < r.logprobs_old.size(-1):
+                assert torch.all(r.logprobs_old[i, g, real:] == 0)
+
+
+def test_rollout_generator_logprobs_are_nonpositive(device):
+    """Behaviour-policy logprobs of sampled tokens should be ≤ 0."""
+    gen, _ = _make_generator(device, group_size=2, max_tokens=4)
+    batch = _make_prompt_batch(batch_size=1, prompt_len=3, device=device)
+    r = gen.generate(batch)
+    for i in range(1):
+        for g in range(2):
+            mask = r.response_mask[i, g]
+            lp = r.logprobs_old[i, g][mask]
+            assert torch.all(lp <= 1e-5)
 
 
 def _make_runner(device, **kw):
-    model, _ = _make_model(device)
-    rm = ConstantRewardModel(1.0)
-    return RolloutRunner(
-        policy_model=model,
-        old_model=_FakeOldModel(),
-        tokenizer=FakeTokenizer(),
-        reward_model=rm,
-        sampling_pipeline=_make_pipeline(),
-        max_tokens=kw.get("max_tokens", 8),
+    generator, model = _make_generator(
+        device,
         group_size=kw.get("group_size", 2),
-        rollout_interval=kw.get("rollout_interval", 2),
-    ), model
+        max_tokens=kw.get("max_tokens", 8),
+        max_batch_size=kw.get("max_batch_size", 8),
+        max_len=kw.get("max_len", 128),
+    )
+    rm = ConstantRewardModel(1.0)
+    return (
+        RolloutRunner(
+            generator=generator,
+            reward_model=rm,
+            rollout_interval=kw.get("rollout_interval", 2),
+        ),
+        model,
+    )
 
 
-def test_rollout_runner_shapes():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def test_rollout_runner_shapes(device):
     runner, _ = _make_runner(device, group_size=3, max_tokens=5)
     batch = _make_prompt_batch(batch_size=2, prompt_len=4, device=device)
-    r = runner(batch)
+    r, is_fresh = runner(batch)
+    assert is_fresh
     assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
     assert r.response_mask.shape == (2, 3, 5)
@@ -217,48 +230,52 @@ def test_rollout_runner_shapes():
     assert len(r.response_texts[0]) == 3
 
 
-def test_rollout_runner_cache_returns_same_object():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def test_rollout_runner_cache_returns_stale_flag(device):
     runner, _ = _make_runner(device, rollout_interval=10)
     batch = _make_prompt_batch(device=device)
-    r1 = runner(batch)
-    r2 = runner(batch)
+    r1, fresh1 = runner(batch)
+    r2, fresh2 = runner(batch)
     assert r1 is r2
+    assert fresh1 is True
+    assert fresh2 is False
 
 
-def test_rollout_runner_step_triggers_new_rollout():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def test_rollout_runner_step_triggers_new_rollout(device):
     runner, _ = _make_runner(device, rollout_interval=2)
     batch = _make_prompt_batch(device=device)
-    r1 = runner(batch)
+    r1, fresh1 = runner(batch)
+    assert fresh1 is True
     runner.step()
     # interval=2 means trigger when _steps_since_rollout >= 2; 1 step not enough
-    r2 = runner(batch)
-    assert r1 is r2
+    r2, fresh2 = runner(batch)
+    assert r2 is r1
+    assert fresh2 is False
     runner.step()
     # Now _steps_since_rollout == 2 -> re-rollout
-    r3 = runner(batch)
+    r3, fresh3 = runner(batch)
     assert r3 is not r1
+    assert fresh3 is True
 
 
-def test_rollout_runner_clear_cache_forces_rerun():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def test_rollout_runner_clear_cache_forces_rerun(device):
     runner, _ = _make_runner(device, rollout_interval=100)
     batch = _make_prompt_batch(device=device)
-    r1 = runner(batch)
+    r1, _ = runner(batch)
     runner.clear_cache()
-    r2 = runner(batch)
+    r2, fresh2 = runner(batch)
     assert r2 is not r1
+    assert fresh2 is True
 
 
-def test_rollout_runner_step_resets_counter():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def test_rollout_runner_step_resets_counter(device):
     runner, _ = _make_runner(device, rollout_interval=1)
     batch = _make_prompt_batch(device=device)
-    r1 = runner(batch)
+    r1, _ = runner(batch)
     runner.step()
-    r2 = runner(batch)
+    r2, fresh2 = runner(batch)
     assert r2 is not r1
+    assert fresh2 is True
     # Counter reset after rollout; second call w/o step should be cached.
-    r3 = runner(batch)
+    r3, fresh3 = runner(batch)
     assert r3 is r2
+    assert fresh3 is False

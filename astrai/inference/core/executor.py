@@ -55,7 +55,23 @@ class Executor:
                 paged_cache=self.kv_cache.bind_tasks(task_ids, prompt_len, self.device),
             )
 
-    def execute_decode(self, tasks: List[Task]) -> List[int]:
+    def execute_decode(
+        self, tasks: List[Task], return_logprobs: bool = False
+    ) -> List[int]:
+        """Decode next token for each task.
+
+        Args:
+            return_logprobs: When ``True``, also record (and return)
+                the log-probability of each sampled token under the
+                post-strategy sampling distribution.  The logprob is
+                appended to ``task.output_logprobs`` and the return
+                list becomes ``List[Tuple[int, float]]``.
+
+        Returns:
+            ``List[int]`` of sampled token IDs, or
+            ``List[Tuple[int, float]]`` of ``(token_id, logprob)`` when
+            ``return_logprobs`` is ``True``.
+        """
         if not tasks:
             return []
 
@@ -115,6 +131,23 @@ class Executor:
                 position_ids=position_ids.unsqueeze(1),
             )
             logits = outputs["logits"][:, -1, :]
+
+        if return_logprobs:
+            tokens, logprobs = sample(
+                logits,
+                temperature=temperatures,
+                top_k=top_ks,
+                top_p=top_ps,
+                frequency_penalty=freq_penalties,
+                input_ids=padded_ids,
+                input_mask=padded_mask,
+                return_logprobs=True,
+            )
+            tokens_list = tokens.tolist()
+            logprobs_list = logprobs.tolist()
+            for t, lp in zip(tasks, logprobs_list):
+                t.output_logprobs.append(float(lp))
+            return list(zip(tokens_list, logprobs_list))
 
         return sample(
             logits,

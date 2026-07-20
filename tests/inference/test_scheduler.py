@@ -191,3 +191,124 @@ def test_prefill_skips_fully_cached_tasks(mock_model_and_tokenizer):
     task_id = scheduler.add_task("short prompt", stream_callback=lambda t: None)
     scheduler.stop()
     assert task_id.startswith("task_")
+
+
+def _make_real_scheduler(device):
+    """Build a scheduler backed by a tiny real model for run_batch tests."""
+    from astrai.config.model_config import AutoRegressiveLMConfig
+    from astrai.model.transformer import AutoRegressiveLM
+
+    class _Tok:
+        stop_ids = [2]
+
+        def encode(self, texts, **_):
+            if isinstance(texts, str):
+                texts = [texts]
+            return [[b for b in t.encode("utf-8")] for t in texts]
+
+        def decode(self, ids, skip_special_tokens=True):
+            return bytes(b for b in ids if b > 2 or not skip_special_tokens).decode(
+                "utf-8", errors="ignore"
+            )
+
+    cfg = AutoRegressiveLMConfig(
+        vocab_size=200,
+        dim=16,
+        n_heads=2,
+        n_kv_heads=1,
+        dim_ffn=32,
+        max_len=64,
+        n_layers=2,
+        norm_eps=1e-5,
+    )
+    model = AutoRegressiveLM(cfg).to(device=device).eval()
+    tokenizer = _Tok()
+    scheduler = InferenceScheduler(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=8,
+        max_seq_len=64,
+        max_prompt_len=64,
+    )
+    return scheduler, tokenizer, model
+
+
+def test_run_batch_returns_token_sequences():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        prompts = [[10, 20, 30], [5, 6, 7, 8]]
+        results = scheduler.run_batch(prompts, max_tokens=4, temperature=1.0)
+        assert len(results) == 2
+        for ids in results:
+            assert isinstance(ids, list)
+            assert len(ids) <= 4
+            assert all(0 <= i < 200 for i in ids)
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_return_logprobs_aligned():
+    """return_logprobs=True gives (token_ids, logprobs) tuples with equal len."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        prompts = [[10, 20, 30, 40]]
+        results = scheduler.run_batch(
+            prompts, max_tokens=5, temperature=1.0, return_logprobs=True
+        )
+        assert len(results) == 1
+        token_ids, logprobs = results[0]
+        assert len(token_ids) == len(logprobs)
+        assert all(lp <= 1e-5 for lp in logprobs)  # logprobs ≤ 0
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_respects_max_tokens():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        prompts = [[10, 20, 30]]
+        results = scheduler.run_batch(prompts, max_tokens=3, temperature=1.0)
+        assert len(results[0]) <= 3
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_stop_id_terminates():
+    """A token matching stop_ids terminates generation for that prompt."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        prompts = [[10, 20, 30]]
+        results = scheduler.run_batch(prompts, max_tokens=32, temperature=1.0)
+        # If stop token 2 was produced, it is the last token
+        if results[0] and results[0][-1] == 2:
+            # No tokens after stop should exist (since we terminate)
+            assert 2 not in results[0][:-1]
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_empty_prompts():
+    """Empty prompt list yields empty result list."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        assert scheduler.run_batch([], max_tokens=4) == []
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_too_long_prompt_skipped():
+    """A prompt longer than max_seq_len yields an empty result slot."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    try:
+        long = list(range(100))  # > max_seq_len=64
+        results = scheduler.run_batch([long, [10, 20]], max_tokens=2)
+        assert results[0] == []
+        assert len(results[1]) <= 2
+    finally:
+        scheduler.stop()

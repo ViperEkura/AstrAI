@@ -6,7 +6,7 @@
 - [Causal Mask](#causal-mask)
 - [Rotary Position Embedding (RoPE)](#rotary-position-embedding-rope)
 - [Training Loop](#training-loop)
-- [Strategies](#strategies) — SEQ, SFT, DPO, GRPO
+- [Strategies](#strategies) — SEQ, SFT, DPO, GRPO, online rollout
 - [LR Schedulers](#lr-schedulers)
 - [Gradient Checkpointing](#gradient-checkpointing)
 - [Checkpoint](#checkpoint)
@@ -146,6 +146,19 @@ Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. External sync of `ol
 
 Keys: `prompts`, `responses`, `masks`, `rewards`.
 
+### Online Rollout
+
+`online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with
+a `RolloutRunner`. The runner renders prompts through the tokenizer chat
+template, generates grouped responses through `InferenceScheduler`, then scores
+them with a `BaseRewardModel`. It refreshes cached rollouts every
+`rollout_interval` optimizer steps. `online_grpo` synchronizes `old_model` when
+a fresh rollout is produced.
+
+Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
+rollout sampling parameters but does not yet offer a CLI argument for the reward
+model factory.
+
 ## LR Schedulers
 
 | Type | Class | Description |
@@ -162,6 +175,7 @@ Trades compute for memory by recomputing activations during backward pass. Speci
 
 ```python
 from astrai.model.components.decoder_block import DecoderBlock
+
 config = TrainConfig(..., gradient_checkpointing_modules=[DecoderBlock])
 ```
 
@@ -181,18 +195,14 @@ Model config (`context.model_config`) saved into `config.json` during training v
 ## TrainContextBuilder (Builder Pattern)
 
 ```python
-context = (
-    TrainContextBuilder(config)
-        .with_resume_dir(resume_dir)
-        .build()
-)
+context = TrainContextBuilder(config).with_param_path(param_path, resume=True).build()
 # Returns TrainContext with model, strategy, optimizer, scheduler, dataloader, checkpoint
 ```
 
-- Loads checkpoint weights if provided
+- Loads checkpoint weights before the model is wrapped
 - Creates executor via `ExecutorFactory.create(cfg.parallel_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
-- Calls `executor.prepare(model, optimizer, dataloader, scheduler)` for model distribution (e.g. DDP) + gradient accumulation wrappers
-- Creates `ResumableDistributedSampler` for shuffle+resume
+- Calls `executor.prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap=...)`; the executor creates, wraps, then builds the optimizer and scheduler for the wrapped model
+- Creates `RDSampler` for shuffle+resume
 - Builds strategy via `StrategyFactory.create(train_type, model, device, **kwargs)`
 
 ## Training CLI
@@ -222,4 +232,4 @@ nohup python scripts/tools/train.py \
 
 Full parameter reference at [params.md](params.md).
 
-> Document Update Time: 2026-07-19
+> Document Update Time: 2026-07-20

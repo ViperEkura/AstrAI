@@ -13,7 +13,7 @@
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--train_type` | Training type (`seq`, `sft`, `dpo`, `grpo`) | required |
+| `--train_type` | Training type (`seq`, `sft`, `dpo`, `grpo`, `online_grpo`, `online_dpo`) | required |
 | `--data_root_path` | Dataset root directory | required |
 | `--param_path` | Model parameters or checkpoint path | required |
 | `--n_epoch` | Total training epochs | 1 |
@@ -100,18 +100,31 @@ Combined optimizer: matrix parameters via **Muon**, non-matrix via **AdamW** (`f
 | `--group_size` | GRPO group size | 4 | `grpo` |
 | `--grpo_clip_eps` | GRPO clipping epsilon | 0.2 | `grpo` |
 | `--grpo_kl_coef` | GRPO KL penalty coefficient | 0.01 | `grpo` |
-| `--grpo_sync_interval` | GRPO ref_model sync interval (steps) | 200 | `grpo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
+
+### Online Rollout
+
+These options apply to `online_grpo` and `online_dpo`. Online strategies require
+a `BaseRewardModel` factory in `TrainConfig`; `train.py` does not currently
+provide a command-line option for configuring one.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--rollout_interval` | Optimizer steps between rollout refreshes | 512 |
+| `--rollout_temperature` | Rollout sampling temperature | 0.7 |
+| `--rollout_top_k` | Rollout top-k filtering (`0` disables) | 0 |
+| `--rollout_top_p` | Rollout nucleus sampling threshold | 0.9 |
+| `--rollout_max_tokens` | Maximum generated tokens per response | 1024 |
 
 ### Scheduler
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--schedule_type` | LR scheduler type (`cosine`, `sgdr`, `wsd`) | cosine |
-| `--min_rate` | Minimum LR as fraction of base LR | None (scheduler default: 0.01) |
+| `--min_rate` | Minimum LR as fraction of base LR | None (scheduler default: 0.05 for cosine/SGDR, 0.0 for WSD) |
 | `--cycle_length` | SGDR first cycle length in steps | None (total_steps - warmup_steps) |
 | `--t_mult` | SGDR cycle length multiplier per restart | 2 |
-| `--stable_steps` | WSD stable plateau steps | None (required for wsd) |
+| `--stable_steps` | WSD stable plateau steps | None (80% of post-warmup steps) |
 | `--decay_steps` | WSD decay steps | None (total_steps - warmup_steps - stable_steps) |
 
 ### Usage Example
@@ -201,4 +214,4 @@ See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 
 ---
 
-> Document Update Time: 2026-07-19
+> Document Update Time: 2026-07-20

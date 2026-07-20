@@ -4,7 +4,6 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch import Tensor
 
 from astrai.inference.core.cache import ContiguousCache, KVCache
 from astrai.inference.core.executor import Executor

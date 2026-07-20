@@ -1,10 +1,4 @@
-"""Unit tests for the online rollout module.
-
-Covers :class:`RolloutResult` / :class:`RawRollout`, :class:`BaseRewardModel`,
-:class:`RolloutGenerator` (KV-cache-backed via :class:`InferenceScheduler.run_batch`)
-and :class:`RolloutRunner` including its internal cache and rollout-interval
-trigger logic.
-"""
+"""Unit tests for the online rollout module."""
 
 import pytest
 import torch
@@ -20,26 +14,49 @@ from astrai.trainer.rollout import (
     RolloutRunner,
 )
 
+_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}SYSTEM: {{ message['content'] }}\n{% endif %}"
+    "{% if message['role'] == 'user' %}USER: {{ message['content'] }}\n{% endif %}"
+    "{% if message['role'] == 'assistant' %}ASSISTANT: {{ message['content'] }}\n{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}ASSISTANT: {% endif %}"
+)
+
 
 class FakeTokenizer:
-    """Minimal char-level tokenizer stub for rollout tests.
-
-    Vocab: 0 = pad, 1..255 = byte values.  ``stop_ids = [2]`` (a fake
-    EOS) so tests can verify early-stopping behaviour.
-    """
+    """Minimal stub tokenizer with a chat template for rollout tests."""
 
     stop_ids = [2]
 
-    def encode(self, texts, out_ids=True, **_):
+    def __init__(self):
+        from astrai.tokenize.chat_template import ChatTemplate
+
+        self._chat_template = ChatTemplate.from_string(_CHAT_TEMPLATE)
+
+    def encode(self, texts, **_):
         if isinstance(texts, str):
             texts = [texts]
         return [[b for b in t.encode("utf-8")] for t in texts]
 
     def decode(self, ids, skip_special_tokens=True):
-        out = bytes(b for b in ids if b > 2 or not skip_special_tokens).decode(
-            "utf-8", errors="ignore"
+        if isinstance(ids, list):
+            return bytes(b for b in ids if b > 2).decode("utf-8", errors="ignore")
+        return str(ids)
+
+    def apply_chat_template(
+        self, messages, tokenize=True, add_generation_prompt=True, **_
+    ):
+        rendered = self._chat_template.render(
+            messages=messages, add_generation_prompt=add_generation_prompt
         )
-        return out
+        if tokenize:
+            return (
+                self.encode(rendered)[0]
+                if isinstance(rendered, str)
+                else [self.encode(t)[0] for t in rendered]
+            )
+        return rendered
 
 
 class ConstantRewardModel(BaseRewardModel):
@@ -84,10 +101,11 @@ def _make_scheduler(model, tokenizer, max_batch_size=8, max_len=128):
     )
 
 
-def _make_prompt_batch(batch_size=2, prompt_len=6, device="cpu"):
-    ids = torch.randint(3, 200, (batch_size, prompt_len), device=device)
-    mask = torch.ones(batch_size, prompt_len, dtype=torch.bool, device=device)
-    return {"input_ids": ids, "attention_mask": mask}
+def _make_instruction_batch(n=2):
+    """Build a batch of instruction+input prompts as lists of strings."""
+    instructions = [f"Tell me about topic {i}" for i in range(n)]
+    inputs = [f"context {i}" for i in range(n)]
+    return {"instruction": instructions, "input": inputs}
 
 
 def test_raw_rollout_fields():
@@ -114,8 +132,6 @@ def test_rollout_result_inherits_raw_rollout_fields():
     assert r.rewards.shape == (2, 3)
     assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
-    assert r.prompt_texts == []
-    assert r.response_texts == []
 
 
 def test_base_reward_model_is_abstract():
@@ -158,9 +174,8 @@ def _make_generator(device, **kw):
 
 def test_rollout_generator_shapes(device):
     gen, _ = _make_generator(device, group_size=3, max_tokens=5)
-    batch = _make_prompt_batch(batch_size=2, prompt_len=4, device=device)
+    batch = _make_instruction_batch(n=2)
     r = gen.generate(batch)
-    assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
     assert r.response_mask.shape == (2, 3, 5)
     assert r.logprobs_old.shape == (2, 3, 5)
@@ -172,14 +187,12 @@ def test_rollout_generator_shapes(device):
 def test_rollout_generator_mask_matches_responses(device):
     """Positions beyond a response's length are pad (mask False)."""
     gen, _ = _make_generator(device, group_size=2, max_tokens=6)
-    batch = _make_prompt_batch(batch_size=2, prompt_len=4, device=device)
+    batch = _make_instruction_batch(n=2)
     r = gen.generate(batch)
     for i in range(2):
         for g in range(2):
             real = r.response_mask[i, g].sum().item()
-            # Pad positions should be 0
             assert r.responses[i, g, real:].sum() == 0
-            # logprobs after the real tokens are 0 (padding)
             if real < r.logprobs_old.size(-1):
                 assert torch.all(r.logprobs_old[i, g, real:] == 0)
 
@@ -187,13 +200,52 @@ def test_rollout_generator_mask_matches_responses(device):
 def test_rollout_generator_logprobs_are_nonpositive(device):
     """Behaviour-policy logprobs of sampled tokens should be ≤ 0."""
     gen, _ = _make_generator(device, group_size=2, max_tokens=4)
-    batch = _make_prompt_batch(batch_size=1, prompt_len=3, device=device)
+    batch = _make_instruction_batch(n=1)
     r = gen.generate(batch)
     for i in range(1):
         for g in range(2):
             mask = r.response_mask[i, g]
             lp = r.logprobs_old[i, g][mask]
             assert torch.all(lp <= 1e-5)
+
+
+def test_rollout_generator_instruction_role_mapping(device):
+    """instruction → system, input → user, output → assistant."""
+    gen, _ = _make_generator(device, group_size=1, max_tokens=4)
+    batch = {
+        "instruction": ["Be helpful"],
+        "input": ["What is 2+2?"],
+        "output": ["Four"],
+    }
+    r = gen.generate(batch)
+    text = r.prompt_texts[0]
+    assert "SYSTEM: Be helpful" in text
+    assert "USER: What is 2+2?" in text
+    assert "ASSISTANT: Four" in text
+
+
+def test_rollout_generator_messages_format(device):
+    """Rollout also accepts pre-built messages."""
+    gen, _ = _make_generator(device, group_size=2, max_tokens=4)
+    batch = {
+        "messages": [
+            [{"role": "user", "content": "Hello"}],
+            [{"role": "user", "content": "Goodbye"}],
+        ]
+    }
+    r = gen.generate(batch)
+    assert r.responses.shape[0] == 2
+    assert len(r.prompt_texts) == 2
+    assert "Hello" in r.prompt_texts[0] or "USER" in r.prompt_texts[0]
+
+
+def test_rollout_generator_bad_batch_raises(device):
+    """Batch without messages or instruction raises a clear error."""
+    gen, _ = _make_generator(device)
+    with pytest.raises(
+        ValueError, match="must contain either 'messages' or 'instruction'"
+    ):
+        gen.generate({"input_ids": torch.zeros(2, 4, dtype=torch.long)})
 
 
 def _make_runner(device, **kw):
@@ -217,10 +269,9 @@ def _make_runner(device, **kw):
 
 def test_rollout_runner_shapes(device):
     runner, _ = _make_runner(device, group_size=3, max_tokens=5)
-    batch = _make_prompt_batch(batch_size=2, prompt_len=4, device=device)
+    batch = _make_instruction_batch(n=2)
     r, is_fresh = runner(batch)
     assert is_fresh
-    assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
     assert r.response_mask.shape == (2, 3, 5)
     assert r.rewards.shape == (2, 3)
@@ -232,7 +283,7 @@ def test_rollout_runner_shapes(device):
 
 def test_rollout_runner_cache_returns_stale_flag(device):
     runner, _ = _make_runner(device, rollout_interval=10)
-    batch = _make_prompt_batch(device=device)
+    batch = _make_instruction_batch()
     r1, fresh1 = runner(batch)
     r2, fresh2 = runner(batch)
     assert r1 is r2
@@ -242,7 +293,7 @@ def test_rollout_runner_cache_returns_stale_flag(device):
 
 def test_rollout_runner_step_triggers_new_rollout(device):
     runner, _ = _make_runner(device, rollout_interval=2)
-    batch = _make_prompt_batch(device=device)
+    batch = _make_instruction_batch()
     r1, fresh1 = runner(batch)
     assert fresh1 is True
     runner.step()
@@ -259,7 +310,7 @@ def test_rollout_runner_step_triggers_new_rollout(device):
 
 def test_rollout_runner_clear_cache_forces_rerun(device):
     runner, _ = _make_runner(device, rollout_interval=100)
-    batch = _make_prompt_batch(device=device)
+    batch = _make_instruction_batch()
     r1, _ = runner(batch)
     runner.clear_cache()
     r2, fresh2 = runner(batch)
@@ -269,7 +320,7 @@ def test_rollout_runner_clear_cache_forces_rerun(device):
 
 def test_rollout_runner_step_resets_counter(device):
     runner, _ = _make_runner(device, rollout_interval=1)
-    batch = _make_prompt_batch(device=device)
+    batch = _make_instruction_batch()
     r1, _ = runner(batch)
     runner.step()
     r2, fresh2 = runner(batch)

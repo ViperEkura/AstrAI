@@ -23,7 +23,6 @@ import tqdm
 from astrai.config.preprocess_config import PipelineConfig
 from astrai.preprocessing.core import (
     build_preprocessing_components,
-    iter_raw_records,
     primary_ids,
 )
 from astrai.preprocessing.packing import PackingStrategyFactory

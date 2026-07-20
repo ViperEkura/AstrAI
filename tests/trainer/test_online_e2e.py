@@ -13,23 +13,40 @@ from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
 
+_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}"
+    "SYSTEM: {{ message['content'] }}\n"
+    "{% elif message['role'] == 'user' %}"
+    "USER: {{ message['content'] }}\n"
+    "{% elif message['role'] == 'assistant' %}"
+    "ASSISTANT: {{ message['content'] }}\n"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}ASSISTANT: {% endif %}"
+)
 
-class PromptDataset(Dataset):
-    """Toy prompt-only dataset for online RL rollout."""
 
-    def __init__(self, n=4, seq_len=8, vocab_size=1000):
-        self.n = n
-        self.seq_len = seq_len
-        self.vocab_size = vocab_size
+class InstructionDataset(Dataset):
+    """Toy instruction/input dataset for online RL rollout.
+
+    Each sample has an ``instruction`` and an optional ``input``; the
+    RolloutGenerator renders both through the tokenizer's chat template
+    so the prompt matches the SFT-trained format.
+    """
+
+    _SAMPLES = [
+        {"instruction": "Hello", "input": ""},
+        {"instruction": "Tell me a story", "input": "about dragons"},
+        {"instruction": "Summarize", "input": "the article"},
+        {"instruction": "Translate", "input": "to French: hi"},
+    ]
 
     def __len__(self):
-        return self.n
+        return len(self._SAMPLES)
 
     def __getitem__(self, idx):
-        return {
-            "input_ids": torch.randint(3, self.vocab_size, (self.seq_len,)),
-            "attention_mask": torch.ones(self.seq_len, dtype=torch.bool),
-        }
+        return dict(self._SAMPLES[idx])
 
 
 class LengthRewardModel(BaseRewardModel):
@@ -46,6 +63,14 @@ class LengthRewardModel(BaseRewardModel):
             for g in range(G):
                 rewards[i, g] = float(len(responses[i][g]))
         return rewards
+
+
+def instruction_collate_fn(batch):
+    """Stack a list of instruction/input dicts into a batch dict of lists."""
+    return {
+        "instruction": [b["instruction"] for b in batch],
+        "input": [b.get("input", "") for b in batch],
+    }
 
 
 def _model_fn(model_config):
@@ -70,15 +95,16 @@ def test_online_dpo_end_to_end(base_test_env):
     tokenizer = base_test_env["tokenizer"]
     model_config = base_test_env["transformer_config"]
 
-    # base_test_env already wrote config.json into test_dir; we only need
-    # to drop the tokenizer files so AutoTokenizer.from_pretrained works.
+    # Equip tokenizer with a chat template so RolloutGenerator can
+    # render instruction/input via apply_chat_template.
+    tokenizer.set_chat_template(_CHAT_TEMPLATE)
     tokenizer.save_pretrained(test_dir)
 
     model_fn = partial(_model_fn, model_config)
     optimizer_fn = _optimizer_fn
     scheduler_fn = _scheduler_fn
 
-    dataset = PromptDataset(n=4, seq_len=8, vocab_size=model_config.vocab_size)
+    dataset = InstructionDataset()
 
     train_config = TrainConfig(
         strategy="online_dpo",
@@ -103,7 +129,7 @@ def test_online_dpo_end_to_end(base_test_env):
         rollout_top_p=1.0,
         rollout_max_tokens=4,
         reward_model_fn=LengthRewardModel,
-        collate_fn=None,
+        collate_fn=instruction_collate_fn,
     )
 
     trainer = Trainer(train_config)

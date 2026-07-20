@@ -15,7 +15,7 @@ Usage::
 import argparse
 import json
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 
 def _tokenize(text: str) -> List[str]:

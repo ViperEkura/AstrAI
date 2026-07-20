@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
 from torch import Tensor
 
 from astrai.inference.core.scheduler import InferenceScheduler
@@ -33,25 +32,26 @@ class RawRollout:
 
     Fields are designed to cover all common RL algorithms:
     GRPO, PPO, Online DPO, Rejection Sampling, etc.
+
+    Fields:
+        prompts: Tokenized prompts, shape ``[B, P_len]``.
+        responses: Generated response token IDs, shape ``[B, G, R_max]``.
+        response_mask: Boolean mask for real (non-pad) response tokens,
+            shape ``[B, G, R_max]``.
+        logprobs_old: Per-token log-probs under the behaviour policy,
+            shape ``[B, G, R_max]``.
+        prompt_texts: Decoded prompt strings (for reward models that
+            need text).
+        response_texts: Decoded response strings, shape ``[B, G]``
+            (for reward models).
     """
 
     prompts: Tensor
-    """Tokenized prompts, shape ``[B, P_len]``."""
-
     responses: Tensor
-    """Generated response token IDs, shape ``[B, G, R_max]``."""
-
     response_mask: Tensor
-    """Boolean mask for real (non-pad) response tokens, shape ``[B, G, R_max]``."""
-
     logprobs_old: Tensor
-    """Per-token log-probs under the behaviour policy, shape ``[B, G, R_max]``."""
-
     prompt_texts: List[str] = field(default_factory=list)
-    """Decoded prompt strings (for reward models that need text)."""
-
     response_texts: List[List[str]] = field(default_factory=list)
-    """Decoded response strings, shape ``[B, G]`` (for reward models)."""
 
 
 @dataclass(kw_only=True)
@@ -60,10 +60,12 @@ class RolloutResult(RawRollout):
 
     Produced by :class:`RolloutRunner` once the :class:`BaseRewardModel`
     has scored the decoded responses.
+
+    Fields:
+        rewards: Reward per response, shape ``[B, G]``.
     """
 
     rewards: Tensor
-    """Reward per response, shape ``[B, G]``."""
 
 
 class BaseRewardModel(ABC):
@@ -126,26 +128,31 @@ class RolloutGenerator:
         self.rep_window = rep_window
 
     @torch.no_grad()
-    def generate(self, batch: Dict[str, Tensor]) -> RawRollout:
-        """Expand prompts by ``group_size`` and generate one response each."""
-        prompt_ids = batch["input_ids"] if "input_ids" in batch else batch["prompts"]
-        prompt_mask = (
-            batch["attention_mask"] if "attention_mask" in batch else (prompt_ids != 0)
-        )
-        B, _ = prompt_ids.shape
-        G = self.group_size
+    def generate(self, batch: Dict) -> RawRollout:
+        """Expand prompts by ``group_size`` and generate one response each.
 
-        prompt_texts: List[str] = []
-        flat_prompt_ids: List[List[int]] = []
-        for i in range(B):
-            ids = prompt_ids[i, prompt_mask[i]].tolist()
-            text = self.tokenizer.decode(ids, skip_special_tokens=True)
-            for _ in range(G):
-                flat_prompt_ids.append(list(ids))
-            prompt_texts.append(text)
+        Accepted batch formats (per sample, repeated B times):
+
+        - **messages**: ``{"messages": [{"role": "user", "content": "..."}, ...]}``
+        - **instruction + input + output**: ``{"instruction": "...",
+          "input": "...", "output": "..."}`` — mapped to ``system`` /
+          ``user`` / ``assistant`` messages; ``input`` and ``output``
+          are optional and skipped when empty.
+
+        Both are rendered through the tokenizer's chat template with
+        ``add_generation_prompt=True`` so rollout prompts match the
+        format the policy was SFT-trained on.
+        """
+        prompt_texts, flat_prompt_ids = self._prepare_prompts(batch)
+        B = len(prompt_texts)
+        G = self.group_size
+        # Re-expand flat list to G copies per prompt for run_batch.
+        expanded_prompt_ids: List[List[int]] = []
+        for ids in flat_prompt_ids:
+            expanded_prompt_ids.extend([list(ids)] * G)
 
         results = self.scheduler.run_batch(
-            flat_prompt_ids,
+            expanded_prompt_ids,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             top_k=self.top_k,
@@ -161,7 +168,14 @@ class RolloutGenerator:
             max_len = max(max_len, len(token_ids))
         max_len = max(max_len, 1)
 
-        device = prompt_ids.device
+        device = self.scheduler.device
+        P_len = max(len(ids) for ids in flat_prompt_ids)
+        prompts_tensor = torch.zeros(B, P_len, dtype=torch.long, device=device)
+        for i, ids in enumerate(flat_prompt_ids):
+            prompts_tensor[i, : len(ids)] = torch.tensor(
+                ids, dtype=torch.long, device=device
+            )
+
         responses = torch.full((B, G, max_len), _PAD, dtype=torch.long, device=device)
         response_mask = torch.zeros((B, G, max_len), dtype=torch.bool, device=device)
         logprobs_old = torch.zeros((B, G, max_len), dtype=torch.float, device=device)
@@ -186,13 +200,79 @@ class RolloutGenerator:
                 )
 
         return RawRollout(
-            prompts=prompt_ids,
+            prompts=prompts_tensor,
             responses=responses,
             response_mask=response_mask,
             logprobs_old=logprobs_old,
             prompt_texts=prompt_texts,
             response_texts=response_texts,
         )
+
+    def _prepare_prompts(self, batch: Dict) -> Tuple[List[str], List[List[int]]]:
+        """Render batch prompts to ``(texts, token_id_lists)``.
+
+        Returns two parallel lists of length B (number of prompts in
+        the batch).  Dispatches by batch keys:
+
+        - ``"messages"``: treated as a pre-built message list per sample.
+        - ``"instruction"`` (optionally ``"input"`` and ``"output"``): mapped
+          to ``system`` / ``user`` / ``assistant`` messages respectively.
+
+        Both paths go through the tokenizer's chat template with
+        ``add_generation_prompt=True``.
+        """
+        if "messages" in batch:
+            messages_list = batch["messages"]
+        elif "instruction" in batch:
+            instructions = batch["instruction"]
+            B = len(instructions)
+            inputs = batch.get("input") or [""] * B
+            outputs = batch.get("output") or [""] * B
+            messages_list = [
+                self._instruction_to_messages(i, u, o)
+                for i, u, o in zip(instructions, inputs, outputs)
+            ]
+        else:
+            raise ValueError(
+                "Rollout batch must contain either 'messages' or "
+                "'instruction' (optionally 'input'/'output'); got keys: "
+                f"{list(batch.keys())}"
+            )
+
+        prompt_texts: List[str] = []
+        flat_prompt_ids: List[List[int]] = []
+        for messages in messages_list:
+            text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            ids = self.tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
+            prompt_texts.append(text)
+            flat_prompt_ids.append(list(ids))
+        return prompt_texts, flat_prompt_ids
+
+    @staticmethod
+    def _instruction_to_messages(
+        instruction: str, inp: str = "", output: str = ""
+    ) -> List[Dict[str, str]]:
+        """Map instruction/input/output to chat messages.
+
+        Role mapping follows the convention used throughout the
+        preprocessing pipeline: ``instruction`` → system, ``input`` →
+        user, ``output`` → assistant.  Empty fields are skipped so a
+        bare instruction produces a ``[system]`` list and the chat
+        template's ``add_generation_prompt`` adds the assistant header
+        for sampling.
+        """
+        messages: List[Dict[str, str]] = []
+        if instruction:
+            messages.append({"role": "system", "content": instruction})
+        if inp:
+            messages.append({"role": "user", "content": inp})
+        if output:
+            messages.append({"role": "assistant", "content": output})
+        return messages
 
 
 class RolloutRunner:

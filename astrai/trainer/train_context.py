@@ -110,8 +110,6 @@ class TrainContextBuilder:
 
         def _before_wrap(m):
             m = m.to(device=device)
-            if preloaded_state_dict is not None:
-                m.load_state_dict(preloaded_state_dict, strict=False)
             if cfg.lora is not None:
                 inject_lora(
                     m,
@@ -119,6 +117,8 @@ class TrainContextBuilder:
                     alpha=cfg.lora.alpha,
                     target_modules=set(cfg.lora.target_modules),
                 )
+            if preloaded_state_dict is not None:
+                m.load_state_dict(preloaded_state_dict, strict=False)
             return m
 
         context = TrainContext(

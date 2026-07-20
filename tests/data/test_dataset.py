@@ -654,6 +654,92 @@ def test_jsonl_store_sft(base_test_env):
     assert item["loss_mask"].dtype == torch.bool
 
 
+def test_sft_jsonl_default_messages_config(base_test_env):
+    """SFT loads a chat-style JSONL dir with no dataset_config.json.
+
+    Falls back to the built-in messages config: every role except
+    ``assistant`` is masked, loss on assistant only.
+    """
+    test_dir = base_test_env["test_dir"]
+    tokenizer = base_test_env["tokenizer"]
+    tokenizer.set_chat_template(
+        "{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}\n{% endfor %}"
+    )
+    tokenizer_path = _save_test_tokenizer(test_dir, tokenizer)
+
+    data_dir = os.path.join(test_dir, "jsonl_data")
+    os.makedirs(data_dir, exist_ok=True)
+    records = [
+        {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "user", "content": "bye"},
+                {"role": "assistant", "content": "see you"},
+            ]
+        },
+    ]
+    with open(os.path.join(data_dir, "data.jsonl"), "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    dataset = DatasetFactory.load(
+        "sft", data_dir, window_size=8, tokenizer_path=tokenizer_path
+    )
+    assert "sequence" in dataset.keys
+    assert "loss_mask" in dataset.keys
+    assert "position_ids" in dataset.keys
+    assert len(dataset) > 0
+    item = dataset[0]
+    assert "input_ids" in item
+    assert "target_ids" in item
+    assert "loss_mask" in item
+    assert "position_ids" in item
+    assert item["loss_mask"].dtype == torch.bool
+
+
+def test_sft_jsonl_explicit_config_takes_priority(base_test_env):
+    """When dataset_config.json exists, it overrides the default messages config."""
+    test_dir = base_test_env["test_dir"]
+    tokenizer = base_test_env["tokenizer"]
+    tokenizer.set_chat_template(
+        "{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}\n{% endfor %}"
+    )
+    tokenizer_path = _save_test_tokenizer(test_dir, tokenizer)
+
+    data_dir = _write_jsonl_dataset(
+        test_dir,
+        tokenizer_path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            }
+        ],
+        config_overrides={
+            "input": {
+                "sections": [{"field": "messages", "action": "$role", "template": True}]
+            },
+            "mask": {"user": "mask", "assistant": "train"},
+            "mask_default": "mask",
+            "preprocessing": {"max_seq_len": 128},
+            "output": {"position_ids_mode": "doc_reset"},
+        },
+    )
+    dataset = DatasetFactory.load(
+        "sft", data_dir, window_size=8, tokenizer_path=tokenizer_path
+    )
+    assert "sequence" in dataset.keys
+    assert "loss_mask" in dataset.keys
+
+
 def test_jsonl_store_pipeline_config_roundtrip(base_test_env):
     test_dir = base_test_env["test_dir"]
     config_path = os.path.join(test_dir, "dataset_config.json")

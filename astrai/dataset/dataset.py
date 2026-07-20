@@ -346,7 +346,15 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
         if processor is not None:
             store.load(load_path, processor=processor, **kwargs)
         else:
-            store.load(load_path, **kwargs)
+            load_kwargs = dict(kwargs)
+            if (
+                tokenizer_path is not None
+                and storage_type == "jsonl"
+                and train_type in ("seq", "sft")
+                and "tokenizer_path" not in load_kwargs
+            ):
+                load_kwargs["tokenizer_path"] = tokenizer_path
+            store.load(load_path, **load_kwargs)
 
         return cls.create(train_type, store=store)
 

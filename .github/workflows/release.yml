@@ -23,6 +23,7 @@ jobs:
         with:
           name: pure-wheel
           path: dist/*.whl
+          if-no-files-found: error
 
   build-cuda-linux:
     name: Build CUDA wheel (Linux)
@@ -50,6 +51,7 @@ jobs:
         with:
           name: cuda-wheel-linux
           path: dist/*.whl
+          if-no-files-found: error
 
   release:
     name: Attach wheels to release
@@ -58,14 +60,33 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download pure-Python wheel
+        uses: actions/download-artifact@v4
         with:
-          pattern: "*-wheel"
-          merge-multiple: true
+          name: pure-wheel
+          path: release-assets/pure
+
+      - name: Download CUDA wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: cuda-wheel-linux
+          path: release-assets/cuda
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          pure_wheels=(release-assets/pure/*.whl)
+          cuda_wheels=(release-assets/cuda/*.whl)
+          test "${#pure_wheels[@]}" -eq 1
+          test "${#cuda_wheels[@]}" -eq 1
+          test "$(basename "${pure_wheels[0]}")" != "$(basename "${cuda_wheels[0]}")"
 
       - name: Create release & upload assets
         uses: softprops/action-gh-release@v2
         with:
-          files: ./*.whl
+          files: |
+            release-assets/pure/*.whl
+            release-assets/cuda/*.whl
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true

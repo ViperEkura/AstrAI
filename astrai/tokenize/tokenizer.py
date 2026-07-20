@@ -10,6 +10,12 @@ from tokenizers import Tokenizer
 
 from astrai.tokenize.chat_template import ChatTemplate
 
+Message = Dict[str, str]
+"""Single chat message with ``role`` and ``content`` keys."""
+
+Messages = List[Message]
+"""Single conversation — a list of messages."""
+
 
 class AutoTokenizer:
     """Base tokenizer class with automatic loading support"""
@@ -120,7 +126,16 @@ class AutoTokenizer:
         is_pretokenized: bool = False,
         add_special_tokens: bool = True,
     ) -> List:
-        """Encode text to tokens or token IDs."""
+        """Encode text to token IDs.
+
+        Accepts both single strings and batches:
+
+        - ``encode("hello")`` → ``[123, 456]``
+        - ``encode(["hello", "world"])`` → ``[[123, 456], [789]]``
+
+        Batches are tokenised in parallel via the Rust backend's
+        ``encode_batch`` (uses all available CPU cores).
+        """
         if self._tokenizer is None:
             raise RuntimeError(
                 "Tokenizer not initialized. Load or create a tokenizer first."
@@ -133,15 +148,13 @@ class AutoTokenizer:
                 add_special_tokens=add_special_tokens,
             )
             return encoded.ids if out_ids else encoded.tokens
-        else:
-            encoded_list = self._tokenizer.encode_batch(
-                tokens,
-                is_pretokenized=is_pretokenized,
-                add_special_tokens=add_special_tokens,
-            )
-            return [
-                encoded.ids if out_ids else encoded.tokens for encoded in encoded_list
-            ]
+
+        encoded_list = self._tokenizer.encode_batch(
+            tokens,
+            is_pretokenized=is_pretokenized,
+            add_special_tokens=add_special_tokens,
+        )
+        return [encoded.ids if out_ids else encoded.tokens for encoded in encoded_list]
 
     def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
         """Decode token IDs to text."""
@@ -227,45 +240,63 @@ class AutoTokenizer:
 
     def apply_chat_template(
         self,
-        messages: List[Dict[str, str]],
+        messages: Union[Messages, List[Messages]],
         system_prompt: Optional[str] = None,
         tokenize: bool = True,
         add_generation_prompt: bool = True,
         **kwargs,
-    ) -> Union[str, List[int]]:
-        """
-        Apply the chat template to messages and optionally tokenize the result.
+    ) -> Union[str, List[int], List[str], List[List[int]]]:
+        """Apply the chat template and optionally tokenize.
+
+        Accepts both single conversations and batches:
+
+        - ``apply_chat_template([msg1, msg2])`` → ``"..."`` or ``[ids]``
+        - ``apply_chat_template([[msg1, msg2], [msg3]])`` → ``["..", ".."]``
+          or ``[[ids], [ids]]``
+
+        Batches render each conversation list and tokenise all at once via
+        :meth:`encode` (``List[str]`` → Rust parallel ``encode_batch``).
 
         Args:
-            messages: List of message dicts with 'role' and 'content'.
-            system_prompt: Optional system prompt string (auto-converted to first message).
+            messages: Single conversation (``Messages``) or batch of
+                conversations (``BatchMessages``).
+            system_prompt: Optional system prompt prepended (single mode only).
             tokenize: Whether to return token IDs (True) or raw string (False).
-            add_generation_prompt: Whether to add the generation prompt (default: True).
-            **kwargs: Additional variables to pass to the template.
+            add_generation_prompt: Whether to add the generation prompt.
+            **kwargs: Additional template variables.
 
         Returns:
-            Either the rendered string or list of token IDs.
-
-        Raises:
-            RuntimeError: If chat template is not set.
+            Single mode: ``str`` or ``List[int]``.
+            Batch mode: ``List[str]`` or ``List[List[int]]``.
         """
         if self._chat_template is None:
             raise RuntimeError(
                 "Chat template not set. Use set_chat_template() to set a template first."
             )
 
-        # Auto-convert system_prompt to first message if provided
+        is_batch = bool(messages) and isinstance(messages[0], list)
+
+        if is_batch:
+            rendered = [
+                self._chat_template.render(
+                    messages=msgs,
+                    add_generation_prompt=add_generation_prompt,
+                    **kwargs,
+                )
+                for msgs in messages
+            ]
+            if tokenize:
+                return self.encode(rendered)  # List[str] → batch encode
+            return rendered
+
+        # Single conversation
         if system_prompt:
             messages = [{"role": "system", "content": system_prompt}] + list(messages)
-
-        # Render the template
         rendered = self._chat_template.render(
             messages=messages,
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
-
         if tokenize:
             return self.encode(rendered)
-
         return rendered

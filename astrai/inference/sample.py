@@ -276,7 +276,8 @@ class SamplingPipeline(BaseSamplingStrategy):
         filter_value: float = -float("inf"),
         input_ids: Optional[Tensor] = None,
         input_mask: Optional[Tensor] = None,
-    ) -> Tensor:
+        return_logprobs: bool = False,
+    ):
         """Apply strategies then sample (softmax + multinomial).
 
         Short-circuits to ``argmax`` when temperature is exactly 0
@@ -286,21 +287,41 @@ class SamplingPipeline(BaseSamplingStrategy):
             logits: Raw logits ``[batch, vocab_size]``.
             input_ids: Previously generated token IDs ``[batch, seq_len]``.
             input_mask: Boolean mask for ``input_ids`` padding.
+            return_logprobs: If ``True``, return ``(tokens, logprobs)``
+                where ``logprobs[i]`` is the log-probability of
+                ``tokens[i]`` under the (post-strategy) sampling
+                distribution.
 
         Returns:
-            Sampled token IDs ``[batch]``.
+            Sampled token IDs ``[batch]``, or — when ``return_logprobs``
+            is ``True`` — a ``(token_ids, chosen_logprobs)`` tuple.
         """
-        for s in self.strategies:
-            if isinstance(s, TemperatureStrategy) and self._is_greedy(s.temperature):
-                return logits.argmax(dim=-1)
-            break
+        if self._is_greedy_pipeline():
+            tokens = logits.argmax(dim=-1)
+            if not return_logprobs:
+                return tokens
+            log_probs = torch.log_softmax(logits.float(), dim=-1)
+            chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+            return tokens, chosen
 
-        return torch.multinomial(
-            torch.softmax(
-                self.apply(logits, filter_value, input_ids, input_mask), dim=-1
-            ),
-            num_samples=1,
+        transformed = self.apply(logits, filter_value, input_ids, input_mask)
+        log_probs = torch.log_softmax(transformed.float(), dim=-1)
+        tokens = torch.multinomial(
+            torch.softmax(transformed, dim=-1), num_samples=1
         ).squeeze(-1)
+        if not return_logprobs:
+            return tokens
+        chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+        return tokens, chosen
+
+    def _is_greedy_pipeline(self) -> bool:
+        """True if the first strategy is greedy temperature (temp=0)."""
+        if not self.strategies:
+            return False
+        first = self.strategies[0]
+        return isinstance(first, TemperatureStrategy) and self._is_greedy(
+            first.temperature
+        )
 
 
 @torch.inference_mode()
@@ -317,7 +338,7 @@ def sample(
 ):
     """Apply sampling strategies then sample (softmax + multinomial).
 
-    Shortcut for ``SamplingPipeline(...).sample(logits)``.
+    Shortcut for ``SamplingPipeline(...).sample(logits, return_logprobs=)``.
 
     When **temperature** is exactly 0 (scalar or single-element tensor)
     the function short-circuits to ``argmax`` for deterministic decode.
@@ -330,37 +351,25 @@ def sample(
         input_mask: Boolean mask for ``input_ids`` padding.
         return_logprobs: If ``True``, also return the log-probability
             of each sampled token under the (post-strategy) sampling
-            distribution.  Useful for RL rollout: the returned logprob
-            is the behaviour policy's log-prob used in PPO/GRPO
-            importance ratios.
+            distribution — useful for RL rollout (PPO/GRPO importance
+            ratios).
 
     Returns:
         Sampled token IDs ``[batch]``, or — when ``return_logprobs`` is
         ``True`` — a ``(token_ids, chosen_logprobs)`` tuple where
         ``chosen_logprobs`` has shape ``[batch]``.
     """
-    if SamplingPipeline._is_greedy(temperature):
-        tokens = logits.argmax(dim=-1)
-        if not return_logprobs:
-            return tokens
-        log_probs = torch.log_softmax(logits.float(), dim=-1)
-        chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
-        return tokens, chosen
-
-    pipeline = SamplingPipeline(
+    return SamplingPipeline(
         [
             TemperatureStrategy(temperature),
             TopKStrategy(top_k),
             TopPStrategy(top_p),
             FrequencyPenaltyStrategy(frequency_penalty),
         ]
+    ).sample(
+        logits,
+        filter_value=filter_value,
+        input_ids=input_ids,
+        input_mask=input_mask,
+        return_logprobs=return_logprobs,
     )
-    if not return_logprobs:
-        return pipeline.sample(logits, filter_value, input_ids, input_mask)
-
-    transformed = pipeline.apply(logits, filter_value, input_ids, input_mask)
-    log_probs = torch.log_softmax(transformed.float(), dim=-1)
-    probs = torch.softmax(transformed, dim=-1)
-    tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-    chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
-    return tokens, chosen

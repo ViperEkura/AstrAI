@@ -119,17 +119,26 @@ static int run_test(int B, int Hq, int Hk, int ql, int kl, int D, int causal) {
     float* ref=new float[nQ];
     cpu_attention_ref(hQ, hK, hV, nullptr, ref, B, Hq, Hk, ql, kl, D, causal ? 0 : -1);
 
-    float max_err=0;
+    float max_abs_err=0, max_rel_err=0;
     for (size_t i=0;i<nQ;i++) {
-        float d=fabsf(bf2f(hOut[i])-ref[i]);
-        if(d>max_err) max_err=d;
+        float err=fabsf(bf2f(hOut[i])-ref[i]);
+        if(err>max_abs_err) max_abs_err=err;
+        float rel=err/fmaxf(fabsf(ref[i]), 1e-8f);
+        if(rel>max_rel_err) max_rel_err=rel;
     }
-    printf("kernel: %.3f ms  max_err: %.6e\n\n",kms,max_err);
+    const float atol=0.01f, rtol=0.01f;
+    bool pass=true;
+    for (size_t i=0;i<nQ;i++) {
+        float err=fabsf(bf2f(hOut[i])-ref[i]);
+        if (err > atol + rtol * fabsf(ref[i])) { pass=false; break; }
+    }
+    printf("kernel: %.3f ms  max_abs_err: %.6e  max_rel_err: %.6e  %s\n\n",
+           kms, max_abs_err, max_rel_err, pass?"PASS":"FAIL");
 
     cudaFree(dQ);cudaFree(dK);cudaFree(dV);cudaFree(dO);
     delete[]hQ;delete[]hK;delete[]hV;delete[]hOut;delete[]ref;delete[]tmp;
 
-    return (max_err < 0.05f) ? 0 : 1;
+    return pass ? 0 : 1;
 }
 
 int main() {

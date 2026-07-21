@@ -53,7 +53,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
                   + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            qreg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]) * p.scale;
+            qreg[i] = __bfloat162float(p.q[q_off + i * p.q_stride_d]);
     }
 
     float m = -FLT_MAX, l = 0.0f;
@@ -111,7 +111,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
                 for (int j = 0; j < 8; j++)
                     part = fmaf(qreg[i + j], k8[j], part);
             }
-            float dot = group_reduce_sum<G>(part, gmask);
+            float dot = group_reduce_sum<G>(part, gmask) * p.scale;
 
             int kv_idx = kv0 + s;
             if constexpr (HasMask) {
@@ -141,7 +141,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     if (q_row < p.q_len) {
         int o_off = batch * p.q_stride_b + q_head * p.q_stride_h
                   + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
-        float rl = (l > 1e-10f) ? (1.0f / l) : 0.0f;
+        float rl = (l > 1e-20f) ? (1.0f / l) : 0.0f;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
             p.o[o_off + i * p.q_stride_d] = __float2bfloat16(acc[i] * rl);

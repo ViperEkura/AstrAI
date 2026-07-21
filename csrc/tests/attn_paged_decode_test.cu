@@ -135,23 +135,30 @@ static int run_test(int B, int Hq, int Hkv, int kv_len, int page_size, int causa
     for (int i = 0; i < B * Hq * HEAD_DIM; i++)
         h_o_paged[i] = __bfloat162float(h_o_bf16[i]);
 
-    float max_err = 0.0f;
+    float max_abs_err = 0.0f, max_rel_err = 0.0f;
     int bad_idx = -1;
     for (int i = 0; i < B * Hq * HEAD_DIM; i++) {
         float e = fabsf(h_o_paged[i] - h_o_ref[i]);
-        if (e > max_err) { max_err = e; bad_idx = i; }
+        if (e > max_abs_err) { max_abs_err = e; bad_idx = i; }
+        float rel = e / fmaxf(fabsf(h_o_ref[i]), 1e-8f);
+        if (rel > max_rel_err) max_rel_err = rel;
     }
 
-    bool pass = max_err < 0.02f;
+    const float atol = 0.01f, rtol = 0.01f;
+    bool pass = true;
+    for (int i = 0; i < B * Hq * HEAD_DIM; i++) {
+        float e = fabsf(h_o_paged[i] - h_o_ref[i]);
+        if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
+    }
 
     if (pass) {
-        printf("PASS (max_abs_err=%.4e)\n", max_err);
+        printf("PASS (max_abs_err=%.4e max_rel_err=%.4e)\n", max_abs_err, max_rel_err);
     } else {
         int b = bad_idx / (Hq * HEAD_DIM);
         int h = (bad_idx / HEAD_DIM) % Hq;
         int d = bad_idx % HEAD_DIM;
-        printf("FAIL (max_abs_err=%.4e at [%d,%d,%d]: ref=%.4f got=%.4f)\n",
-               max_err, b, h, d, h_o_ref[bad_idx], h_o_paged[bad_idx]);
+        printf("FAIL (max_abs_err=%.4e max_rel_err=%.4e at [%d,%d,%d]: ref=%.4f got=%.4f)\n",
+               max_abs_err, max_rel_err, b, h, d, h_o_ref[bad_idx], h_o_paged[bad_idx]);
         printf("  ref[0..7]:");
         for (int i = 0; i < 8 && i < HEAD_DIM; i++)
             printf(" %.4f", h_o_ref[i]);

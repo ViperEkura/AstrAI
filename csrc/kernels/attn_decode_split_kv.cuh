@@ -84,8 +84,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             int v_off = kv_base + kv_idx * p.kv_stride_l
                         + lane * hd_per_thread * p.kv_stride_d;
             for (int i = 0; i < hd_per_thread; i++)
-                acc_reg[i] = acc_reg[i] * alpha
-                             + __bfloat162float(p.v[v_off + i * p.kv_stride_d]) * beta;
+                acc_reg[i] = fmaf(acc_reg[i], alpha,
+                                  __bfloat162float(p.v[v_off + i * p.kv_stride_d]) * beta);
             m = new_m;
         }
         __syncthreads();
@@ -123,10 +123,10 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
         if (mi <= -FLT_MAX) continue;
         float li = mlp[s * 2 + 1];
         float nm = fmaxf(m, mi);
-        float corr = __expf(m - nm);
-        float e = __expf(mi - nm);
-        acc = acc * corr + op[s * p.head_dim + d] * e;
-        l = l * corr + li * e;
+        float corr = expf(m - nm);
+        float e = expf(mi - nm);
+        acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
+        l = fmaf(l, corr, li * e);
         m = nm;
     }
 

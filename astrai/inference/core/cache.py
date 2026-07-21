@@ -435,24 +435,13 @@ class ContiguousCacheView(CacheView):
             pos = self._write_positions
             self._cache.k[layer_id, indices, pos] = k.squeeze(1)
             self._cache.v[layer_id, indices, pos] = v.squeeze(1)
-            for s, p in zip(indices.tolist(), pos.tolist()):
-                cur = self._cache._slot_len.get(s, 0)
-                if p + 1 > cur:
-                    self._cache._slot_len[s] = p + 1
         else:
             start_pos = self._total_len - seq_len
             self._cache.k[layer_id, indices, start_pos : start_pos + seq_len] = k
             self._cache.v[layer_id, indices, start_pos : start_pos + seq_len] = v
-            new_len = start_pos + seq_len
-            for s in indices.tolist():
-                cur = self._cache._slot_len.get(s, 0)
-                if new_len > cur:
-                    self._cache._slot_len[s] = new_len
 
     def gather(self, layer_id: int) -> Tuple[Tensor, Tensor]:
-        max_len = max(
-            self._cache._slot_len.get(int(s), 0) for s in self._batch_indices.tolist()
-        )
+        max_len = self._total_len
         indices = self._batch_indices
         k = self._cache.k[layer_id, indices, :max_len]
         v = self._cache.v[layer_id, indices, :max_len]
@@ -528,6 +517,9 @@ class ContiguousCache(KVCache):
     ) -> ContiguousCacheView:
         slots = [self._task_slot[tid] for tid in task_ids]
         batch_indices = torch.tensor(slots, dtype=torch.long, device=device)
+        for slot in slots:
+            if total_len > self._slot_len.get(slot, 0):
+                self._slot_len[slot] = total_len
         return ContiguousCacheView(
             self, batch_indices, total_len, write_positions=write_positions
         )

@@ -5,13 +5,6 @@
 
 using bf16 = __nv_bfloat16;
 
-inline int compute_num_splits(int base_blocks, int tiles_total) {
-    int sm_count = 0;
-    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
-    int n = (2 * sm_count + base_blocks - 1) / base_blocks;
-    return std::max(1, std::min(n, std::min(tiles_total, 32)));
-}
-
 // Dispatch head_dim: shared macro — avoids C++20 lambda template syntax.
 // Usage: DISPATCH_HEAD_DIM(hd, fn, arg)
 //   Expands to: fn<32>(arg); fn<64>(arg); etc.

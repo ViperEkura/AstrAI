@@ -18,16 +18,6 @@ inline double now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-inline int compute_num_splits(int base_blocks, int tiles_total) {
-    int sm_count = 0;
-    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
-    int n = (2 * sm_count + base_blocks - 1) / base_blocks;
-    if (n > tiles_total) n = tiles_total;
-    if (n > 32) n = 32;
-    if (n < 1) n = 1;
-    return n;
-}
-
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t _e = (call); \

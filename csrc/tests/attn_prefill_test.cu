@@ -1,68 +1,12 @@
 /*
-Pure-C test — updated for KernelTraits + IsCausal/HasMask.
+Pure-C test — uses shared dispatcher.
 nvcc -I csrc -arch=sm_89 -O3 \
     --use_fast_math --ptxas-options=-O3 --extra-device-vectorization \
     csrc/tests/attn_prefill_test.cu -o test && ./test
 */
 
 #include "test_utils.cuh"
-#include "../kernels/attn_prefill_split_q.cuh"
-#ifndef ASTRAI_NO_MMA
-#include "../kernels/attn_prefill_split_q_mma.cuh"
-#endif
-
-#ifndef ASTRAI_NO_MMA
-template <int HEAD_DIM, bool IsCausal, bool HasMask>
-static void launch_mma_prefill(AttentionParams<bf16>& p) {
-    constexpr int WARPS = 4;
-    constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
-    using Traits = KernelTraits<HEAD_DIM, BC, WARPS, 2>;
-    dim3 grid((p.q_len + Traits::BR * WARPS - 1) / (Traits::BR * WARPS),
-              p.q_head, p.batch);
-    dim3 block(Traits::NUM_THREADS, 1, 1);
-    attn_prefill_split_q_mma_kernel<Traits, IsCausal, HasMask><<<grid, block>>>(p);
-}
-#endif
-
-template <int HEAD_DIM, bool IsCausal, bool HasMask>
-static void launch_scalar_prefill(AttentionParams<bf16>& p) {
-    constexpr int G = 8, ROWS = 32, P_BC = 32;
-    dim3 grid((p.q_len + ROWS - 1) / ROWS, p.q_head, p.batch);
-    dim3 block(G, ROWS, 1);
-    attn_prefill_split_q_kernel_t<HEAD_DIM, G, ROWS, P_BC,
-                                   IsCausal, HasMask><<<grid, block>>>(p);
-}
-
-template <int HEAD_DIM>
-static void launch_prefill_dispatch(AttentionParams<bf16>& p) {
-    bool is_causal = (p.causal_offset >= 0);
-    bool has_mask = (p.use_mask && p.mask);
-#ifndef ASTRAI_NO_MMA
-    if (is_causal) {
-        if (has_mask)      launch_mma_prefill<HEAD_DIM, true,  true>(p);
-        else               launch_mma_prefill<HEAD_DIM, true,  false>(p);
-    } else {
-        if (has_mask)      launch_mma_prefill<HEAD_DIM, false, true>(p);
-        else               launch_mma_prefill<HEAD_DIM, false, false>(p);
-    }
-#else
-    if (is_causal) {
-        if (has_mask)      launch_scalar_prefill<HEAD_DIM, true,  true>(p);
-        else               launch_scalar_prefill<HEAD_DIM, true,  false>(p);
-    } else {
-        if (has_mask)      launch_scalar_prefill<HEAD_DIM, false, true>(p);
-        else               launch_scalar_prefill<HEAD_DIM, false, false>(p);
-    }
-#endif
-}
-
-static void dispatch_prefill(AttentionParams<bf16>& p) {
-    switch (p.head_dim) {
-        case 64:  launch_prefill_dispatch<64>(p);  break;
-        case 128: launch_prefill_dispatch<128>(p); break;
-        default:  printf("bench: unsupported D=%d\n", p.head_dim);
-    }
-}
+#include "../kernels/attn_dispatchers.cuh"
 
 // Warmed-up, CUDA-event timed throughput sweep over the production MMA path.
 static void bench() {
@@ -105,14 +49,15 @@ static void bench() {
         p.scale=1.0f/sqrtf((float)D);
         p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
-        for (int i=0;i<WARMUP;i++) dispatch_prefill(p);
+        auto launch = [&]() { dispatch_by_head_dim(D, [&]<int H>() { dispatch_prefill<H>(p); }); };
+        for (int i=0;i<WARMUP;i++) launch();
         cudaDeviceSynchronize();
         cudaError_t err=cudaGetLastError();
         if (err!=cudaSuccess){printf("CUDA err: %s\n",cudaGetErrorString(err));return;}
 
         cudaEvent_t s,e; cudaEventCreate(&s); cudaEventCreate(&e);
         cudaEventRecord(s);
-        for (int i=0;i<ITERS;i++) dispatch_prefill(p);
+        for (int i=0;i<ITERS;i++) launch();
         cudaEventRecord(e); cudaEventSynchronize(e);
         float ms=0; cudaEventElapsedTime(&ms,s,e); ms/=ITERS;
 
@@ -162,7 +107,7 @@ static int run_test(int B, int Hq, int Hk, int ql, int kl, int D, int causal) {
     p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
 
     double t0=now_ms();
-    dispatch_prefill(p);
+    dispatch_by_head_dim(D, [&]<int H>() { dispatch_prefill<H>(p); });
     cudaDeviceSynchronize();
     double kms=now_ms()-t0;
     cudaError_t err=cudaGetLastError();

@@ -18,12 +18,13 @@ when available, otherwise falls back to ``torch.nn.functional.scaled_dot_product
 """
 
 from astrai.extension.loader import KERNEL_NAMES, is_available
-from astrai.extension.ops import attn_decode, attn_paged_decode, attn_prefill
+from astrai.extension.ops import attention, attn_decode, attn_paged_decode, attn_prefill
 
 __all__ = [
     "attn_decode",
     "attn_paged_decode",
     "attn_prefill",
+    "attention",
     "is_available",
     "KERNEL_NAMES",
 ]

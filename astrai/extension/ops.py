@@ -244,3 +244,55 @@ def attn_paged_decode(
     return _torch_fallback(
         q, k, v, mask, causal_offset, scale, q_layout=li, kv_layout=1
     )
+
+
+def attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    causal_offset: int = -1,
+    scale: float = 0.0,
+    layout: str = "bhld",
+) -> torch.Tensor:
+    """Dispatch to decode or prefill attention based on the query length.
+
+    A query length of one is the decode case; longer queries use prefill.
+    The paged-cache decode path cannot be selected here because its page-table
+    arguments are not part of this interface.
+    """
+    li = _parse_layout(layout)
+
+    if q.ndim not in (2, 3, 4) or k.ndim != q.ndim or v.ndim != q.ndim:
+        raise ValueError(
+            "q, k, and v must all have the same rank in {2, 3, 4}, "
+            f"got {q.ndim}D, {k.ndim}D, {v.ndim}D"
+        )
+    if k.shape != v.shape:
+        raise ValueError(
+            f"k and v must have the same shape, got {k.shape} and {v.shape}"
+        )
+
+    original_ndim = q.ndim
+    if original_ndim == 2:
+        # [L, D] -> [1, 1, L, D] or [1, L, 1, D]
+        q = q.unsqueeze(0).unsqueeze(1 if li == 0 else 2)
+        k = k.unsqueeze(0).unsqueeze(1 if li == 0 else 2)
+        v = v.unsqueeze(0).unsqueeze(1 if li == 0 else 2)
+    elif original_ndim == 3:
+        # [B, L, D] -> single-head 4D input.
+        q = q.unsqueeze(1 if li == 0 else 2)
+        k = k.unsqueeze(1 if li == 0 else 2)
+        v = v.unsqueeze(1 if li == 0 else 2)
+
+    q_len = q.size(2 if li == 0 else 1)
+    if q_len == 1:
+        out = attn_decode(q, k, v, mask, causal_offset, scale, layout)
+    else:
+        out = attn_prefill(q, k, v, mask, causal_offset, scale, layout)
+
+    if original_ndim == 2:
+        return out.squeeze(0).squeeze(0 if li == 0 else 1)
+    if original_ndim == 3:
+        return out.squeeze(1 if li == 0 else 2)
+    return out

@@ -12,7 +12,7 @@ __device__ inline float paged_warp_reduce_sum(float val) {
     return val;
 }
 
-// Split-KV scalar decode: one warp per query head, grid.z partitions KV.
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
 __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) {
     int batch = blockIdx.x / p.kv_head;
     int kv_head = blockIdx.x % p.kv_head;
@@ -22,7 +22,6 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
     int lane = threadIdx.x;
     int hd_per_thread = p.head_dim / 32;
 
-    // Q: stride-based [batch, q_head, q_len=1, head_dim]
     float q_reg[8];
     int q_off = batch * p.q_stride_b + q_head * p.q_stride_h
               + lane * hd_per_thread * p.q_stride_d;
@@ -46,7 +45,8 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
         int this_chunk = min(PDC_CHUNK, p.kv_len - chunk_start);
 
         int total = this_chunk * p.head_dim;
-        for (int i = threadIdx.y * 32 + lane; i < total; i += blockDim.x * blockDim.y) {
+        for (int i = threadIdx.y * 32 + lane; i < total;
+             i += blockDim.x * blockDim.y) {
             int s = i / p.head_dim;
             int d_dim = i % p.head_dim;
             int pos = chunk_start + s;
@@ -69,14 +69,19 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
             float partial = 0.0f;
             #pragma unroll
             for (int i = 0; i < hd_per_thread; i++)
-                partial += q_reg[i] * __bfloat162float(k_smem[s * p.head_dim + lane * hd_per_thread + i]);
+                partial += q_reg[i] * __bfloat162float(
+                    k_smem[s * p.head_dim + lane * hd_per_thread + i]);
             partial = paged_warp_reduce_sum(partial) * p.scale;
 
             int kv_idx = chunk_start + s;
-            if (p.use_mask && p.mask && !p.mask[mask_base + kv_idx])
-                partial = -FLT_MAX;
-            if (p.causal_offset >= 0 && kv_idx > p.causal_offset)
-                partial = -FLT_MAX;
+            if constexpr (HasMask) {
+                if (!p.mask[mask_base + kv_idx])
+                    partial = -FLT_MAX;
+            }
+            if constexpr (IsCausal) {
+                if (kv_idx > p.causal_offset)
+                    partial = -FLT_MAX;
+            }
 
             float new_m = fmaxf(m, partial);
             float alpha = expf(m - new_m);
@@ -93,7 +98,8 @@ __global__ void paged_attn_decode_split_kv_kernel(PagedAttentionParams<bf16> p) 
                                + (int64_t)kv_head * p.head_dim;
                 #pragma unroll
                 for (int i = 0; i < hd_per_thread; i++)
-                    acc_reg[i] = acc_reg[i] * alpha + __bfloat162float(p.v_cache[v_base + lane * hd_per_thread + i]) * beta;
+                    acc_reg[i] = acc_reg[i] * alpha
+                                 + __bfloat162float(p.v_cache[v_base + lane * hd_per_thread + i]) * beta;
             } else {
                 #pragma unroll
                 for (int i = 0; i < hd_per_thread; i++)

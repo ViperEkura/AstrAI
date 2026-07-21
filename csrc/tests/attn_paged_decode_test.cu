@@ -36,34 +36,63 @@ static void gather_kv_cpu(
     }
 }
 
+#ifndef ASTRAI_NO_MMA
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
+static void launch_paged_mma_decode(PagedAttentionParams<bf16, float>& p) {
+    constexpr int STAGES = (HEAD_DIM <= 128) ? 2 : 1;
+    using Traits = KernelTraits<HEAD_DIM, 32, 1, STAGES>;
+    int tiles_total = (p.kv_len + 32 - 1) / 32;
+    p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
+    paged_attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask>
+        <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
+}
+#endif
+
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
+static void launch_paged_scalar_decode(PagedAttentionParams<bf16, float>& p) {
+    int group_sz = p.q_head / p.kv_head;
+    int chunks_total = (p.kv_len + PDC_CHUNK - 1) / PDC_CHUNK;
+    p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
+    size_t smem = PDC_CHUNK * p.head_dim * sizeof(bf16);
+    paged_attn_decode_split_kv_kernel<HEAD_DIM, IsCausal, HasMask><<<
+        dim3(p.batch * p.kv_head, 1, p.num_splits),
+        dim3(32, group_sz), smem>>>(p);
+}
+
 template <int HEAD_DIM>
 static void launch_paged_decode(PagedAttentionParams<bf16, float>& p) {
+    bool is_causal = (p.causal_offset >= 0);
+    bool has_mask = (p.use_mask && p.mask);
+
 #ifndef ASTRAI_NO_MMA
     int G_check = p.q_head / p.kv_head;
-    bool use_mma = !p.use_mask && G_check >= 1 && G_check <= 16 && p.page_size >= 32;
+    bool use_mma = G_check >= 1 && G_check <= 16 && p.page_size >= 32;
     if (use_mma) {
-        constexpr int STAGES = (HEAD_DIM <= 128) ? 2 : 1;
-        int tiles_total = (p.kv_len + 32 - 1) / 32;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
-        paged_attn_decode_split_kv_mma_kernel<HEAD_DIM, 32, STAGES>
-            <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
+        if (is_causal) {
+            if (has_mask)      launch_paged_mma_decode<HEAD_DIM, true,  true>(p);
+            else               launch_paged_mma_decode<HEAD_DIM, true,  false>(p);
+        } else {
+            if (has_mask)      launch_paged_mma_decode<HEAD_DIM, false, true>(p);
+            else               launch_paged_mma_decode<HEAD_DIM, false, false>(p);
+        }
     } else
 #endif
     {
-        int group_sz = p.q_head / p.kv_head;
-        int chunks_total = (p.kv_len + PDC_CHUNK - 1) / PDC_CHUNK;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
-        size_t smem = PDC_CHUNK * p.head_dim * sizeof(bf16);
-        paged_attn_decode_split_kv_kernel<<<
-            dim3(p.batch * p.kv_head, 1, p.num_splits),
-            dim3(32, group_sz), smem>>>(p);
+        if (is_causal) {
+            if (has_mask)      launch_paged_scalar_decode<HEAD_DIM, true,  true>(p);
+            else               launch_paged_scalar_decode<HEAD_DIM, true,  false>(p);
+        } else {
+            if (has_mask)      launch_paged_scalar_decode<HEAD_DIM, false, true>(p);
+            else               launch_paged_scalar_decode<HEAD_DIM, false, false>(p);
+        }
     }
     paged_attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 
 template <int HEAD_DIM>
-static int run_test(int B, int Hq, int Hkv, int kv_len, int page_size, int seed) {
-    printf("B=%d Hq=%d Hkv=%d kv_len=%d page_sz=%d head_dim=%d ... ", B, Hq, Hkv, kv_len, page_size, HEAD_DIM);
+static int run_test(int B, int Hq, int Hkv, int kv_len, int page_size, int causal, int seed) {
+    printf("B=%d Hq=%d Hkv=%d kv_len=%d page_sz=%d head_dim=%d causal=%d ... ",
+           B, Hq, Hkv, kv_len, page_size, HEAD_DIM, causal);
     fflush(stdout);
 
     int max_pages = (kv_len + page_size - 1) / page_size;
@@ -138,13 +167,14 @@ static int run_test(int B, int Hq, int Hkv, int kv_len, int page_size, int seed)
     }
 
     float* h_o_ref = (float*)calloc(B * Hq * HEAD_DIM, sizeof(float));
-    cpu_attention_ref(h_q_f, h_k_f, h_v_f, nullptr, h_o_ref, B, Hq, Hkv, 1, kv_len, HEAD_DIM, -1);
+    cpu_attention_ref(h_q_f, h_k_f, h_v_f, nullptr, h_o_ref, B, Hq, Hkv,
+                      1, kv_len, HEAD_DIM, causal ? 0 : -1);
 
     float scale_val = 1.0f / sqrtf((float)HEAD_DIM);
     PagedAttentionParams<bf16, float> p;
     p.batch = B; p.q_head = Hq; p.kv_head = Hkv; p.q_len = 1;
     p.kv_len = kv_len; p.head_dim = HEAD_DIM;
-    p.use_mask = 0; p.causal_offset = -1;
+    p.use_mask = 0; p.causal_offset = causal ? 0 : -1;
     set_default_paged_strides(p);
     p.num_splits = 1; p.scale = scale_val;
     p.page_size = page_size; p.max_pages = max_pages;
@@ -201,25 +231,24 @@ static int run_test(int B, int Hq, int Hkv, int kv_len, int page_size, int seed)
 
 struct TestCase {
     int head_dim;
-    int B, Hq, Hkv, kv_len, page_size, seed;
+    int B, Hq, Hkv, kv_len, page_size, causal, seed;
 };
 
 static const TestCase TESTS[] = {
-    {128, 1, 1, 1, 8, 128, 1},
-    {128, 1, 4, 4, 128, 128, 2},
-    {128, 2, 4, 4, 256, 128, 3},
-    {128, 1, 4, 1, 64, 64, 4},
-    {128, 1, 8, 2, 64, 128, 5},
-    {128, 2, 16, 4, 128, 128, 6},
-    {64, 1, 4, 2, 32, 128, 7},
-    {256, 1, 2, 1, 16, 128, 8},
-    {32, 1, 4, 2, 32, 64, 9},
-    {128, 3, 8, 2, 256, 128, 10},
-    {128, 2, 32, 8, 512, 128, 11},
-#ifndef ASTRAI_NO_MMA
-    {128, 1, 16, 2, 256, 128, 12},
-    {128, 2, 32, 4, 512, 128, 13},
-#endif
+    {128, 1, 1, 1, 8, 128, 0, 1},
+    {128, 1, 4, 4, 128, 128, 0, 2},
+    {128, 2, 4, 4, 256, 128, 0, 3},
+    {128, 1, 4, 1, 64, 64, 0, 4},
+    {128, 1, 8, 2, 64, 128, 0, 5},
+    {128, 2, 16, 4, 128, 128, 0, 6},
+    {64, 1, 4, 2, 32, 128, 0, 7},
+    {256, 1, 2, 1, 16, 128, 0, 8},
+    {32, 1, 4, 2, 32, 64, 0, 9},
+    {128, 3, 8, 2, 256, 128, 0, 10},
+    {128, 2, 32, 8, 512, 128, 0, 11},
+    {128, 1, 16, 2, 256, 128, 0, 12},
+    {128, 2, 32, 4, 512, 128, 0, 13},
+    {128, 2, 8, 2, 128, 128, 1, 14},   // causal paged decode
 };
 
 static int dispatch_test(const TestCase& tc) {
@@ -227,13 +256,11 @@ static int dispatch_test(const TestCase& tc) {
     int r = 0;
     dispatch_by_head_dim(tc.head_dim, [&]<int D>() {
         matched = true;
-        r = run_test<D>(tc.B, tc.Hq, tc.Hkv, tc.kv_len, tc.page_size, tc.seed);
+        r = run_test<D>(tc.B, tc.Hq, tc.Hkv, tc.kv_len, tc.page_size, tc.causal, tc.seed);
     });
     return matched ? r : 1;
 }
 
-// Warmed-up, CUDA-event timed sweep over paged decode configs.
-// Bytes = K + V read through page table (B*Hk*kv*D each), bf16.
 template <int HEAD_DIM>
 static void bench_config(int B, int Hq, int Hkv, int kv_len, int page_size) {
     int max_pages = (kv_len + page_size - 1) / page_size;

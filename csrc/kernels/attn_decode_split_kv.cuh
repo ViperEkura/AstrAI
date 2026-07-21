@@ -12,6 +12,7 @@ __device__ inline float warp_reduce_sum(float val) {
     return val;
 }
 
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
 __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     int batch = blockIdx.x / p.kv_head;
     int kv_head = blockIdx.x % p.kv_head;
@@ -48,7 +49,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
 
         // Load K into shared memory (gather from strided global)
         int total = this_chunk * p.head_dim;
-        for (int i = threadIdx.y * 32 + lane; i < total; i += blockDim.x * blockDim.y) {
+        for (int i = threadIdx.y * 32 + lane; i < total;
+             i += blockDim.x * blockDim.y) {
             int s = i / p.head_dim;
             int d_dim = i % p.head_dim;
             int kv_idx = chunk_start + s;
@@ -60,24 +62,30 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
         for (int s = 0; s < this_chunk; s++) {
             float partial = 0.0f;
             for (int i = 0; i < hd_per_thread; i++)
-                partial += q_reg[i] * __bfloat162float(k_smem[s * p.head_dim + lane * hd_per_thread + i]);
+                partial += q_reg[i] * __bfloat162float(
+                    k_smem[s * p.head_dim + lane * hd_per_thread + i]);
             partial = warp_reduce_sum(partial) * p.scale;
 
             int kv_idx = chunk_start + s;
-            if (p.use_mask && p.mask && !p.mask[mask_base + kv_idx])
-                partial = -FLT_MAX;
-            if (p.causal_offset >= 0 && kv_idx > p.causal_offset)
-                partial = -FLT_MAX;
+            if constexpr (HasMask) {
+                if (!p.mask[mask_base + kv_idx])
+                    partial = -FLT_MAX;
+            }
+            if constexpr (IsCausal) {
+                if (kv_idx > p.causal_offset)
+                    partial = -FLT_MAX;
+            }
 
             float new_m = fmaxf(m, partial);
             float alpha = expf(m - new_m);
             float beta  = expf(partial - new_m);
             d = d * alpha + beta;
 
-            // V: stride-based read
-            int v_off = kv_base + kv_idx * p.kv_stride_l + lane * hd_per_thread * p.kv_stride_d;
+            int v_off = kv_base + kv_idx * p.kv_stride_l
+                        + lane * hd_per_thread * p.kv_stride_d;
             for (int i = 0; i < hd_per_thread; i++)
-                acc_reg[i] = acc_reg[i] * alpha + __bfloat162float(p.v[v_off + i * p.kv_stride_d]) * beta;
+                acc_reg[i] = acc_reg[i] * alpha
+                             + __bfloat162float(p.v[v_off + i * p.kv_stride_d]) * beta;
             m = new_m;
         }
         __syncthreads();
@@ -97,9 +105,6 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
     }
 }
 
-// Reduce split-K partials into the final bf16 output. One block per (batch,
-// q_head); each thread folds across all splits with a single-pass
-// online-rescale reduction (expf + FMA counts halved vs 3-pass original).
 __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     int bh = blockIdx.x;
     int d = threadIdx.x;
@@ -126,7 +131,6 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
     }
 
     float inv = (l > 1e-20f) ? (1.0f / l) : 0.0f;
-    // Stride-based output write (q_len=1 for decode, so stride_l not needed)
     int o_off = batch * p.q_stride_b + q_head * p.q_stride_h + d * p.q_stride_d;
     p.o[o_off] = __float2bfloat16(acc * inv);
 }

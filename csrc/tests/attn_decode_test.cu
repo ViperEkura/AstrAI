@@ -1,5 +1,5 @@
 /*
-Pure-C test:
+Pure-C test — updated for KernelTraits + IsCausal/HasMask.
 nvcc -I csrc -arch=sm_89 -O3 \
     --use_fast_math --ptxas-options=-O3 --extra-device-vectorization \
     csrc/tests/attn_decode_test.cu -o test && ./test
@@ -11,35 +11,29 @@ nvcc -I csrc -arch=sm_89 -O3 \
 #include "../kernels/attn_decode_split_kv_mma.cuh"
 #endif
 
-// Split-K scratch (torch-free): the production launcher allocates these from
-// torch; here we pass pre-allocated device buffers so the bench loop doesn't
-// pay a cudaMalloc per iteration. Size for the maximum split count (32).
+// Split-K scratch (torch-free)
 struct DecodeScratch {
     float* o_part = nullptr;
     float* ml_part = nullptr;
 };
 
-// Launch the production decode path (tensor-core head-packing MMA on sm_80+,
-// scalar fallback otherwise), mirroring dispatch_decode() in attn_decode.cu.
 #ifndef ASTRAI_NO_MMA
-static bool decode_use_mma(const AttentionParams<bf16>& p) {
-    int G = p.q_head / p.kv_head;
-    return !p.use_mask && G > 1 && G <= 16;
-}
-
-template <int HEAD_DIM, int BC, int STAGES = (HEAD_DIM <= 128) ? 2 : 1>
+template <int HEAD_DIM, int BC, bool IsCausal, bool HasMask>
 static void launch_mma_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
+    constexpr int STAGES = (HEAD_DIM <= 128) ? 2 : 1;
+    using Traits = KernelTraits<HEAD_DIM, BC, 1, STAGES>;
     int tiles_total = (p.kv_len + BC - 1) / BC;
     p.num_splits = compute_num_splits(p.batch * p.kv_head, tiles_total);
     p.o_part = sc.o_part;
     p.ml_part = sc.ml_part;
 
-    attn_decode_split_kv_mma_kernel<HEAD_DIM, BC, STAGES>
+    attn_decode_split_kv_mma_kernel<Traits, IsCausal, HasMask>
         <<<dim3(p.kv_head, p.batch, p.num_splits), 32>>>(p);
     attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 #endif
 
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
 static void launch_scalar_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     int gs = p.q_head / p.kv_head;
     int chunks_total = (p.kv_len + DC_CHUNK - 1) / DC_CHUNK;
@@ -48,16 +42,36 @@ static void launch_scalar_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
     p.ml_part = sc.ml_part;
 
     size_t smem = DC_CHUNK * p.head_dim * sizeof(bf16);
-    attn_decode_split_kv_kernel<<<dim3(p.batch * p.kv_head, 1, p.num_splits), dim3(32, gs), smem>>>(p);
+    attn_decode_split_kv_kernel<HEAD_DIM, IsCausal, HasMask>
+        <<<dim3(p.batch * p.kv_head, 1, p.num_splits), dim3(32, gs), smem>>>(p);
     attn_decode_combine_kernel<<<p.batch * p.q_head, p.head_dim>>>(p);
 }
 
 template <int HEAD_DIM>
 static void dispatch_decode_t(AttentionParams<bf16>& p, DecodeScratch& sc) {
+    bool is_causal = (p.causal_offset >= 0);
+    bool has_mask = (p.use_mask && p.mask);
+
 #ifndef ASTRAI_NO_MMA
-    if (decode_use_mma(p)) { launch_mma_decode<HEAD_DIM, 32>(p, sc); return; }
+    int G = p.q_head / p.kv_head;
+    if (G >= 1 && G <= 16) {
+        if (is_causal) {
+            if (has_mask)      launch_mma_decode<HEAD_DIM, 32, true,  true>(p, sc);
+            else               launch_mma_decode<HEAD_DIM, 32, true,  false>(p, sc);
+        } else {
+            if (has_mask)      launch_mma_decode<HEAD_DIM, 32, false, true>(p, sc);
+            else               launch_mma_decode<HEAD_DIM, 32, false, false>(p, sc);
+        }
+        return;
+    }
 #endif
-    launch_scalar_decode(p, sc);
+    if (is_causal) {
+        if (has_mask)      launch_scalar_decode<HEAD_DIM, true,  true>(p, sc);
+        else               launch_scalar_decode<HEAD_DIM, true,  false>(p, sc);
+    } else {
+        if (has_mask)      launch_scalar_decode<HEAD_DIM, false, true>(p, sc);
+        else               launch_scalar_decode<HEAD_DIM, false, false>(p, sc);
+    }
 }
 
 static void dispatch_decode(AttentionParams<bf16>& p, DecodeScratch& sc) {
@@ -123,77 +137,92 @@ static void bench() {
     }
 }
 
+static int run_test(int B, int Hq, int Hk, int sl, int D, int causal) {
+    int gs = Hq / Hk;
+    printf("=== B=%d Hq=%d Hk=%d seq=%d D=%d gs=%d causal=%d ===\n",
+           B,Hq,Hk,sl,D,gs,causal);
+
+    size_t nQ = B*Hq*1*D, nKV = B*Hk*sl*D;
+    float *hQ=new float[nQ], *hK=new float[nKV], *hV=new float[nKV];
+    for (size_t i=0;i<nQ;i++) hQ[i]=randf();
+    for (size_t i=0;i<nKV;i++){hK[i]=randf();hV[i]=randf();}
+
+    bool* hMask=new bool[B*sl];
+    for (int i=0;i<B*sl;i++) hMask[i]=true;
+
+    bf16 *dQ,*dK,*dV,*dO,*tmp;
+    bool* dMask;
+    cudaMalloc(&dQ,nQ*2); cudaMalloc(&dK,nKV*2);
+    cudaMalloc(&dV,nKV*2); cudaMalloc(&dO,nQ*2);
+    cudaMalloc(&dMask,B*sl);
+
+    tmp=new bf16[max(nQ,nKV)];
+    for (size_t i=0;i<nQ;i++) tmp[i]=f2bf(hQ[i]);
+    cudaMemcpy(dQ,tmp,nQ*2,cudaMemcpyHostToDevice);
+    for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(hK[i]);
+    cudaMemcpy(dK,tmp,nKV*2,cudaMemcpyHostToDevice);
+    for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(hV[i]);
+    cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
+    cudaMemcpy(dMask,hMask,B*sl,cudaMemcpyHostToDevice);
+
+    AttentionParams<bf16> p;
+    p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
+    p.use_mask=0; p.causal_offset=causal?0:-1;
+    p.scale=1.0f/sqrtf((float)D);
+    set_default_strides(p);
+    p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
+
+    DecodeScratch sc;
+    cudaMalloc(&sc.o_part, (size_t)B*Hq*32*D*sizeof(float));
+    cudaMalloc(&sc.ml_part, (size_t)B*Hq*32*2*sizeof(float));
+
+    double t0=now_ms();
+    dispatch_decode(p, sc);
+    cudaDeviceSynchronize();
+    double kms=now_ms()-t0;
+    cudaError_t err=cudaGetLastError();
+    if (err!=cudaSuccess){printf("CUDA err: %s\n",cudaGetErrorString(err));return 1;}
+
+    bf16* hOut=new bf16[nQ];
+    cudaMemcpy(hOut,dO,nQ*2,cudaMemcpyDeviceToHost);
+
+    float* ref=new float[nQ];
+    cpu_attention_ref(hQ, hK, hV, hMask, ref, B, Hq, Hk, 1, sl, D, causal ? 0 : -1);
+
+    float max_err=0;
+    for (size_t i=0;i<nQ;i++){
+        float d=fabsf(bf2f(hOut[i])-ref[i]);
+        if(d>max_err) max_err=d;
+    }
+    printf("kernel: %.3f ms  max_err: %.6e\n\n",kms,max_err);
+
+    cudaFree(dQ);cudaFree(dK);cudaFree(dV);cudaFree(dO);cudaFree(dMask);
+    cudaFree(sc.o_part);cudaFree(sc.ml_part);
+    delete[]hQ;delete[]hK;delete[]hV;delete[]hMask;delete[]hOut;delete[]ref;delete[]tmp;
+
+    return (max_err < 0.05f) ? 0 : 1;
+}
+
 int main() {
-    const int configs[][5] = {
-        {1, 2, 1, 64, 32},    // B,Hq,Hk,seq_len,D
-        {1, 32, 4, 512, 128},
-        {1, 32, 4, 1024, 128},
+    const int configs[][6] = {
+        {1, 2, 1, 64, 32, 0},     // B,Hq,Hk,seq_len,D,causal
+        {1, 32, 4, 512, 128, 0},
+        {1, 32, 4, 1024, 128, 0},
+        {1, 32, 4, 512, 128, 1},   // causal decode
     };
     int n_cfgs = sizeof(configs) / sizeof(configs[0]);
+    int fail = 0;
 
     for (int ci = 0; ci < n_cfgs; ci++) {
         int B = configs[ci][0], Hq = configs[ci][1], Hk = configs[ci][2];
-        int sl = configs[ci][3], D = configs[ci][4], gs = Hq / Hk;
-        printf("=== B=%d Hq=%d Hk=%d seq=%d D=%d gs=%d ===\n", B,Hq,Hk,sl,D,gs);
+        int sl = configs[ci][3], D = configs[ci][4], causal = configs[ci][5];
+        fail += run_test(B, Hq, Hk, sl, D, causal);
+        if (fail) break;
+    }
 
-        size_t nQ = B*Hq*1*D, nKV = B*Hk*sl*D;
-        float *hQ=new float[nQ], *hK=new float[nKV], *hV=new float[nKV];
-        for (size_t i=0;i<nQ;i++) hQ[i]=randf();
-        for (size_t i=0;i<nKV;i++){hK[i]=randf();hV[i]=randf();}
-
-        bool* hMask=new bool[B*sl];
-        for (int i=0;i<B*sl;i++) hMask[i]=true;
-
-        bf16 *dQ,*dK,*dV,*dO,*tmp;
-        bool* dMask;
-        cudaMalloc(&dQ,nQ*2); cudaMalloc(&dK,nKV*2);
-        cudaMalloc(&dV,nKV*2); cudaMalloc(&dO,nQ*2);
-        cudaMalloc(&dMask,B*sl);
-
-        tmp=new bf16[max(nQ,nKV)];
-        for (size_t i=0;i<nQ;i++) tmp[i]=f2bf(hQ[i]);
-        cudaMemcpy(dQ,tmp,nQ*2,cudaMemcpyHostToDevice);
-        for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(hK[i]);
-        cudaMemcpy(dK,tmp,nKV*2,cudaMemcpyHostToDevice);
-        for (size_t i=0;i<nKV;i++) tmp[i]=f2bf(hV[i]);
-        cudaMemcpy(dV,tmp,nKV*2,cudaMemcpyHostToDevice);
-        cudaMemcpy(dMask,hMask,B*sl,cudaMemcpyHostToDevice);
-
-        AttentionParams<bf16> p;
-        p.batch=B; p.q_head=Hq; p.kv_head=Hk; p.q_len=1; p.kv_len=sl; p.head_dim=D;
-        p.use_mask=0; p.causal_offset=-1;
-        p.scale=1.0f/sqrtf((float)D);
-        set_default_strides(p);
-        p.q=dQ; p.k=dK; p.v=dV; p.mask=nullptr; p.o=dO;
-
-        // Split-K scratch (max 32 splits), sized for the production MMA path.
-        DecodeScratch sc;
-        cudaMalloc(&sc.o_part, (size_t)B*Hq*32*D*sizeof(float));
-        cudaMalloc(&sc.ml_part, (size_t)B*Hq*32*2*sizeof(float));
-
-        double t0=now_ms();
-        dispatch_decode(p, sc);
-        cudaDeviceSynchronize();
-        double kms=now_ms()-t0;
-        cudaError_t err=cudaGetLastError();
-        if (err!=cudaSuccess){printf("CUDA err: %s\n",cudaGetErrorString(err));return 1;}
-
-        bf16* hOut=new bf16[nQ];
-        cudaMemcpy(hOut,dO,nQ*2,cudaMemcpyDeviceToHost);
-
-        float* ref=new float[nQ];
-        cpu_attention_ref(hQ, hK, hV, hMask, ref, B, Hq, Hk, 1, sl, D, -1);
-
-        float max_err=0;
-        for (size_t i=0;i<nQ;i++){
-            float d=fabsf(bf2f(hOut[i])-ref[i]);
-            if(d>max_err) max_err=d;
-        }
-        printf("kernel: %.3f ms  max_err: %.6e\n\n",kms,max_err);
-
-        cudaFree(dQ);cudaFree(dK);cudaFree(dV);cudaFree(dO);cudaFree(dMask);
-        cudaFree(sc.o_part);cudaFree(sc.ml_part);
-        delete[]hQ;delete[]hK;delete[]hV;delete[]hMask;delete[]hOut;delete[]ref;delete[]tmp;
+    if (fail) {
+        printf("FAILED\n");
+        return fail;
     }
     printf("All tests passed!\n");
     bench();

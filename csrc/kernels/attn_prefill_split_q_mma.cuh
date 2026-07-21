@@ -4,121 +4,76 @@
 #include "attn_common.h"
 #include "attn_mma_utils.cuh"
 
-using bf16 = __nv_bfloat16;
-
 // Tensor-core prefill flash attention (raw mma.sync PTX).
 // One warp owns BR=16 query rows. S = Q@K^T and O = P@V run on bf16 tensor
-// cores via mma.sync.m16n8k16 (f32 accumulate). Q fragments are loaded once
-// straight from global into the mma A-operand layout (no smem staging) and
-// kept resident in registers across the tile loop. S, O, and the online-softmax
-// stats (m, l) also live in registers.
-// Shared memory is statically sized via template parameters — no dynamic
-// allocation. The mma fragment layout is used directly: the S accumulator
-// (f32) maps element-for-element onto the P matrix_a (bf16) operand, so
-// softmax needs no shuffle repack; row reductions fold across the 4-lane
-// thread group. Templated on <HEAD_DIM, WARPS, BC> with BC a multiple of 16.
+// cores via mma.sync.m16n8k16 (f32 accumulate).
 //
-// Software pipeline: K/V are double-buffered and loaded via cp.async one tile
-// ahead, so the next tile streams from global memory while the current tile's
-// tensor-core math runs — hiding load latency (long_scoreboard). A single
-// __syncthreads per tile both publishes the freshly loaded tile cross-warp and
-// (because it runs before the next prefetch) guards the buffer being refilled,
-// so no second barrier is needed. Predicated cp.async (cp_async_16_pred)
-// zero-fills rows past kv_len, unifying full and partial tiles on one path.
-// BC=32 (D<=128) amortizes the per-tile wait+barrier+loop overhead over more
-// tensor-core work — this kernel is latency-bound (low occupancy from high
-// register pressure), so fewer, larger tiles beat many tiny ones.
+// IsCausal and HasMask are compile-time bools — the compiler eliminates all
+// dead branches in the inner compute loop (FA2-style).
 //
-// Optimizations: load Q fragments directly from global in mma A-operand layout
-// (no sQ staging, no prologue barriers); post-multiply scale in float after
-// S=Q@K^T to avoid bf16 precision loss; packed bf16x2 output stores;
-// causal tile skipping (block-level prefetch bound + warp-level compute skip);
-// XOR swizzle (swiz_col) → eliminates ldmatrix bank conflicts without LD
-// padding (LD=HEAD_DIM).
-
-template <int HEAD_DIM, int WARPS, int BC>
+// Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2>.
+template <typename Traits, bool IsCausal, bool HasMask>
 __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
-    constexpr int BR = 16;
-    constexpr int KD = HEAD_DIM / 16;  // Q/K k-tiles
-    constexpr int NC8 = BC / 8;        // S n-tiles (N=8 each)
-    constexpr int KT2 = BC / 16;       // P k-tiles (K=16 each)
-    constexpr int DN8 = HEAD_DIM / 8;  // O n-tiles (N=8 each)
-    constexpr int LD = HEAD_DIM;   // XOR swizzle (swiz_col) handles bank conflicts
-    constexpr int SWIZ_MASK = (HEAD_DIM >= 64) ? 7 : (HEAD_DIM / 8 - 1);  // chunk bits, stay within LD
-
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int gid = lane >> 2;   // 0..7  → rows gid, gid+8
+    const int gid = lane >> 2;   // 0..7
     const int tid4 = lane & 3;   // 0..3
-    const int nthreads = WARPS * 32;
 
     const int q_head = blockIdx.y;
     const int batch = blockIdx.z;
     const int kv_head = q_head / (p.q_head / p.kv_head);
-    const int qrow0 = (blockIdx.x * WARPS + warp) * BR;
+    const int qrow0 = (blockIdx.x * Traits::WARPS + warp) * Traits::BR;
 
-    // ---- Static shared memory: double-buffered K/V ----
-    // K/V are double-buffered (STAGES=2): the next tile's cp.async load runs
-    // while the current tile's tensor-core math executes, hiding global-load
-    // latency (FA2-style software pipeline). No dynamic smem / carveout opt-in.
-    constexpr int STAGES = 2;
-    __shared__ __align__(16) bf16 sK[STAGES * BC * LD];
-    __shared__ __align__(16) bf16 sV[STAGES * BC * LD];
+    // Static shared memory: double-buffered K/V (no sQ — Q goes direct
+    // to registers in mma A-operand layout).
+    __shared__ __align__(16) bf16 sK[Traits::STAGES * Traits::BC * Traits::LD];
+    __shared__ __align__(16) bf16 sV[Traits::STAGES * Traits::BC * Traits::LD];
 
     // Load Q fragments straight from global into mma A-operand layout.
-    // stride_row = p.q_stride_l for prefill (multi-q rows across q_len).
-    // See attn_mma_utils.cuh for the shared template.
     const int q_base = batch * p.q_stride_b + q_head * p.q_stride_h;
     const int qra = qrow0 + gid;
     const int qrb = qrow0 + gid + 8;
     const bool va = qra < p.q_len, vb = qrb < p.q_len;
-    unsigned Qa[KD][4];
-    load_q_mma_frags<KD>(p.q + q_base, p.q_stride_l, p.q_stride_d,
-                          qra, qrb, va, vb, tid4, Qa);
+    unsigned Qa[Traits::KD][4];
+    load_q_mma_frags<Traits::KD>(p.q + q_base, p.q_stride_l, p.q_stride_d,
+                                  qra, qrb, va, vb, tid4, Qa);
 
-    float Oacc[DN8][4];
-#pragma unroll
-    for (int j = 0; j < DN8; j++)
+    float Oacc[Traits::DN8][4];
+    #pragma unroll
+    for (int j = 0; j < Traits::DN8; j++)
         Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
     float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
 
     // KV: stride-based base
     const int kv_base = batch * p.kv_stride_b + kv_head * p.kv_stride_h;
-    const int tiles = (p.kv_len + BC - 1) / BC;
-    const int qr0 = qrow0 + gid;      // row for c0/c1
-    const int qr1 = qrow0 + gid + 8;  // row for c2/c3
+    const int tiles = (p.kv_len + Traits::BC - 1) / Traits::BC;
+    const int qr0 = qrow0 + gid;
+    const int qr1 = qrow0 + gid + 8;
 
-    // Causal tile-skip bounds (no-op when causal_offset < 0)
-    const int use_skip = (p.causal_offset >= 0) ? 1 : 0;
-    const int max_kv = qrow0 + BR - 1 + p.causal_offset;
+    // Causal tile-skip bounds (dead code when IsCausal == false)
+    const int max_kv = qrow0 + Traits::BR - 1 + p.causal_offset;
     const int block_max_kv =
-        blockIdx.x * WARPS * BR + WARPS * BR - 1 + p.causal_offset;
-    const int has_mask = p.use_mask && p.mask;
+        blockIdx.x * Traits::WARPS * Traits::BR + Traits::WARPS * Traits::BR - 1
+        + p.causal_offset;
 
-    // Last active tile: block-level causal bound (all warps in the block share
-    // the K/V load, so the prefetch range is the block max, not per-warp).
     int t_end = tiles - 1;
-    if (use_skip) {
-        int bt = block_max_kv / BC;
+    if constexpr (IsCausal) {
+        int bt = block_max_kv / Traits::BC;
         if (bt < t_end) t_end = bt;
     }
 
-    constexpr int VEC = 8;  // bf16 per cp.async unit (16 bytes)
-    constexpr int TOTAL = BC * HEAD_DIM;
-
     // ---- Load tile lambda: predicated cp.async ----
-    // Issue cp.async loads for tile `ti` into shared buffer `buf`. Predicated
-    // loads zero-fill rows past kv_len, so partial tiles need no scalar path.
     auto load_tile = [&](int ti, int buf) {
-        int kv0 = ti * BC;
-        bf16* dK = sK + buf * BC * LD;
-        bf16* dV = sV + buf * BC * LD;
-#pragma unroll
-        for (int i = threadIdx.x * VEC; i < TOTAL; i += nthreads * VEC) {
-            int r = i / HEAD_DIM, d = i % HEAD_DIM;
+        int kv0 = ti * Traits::BC;
+        bf16* dK = sK + buf * Traits::BC * Traits::LD;
+        bf16* dV = sV + buf * Traits::BC * Traits::LD;
+        #pragma unroll
+        for (int i = threadIdx.x * Traits::VEC; i < Traits::TOTAL;
+             i += Traits::NUM_THREADS * Traits::VEC) {
+            int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
             int kc = kv0 + r;
             bool valid = kc < p.kv_len;
-            int off = r * LD + swiz_col(d, r, SWIZ_MASK);
+            int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
             int g_off = kv_base + kc * p.kv_stride_l + d * p.kv_stride_d;
             cp_async_16_pred(&dK[off], &p.k[g_off], valid);
             cp_async_16_pred(&dV[off], &p.v[g_off], valid);
@@ -132,65 +87,60 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
     for (int ti = 0; ti <= t_end; ti++) {
         int buf = ti & 1;
 
-        // Wait for the current tile's async copies, then a single barrier: it
-        // both publishes this tile's data cross-warp AND guarantees the prior
-        // compute on the buffer we are about to refill has finished. Issuing
-        // the next tile's load *after* this barrier lets one barrier cover both
-        // hazards (vs two), while the load still overlaps this tile's math.
+        // Wait for current tile, then publish cross-warp + guard buffer reuse.
         cp_async_wait_group<0>();
         __syncthreads();
         if (ti < t_end) load_tile(ti + 1, (ti + 1) & 1);
 
-        const bf16* bK = sK + buf * BC * LD;
-        const bf16* bV = sV + buf * BC * LD;
-        int kv0 = ti * BC;
+        const bf16* bK = sK + buf * Traits::BC * Traits::LD;
+        const bf16* bV = sV + buf * Traits::BC * Traits::LD;
+        int kv0 = ti * Traits::BC;
 
-        // Warp-level causal skip
-        if (!use_skip || kv0 <= max_kv) {
+        // Warp-level causal skip (dead branch eliminated when IsCausal == false)
+        if (!IsCausal || kv0 <= max_kv) {
 
-        // S = Q @ K^T + scale + online softmax + O += P @ V
-        float Sacc[NC8][4];
-        mma_compute_scores<KD, NC8>(Qa, bK, LD, SWIZ_MASK, lane, Sacc);
+            float Sacc[Traits::NC8][4];
+            mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
 
-        // post-multiply scale in float (no bf16 precision loss from pre-scaling Q)
-        #pragma unroll
-        for (int n8 = 0; n8 < NC8; n8++)
-            Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
-            Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
+            // Post-multiply scale in float (no bf16 precision loss)
+            #pragma unroll
+            for (int n8 = 0; n8 < Traits::NC8; n8++)
+                Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
+                Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
 
-        int maxc0 = (p.causal_offset >= 0) ? min(p.kv_len, qr0 + p.causal_offset + 1)
-                                        : p.kv_len;
-        int maxc1 = (p.causal_offset >= 0) ? min(p.kv_len, qr1 + p.causal_offset + 1)
-                                        : p.kv_len;
-        mma_softmax_tile<NC8, DN8>(kv0, maxc0, maxc1,
-                                    qr0, qr1,
-                                    p.mask_b_stride, p.mask_q_stride,
-                                    batch,
-                                    p.mask, has_mask,
-                                    Sacc, Oacc, m0, m1, l0, l1, lane);
+            int maxc0 = IsCausal ? min(p.kv_len, qr0 + p.causal_offset + 1)
+                                 : p.kv_len;
+            int maxc1 = IsCausal ? min(p.kv_len, qr1 + p.causal_offset + 1)
+                                 : p.kv_len;
+            mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1,
+                                               qr0, qr1,
+                                               p.mask_b_stride, p.mask_q_stride,
+                                               batch,
+                                               p.mask,
+                                               Sacc, Oacc, m0, m1, l0, l1, lane);
 
-        mma_pv_accumulate<DN8, KT2>(Sacc, bV, LD, SWIZ_MASK, lane, Oacc);
-        }  // if active (warp-level causal skip)
+            mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
+        }
     }
 
-    // ---- write output ---- (packed bf16x2 stores: one 32-bit STG per pair,
-    // halves store count and removes the uncoalesced scalar-store penalty)
+    // ---- write output: packed bf16x2 stores ----
     float rl0 = (l0 > 1e-20f) ? (1.0f / l0) : 0.0f;
     float rl1 = (l1 > 1e-20f) ? (1.0f / l1) : 0.0f;
-    // O: stride-based write
     const int o_base = batch * p.q_stride_b + q_head * p.q_stride_h;
-#pragma unroll
-    for (int dn8 = 0; dn8 < DN8; dn8++) {
+    #pragma unroll
+    for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
         if (qr0 < p.q_len) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][0] * rl0,
-                                                     Oacc[dn8][1] * rl0);
-            *reinterpret_cast<__nv_bfloat162*>(&p.o[o_base + qr0 * p.q_stride_l + d * p.q_stride_d]) = v;
+                                                      Oacc[dn8][1] * rl0);
+            *reinterpret_cast<__nv_bfloat162*>(
+                &p.o[o_base + qr0 * p.q_stride_l + d * p.q_stride_d]) = v;
         }
         if (qr1 < p.q_len) {
             __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][2] * rl1,
-                                                     Oacc[dn8][3] * rl1);
-            *reinterpret_cast<__nv_bfloat162*>(&p.o[o_base + qr1 * p.q_stride_l + d * p.q_stride_d]) = v;
+                                                      Oacc[dn8][3] * rl1);
+            *reinterpret_cast<__nv_bfloat162*>(
+                &p.o[o_base + qr1 * p.q_stride_l + d * p.q_stride_d]) = v;
         }
     }
 }

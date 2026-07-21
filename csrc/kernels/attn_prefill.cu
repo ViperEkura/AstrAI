@@ -3,30 +3,48 @@
 
 #ifndef ASTRAI_NO_MMA
 #include "attn_prefill_split_q_mma.cuh"
+
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
+static void launch_mma_prefill(AttentionParams<bf16>& p) {
+    constexpr int WARPS = 4;
+    constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
+    using Traits = KernelTraits<HEAD_DIM, BC, WARPS, 2>;
+    dim3 grid((p.q_len + Traits::BR * WARPS - 1) / (Traits::BR * WARPS),
+              p.q_head, p.batch);
+    dim3 block(Traits::NUM_THREADS, 1, 1);
+    attn_prefill_split_q_mma_kernel<Traits, IsCausal, HasMask><<<grid, block>>>(p);
+}
 #endif
 
-template <int HEAD_DIM>
-static void dispatch_prefill(AttentionParams<bf16>& p) {
-#ifndef ASTRAI_NO_MMA
-    constexpr int WARPS = 4, BR = 16;
-    // KV tile: bigger tiles amortize the per-tile cp.async wait + barrier +
-    // loop overhead over more tensor-core work (this kernel is latency-bound,
-    // not compute/bandwidth-bound), so BC=32 wins ~6-8% over BC=16 for
-    // D<=128. D=256 stays at 16: BC=32 double-buffered would need 64KB smem,
-    // over the 48KB static cap.
-    constexpr int BC = (HEAD_DIM <= 128) ? 32 : 16;
-    dim3 grid((p.q_len + BR * WARPS - 1) / (BR * WARPS), p.q_head, p.batch);
-    dim3 block(WARPS * 32, 1, 1);
-    // Static shared memory — double-buffered K/V only (no sQ: Q goes direct
-    // to registers). 2*BC*LD bf16 each for sK and sV → 4*BC*HEAD_DIM*2 bytes.
-    // Occupancy is smem-capped: D=64→3 blocks/SM (16KB), D=128→1 (32KB),
-    // D=256→1 (32KB, BC=16).
-    attn_prefill_split_q_mma_kernel<HEAD_DIM, WARPS, BC><<<grid, block>>>(p);
-#else
+template <int HEAD_DIM, bool IsCausal, bool HasMask>
+static void launch_scalar_prefill(AttentionParams<bf16>& p) {
     constexpr int G = 8, ROWS = 32, P_BC = 32;
     dim3 grid((p.q_len + ROWS - 1) / ROWS, p.q_head, p.batch);
     dim3 block(G, ROWS, 1);
-    attn_prefill_split_q_kernel_t<HEAD_DIM, G, ROWS, P_BC><<<grid, block>>>(p);
+    attn_prefill_split_q_kernel_t<HEAD_DIM, G, ROWS, P_BC, IsCausal, HasMask><<<grid, block>>>(p);
+}
+
+template <int HEAD_DIM>
+static void dispatch_prefill(AttentionParams<bf16>& p) {
+    bool is_causal = (p.causal_offset >= 0);
+    bool has_mask = (p.use_mask && p.mask);
+
+#ifndef ASTRAI_NO_MMA
+    if (is_causal) {
+        if (has_mask)      launch_mma_prefill<HEAD_DIM, true, true>(p);
+        else               launch_mma_prefill<HEAD_DIM, true, false>(p);
+    } else {
+        if (has_mask)      launch_mma_prefill<HEAD_DIM, false, true>(p);
+        else               launch_mma_prefill<HEAD_DIM, false, false>(p);
+    }
+#else
+    if (is_causal) {
+        if (has_mask)      launch_scalar_prefill<HEAD_DIM, true, true>(p);
+        else               launch_scalar_prefill<HEAD_DIM, true, false>(p);
+    } else {
+        if (has_mask)      launch_scalar_prefill<HEAD_DIM, false, true>(p);
+        else               launch_scalar_prefill<HEAD_DIM, false, false>(p);
+    }
 #endif
 }
 

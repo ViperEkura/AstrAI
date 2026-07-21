@@ -6,12 +6,9 @@
 using bf16 = __nv_bfloat16;
 
 // v9: group-split register blocking. G threads cooperate on one query row,
-// each owning HEAD_DIM/G dims of qreg[]/acc[]. Small per-thread footprint keeps
-// occupancy high; the S dot product is reduced across the G-lane group with a
-// short shuffle chain (log2(G) shuffles) instead of a full 32-lane warp reduce.
-// Online (per-kv) softmax — cheap because acc[] is only HEAD_DIM/G long.
-// Templated on <HEAD_DIM, G, ROWS, P_BC>. Block = (G, ROWS). G power-of-two,
-// G*ROWS a multiple of 32 with groups warp-aligned.
+// each owning HEAD_DIM/G dims of qreg[]/acc[]. IsCausal and HasMask are
+// compile-time bools — the compiler eliminates dead branches.
+// Templated on <HEAD_DIM, G, ROWS, P_BC, IsCausal, HasMask>.
 
 template <int G>
 __device__ __forceinline__ float group_reduce_sum(float v, unsigned mask) {
@@ -21,8 +18,7 @@ __device__ __forceinline__ float group_reduce_sum(float v, unsigned mask) {
     return v;
 }
 
-// load 8 contiguous bf16 from (16-byte aligned) smem as one float4, unpack to
-// 8 floats — cuts shared-load instructions 8x vs scalar bf16 loads.
+// load 8 contiguous bf16 from (16-byte aligned) smem as one float4
 __device__ __forceinline__ void ld8(const bf16* p, float* o) {
     float4 raw = *reinterpret_cast<const float4*>(p);
     const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
@@ -34,7 +30,7 @@ __device__ __forceinline__ void ld8(const bf16* p, float* o) {
     }
 }
 
-template <int HEAD_DIM, int G, int ROWS, int P_BC>
+template <int HEAD_DIM, int G, int ROWS, int P_BC, bool IsCausal, bool HasMask>
 __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     constexpr int DPT = HEAD_DIM / G;
 
@@ -73,8 +69,6 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     int tt      = G * ROWS;
     int lid     = row * G + gpos;
 
-    // per-group shuffle mask: only the G lanes of this row's group participate,
-    // so causal masking (differing loop bounds across rows in a warp) is safe.
     int lane_in_warp = lid & 31;
     unsigned gmask = (G == 32) ? 0xFFFFFFFFu
                                : (((1u << G) - 1u) << (lane_in_warp & ~(G - 1)));
@@ -95,12 +89,14 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
         __syncthreads();
 
         int lim = tlen;
-        if (p.causal_offset >= 0 && q_row < p.q_len) {
-            int ep = q_row + p.causal_offset + 1;
-            if (kv0 >= ep)
-                lim = 0;
-            else if (kv0 + tlen > ep)
-                lim = ep - kv0;
+        if constexpr (IsCausal) {
+            if (q_row < p.q_len) {
+                int ep = q_row + p.causal_offset + 1;
+                if (kv0 >= ep)
+                    lim = 0;
+                else if (kv0 + tlen > ep)
+                    lim = ep - kv0;
+            }
         }
 
         int mask_row_base = mask_batch_base + q_row * p.mask_q_stride;
@@ -118,8 +114,10 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
             float dot = group_reduce_sum<G>(part, gmask);
 
             int kv_idx = kv0 + s;
-            if (p.use_mask && p.mask && !p.mask[mask_row_base + kv_idx])
-                dot = -FLT_MAX;
+            if constexpr (HasMask) {
+                if (!p.mask[mask_row_base + kv_idx])
+                    dot = -FLT_MAX;
+            }
 
             float nm = fmaxf(m, dot);
             float al = __expf(m - nm);
@@ -141,7 +139,6 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     }
 
     if (q_row < p.q_len) {
-        // O: stride-based write
         int o_off = batch * p.q_stride_b + q_head * p.q_stride_h
                   + q_row * p.q_stride_l + gpos * DPT * p.q_stride_d;
         float rl = (l > 1e-10f) ? (1.0f / l) : 0.0f;

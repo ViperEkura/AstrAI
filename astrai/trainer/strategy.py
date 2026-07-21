@@ -1,7 +1,7 @@
 """Training strategy implementations with factory pattern."""
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Union
+from typing import Callable, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -29,9 +29,10 @@ def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
 
 
 def get_logprobs(
-    model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
+    model: nn.Module,
     input_ids: Tensor,
-    mask: Tensor,
+    attn_mask: Tensor,
+    loss_mask: Tensor,
     reduction: str,
 ) -> Tensor:
     """Compute token-wise log probabilities from model outputs.
@@ -39,7 +40,8 @@ def get_logprobs(
     Args:
         model: The language model
         input_ids: Input token IDs of shape [batch_size, seq_len]
-        mask: Attention mask of shape [batch_size, seq_len]
+        attn_mask: Attention mask passed to the model (may include causal).
+        loss_mask: Per-token mask for loss reduction.
         reduction: How to reduce over sequence dimension ("mean", "sum", "none")
 
     Returns:
@@ -52,9 +54,12 @@ def get_logprobs(
         )
 
     shifted_input_ids = input_ids[:, 1:]
-    shifted_mask = mask[:, 1:]
+    shifted_loss_mask = loss_mask[:, 1:]
 
-    logits = model(input_ids[:, :-1], mask[:, :-1])["logits"]
+    logits = model(
+        input_ids[:, :-1],
+        attn_mask[:, :, :-1, :-1] if attn_mask.dim() == 4 else attn_mask[:, :-1],
+    )["logits"]
     log_probs = torch.log_softmax(logits.float(), dim=-1)
 
     token_logprobs = torch.gather(
@@ -62,13 +67,13 @@ def get_logprobs(
     ).squeeze(-1)
 
     if reduction == "mean":
-        return (token_logprobs * shifted_mask).sum(dim=-1) / shifted_mask.sum(
+        return (token_logprobs * shifted_loss_mask).sum(dim=-1) / shifted_loss_mask.sum(
             dim=-1
         ).clamp(min=1.0)
     elif reduction == "sum":
-        return (token_logprobs * shifted_mask).sum(dim=-1)
+        return (token_logprobs * shifted_loss_mask).sum(dim=-1)
     else:
-        return token_logprobs * shifted_mask
+        return token_logprobs * shifted_loss_mask
 
 
 def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
@@ -289,13 +294,31 @@ class DPOStrategy(BaseStrategy):
         chosen_mask, rejected_mask = batch["chosen_mask"], batch["rejected_mask"]
 
         concat_ids = torch.cat([chosen_ids, rejected_ids], dim=0)
-        concat_mask = torch.cat([chosen_mask, rejected_mask], dim=0)
+        concat_loss_mask = torch.cat([chosen_mask, rejected_mask], dim=0)
 
-        log_pi = get_logprobs(self.model, concat_ids, concat_mask, self.reduction)
+        # Build full attention mask: key-padding + causal
+        key_pad = concat_ids.bool()[:, None, None, :]  # [B*2, 1, 1, S]
+        S = key_pad.shape[-1]
+        causal = torch.tril(
+            torch.ones(S, S, dtype=torch.bool, device=concat_ids.device)
+        )[None, None, :, :]  # [1, 1, S, S]
+        full_mask = key_pad & causal  # [B*2, 1, S, S] — composed
+
+        log_pi = get_logprobs(
+            self.model,
+            concat_ids,
+            full_mask,
+            concat_loss_mask,
+            self.reduction,
+        )
 
         with torch.no_grad():
             log_ref = get_logprobs(
-                self.ref_model, concat_ids, concat_mask, self.reduction
+                self.ref_model,
+                concat_ids,
+                full_mask,
+                concat_loss_mask,
+                self.reduction,
             )
 
         log_pi_chosen = log_pi[: chosen_ids.shape[0]]
@@ -399,18 +422,26 @@ class GRPOStrategy(BaseStrategy):
             [torch.zeros_like(prompt_expanded, dtype=torch.bool), masks_flat], dim=-1
         )
 
+        # Build full attention mask: key-padding + causal
+        key_pad = full_sequences.bool()[:, None, None, :]
+        S = key_pad.shape[-1]
+        causal = torch.tril(
+            torch.ones(S, S, dtype=torch.bool, device=full_sequences.device)
+        )[None, None, :, :]
+        attn_mask = key_pad & causal
+
         # get_logprobs returns [B*G, S-1] (S = prompt_len + response_len).
         # Response token logprobs occupy the last ``response_len`` positions
         # (the first response token is predicted from the last prompt token).
         token_log_probs_policy = get_logprobs(
-            self.model, full_sequences, full_masks, "none"
+            self.model, full_sequences, attn_mask, full_masks, "none"
         )[:, prompt_len - 1 :]
         with torch.no_grad():
             token_log_probs_old = get_logprobs(
-                self.old_model, full_sequences, full_masks, "none"
+                self.old_model, full_sequences, attn_mask, full_masks, "none"
             )[:, prompt_len - 1 :]
             token_log_probs_ref = get_logprobs(
-                self.ref_model, full_sequences, full_masks, "none"
+                self.ref_model, full_sequences, attn_mask, full_masks, "none"
             )[:, prompt_len - 1 :]
 
         # Reshape to [B, G, response_len]

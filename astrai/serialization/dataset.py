@@ -100,7 +100,7 @@ def load_bin(file_path: str) -> Dict[str, List[Tensor]]:
         arr = np.memmap(
             os.path.join(file_path, f"{key}.bin"),
             dtype=info["dtype"],
-            mode="r",
+            mode="c",
             shape=tuple(info["shape"]),
         )
         segments[key] = [torch.from_numpy(arr)]

@@ -113,10 +113,38 @@ class AutoRegressiveLM(AutoModel):
         attn_mask = process_attention_mask(input_mask)
         use_sdpa_causal_mask = attn_mask is None
 
+        router_outputs = []
         for layer in self.layers:
-            x = layer(x, rotary_emb, attn_mask, paged_cache, use_sdpa_causal_mask)
+            x, layer_router_outputs = layer(
+                x,
+                rotary_emb,
+                attn_mask,
+                paged_cache,
+                use_sdpa_causal_mask,
+                return_router_losses=True,
+            )
+            if layer_router_outputs is not None:
+                router_outputs.append(layer_router_outputs)
 
         hidden_states = self.norm(x)
         logits = self.lm_head(hidden_states)
 
-        return {"logits": logits, "hidden_states": hidden_states}
+        output = {"logits": logits, "hidden_states": hidden_states}
+        if router_outputs:
+            aux_losses, z_losses, expert_loads, router_entropies = zip(
+                *router_outputs
+            )
+            router_aux_loss = torch.stack(aux_losses).mean()
+            router_z_loss = torch.stack(z_losses).mean()
+            output.update(
+                router_aux_loss=router_aux_loss,
+                router_z_loss=router_z_loss,
+                router_loss=(
+                    self.config.router_aux_loss_coef * router_aux_loss
+                    + self.config.router_z_loss_coef * router_z_loss
+                ),
+                router_expert_load=torch.stack(expert_loads).mean(dim=0),
+                router_entropy=torch.stack(router_entropies).mean(),
+            )
+
+        return output

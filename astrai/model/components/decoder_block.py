@@ -35,7 +35,8 @@ class DecoderBlock(nn.Module):
         attention_mask: Optional[Tensor] = None,
         paged_cache: Optional[CacheView] = None,
         is_causal: bool = False,
-    ) -> Tensor:
+        return_router_losses: bool = False,
+    ):
         attn_output = self.attention(
             self.input_norm(x),
             rotary_emb,
@@ -44,6 +45,12 @@ class DecoderBlock(nn.Module):
             is_causal,
         )
         x = attn_output + x
-        x = self.mlp(self.post_attention_norm(x)) + x
+        mlp_output = self.mlp(self.post_attention_norm(x))
+        router_outputs = None
+        if isinstance(mlp_output, tuple):
+            mlp_output, *router_outputs = mlp_output
+        x = mlp_output + x
 
+        if return_router_losses:
+            return x, router_outputs
         return x

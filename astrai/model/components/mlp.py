@@ -42,7 +42,16 @@ class DeepSeekMoE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.n_activated_experts = n_activated_experts
-        self.topk_method = topk_method
+        self.topk_method = topk_method or "greedy"
+
+        if self.topk_method != "greedy":
+            raise ValueError(
+                f"Unsupported MoE top-k method: {self.topk_method!r}"
+            )
+        if not 0 < n_activated_experts <= n_routed_experts:
+            raise ValueError(
+                "n_activated_experts must be in [1, n_routed_experts]"
+            )
 
         self.router = Linear(dim, n_routed_experts, bias=False)
         moe_scale = 1 / max(n_shared_experts, 1) + 1 / n_activated_experts
@@ -61,30 +70,51 @@ class DeepSeekMoE(nn.Module):
             ]
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor):
         bsz, seq_len, dim = x.shape
         x_flat = x.view(-1, dim)
 
         shared_out = self._shared_forward(x_flat)
-        routed_out = self._routed_forward(x_flat)
+        routed_out, aux_loss, z_loss, expert_load, router_entropy = (
+            self._routed_forward(x_flat)
+        )
 
         out = (shared_out + routed_out).view(bsz, seq_len, dim)
-        return out
+        return out, aux_loss, z_loss, expert_load, router_entropy
 
     def _shared_forward(self, x: Tensor) -> Tensor:
         if self.n_shared_experts == 0:
             return torch.zeros_like(x)
         return sum(e(x) for e in self.shared_experts) / self.n_shared_experts
 
-    def _routed_forward(self, x: Tensor) -> Tensor:
+    def _routed_forward(self, x: Tensor):
         N, D = x.shape
         K = self.n_activated_experts
 
         router_logits = self.router(x)
-        router_probs = torch.softmax(router_logits.float(), dim=-1).to(x.dtype)
+        router_logits_fp32 = router_logits.float()
+        router_probs_fp32 = torch.softmax(router_logits_fp32, dim=-1)
+        router_probs = router_probs_fp32.to(x.dtype)
 
         topk_weights, topk_indices = torch.topk(router_probs, K, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        # Switch-style differentiable load-balancing loss.  Expert load is
+        # measured over all top-k assignments, so a uniform router has loss 1.
+        assignments = F.one_hot(
+            topk_indices, num_classes=self.n_routed_experts
+        ).float()
+        expert_load = assignments.mean(dim=(0, 1))
+        mean_router_prob = router_probs_fp32.mean(dim=0)
+        aux_loss = self.n_routed_experts * torch.sum(
+            expert_load * mean_router_prob
+        )
+        z_loss = torch.logsumexp(router_logits_fp32, dim=-1).square().mean()
+        router_entropy = -torch.sum(
+            router_probs_fp32
+            * torch.log(router_probs_fp32.clamp_min(torch.finfo(torch.float32).tiny)),
+            dim=-1,
+        ).mean()
 
         output = torch.zeros(N, D, device=x.device, dtype=x.dtype)
         for expert_idx in range(self.n_routed_experts):
@@ -97,4 +127,10 @@ class DeepSeekMoE(nn.Module):
             weights = topk_weights[token_idx, k_idx].unsqueeze(-1)
             output.index_add_(0, token_idx, expert_output * weights)
 
-        return output
+        return (
+            output,
+            aux_loss,
+            z_loss,
+            expert_load.detach(),
+            router_entropy.detach(),
+        )

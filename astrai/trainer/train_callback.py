@@ -17,9 +17,17 @@ from astrai.parallel import only_on_rank
 from astrai.parallel.setup import get_current_device
 from astrai.serialization import Checkpoint
 from astrai.trainer.metric_util import (
+    ctx_get_expert_load_cv,
+    ctx_get_expert_load_max,
+    ctx_get_expert_load_min,
     ctx_get_grad_norm,
+    ctx_get_language_model_loss,
     ctx_get_loss,
     ctx_get_lr,
+    ctx_get_router_aux_loss,
+    ctx_get_router_entropy,
+    ctx_get_router_loss,
+    ctx_get_router_z_loss,
     ctx_get_val_loss,
 )
 from astrai.trainer.train_context import TrainContext
@@ -221,6 +229,9 @@ class ProgressBarCallback(TrainCallback):
             postfix["grad_norm"] = f"{context.grad_norm:.2f}"
         if context.val_loss is not None:
             postfix["val_loss"] = f"{context.val_loss:.4f}"
+        if context.router_loss is not None:
+            postfix["router"] = f"{context.router_loss:.3e}"
+            postfix["load_cv"] = f"{context.expert_load_cv:.2f}"
         self.progress_bar.set_postfix(postfix)
         self.progress_bar.update(1)
 
@@ -256,6 +267,14 @@ class MetricCallback(TrainCallback):
             "lr": ctx_get_lr,
             "val_loss": ctx_get_val_loss,
             "grad_norm": ctx_get_grad_norm,
+            "language_model_loss": ctx_get_language_model_loss,
+            "router_loss": ctx_get_router_loss,
+            "router_aux_loss": ctx_get_router_aux_loss,
+            "router_z_loss": ctx_get_router_z_loss,
+            "router_entropy": ctx_get_router_entropy,
+            "expert_load_min": ctx_get_expert_load_min,
+            "expert_load_max": ctx_get_expert_load_max,
+            "expert_load_cv": ctx_get_expert_load_cv,
         }
 
     def _metrics(self, context: TrainContext, names):

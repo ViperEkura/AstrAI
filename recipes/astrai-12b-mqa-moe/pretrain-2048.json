@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "input": {
+    "sections": [
+      {
+        "field": "text",
+        "action": "train"
+      }
+    ]
+  },
+  "preprocessing": {
+    "max_seq_len": 2048
+  },
+  "output": {
+    "storage_format": "bin"
+  }
+}

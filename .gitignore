@@ -25,6 +25,7 @@
 !/Dockerfile
 !/docker-compose.yml
 !/assets/**
+!/recipes/**
 !/CONTRIBUTING.md
 !/LICENSE
 !/pyproject.toml

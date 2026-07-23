@@ -50,6 +50,7 @@ class MuonMix(optim.Optimizer):
                 and "bias" not in name
                 and "embed" not in name
                 and "lm_head" not in name
+                and ".router." not in name
             ):
                 matrix_params.append(param)
             else:

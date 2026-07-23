@@ -90,11 +90,16 @@ class GQA(nn.Module):
             paged_cache.write(self.layer_id, k, v)
             k, v = paged_cache.gather(self.layer_id)
 
-        k, v = repeat_kv(k, self.n_rep), repeat_kv(v, self.n_rep)
-
         q, k, v = q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
         sdqa_out = (
-            F.scaled_dot_product_attention(q, k, v, attn_mask, is_causal=is_causal)
+            F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask,
+                is_causal=is_causal,
+                enable_gqa=self.n_rep > 1,
+            )
             .permute(0, 2, 1, 3)
             .contiguous()
             .flatten(2)

@@ -114,6 +114,30 @@ class BaseStrategy(ABC):
         self.executor = kwargs.pop("executor", None)
         self.extra_kwargs = kwargs
         self._rollout_runner = None
+        self.last_metrics: Dict[str, float] = {}
+
+    def combine_model_loss(
+        self, outputs: Dict[str, Tensor], language_model_loss: Tensor
+    ) -> Tensor:
+        """Add optional MoE router losses and expose detached train metrics."""
+        self.last_metrics = {"language_model_loss": language_model_loss.detach().item()}
+        router_loss = outputs.get("router_loss")
+        if router_loss is None:
+            return language_model_loss
+
+        expert_load = outputs["router_expert_load"].detach().float()
+        load_mean = expert_load.mean()
+        load_cv = expert_load.std(unbiased=False) / load_mean.clamp_min(1e-12)
+        self.last_metrics.update(
+            router_loss=router_loss.detach().item(),
+            router_aux_loss=outputs["router_aux_loss"].detach().item(),
+            router_z_loss=outputs["router_z_loss"].detach().item(),
+            router_entropy=outputs["router_entropy"].detach().item(),
+            expert_load_min=expert_load.min().item(),
+            expert_load_max=expert_load.max().item(),
+            expert_load_cv=load_cv.item(),
+        )
+        return language_model_loss + router_loss
 
     @abstractmethod
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
@@ -215,7 +239,8 @@ class SEQStrategy(BaseStrategy):
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         batch = move_to_device(batch, self.device)
         input_ids, target_ids = batch["input_ids"], batch["target_ids"]
-        logits = self.model(input_ids=input_ids)["logits"]
+        outputs = self.model(input_ids=input_ids)
+        logits = outputs["logits"]
 
         loss = F.cross_entropy(
             input=logits.flatten(0, 1).float(),
@@ -223,7 +248,7 @@ class SEQStrategy(BaseStrategy):
             label_smoothing=self.label_smoothing,
         )
 
-        return loss
+        return self.combine_model_loss(outputs, loss)
 
 
 @StrategyFactory.register("sft")
@@ -255,9 +280,10 @@ class SFTStrategy(BaseStrategy):
         ignore_index = -100
         input_mask = make_doc_boundary_mask(position_ids)
         target_ids = target_ids.masked_fill(~loss_mask, ignore_index)
-        logits = self.model(
+        outputs = self.model(
             input_ids=input_ids, position_ids=position_ids, input_mask=input_mask
-        )["logits"]
+        )
+        logits = outputs["logits"]
 
         loss = F.cross_entropy(
             input=logits.flatten(0, 1).float(),
@@ -266,7 +292,7 @@ class SFTStrategy(BaseStrategy):
             label_smoothing=self.label_smoothing,
         )
 
-        return loss
+        return self.combine_model_loss(outputs, loss)
 
 
 @StrategyFactory.register("dpo")

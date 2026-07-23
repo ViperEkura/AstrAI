@@ -472,7 +472,9 @@ def train(
     ]
     assert os.path.exists(param_path)
     if nprocs > 1 and parallel_mode == "none":
-        raise ValueError("--nprocs > 1 requires --parallel_mode to be 'ddp', 'fsdp', or 'fsdp2'")
+        raise ValueError(
+            "--nprocs > 1 requires --parallel_mode to be 'ddp', 'fsdp', or 'fsdp2'"
+        )
 
     # Load config
     config_path = os.path.join(param_path, "config.json")

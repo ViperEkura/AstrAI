@@ -363,9 +363,7 @@ class FSDP2Executor(BaseExecutor):
 
     @contextmanager
     def _no_sync(self, model: nn.Module):
-        fsdp_modules = [
-            m for m in model.modules() if isinstance(m, FSDPModule)
-        ]
+        fsdp_modules = [m for m in model.modules() if isinstance(m, FSDPModule)]
         if fsdp_modules:
             for m in fsdp_modules:
                 m.set_requires_gradient_sync(False, recurse=True)

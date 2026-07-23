@@ -71,6 +71,18 @@ class ConstantRewardModel(BaseRewardModel):
         return torch.full((B, G), float(self.value))
 
 
+class BadShapeRewardModel(BaseRewardModel):
+    def score(self, prompts, responses):
+        return torch.zeros(len(prompts))
+
+
+class NonFiniteRewardModel(BaseRewardModel):
+    def score(self, prompts, responses):
+        B = len(prompts)
+        G = len(responses[0]) if B else 0
+        return torch.full((B, G), float("nan"))
+
+
 def _make_config(vocab_size=200, max_position_embeddings=128):
     return AutoRegressiveLMConfig(
         vocab_size=vocab_size,
@@ -111,6 +123,7 @@ def _make_instruction_batch(n=2):
 def test_raw_rollout_fields():
     r = RawRollout(
         prompts=torch.zeros(2, 4, dtype=torch.long),
+        prompt_mask=torch.ones(2, 4, dtype=torch.bool),
         responses=torch.zeros(2, 3, 5, dtype=torch.long),
         response_mask=torch.ones(2, 3, 5, dtype=torch.bool),
         logprobs_old=torch.zeros(2, 3, 5),
@@ -124,6 +137,7 @@ def test_raw_rollout_fields():
 def test_rollout_result_inherits_raw_rollout_fields():
     r = RolloutResult(
         prompts=torch.zeros(2, 4, dtype=torch.long),
+        prompt_mask=torch.ones(2, 4, dtype=torch.bool),
         responses=torch.zeros(2, 3, 5, dtype=torch.long),
         response_mask=torch.ones(2, 3, 5, dtype=torch.bool),
         logprobs_old=torch.zeros(2, 3, 5),
@@ -132,6 +146,7 @@ def test_rollout_result_inherits_raw_rollout_fields():
     assert r.rewards.shape == (2, 3)
     assert r.prompts.shape == (2, 4)
     assert r.responses.shape == (2, 3, 5)
+    assert r.prompt_mask.shape == (2, 4)
 
 
 def test_base_reward_model_is_abstract():
@@ -179,9 +194,26 @@ def test_rollout_generator_shapes(device):
     assert r.responses.shape == (2, 3, 5)
     assert r.response_mask.shape == (2, 3, 5)
     assert r.logprobs_old.shape == (2, 3, 5)
+    assert r.prompt_mask.shape == r.prompts.shape
     assert len(r.prompt_texts) == 2
     assert len(r.response_texts) == 2
     assert len(r.response_texts[0]) == 3
+
+
+def test_rollout_generator_uses_eval_and_restores_mode(device):
+    gen, model = _make_generator(device, group_size=1, max_tokens=2)
+    model.train()
+    seen_training = []
+    original = gen.scheduler.run_batch
+
+    def recording_run_batch(*args, **kwargs):
+        seen_training.append(model.training)
+        return original(*args, **kwargs)
+
+    gen.scheduler.run_batch = recording_run_batch
+    gen.generate(_make_instruction_batch(n=1))
+    assert seen_training == [False]
+    assert model.training is True
 
 
 def test_rollout_generator_mask_matches_responses(device):
@@ -289,6 +321,24 @@ def test_rollout_runner_cache_returns_stale_flag(device):
     assert r1 is r2
     assert fresh1 is True
     assert fresh2 is False
+
+
+def test_rollout_runner_refreshes_for_different_batch(device):
+    runner, _ = _make_runner(device, rollout_interval=100)
+    r1, fresh1 = runner(_make_instruction_batch(n=1))
+    batch2 = {"instruction": ["Different prompt"], "input": [""]}
+    r2, fresh2 = runner(batch2)
+    assert fresh1 is True
+    assert fresh2 is True
+    assert r2 is not r1
+
+
+@pytest.mark.parametrize("reward_model", [BadShapeRewardModel, NonFiniteRewardModel])
+def test_rollout_runner_rejects_invalid_rewards(device, reward_model):
+    generator, _ = _make_generator(device, group_size=2, max_tokens=2)
+    runner = RolloutRunner(generator, reward_model(), rollout_interval=1)
+    with pytest.raises(ValueError):
+        runner(_make_instruction_batch(n=1))
 
 
 def test_rollout_runner_step_triggers_new_rollout(device):

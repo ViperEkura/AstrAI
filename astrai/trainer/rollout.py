@@ -35,6 +35,7 @@ class RawRollout:
 
     Fields:
         prompts: Tokenized prompts, shape ``[B, P_len]``.
+        prompt_mask: Boolean mask for real prompt tokens, shape ``[B, P_len]``.
         responses: Generated response token IDs, shape ``[B, G, R_max]``.
         response_mask: Boolean mask for real (non-pad) response tokens,
             shape ``[B, G, R_max]``.
@@ -47,6 +48,7 @@ class RawRollout:
     """
 
     prompts: Tensor
+    prompt_mask: Tensor
     responses: Tensor
     response_mask: Tensor
     logprobs_old: Tensor
@@ -143,6 +145,15 @@ class RolloutGenerator:
         ``add_generation_prompt=True`` so rollout prompts match the
         format the policy was SFT-trained on.
         """
+        model = self.scheduler._executor.model
+        was_training = model.training
+        model.eval()
+        try:
+            return self._generate_eval(batch)
+        finally:
+            model.train(was_training)
+
+    def _generate_eval(self, batch: Dict) -> RawRollout:
         prompt_texts, flat_prompt_ids = self._prepare_prompts(batch)
         B = len(prompt_texts)
         G = self.group_size
@@ -161,6 +172,15 @@ class RolloutGenerator:
             rep_window=self.rep_window,
             return_logprobs=True,
         )
+        if len(results) != B * G:
+            raise RuntimeError(
+                f"Rollout scheduler returned {len(results)} results, expected {B * G}"
+            )
+        for token_ids, logprobs in results:
+            if len(token_ids) != len(logprobs):
+                raise RuntimeError(
+                    "Rollout scheduler returned misaligned token IDs and logprobs"
+                )
 
         # Each element is (token_ids, logprobs); pad to max length.
         max_len = 0
@@ -171,10 +191,12 @@ class RolloutGenerator:
         device = self.scheduler.device
         P_len = max(len(ids) for ids in flat_prompt_ids)
         prompts_tensor = torch.zeros(B, P_len, dtype=torch.long, device=device)
+        prompt_mask = torch.zeros(B, P_len, dtype=torch.bool, device=device)
         for i, ids in enumerate(flat_prompt_ids):
-            prompts_tensor[i, : len(ids)] = torch.tensor(
+            prompts_tensor[i, -len(ids) :] = torch.tensor(
                 ids, dtype=torch.long, device=device
             )
+            prompt_mask[i, -len(ids) :] = True
 
         responses = torch.full((B, G, max_len), _PAD, dtype=torch.long, device=device)
         response_mask = torch.zeros((B, G, max_len), dtype=torch.bool, device=device)
@@ -201,6 +223,7 @@ class RolloutGenerator:
 
         return RawRollout(
             prompts=prompts_tensor,
+            prompt_mask=prompt_mask,
             responses=responses,
             response_mask=response_mask,
             logprobs_old=logprobs_old,
@@ -239,17 +262,35 @@ class RolloutGenerator:
                 f"{list(batch.keys())}"
             )
 
-        prompt_texts: List[str] = []
-        flat_prompt_ids: List[List[int]] = []
-        for messages in messages_list:
-            text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+        try:
+            prompt_texts = self.tokenizer.apply_chat_template(
+                messages_list, tokenize=False, add_generation_prompt=True
             )
-            ids = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
-            )
-            prompt_texts.append(text)
-            flat_prompt_ids.append(list(ids))
+            if (
+                not isinstance(prompt_texts, list)
+                or len(prompt_texts) != len(messages_list)
+                or not all(isinstance(text, str) for text in prompt_texts)
+            ):
+                raise TypeError("Tokenizer does not support batched chat templates")
+            flat_prompt_ids = self.tokenizer.encode(prompt_texts)
+            if len(flat_prompt_ids) != len(messages_list) or not all(
+                isinstance(ids, list) for ids in flat_prompt_ids
+            ):
+                raise TypeError("Tokenizer does not support batched encoding")
+        except (TypeError, IndexError, KeyError):
+            # Keep compatibility with lightweight tokenizer adapters that only
+            # implement the single-conversation template API.
+            prompt_texts = []
+            flat_prompt_ids = []
+            for messages in messages_list:
+                text = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                ids = self.tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True
+                )
+                prompt_texts.append(text)
+                flat_prompt_ids.append(list(ids))
         return prompt_texts, flat_prompt_ids
 
     @staticmethod
@@ -308,6 +349,7 @@ class RolloutRunner:
         self.rollout_interval = rollout_interval
 
         self._cache: Optional[RolloutResult] = None
+        self._cache_key = None
         self._steps_since_rollout: int = 0
 
     def step(self):
@@ -317,12 +359,40 @@ class RolloutRunner:
     def clear_cache(self):
         """Force next call to re-run rollout."""
         self._cache = None
+        self._cache_key = None
+
+    @staticmethod
+    def _batch_key(batch: Dict):
+        """Build a stable key for the prompt fields accepted by the generator."""
+
+        def freeze(value):
+            if isinstance(value, dict):
+                return tuple(sorted((key, freeze(val)) for key, val in value.items()))
+            if isinstance(value, (list, tuple)):
+                return tuple(freeze(item) for item in value)
+            return value
+
+        fields = ("messages", "instruction", "input", "output")
+        return tuple(
+            (field, freeze(batch[field])) for field in fields if field in batch
+        )
 
     def _score(self, raw: RawRollout) -> RolloutResult:
         rewards = self.reward_model.score(raw.prompt_texts, raw.response_texts)
+        if not isinstance(rewards, Tensor):
+            rewards = torch.as_tensor(rewards, dtype=torch.float32)
+        expected_shape = raw.responses.shape[:2]
+        if rewards.shape != expected_shape:
+            raise ValueError(
+                f"Reward model returned shape {tuple(rewards.shape)}, "
+                f"expected {tuple(expected_shape)}"
+            )
+        if not torch.isfinite(rewards).all():
+            raise ValueError("Reward model returned non-finite values")
         device = raw.prompts.device
         return RolloutResult(
             prompts=raw.prompts,
+            prompt_mask=raw.prompt_mask,
             responses=raw.responses,
             response_mask=raw.response_mask,
             rewards=rewards.to(device=device),
@@ -337,9 +407,15 @@ class RolloutRunner:
         Triggers a new rollout when ``_steps_since_rollout >= rollout_interval``
         or when the cache is empty.
         """
-        if self._cache is None or self._steps_since_rollout >= self.rollout_interval:
+        cache_key = self._batch_key(batch)
+        if (
+            self._cache is None
+            or cache_key != self._cache_key
+            or self._steps_since_rollout >= self.rollout_interval
+        ):
             raw = self.generator.generate(batch)
             self._cache = self._score(raw)
+            self._cache_key = cache_key
             self._steps_since_rollout = 0
             return self._cache, True
         return self._cache, False

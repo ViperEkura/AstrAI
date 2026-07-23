@@ -190,7 +190,8 @@ def grpo_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
       - rewards:  [G]
 
     Output:
-      - prompts:   [B, P_max]
+      - prompts:   [B, P_max], left-padded
+      - prompt_mask: [B, P_max]
       - responses: [B, G, R_max]
       - masks:     [B, G, R_max]
       - rewards:   [B, G]
@@ -201,13 +202,15 @@ def grpo_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
     R_max = max(r.size(0) for b in batch for r in b["responses"])
 
     prompts = torch.zeros(B, P_max, dtype=torch.long)
+    prompt_mask = torch.zeros(B, P_max, dtype=torch.bool)
     responses = torch.zeros(B, G, R_max, dtype=torch.long)
     masks = torch.zeros(B, G, R_max, dtype=torch.bool)
     rewards = torch.zeros(B, G, dtype=torch.float32)
 
     for i, b in enumerate(batch):
         p_len = b["prompts"].size(0)
-        prompts[i, :p_len] = b["prompts"]
+        prompts[i, -p_len:] = b["prompts"]
+        prompt_mask[i, -p_len:] = True
         rewards[i, : b["rewards"].size(0)] = b["rewards"]
         for g in range(min(G, len(b["responses"]))):
             r_len = b["responses"][g].size(0)
@@ -217,6 +220,7 @@ def grpo_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
 
     return {
         "prompts": prompts,
+        "prompt_mask": prompt_mask,
         "responses": responses,
         "masks": masks,
         "rewards": rewards,

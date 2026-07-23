@@ -158,6 +158,11 @@ class BaseStrategy(ABC):
         """
         pass
 
+    def on_optimizer_step(self):
+        """Advance online rollout state after a successful optimizer step."""
+        if self._rollout_runner is not None:
+            self._rollout_runner.step()
+
     def __call__(self, batch: Dict[str, Tensor]) -> Tensor:
         """Run offline or online forward depending on runner injection."""
         if self._rollout_runner is None:
@@ -166,8 +171,6 @@ class BaseStrategy(ABC):
         result, is_fresh = self._rollout_runner(batch)
         if is_fresh:
             self._on_rollout_refresh()
-            if self.executor and self.executor.sync_gradients:
-                self._rollout_runner.step()
 
         train_batch = self.prepare_from_rollout(result)
         return self.compute_loss(train_batch)
@@ -411,6 +414,12 @@ class GRPOStrategy(BaseStrategy):
         responses_flat = responses.view(-1, response_len)
         masks_flat = masks.view(-1, response_len)
         prompt_expanded = prompts.unsqueeze(1).repeat(1, group_size, 1).flatten(0, 1)
+        prompt_mask = batch.get("prompt_mask")
+        if prompt_mask is None:
+            prompt_mask = prompts.ne(0)
+        prompt_mask_expanded = (
+            prompt_mask.unsqueeze(1).expand(-1, group_size, -1).flatten(0, 1)
+        )
         prompt_len = prompt_expanded.size(1)
 
         full_sequences = torch.cat([prompt_expanded, responses_flat], dim=-1)
@@ -423,7 +432,9 @@ class GRPOStrategy(BaseStrategy):
         )
 
         # Build full attention mask: key-padding + causal
-        key_pad = full_sequences.bool()[:, None, None, :]
+        key_pad = torch.cat([prompt_mask_expanded, masks_flat.bool()], dim=-1)[
+            :, None, None, :
+        ]
         S = key_pad.shape[-1]
         causal = torch.tril(
             torch.ones(S, S, dtype=torch.bool, device=full_sequences.device)
@@ -485,6 +496,7 @@ class GRPOStrategy(BaseStrategy):
     def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
         return {
             "prompts": result.prompts,
+            "prompt_mask": result.prompt_mask,
             "responses": result.responses,
             "masks": result.response_mask,
             "rewards": result.rewards,

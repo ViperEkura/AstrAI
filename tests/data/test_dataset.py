@@ -937,8 +937,9 @@ def test_grpo_collate_variable_lengths():
     assert result["masks"].shape == (2, 2, 4)
     assert result["rewards"].shape == (2, 2)
 
-    # Check padding: item 1 prompt is length 2, padded to 3
-    assert result["prompts"][1, 2] == 0
+    # Prompts are left-padded so each response follows its real prompt tokens.
+    assert torch.equal(result["prompts"][1], torch.tensor([0, 10, 11]))
+    assert torch.equal(result["prompt_mask"][1], torch.tensor([False, True, True]))
 
     # Check response content: item 0, response 0 is [4,5] padded to 4
     assert result["responses"][0, 0, 0] == 4

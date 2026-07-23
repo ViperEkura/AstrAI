@@ -63,6 +63,7 @@ def _make_frozen(model, device):
 def _make_rollout_result(B=2, G=4, P=6, R=8, device="cpu"):
     return RolloutResult(
         prompts=torch.randint(3, 200, (B, P), device=device),
+        prompt_mask=torch.ones(B, P, dtype=torch.bool, device=device),
         responses=torch.randint(3, 200, (B, G, R), device=device),
         response_mask=torch.ones(B, G, R, dtype=torch.bool, device=device),
         rewards=torch.randn(B, G, device=device),
@@ -177,6 +178,7 @@ def test_grpo_prepare_from_rollout_mapping(device):
     r = _make_rollout_result(device=device)
     batch = strat.prepare_from_rollout(r)
     assert batch["prompts"] is r.prompts
+    assert batch["prompt_mask"] is r.prompt_mask
     assert batch["responses"] is r.responses
     assert batch["masks"] is r.response_mask
     assert batch["rewards"] is r.rewards
@@ -255,9 +257,11 @@ def test_grpo_no_resync_when_same_cached_result(device):
     runner = _RecordingRunner(_make_rollout_result(device=device))
     strat.set_rollout_runner(runner)
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    strat.on_optimizer_step()
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    strat.on_optimizer_step()
     assert runner.calls == 2
-    assert runner.step_calls == 1
+    assert runner.step_calls == 2
 
 
 def test_grpo_resync_when_new_rollout_result(device):
@@ -265,8 +269,10 @@ def test_grpo_resync_when_new_rollout_result(device):
     runner = _RecordingRunner(_make_rollout_result(device=device))
     strat.set_rollout_runner(runner)
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    strat.on_optimizer_step()
     runner.swap_result(_make_rollout_result(device=device))
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    strat.on_optimizer_step()
     assert runner.calls == 2
     assert runner.step_calls == 2
 
@@ -281,8 +287,10 @@ def test_dpo_no_sync_hook_when_new_rollout_result(device):
     runner = _RecordingRunner(_make_rollout_result(device=device))
     strat.set_rollout_runner(runner)
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    strat.on_optimizer_step()
     runner.swap_result(_make_rollout_result(device=device))
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    strat.on_optimizer_step()
     assert runner.step_calls == 2
 
 
@@ -301,6 +309,7 @@ def test_step_called_when_sync_gradients_true(device):
     runner = _RecordingRunner(_make_rollout_result(device=device))
     strat.set_rollout_runner(runner)
     strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
+    strat.on_optimizer_step()
     assert runner.step_calls == 1
 
 

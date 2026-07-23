@@ -83,6 +83,7 @@ class Trainer:
                         if executor.sync_gradients:
                             self._call_callbacks("on_optimizer_step", context)
                             context.optimizer.step()
+                            context.strategy.on_optimizer_step()
                             context.optimizer.zero_grad()
 
                             if context.scheduler:

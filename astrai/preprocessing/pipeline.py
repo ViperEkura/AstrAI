@@ -80,6 +80,9 @@ class Pipeline:
     def transform(self, item: dict) -> Optional[dict]:
         return self.mask_builder.build(item, self.config, self.tokenizer)
 
+    def transform_batch(self, items: list[dict]) -> list[Optional[dict]]:
+        return self.mask_builder.build_batch(items, self.config, self.tokenizer)
+
     def run(self):
         domains: dict = defaultdict(lambda: defaultdict(list))
         total_tokens = 0
@@ -88,39 +91,55 @@ class Pipeline:
 
         pp = self.config.preprocessing
 
-        for item in tqdm.tqdm(
-            self._iter_items(), desc="Tokenizing", unit="docs", mininterval=0.5
-        ):
-            if pp.max_items and count >= pp.max_items:
-                break
-
+        progress = tqdm.tqdm(desc="Tokenizing", unit="docs", mininterval=0.5)
+        stop = False
+        for items in self._iter_batches(pp.batch_size):
+            progress.update(len(items))
             try:
-                result = self.transform(item)
+                results = self.transform_batch(items)
             except Exception:
                 logger.warning(
-                    "Failed to process item #%d, skipping", count + 1, exc_info=True
+                    "Failed to process batch, retrying records individually",
+                    exc_info=True,
                 )
-                continue
-            if result is None:
-                continue
+                results = []
+                for item in items:
+                    try:
+                        results.append(self.transform(item))
+                    except Exception:
+                        logger.warning(
+                            "Failed to process item, skipping", exc_info=True
+                        )
+                        results.append(None)
 
-            domain = result.pop("domain", "__default__")
-            ids = primary_ids(result)
-            if not ids:
-                continue
+            for result in results:
+                if pp.max_items and count >= pp.max_items:
+                    stop = True
+                    break
+                if result is None:
+                    continue
 
-            bucket = domains[domain]
-            self._align_bucket(bucket, result, ids)
-            for key, val in result.items():
-                bucket[key].append(val)
+                domain = result.pop("domain", "__default__")
+                ids = primary_ids(result)
+                if not ids:
+                    continue
 
-            count += 1
-            total_tokens += len(ids)
+                bucket = domains[domain]
+                self._align_bucket(bucket, result, ids)
+                for key, val in result.items():
+                    bucket[key].append(val)
 
-            if total_tokens >= self.config.output.max_tokens_per_shard:
-                self._flush(domains, shard_idx)
-                domains.clear()
-                total_tokens = 0
+                count += 1
+                total_tokens += len(ids)
+
+                if total_tokens >= self.config.output.max_tokens_per_shard:
+                    self._flush(domains, shard_idx)
+                    domains.clear()
+                    total_tokens = 0
+            if stop:
+                break
+
+        progress.close()
 
         if total_tokens > 0:
             self._flush(domains, shard_idx)
@@ -148,6 +167,17 @@ class Pipeline:
                         if not line:
                             continue
                         yield json.loads(line)
+
+    def _iter_batches(self, batch_size: int):
+        batch_size = max(1, batch_size)
+        batch = []
+        for item in self._iter_items():
+            batch.append(item)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
 
     def _flush(self, domains, shard_idx):
         for domain, keys in domains.items():

@@ -45,6 +45,8 @@ class ProcessingConfig(BaseConfig):
         Maximum number of characters to keep (default: 2_000_000).
     max_items : Optional[int]
         Maximum number of items to process (default: None, unlimited).
+    batch_size : int
+        Number of records tokenized together (default: 256).
     packing_strategy : str
         How to pack sequences into a contiguous stream.
 
@@ -65,6 +67,7 @@ class ProcessingConfig(BaseConfig):
     min_chars: int = 50
     max_chars: int = 2_000_000
     max_items: Optional[int] = None
+    batch_size: int = 256
     packing_strategy: str = "simple"
     max_packed_len: int = 8192
     truncation_mode: str = "keep_start"

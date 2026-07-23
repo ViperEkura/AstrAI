@@ -68,6 +68,28 @@ def test_chat_mask_only_assistant(chat_tokenizer, builder):
     assert len(masked) > 0
 
 
+def test_chat_batch_matches_single(chat_tokenizer, builder):
+    config = make_chat_config()
+    items = [
+        {
+            "messages": [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+            ]
+        },
+        {
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": "Say hello."},
+                {"role": "assistant", "content": "Hello."},
+            ]
+        },
+    ]
+    batch = builder.build_batch(items, config, chat_tokenizer)
+    single = [builder.build(item, config, chat_tokenizer) for item in items]
+    assert batch == single
+
+
 @pytest.mark.parametrize(
     "mask_rules,mask_default,expect_nonzero",
     [
@@ -150,6 +172,17 @@ def test_instruction_basic(test_tokenizer, builder):
     result = builder.build(item, config, test_tokenizer)
     assert result is not None
     assert len(result["sequence"]) == len(result["loss_mask"])
+
+
+def test_instruction_batch_matches_single(test_tokenizer, builder):
+    config = make_instruction_config()
+    items = [
+        {"prompt": "Translate to French: Hello", "response": "Bonjour"},
+        {"prompt": "Translate to German: Hello", "response": "Hallo"},
+    ]
+    assert builder.build_batch(items, config, test_tokenizer) == [
+        builder.build(item, config, test_tokenizer) for item in items
+    ]
 
 
 def test_instruction_prompt_masked(test_tokenizer, builder):
@@ -361,6 +394,25 @@ def test_grpo_basic(chat_tokenizer, builder):
         assert len(result["masks"][i]) == len(result["responses"][i])
 
     assert result["rewards"] == [1.0, 0.5, 0.8, 0.2]
+
+
+def test_grpo_batch_matches_single(chat_tokenizer, builder):
+    config = make_grpo_config()
+    items = [
+        {
+            "prompt": [{"role": "user", "content": "What is 2+2?"}],
+            "responses": ["4", "5"],
+            "rewards": [1.0, 0.0],
+        },
+        {
+            "prompt": [{"role": "user", "content": "Say hello."}],
+            "responses": ["Hello", "Hi"],
+            "rewards": [1.0, 0.5],
+        },
+    ]
+    assert builder.build_batch(items, config, chat_tokenizer) == [
+        builder.build(item, config, chat_tokenizer) for item in items
+    ]
 
 
 def test_grpo_response_tokens_all_trained(chat_tokenizer, builder):

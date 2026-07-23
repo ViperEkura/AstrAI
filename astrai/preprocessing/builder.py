@@ -94,6 +94,97 @@ class SectionRenderer:
 
         return all_ids, loss_mask
 
+    def process_sections_batch(
+        self,
+        items: list[dict],
+        sections: list,
+        config,
+        tokenizer,
+        *,
+        is_top_level=False,
+        filter_text=True,
+    ):
+        """Render and tokenize a group of records with batched Rust tokenization."""
+        has_template = any(s.get("template") for s in sections)
+        is_text_config = not has_template and all(
+            s["action"] == "train" for s in sections
+        )
+        plans: list[list[tuple[str, str, bool]]] = []
+
+        for item in items:
+            plan: list[tuple[str, str, bool]] = []
+            first_section = True
+            for sec in sections:
+                field = sec["field"]
+                action = sec["action"]
+                use_template = sec.get("template", False)
+                add_special = sec.get(
+                    "add_special_tokens", not use_template and first_section
+                )
+
+                if use_template:
+                    messages = item.get(field)
+                    if not isinstance(messages, list) or not messages:
+                        continue
+                    for msg in messages:
+                        role = msg.get("role", "")
+                        rendered = tokenizer.apply_chat_template(
+                            [msg], tokenize=False, add_generation_prompt=False
+                        )
+                        plan.append(
+                            (rendered, _resolve_action(action, role, config), False)
+                        )
+                else:
+                    text = str(item.get(field, ""))
+                    if not text.strip():
+                        continue
+                    if is_text_config and filter_text:
+                        pp = config.preprocessing
+                        if pp.min_chars > 0 and len(text) < pp.min_chars:
+                            continue
+                        if len(text) > pp.max_chars:
+                            continue
+                    plan.append((text, action, add_special))
+
+                first_section = False
+            plans.append(plan)
+
+        encoded: dict[tuple[int, int], list[int]] = {}
+        for add_special in (False, True):
+            refs = [
+                (item_idx, unit_idx, text)
+                for item_idx, plan in enumerate(plans)
+                for unit_idx, (text, _, add) in enumerate(plan)
+                if add == add_special
+            ]
+            if not refs:
+                continue
+            ids_batch = tokenizer.encode(
+                [text for _, _, text in refs], add_special_tokens=add_special
+            )
+            for (item_idx, unit_idx, _), ids in zip(refs, ids_batch):
+                encoded[(item_idx, unit_idx)] = ids
+
+        outputs = []
+        max_len = config.preprocessing.max_seq_len
+        for item_idx, plan in enumerate(plans):
+            all_ids = []
+            loss_mask = []
+            if is_top_level and has_template and tokenizer.bos_token_id is not None:
+                all_ids.append(tokenizer.bos_token_id)
+                loss_mask.append(0)
+            for unit_idx, (_, action, _) in enumerate(plan):
+                ids = encoded[(item_idx, unit_idx)]
+                all_ids.extend(ids)
+                loss_mask.extend([1 if action == "train" else 0] * len(ids))
+            all_ids = all_ids[:max_len]
+            loss_mask = loss_mask[: len(all_ids)]
+            if not all_ids or (is_top_level and has_template and len(all_ids) <= 1):
+                outputs.append((None, None))
+            else:
+                outputs.append((all_ids, loss_mask))
+        return outputs
+
     def process_list_field(self, item: dict, sections: list, config, tokenizer):
         """Tokenize a list-valued field, preserving per-element boundaries.
 
@@ -146,6 +237,42 @@ class SectionRenderer:
         if not per_item_ids:
             return None, None
         return per_item_ids, per_item_masks
+
+    def process_list_field_batch(self, items, sections, config, tokenizer):
+        per_item_ids = [[] for _ in items]
+        per_item_masks = [[] for _ in items]
+
+        for sec in sections:
+            wrappers = []
+            owners = []
+            field = sec["field"]
+            for item_idx, item in enumerate(items):
+                values = item.get(field)
+                if not isinstance(values, list):
+                    continue
+                for val in values:
+                    if sec.get("template", False) and not isinstance(val, list):
+                        continue
+                    wrappers.append({field: val if isinstance(val, list) else str(val)})
+                    owners.append(item_idx)
+
+            rendered = self.process_sections_batch(
+                wrappers,
+                [sec],
+                config,
+                tokenizer,
+                is_top_level=False,
+                filter_text=False,
+            )
+            for owner, (ids, mask) in zip(owners, rendered):
+                if ids:
+                    per_item_ids[owner].append(ids)
+                    per_item_masks[owner].append(mask)
+
+        return [
+            (ids, masks) if ids else (None, None)
+            for ids, masks in zip(per_item_ids, per_item_masks)
+        ]
 
     @staticmethod
     def is_value_section(sections: list) -> bool:
@@ -214,6 +341,9 @@ class BaseMaskBuilder(ABC):
     @abstractmethod
     def build(self, item: dict, config, tokenizer) -> Optional[dict]: ...
 
+    def build_batch(self, items: list[dict], config, tokenizer) -> list[Optional[dict]]:
+        return [self.build(item, config, tokenizer) for item in items]
+
 
 class MaskBuilderFactory(BaseFactory["BaseMaskBuilder"]):
     pass
@@ -247,6 +377,27 @@ class SingleOutputMaskBuilder(BaseMaskBuilder):
         if not all(m == 1 for m in mask):
             result["loss_mask"] = mask
         return result
+
+    def build_batch(self, items, config, tokenizer):
+        sections = config.input.sections
+        if not sections:
+            return [None] * len(items)
+        rendered = self.renderer.process_sections_batch(
+            items, sections, config, tokenizer, is_top_level=True
+        )
+        results = []
+        for item, (ids, mask) in zip(items, rendered):
+            if ids is None:
+                results.append(None)
+                continue
+            result = {
+                "sequence": ids,
+                "domain": _extract_domain(item, config.output.domain_key),
+            }
+            if not all(m == 1 for m in mask):
+                result["loss_mask"] = mask
+            results.append(result)
+        return results
 
 
 @MaskBuilderFactory.register("multi")
@@ -317,6 +468,49 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
         result["domain"] = _extract_domain(item, config.output.domain_key)
         return result
 
+    def build_batch(self, items, config, tokenizer):
+        sources_spec = getattr(config.input, "sources", None)
+        if not sources_spec:
+            return [None] * len(items)
+
+        results = [{} for _ in items]
+        for output_key, spec in sources_spec.items():
+            sections = spec.get("sections", [])
+            if not sections:
+                continue
+            if self.renderer.is_value_section(sections):
+                for item, result in zip(items, results):
+                    value = self.renderer.extract_raw_value(item, sections)
+                    if value is not None:
+                        result[output_key] = value
+                continue
+
+            mask_key = spec.get("mask_key", f"{output_key}_mask")
+            if spec.get("list_field", False):
+                rendered = self.renderer.process_list_field_batch(
+                    items, sections, config, tokenizer
+                )
+            else:
+                rendered = self.renderer.process_sections_batch(
+                    items, sections, config, tokenizer, is_top_level=True
+                )
+
+            for result, (ids, mask) in zip(results, rendered):
+                if ids is None:
+                    continue
+                result[output_key] = ids
+                if spec.get("list_field", False) or not all(m == 1 for m in mask):
+                    result[mask_key] = mask
+                elif "mask_key" in spec:
+                    result[mask_key] = mask
+
+        return [
+            ({**result, "domain": _extract_domain(item, config.output.domain_key)})
+            if result
+            else None
+            for item, result in zip(items, results)
+        ]
+
 
 @MaskBuilderFactory.register("sectioned")
 class SectionedMaskBuilder(BaseMaskBuilder):
@@ -335,3 +529,9 @@ class SectionedMaskBuilder(BaseMaskBuilder):
         if sources_spec:
             return self._multi.build(item, config, tokenizer)
         return self._single.build(item, config, tokenizer)
+
+    def build_batch(self, items, config, tokenizer):
+        sources_spec = getattr(config.input, "sources", None)
+        if sources_spec:
+            return self._multi.build_batch(items, config, tokenizer)
+        return self._single.build_batch(items, config, tokenizer)

@@ -22,9 +22,19 @@ def main():
         default="params",
         help="Path to tokenizer directory (default: params)",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Number of records tokenized together (default: config value)",
+    )
     args = parser.parse_args()
 
     config = PipelineConfig.from_file(args.config)
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            parser.error("--batch_size must be at least 1")
+        config.preprocessing.batch_size = args.batch_size
 
     Pipeline(
         config=config,

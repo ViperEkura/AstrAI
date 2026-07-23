@@ -327,8 +327,8 @@ def parse_args() -> argparse.Namespace:
         "--parallel_mode",
         type=str,
         default="none",
-        choices=["none", "ddp", "fsdp"],
-        help="Parallel training strategy (none, ddp, fsdp).",
+        choices=["none", "ddp", "fsdp", "fsdp2"],
+        help="Parallel training strategy (none, ddp, fsdp, fsdp2).",
     )
     parser.add_argument(
         "--device_type", type=str, default="cuda", help="Device type to use."
@@ -472,7 +472,7 @@ def train(
     ]
     assert os.path.exists(param_path)
     if nprocs > 1 and parallel_mode == "none":
-        raise ValueError("--nprocs > 1 requires --parallel_mode to be 'ddp' or 'fsdp'")
+        raise ValueError("--nprocs > 1 requires --parallel_mode to be 'ddp', 'fsdp', or 'fsdp2'")
 
     # Load config
     config_path = os.path.join(param_path, "config.json")

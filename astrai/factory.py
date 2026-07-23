@@ -67,7 +67,10 @@ class BaseFactory(ABC, Generic[T]):
             if _get_origin(orig_base) is BaseFactory:
                 (arg,) = _get_args(orig_base)
                 cls._entries = {}
-                cls._component_base = _resolve_type(arg, cls)
+                try:
+                    cls._component_base = _resolve_type(arg, cls)
+                except Exception:
+                    cls._component_base = None
                 return
 
     @classmethod

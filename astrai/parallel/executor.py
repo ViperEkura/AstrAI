@@ -317,9 +317,11 @@ class FSDPExecutor(BaseExecutor):
 class FSDP2Executor(BaseExecutor):
     """FSDP2 executor using `torch.distributed.fsdp.fully_shard` (per-module API).
 
-    Unlike FSDP1's `FSDP(model, ...)` wrapper, FSDP2 wraps each submodule
-    individually via `fully_shard(module)`. Original `Parameter` objects are
-    preserved (as DTensors) — no `FlatParameter`, no `use_orig_params=True` hack.
+    Wraps each child module individually via ``fully_shard``.
+    Skips the root model because ``ABC + Generic[T]`` in the MRO makes
+    FSDP2's dynamic ``__class__`` assignment fail at the CPython level.
+    Original ``Parameter`` objects are preserved (as DTensors) — no
+    ``FlatParameter``, no ``use_orig_params=True`` hack.
     """
 
     def __init__(
@@ -346,26 +348,37 @@ class FSDP2Executor(BaseExecutor):
         )
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-        model = fully_shard(model, **kwargs)
-        logger.info("Model wrapped with FSDP2 (world_size=%d)", get_world_size())
+        for child in model.children():
+            if isinstance(child, nn.ModuleList):
+                for sub in child:
+                    fully_shard(sub, **kwargs)
+            else:
+                fully_shard(child, **kwargs)
+
+        logger.info(
+            "FSDP2 wrapping applied to %d direct children (root skipped for ABC compat)",
+            len(list(model.children())),
+        )
         return model
 
     @contextmanager
     def _no_sync(self, model: nn.Module):
-        if isinstance(model, FSDPModule):
-            model.set_requires_gradient_sync(False, recurse=True)
+        fsdp_modules = [
+            m for m in model.modules() if isinstance(m, FSDPModule)
+        ]
+        if fsdp_modules:
+            for m in fsdp_modules:
+                m.set_requires_gradient_sync(False, recurse=True)
             try:
                 yield
             finally:
-                model.set_requires_gradient_sync(True, recurse=True)
+                for m in fsdp_modules:
+                    m.set_requires_gradient_sync(True, recurse=True)
         else:
             yield
 
     def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
-        if isinstance(model, FSDPModule) and self.use_distributed:
-            for module in model.modules():
-                if isinstance(module, FSDPModule):
-                    module.unshard()
+        if self.use_distributed:
             total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             if isinstance(total_norm, torch.Tensor):
                 return total_norm.item()
@@ -373,7 +386,7 @@ class FSDP2Executor(BaseExecutor):
         return super().clip_grad_norm(model, max_norm)
 
     def unwrap_model(self, model: nn.Module):
-        if not self.use_distributed or not isinstance(model, FSDPModule):
+        if not self.use_distributed:
             return model.state_dict()
 
         if get_rank() != 0:
@@ -384,7 +397,13 @@ class FSDP2Executor(BaseExecutor):
                 module.unshard()
 
         state_dict = model.state_dict()
-        return {
+        result = {
             k: (v.full_tensor() if isinstance(v, DTensor) else v)
             for k, v in state_dict.items()
         }
+
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
+
+        return result

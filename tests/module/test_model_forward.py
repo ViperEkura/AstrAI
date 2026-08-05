@@ -68,13 +68,20 @@ def test_collect_moe_diagnostics_empty_list():
 
 
 def test_collect_moe_diagnostics_uniform_routing():
-    """Uniform routing should produce near-zero imbalance, zero dead experts."""
+    """Uniform routing probabilities with top_k=2 → tie-breaking by index.
+
+    torch.topk breaks ties by index, so with equal probabilities
+    experts 0 and 1 always win over experts 2 and 3:
+      - dead_expert_fraction = 2/4 = 0.5
+      - load_ratios = [2, 2, 0, 0] → |ratio-1| = [1, 1, 1, 1] → mean = 1.0
+      - load_imbalance_max = 2.0
+    """
     probs = torch.ones(128, 4) / 4.0
     diag = _collect_moe_diagnostics([probs], top_k=2)
 
-    assert diag["dead_expert_fraction"] == pytest.approx(0.0, abs=1e-6)
-    # Uniform load → load_ratios all ≈1 → imbalance near 0
-    assert diag["load_imbalance_mean"] < 0.01
+    assert diag["dead_expert_fraction"] == pytest.approx(0.5, abs=1e-6)
+    assert diag["load_imbalance_mean"] == pytest.approx(1.0, abs=1e-6)
+    assert diag["load_imbalance_max"] == pytest.approx(2.0, abs=1e-6)
 
 
 def test_collect_moe_diagnostics_max_entropy():

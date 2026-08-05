@@ -265,6 +265,103 @@ def test_moe_defaults_preserve_normalized_routing():
     assert model.layers[0].mlp.norm_topk_prob is True
 
 
+def test_moe_router_probs_populated_after_forward():
+    """Verify DeepSeekMoE._router_probs is set after forward in training mode."""
+    from astrai.config.model_config import AutoRegressiveLMConfig
+    from astrai.model.components.mlp import DeepSeekMoE
+
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        ffn_type="moe",
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        topk_method="greedy",
+    )
+    model = AutoRegressiveLM(config)
+    model.train()
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+
+    with torch.enable_grad():
+        model(input_ids)
+
+    # All MoE layers should have router_probs set
+    moe_layers = [m for m in model.modules() if isinstance(m, DeepSeekMoE)]
+    assert len(moe_layers) > 0
+    for layer in moe_layers:
+        assert layer._router_probs is not None
+        assert layer._router_probs.ndim == 2
+        assert layer._router_probs.shape[-1] == 4  # n_routed_experts
+
+
+def test_get_moe_router_probs_moe_model():
+    """Verify get_moe_router_probs() returns a list of tensors for MoE models."""
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        ffn_type="moe",
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+    )
+    model = AutoRegressiveLM(config)
+    model.train()
+
+    with torch.enable_grad():
+        model(torch.randint(0, config.vocab_size, (2, 8)))
+
+    probs = model.get_moe_router_probs()
+    assert isinstance(probs, list)
+    assert len(probs) == 2  # num_hidden_layers
+    for p in probs:
+        assert p.ndim == 2
+        assert p.shape[-1] == 4
+
+
+def test_get_moe_router_probs_non_moe_model():
+    """Verify get_moe_router_probs() returns empty list for non-MoE models."""
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(**TINY_CONFIG, ffn_type="mlp")
+    model = AutoRegressiveLM(config)
+
+    probs_untrained = model.get_moe_router_probs()
+    assert probs_untrained == []
+
+    model.train()
+    with torch.enable_grad():
+        model(torch.randint(0, config.vocab_size, (2, 8)))
+
+    probs = model.get_moe_router_probs()
+    assert probs == []
+
+
+def test_collect_router_probs_static_method():
+    """Verify DeepSeekMoE.collect_router_probs static method."""
+    from astrai.model.components.mlp import DeepSeekMoE
+
+    moe = DeepSeekMoE(
+        dim=8,
+        dim_ffn=16,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+    )
+    moe.train()
+    with torch.enable_grad():
+        moe(torch.randn(2, 8, 8))
+
+    # collect_router_probs should find the MoE layer
+    probs = DeepSeekMoE.collect_router_probs(moe)
+    assert len(probs) == 1
+    assert probs[0].shape[-1] == 4
+
+    # On a plain MLP module, should return empty
+    mlp_module = MLP(8, 16)
+    assert DeepSeekMoE.collect_router_probs(mlp_module) == []
+
+
 def test_moe_aux_loss_only_emitted_during_training():
     from astrai.config.model_config import AutoRegressiveLMConfig
 

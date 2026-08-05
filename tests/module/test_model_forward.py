@@ -14,9 +14,9 @@ from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.strategy import (
     SEQStrategy,
     SFTStrategy,
+    StrategyFactory,
     _collect_moe_diagnostics,
     _load_balancing_loss,
-    StrategyFactory,
 )
 from tests.helpers import TINY_CONFIG
 

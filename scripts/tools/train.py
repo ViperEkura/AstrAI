@@ -290,6 +290,13 @@ _START_METHODS = ["spawn", "fork", "forkserver"]
     help="Label smoothing.",
 )
 @opt(
+    "--moe_aux_loss_coef",
+    type=float,
+    default=0.01,
+    group="Algorithm",
+    help="MoE load balancing auxiliary loss coefficient (0=disable).",
+)
+@opt(
     "--rollout_interval",
     type=int,
     default=512,
@@ -813,6 +820,7 @@ def train(
         rollout_top_p=rollout_top_p,
         rollout_max_tokens=rollout_max_tokens,
         reward_model_fn=reward_model_fn,
+        moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),
     )
 
     trainer = Trainer(train_config)

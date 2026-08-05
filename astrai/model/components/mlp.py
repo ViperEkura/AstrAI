@@ -1,4 +1,4 @@
-from typing import Optional, TypedDict
+from typing import List, Optional, TypedDict
 
 import torch
 import torch.nn as nn
@@ -70,6 +70,7 @@ class DeepSeekMoE(nn.Module):
         )
 
         self.router = Linear(dim, n_routed_experts, bias=False)
+        self._router_probs: Optional[Tensor] = None
         moe_scale = 1 / max(n_shared_experts, 1) + 1 / n_activated_experts
         down_init_std = 0.02 / (2 * n_layers * moe_scale) ** 0.5
 
@@ -111,6 +112,7 @@ class DeepSeekMoE(nn.Module):
 
         router_logits = self.router(x)
         router_probs = torch.softmax(router_logits.float(), dim=-1).to(x.dtype)
+        self._router_probs = router_probs.detach()
 
         topk_weights, topk_indices = torch.topk(router_probs, K, dim=-1)
         if self.norm_topk_prob:
@@ -139,3 +141,12 @@ class DeepSeekMoE(nn.Module):
             output.index_add_(0, token_idx, expert_output * weights)
 
         return {"hidden_states": output, "aux_loss": aux_loss}
+
+    @staticmethod
+    def collect_router_probs(module: nn.Module) -> List[Tensor]:
+        """Recursively collect router_probs from all DeepSeekMoE submodules."""
+        probs: List[Tensor] = []
+        for m in module.modules():
+            if isinstance(m, DeepSeekMoE) and m._router_probs is not None:
+                probs.append(m._router_probs)
+        return probs

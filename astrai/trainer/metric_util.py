@@ -88,3 +88,23 @@ def ctx_get_grad_snr(ctx):
     if tracker is None:
         return None
     return tracker.snr
+
+
+def ctx_get_moe_aux_loss(ctx):
+    return ctx.strategy._moe_metrics.get("aux_loss")
+
+
+def ctx_get_router_entropy(ctx):
+    return ctx.strategy._moe_metrics.get("router_entropy")
+
+
+def ctx_get_dead_expert_fraction(ctx):
+    return ctx.strategy._moe_metrics.get("dead_expert_fraction")
+
+
+def ctx_get_load_imbalance_mean(ctx):
+    return ctx.strategy._moe_metrics.get("load_imbalance_mean")
+
+
+def ctx_get_load_imbalance_max(ctx):
+    return ctx.strategy._moe_metrics.get("load_imbalance_max")

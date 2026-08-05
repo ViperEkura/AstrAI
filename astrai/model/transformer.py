@@ -1,4 +1,4 @@
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,7 @@ from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.linear import Linear
+from astrai.model.components.mlp import DeepSeekMoE
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
 
@@ -133,3 +134,7 @@ class AutoRegressiveLM(AutoModel):
         if aux_losses:
             output["aux_loss"] = torch.stack(aux_losses).mean()
         return output
+
+    def get_moe_router_probs(self) -> List[Tensor]:
+        """Return router_probs from all MoE layers for strategy-side aux loss."""
+        return DeepSeekMoE.collect_router_probs(self)

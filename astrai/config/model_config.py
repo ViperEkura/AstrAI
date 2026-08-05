@@ -97,6 +97,7 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     norm_topk_prob: bool = True
     decoder_sparse_step: int = 1
     mlp_only_layers: Optional[list[int]] = None
+    moe_aux_loss_coef: float = 0.01
 
     @field_validator("attn_type")
     def _validate_attn_type(cls, v: str) -> str:

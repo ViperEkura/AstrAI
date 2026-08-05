@@ -173,9 +173,15 @@ def _collect_moe_diagnostics(
 
     return {
         "router_entropy": float(torch.stack(layer_entropies).mean().cpu().item()),
-        "dead_expert_fraction": float(torch.stack(layer_dead_fractions).mean().cpu().item()),
-        "load_imbalance_mean": float(torch.stack(layer_imbalance_means).mean().cpu().item()),
-        "load_imbalance_max": float(torch.stack(layer_imbalance_maxs).mean().cpu().item()),
+        "dead_expert_fraction": float(
+            torch.stack(layer_dead_fractions).mean().cpu().item()
+        ),
+        "load_imbalance_mean": float(
+            torch.stack(layer_imbalance_means).mean().cpu().item()
+        ),
+        "load_imbalance_max": float(
+            torch.stack(layer_imbalance_maxs).mean().cpu().item()
+        ),
     }
 
 

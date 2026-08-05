@@ -237,9 +237,7 @@ class TestSEQStrategyMoE:
         """Pure MLP model: model outputs no aux_loss → no MoE metrics."""
         from astrai.config.model_config import AutoRegressiveLMConfig
 
-        mlp_config = AutoRegressiveLMConfig(
-            **{**TINY_CONFIG, "ffn_type": "mlp"}
-        )
+        mlp_config = AutoRegressiveLMConfig(**{**TINY_CONFIG, "ffn_type": "mlp"})
         mlp_model = AutoRegressiveLM(mlp_config).to(self.device)
         mlp_model.train()
 

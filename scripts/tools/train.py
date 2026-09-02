@@ -313,6 +313,23 @@ _START_METHODS = sorted(START_METHODS)
     help="GRPO KL penalty coefficient.",
 )
 @opt(
+    "--grpo_loss_variant",
+    type=click.Choice(["grpo", "dr_grpo"]),
+    default="grpo",
+    group="Algorithm",
+    help="GRPO objective variant.",
+)
+@opt(
+    "--grpo_max_completion_length",
+    type=click.IntRange(min=1),
+    default=None,
+    group="Algorithm",
+    help=(
+        "Fixed Dr.GRPO completion budget; online Dr.GRPO defaults to "
+        "--rollout_max_tokens."
+    ),
+)
+@opt(
     "--label_smoothing",
     type=float,
     default=0.0,
@@ -681,6 +698,8 @@ def train(
         "clip_eps": kwargs.pop("grpo_clip_eps"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
+        "loss_variant": kwargs.pop("grpo_loss_variant"),
+        "max_completion_length": kwargs.pop("grpo_max_completion_length"),
     }
 
     rollout_interval = kwargs.pop("rollout_interval", 512)

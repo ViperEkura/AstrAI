@@ -1,6 +1,7 @@
 """Training strategy implementations with factory pattern."""
 
 from abc import ABC
+from numbers import Integral
 from typing import Callable, Dict, List, Optional, TypedDict, Union
 
 import torch
@@ -555,6 +556,8 @@ class GRPOStrategy(BaseStrategy):
         clip_eps: float = 0.2,
         kl_coef: float = 0.01,
         group_size: int = 4,
+        loss_variant: str = "grpo",
+        max_completion_length: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
@@ -563,6 +566,38 @@ class GRPOStrategy(BaseStrategy):
         self.clip_eps = clip_eps
         self.kl_coef = kl_coef
         self.group_size = group_size
+        if loss_variant not in ("grpo", "dr_grpo"):
+            raise ValueError("loss_variant must be either 'grpo' or 'dr_grpo'")
+        if max_completion_length is not None:
+            if isinstance(max_completion_length, bool) or not isinstance(
+                max_completion_length, Integral
+            ):
+                raise TypeError("max_completion_length must be an integer")
+            if max_completion_length <= 0:
+                raise ValueError("max_completion_length must be positive")
+            max_completion_length = int(max_completion_length)
+        if loss_variant == "dr_grpo" and max_completion_length is None:
+            raise ValueError(
+                "max_completion_length is required when loss_variant='dr_grpo'"
+            )
+        self.loss_variant = loss_variant
+        self.max_completion_length = max_completion_length
+
+    def _group_advantages(self, rewards: Tensor, eps: float) -> Tensor:
+        """Return reward advantages for the configured GRPO objective."""
+        centered_rewards = rewards - rewards.mean(dim=-1, keepdim=True)
+        if self.loss_variant == "dr_grpo":
+            return centered_rewards
+        std = rewards.std(dim=-1, keepdim=True, unbiased=False)
+        return centered_rewards / (std + eps)
+
+    def _policy_loss_normalizer(self, token_masks: Tensor) -> Union[Tensor, int]:
+        """Return the active-token or fixed-budget policy denominator."""
+        if self.loss_variant == "dr_grpo":
+            assert self.max_completion_length is not None
+            batch_size, group_size, _ = token_masks.shape
+            return batch_size * group_size * self.max_completion_length
+        return token_masks.sum().clamp(min=1.0)
 
     def sync_old_model(self):
         """Copy current policy weights to old model."""
@@ -580,6 +615,15 @@ class GRPOStrategy(BaseStrategy):
         rewards = batch["rewards"]
 
         batch_size, group_size, response_len = responses.shape
+        if (
+            self.loss_variant == "dr_grpo"
+            and self.max_completion_length is not None
+            and response_len > self.max_completion_length
+        ):
+            raise ValueError(
+                f"response length {response_len} exceeds max_completion_length "
+                f"{self.max_completion_length}"
+            )
         responses_flat = responses.view(-1, response_len)
         masks_flat = masks.view(-1, response_len)
         prompt_expanded = prompts.unsqueeze(1).repeat(1, group_size, 1).flatten(0, 1)
@@ -637,11 +681,11 @@ class GRPOStrategy(BaseStrategy):
         token_log_probs_ref = token_log_probs_ref.view(batch_size, group_size, -1)
         token_masks = masks_flat.view(batch_size, group_size, -1).float()
 
-        # Group-normalized advantages from scalar per-response rewards.
+        # Scalar per-response advantages: standard GRPO divides centered
+        # rewards by the group standard deviation, while Dr.GRPO deliberately
+        # removes that normalization.
         eps = 1e-8
-        mean = rewards.mean(dim=-1, keepdim=True)
-        std = rewards.std(dim=-1, keepdim=True, unbiased=False)
-        advantages = (rewards - mean) / (std + eps)
+        advantages = self._group_advantages(rewards, eps)
         # Broadcast scalar advantage to every response token: [B, G, 1]
         advantages = advantages.unsqueeze(-1)
 
@@ -653,7 +697,8 @@ class GRPOStrategy(BaseStrategy):
         surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
         per_token_policy_loss = -torch.min(surr1, surr2)
         token_count = token_masks.sum().clamp(min=1.0)
-        policy_loss = (per_token_policy_loss * token_masks).sum() / token_count
+        policy_normalizer = self._policy_loss_normalizer(token_masks)
+        policy_loss = (per_token_policy_loss * token_masks).sum() / policy_normalizer
 
         # KL penalty to frozen reference model with k1 estimator (non-negative):
         # k1 = π_ref / π_θ - log(π_ref / π_θ) - 1, where π_ref / π_θ = exp(log_ref - log_policy).

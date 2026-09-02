@@ -142,6 +142,8 @@ with `--optimizer=muon_adamw`.
 | `--group_size` | GRPO/rollout group size | 4 | `grpo`, `online_grpo`, `online_dpo` |
 | `--grpo_clip_eps` | GRPO clipping epsilon | 0.2 | `grpo`, `online_grpo` |
 | `--grpo_kl_coef` | GRPO KL penalty coefficient | 0.01 | `grpo`, `online_grpo` |
+| `--grpo_loss_variant` | Objective variant (`grpo` or `dr_grpo`) | `grpo` | `grpo`, `online_grpo` |
+| `--grpo_max_completion_length` | Fixed completion budget used by Dr.GRPO; online mode defaults to `rollout_max_tokens` | None | `grpo`, `online_grpo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
 
 ### Online Rollout

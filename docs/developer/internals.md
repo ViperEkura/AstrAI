@@ -88,6 +88,12 @@ Where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the per-toke
 
 Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`.
 
+`loss_variant="dr_grpo"` removes reward standard-deviation normalization and
+uses `batch_size * group_size * max_completion_length` as the fixed policy-loss
+denominator. The per-token scale therefore stays fixed when the number of valid
+response tokens changes across batches. The default `loss_variant="grpo"`
+preserves the existing objective exactly.
+
 ### MoE Load Balancing
 
 MoE layers add a differentiable load-balancing term based on mean router probabilities and top-k expert assignment frequency. The training objective is:

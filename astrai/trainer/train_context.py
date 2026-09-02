@@ -279,6 +279,12 @@ class TrainContextBuilder:
     def _create_strategy(self, context: TrainContext, executor: BaseExecutor) -> dict:
         cfg = self.config
         kwargs = dict(cfg.strategy_kwargs)
+        if (
+            cfg.strategy == "online_grpo"
+            and kwargs.get("loss_variant") == "dr_grpo"
+            and kwargs.get("max_completion_length") is None
+        ):
+            kwargs["max_completion_length"] = cfg.rollout_max_tokens
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo"):
             kwargs["ref_model"] = create_ref_model(

@@ -157,6 +157,23 @@ Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. External sync of `ol
 
 Keys: `prompts`, `responses`, `masks`, `rewards`.
 
+Set `loss_variant="dr_grpo"` to use the two bias-removal changes from
+[Understanding R1-Zero-Like Training](https://arxiv.org/abs/2503.20783):
+
+$$
+A_i^{\text{Dr.GRPO}} = r_i - \mu, \qquad
+L_{\text{policy}} = \frac{1}{BG L_{\max}}
+\sum_{i=1}^{B}\sum_{j=1}^{G}\sum_{t=1}^{L_{\max}}
+m_{ijt}\,\ell_{ijt}.
+$$
+
+Unlike standard GRPO, this variant does not divide centered rewards by their
+group standard deviation and does not divide policy loss by the number of valid
+tokens. `max_completion_length` is therefore required as a fixed generation
+budget; online training uses `rollout_max_tokens` when it is not set explicitly.
+The KL regularizer remains independently configurable. Set `kl_coef=0` to match
+the paper's no-KL recipe.
+
 ### Online Rollout
 
 `online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with

@@ -81,6 +81,16 @@ _ONLINE_STRATEGIES = [
         {"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
         id="grpo",
     ),
+    pytest.param(
+        "online_grpo",
+        {
+            "clip_eps": 0.2,
+            "kl_coef": 0.0,
+            "group_size": 2,
+            "loss_variant": "dr_grpo",
+        },
+        id="dr-grpo",
+    ),
     pytest.param("online_dpo", {"beta": 0.1, "group_size": 2}, id="dpo"),
 ]
 

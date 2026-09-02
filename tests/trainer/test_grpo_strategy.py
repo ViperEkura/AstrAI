@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import astrai.trainer.strategy as strategy_module
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.strategy import GRPOStrategy
 from tests.helpers import FakeExecutor, make_frozen, make_model
@@ -69,6 +70,103 @@ def test_grpo_loss_backward(grpo_strategy):
         for p in strategy.model.parameters()
     )
     assert has_grad
+
+
+def test_grpo_default_advantages_remain_group_standardized(grpo_strategy):
+    strategy, device = grpo_strategy
+    rewards = torch.tensor([[1.0, 2.0, 5.0]], device=device)
+    advantages = strategy._group_advantages(rewards, eps=1e-8)
+    expected = (rewards - rewards.mean(dim=-1, keepdim=True)) / rewards.std(
+        dim=-1, keepdim=True, unbiased=False
+    )
+    torch.testing.assert_close(advantages, expected)
+
+
+def test_dr_grpo_uses_centered_rewards_and_fixed_completion_budget(
+    grpo_strategy, monkeypatch
+):
+    base_strategy, device = grpo_strategy
+    strategy = GRPOStrategy(
+        model=base_strategy.model,
+        device=device,
+        old_model=base_strategy.old_model,
+        ref_model=base_strategy.ref_model,
+        clip_eps=0.2,
+        kl_coef=0.0,
+        group_size=2,
+        loss_variant="dr_grpo",
+        max_completion_length=8,
+        executor=FakeExecutor(),
+    )
+    batch = {
+        "prompts": torch.tensor([[5]], device=device),
+        "responses": torch.tensor([[[6, 7, 8, 9], [10, 0, 0, 0]]], device=device),
+        "masks": torch.tensor(
+            [[[1, 1, 1, 1], [1, 0, 0, 0]]], device=device, dtype=torch.bool
+        ),
+        "rewards": torch.tensor([[4.0, 1.0]], device=device),
+    }
+    zeros = torch.zeros(2, 4, device=device)
+
+    def fake_get_logprobs(*_args, **_kwargs):
+        return {"logprobs": zeros, "aux_loss": None, "router_stats": None}
+
+    monkeypatch.setattr(strategy_module, "get_logprobs", fake_get_logprobs)
+    output = strategy.compute_loss_output(batch)
+
+    torch.testing.assert_close(
+        strategy._group_advantages(batch["rewards"], eps=1e-8),
+        torch.tensor([[1.5, -1.5]], device=device),
+    )
+    # Sum of masked per-token losses is -(4 * 1.5 - 1 * 1.5) = -4.5;
+    # Dr.GRPO divides by B * G * fixed_budget = 1 * 2 * 8 = 16.
+    assert output["metrics"]["policy_loss"] == pytest.approx(-4.5 / 16, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        ({"loss_variant": "unknown"}, ValueError, "loss_variant"),
+        ({"loss_variant": "dr_grpo"}, ValueError, "max_completion_length"),
+        (
+            {"loss_variant": "dr_grpo", "max_completion_length": 0},
+            ValueError,
+            "positive",
+        ),
+        (
+            {"loss_variant": "dr_grpo", "max_completion_length": 4.5},
+            TypeError,
+            "integer",
+        ),
+    ],
+)
+def test_grpo_rejects_invalid_loss_variant_config(grpo_strategy, kwargs, error, match):
+    strategy, device = grpo_strategy
+    with pytest.raises(error, match=match):
+        GRPOStrategy(
+            model=strategy.model,
+            device=device,
+            old_model=strategy.old_model,
+            ref_model=strategy.ref_model,
+            executor=FakeExecutor(),
+            **kwargs,
+        )
+
+
+def test_dr_grpo_rejects_response_longer_than_fixed_budget(grpo_strategy):
+    base_strategy, device = grpo_strategy
+    strategy = GRPOStrategy(
+        model=base_strategy.model,
+        device=device,
+        old_model=base_strategy.old_model,
+        ref_model=base_strategy.ref_model,
+        loss_variant="dr_grpo",
+        max_completion_length=3,
+        executor=FakeExecutor(),
+    )
+    batch = _make_batch(batch_size=1, group_size=2, response_len=4, device=device)
+    with pytest.raises(ValueError, match="exceeds max_completion_length"):
+        strategy.compute_loss_output(batch)
 
 
 @pytest.mark.parametrize("model_name", ["ref_model", "old_model"])

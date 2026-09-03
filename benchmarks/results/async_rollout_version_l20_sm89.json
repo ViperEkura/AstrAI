@@ -29,5 +29,43 @@
     "median_delta_percent": 0.49556192483617423,
     "p99_delta_percent": -12.171488652922779
   },
-  "scope_limit": "single-process deterministic race replay; no multiprocess or external reward-service soak"
+  "integrated_ddp_soak": {
+    "status": "pass",
+    "recorded_at": "2026-09-03T10:59:43+08:00",
+    "integration_revision": "fe81f17772db7acb8d7575b3f617a454a83ca58d",
+    "scope": "PR #59 rollout-version fencing combined with PR #55 DDP rollout path",
+    "world_sizes": [1, 2, 3],
+    "runs": [
+      {
+        "world_size": 1,
+        "steps": 200,
+        "stale_reject_total": 20,
+        "future_version_reject_total": 10,
+        "version_mismatch_total": 0
+      },
+      {
+        "world_size": 2,
+        "steps": 400,
+        "stale_reject_total": 80,
+        "future_version_reject_total": 20,
+        "version_mismatch_total": 0
+      },
+      {
+        "world_size": 3,
+        "steps": 1000,
+        "stale_reject_total": 300,
+        "future_version_reject_total": 75,
+        "version_mismatch_total": 0
+      }
+    ],
+    "long_soak": {
+      "world_size": 3,
+      "steps": 100000,
+      "elapsed_seconds": 2486.142,
+      "allocated_memory_drift_mib": 0.0,
+      "reserved_memory_drift_mib": 0.0,
+      "parameter_digest_mismatches": 0
+    }
+  },
+  "scope_limit": "The deterministic stale-rollout comparison is single-process; the additional DDP runs validate cross-rank integration and rejection contracts rather than an external reward service."
 }

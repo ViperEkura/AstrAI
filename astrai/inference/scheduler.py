@@ -3,7 +3,7 @@ import threading
 import uuid
 from contextlib import nullcontext
 from functools import wraps
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 import torch
 
@@ -27,6 +27,7 @@ from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def _with_weight_lock(method):
@@ -128,15 +129,9 @@ class InferenceScheduler:
         """Version of the model weights used for subsequent generations."""
         return self._policy_version
 
-    @_with_weight_lock
-    def update_weights(self, policy_version: int) -> int:
-        """Acknowledge an in-place weight update and invalidate stale KV state.
-
-        The scheduler owns the same model object as the in-process trainer, so
-        weights have already changed when this method is called.  The explicit
-        version update makes that lifecycle visible and prevents prefix KV
-        entries produced by older weights from being reused.
-        """
+    def _validate_weight_version(
+        self, policy_version: int, *, require_advance: bool = False
+    ) -> None:
         if (
             isinstance(policy_version, bool)
             or not isinstance(policy_version, int)
@@ -148,16 +143,56 @@ class InferenceScheduler:
                 f"policy_version cannot move backwards from "
                 f"{self._policy_version} to {policy_version}"
             )
-        if policy_version == self._policy_version:
-            return self._policy_version
+        if require_advance and policy_version == self._policy_version:
+            raise ValueError(
+                f"policy_version must advance beyond {self._policy_version} "
+                "when model weights are mutated"
+            )
+
+    def _ensure_weight_update_ready(self) -> None:
         if self._loop_thread is not None and self._loop_thread.is_alive():
             raise RuntimeError("Stop the scheduler before updating model weights")
         if self._task_mgr.get_active_tasks() or self._task_mgr.get_waiting_tasks():
             raise RuntimeError("Cannot update model weights while tasks are queued")
 
+    def _commit_weight_version(self, policy_version: int) -> int:
         self._task_cache.invalidate_cache()
         self._policy_version = policy_version
         return self._policy_version
+
+    @_with_weight_lock
+    def update_weights(self, policy_version: int) -> int:
+        """Acknowledge an in-place weight update and invalidate stale KV state.
+
+        The scheduler owns the same model object as the in-process trainer, so
+        weights have already changed when this method is called. The explicit
+        version update makes that lifecycle visible and prevents prefix KV
+        entries produced by older weights from being reused.
+        """
+        self._validate_weight_version(policy_version)
+        if policy_version == self._policy_version:
+            return self._policy_version
+        self._ensure_weight_update_ready()
+        return self._commit_weight_version(policy_version)
+
+    @_with_weight_lock
+    def apply_weight_update(self, policy_version: int, update: Callable[[], T]) -> T:
+        """Mutate shared weights and publish their version without generation."""
+        if not callable(update):
+            raise TypeError("update must be callable")
+        self._validate_weight_version(policy_version, require_advance=True)
+        self._ensure_weight_update_ready()
+
+        result = update()
+        self._commit_weight_version(policy_version)
+        return result
+
+    @_with_weight_lock
+    def with_policy_snapshot(self, inspect: Callable[[int], T]) -> T:
+        """Inspect state while the scheduler's policy version remains stable."""
+        if not callable(inspect):
+            raise TypeError("inspect must be callable")
+        return inspect(self._policy_version)
 
     def add_task(self, prompt: str, **kwargs) -> str:
         return self._task_mgr.add_task(prompt, **kwargs)

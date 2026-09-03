@@ -156,10 +156,19 @@ provide a command-line option for configuring one.
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--rollout_interval` | Optimizer steps between rollout refreshes | 512 |
+| `--rollout_max_policy_lag` | Maximum accepted rollout/live policy-version gap (`None` derives `rollout_interval - 1`) | None |
 | `--rollout_temperature` | Rollout sampling temperature | 0.7 |
 | `--rollout_top_k` | Rollout top-k filtering (`0` disables) | 0 |
 | `--rollout_top_p` | Rollout nucleus sampling threshold | 0.9 |
 | `--rollout_max_tokens` | Maximum generated tokens per response | 1024 |
+| `--rollout_dynamic_sampling` | Refill low-variance online GRPO groups with version fencing | false |
+| `--rollout_dynamic_variance_threshold` | Minimum population reward variance for group acceptance | 0.0 |
+| `--rollout_dynamic_max_refill_rounds` | Maximum refill attempts after initial generation | 2 |
+| `--rollout_dynamic_max_generated_tokens_per_group` | Hard generated-token budget per group | 32768 |
+| `--rollout_dynamic_max_wall_time_per_group` | Hard wall-clock budget per group (seconds) | 300.0 |
+| `--rollout_dynamic_max_total_tokens_per_step` | Hard generated-token budget per training step | 262144 |
+| `--rollout_dynamic_max_pending_groups` | Maximum prompt groups admitted into one sampling step | 128 |
+| `--rollout_dynamic_seed` | Base seed for reproducible refill attempts (`None` uses `random_seed`) | None |
 
 ### Scheduler
 

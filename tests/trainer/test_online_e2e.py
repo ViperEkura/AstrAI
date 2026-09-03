@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 import astrai.trainer.train_context as train_context
 from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
+from astrai.serialization import Checkpoint
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
@@ -52,6 +53,15 @@ class LengthRewardModel(BaseRewardModel):
             for g in range(G):
                 rewards[i, g] = float(len(responses[i][g]))
         return rewards
+
+
+class RankRewardModel(BaseRewardModel):
+    """Always gives each response rank a distinct reward."""
+
+    def score(self, prompts, responses):
+        return torch.arange(len(responses[0]), dtype=torch.float32).repeat(
+            len(prompts), 1
+        )
 
 
 def instruction_collate_fn(batch):
@@ -126,6 +136,7 @@ def test_online_rollout_end_to_end(
         parallel_mode="none",
         strategy_kwargs=strategy_kwargs,
         rollout_interval=1,
+        rollout_max_policy_lag=0,
         rollout_temperature=1.0,
         rollout_top_k=0,
         rollout_top_p=1.0,
@@ -137,5 +148,57 @@ def test_online_rollout_end_to_end(
     trainer = Trainer(train_config)
     trainer.train(param_path=test_dir)
 
-    assert os.path.isdir(os.path.join(test_dir, "ckpt"))
+    checkpoint_dir = os.path.join(test_dir, "ckpt", "epoch_0_step_2")
+    assert os.path.isdir(checkpoint_dir)
+    checkpoint = Checkpoint.load(checkpoint_dir)
+    assert checkpoint.meta["policy_version"] == 2
     assert len(created_reference_models) == 1
+
+
+@pytest.mark.integration
+def test_dynamic_sampling_online_grpo_end_to_end(base_test_env):
+    """Exercise TrainConfig -> runner wiring with dynamic sampling enabled."""
+    test_dir = base_test_env["test_dir"]
+    device = base_test_env["device"]
+    tokenizer = base_test_env["tokenizer"]
+    model_config = base_test_env["transformer_config"]
+    tokenizer.set_chat_template(CHAT_TEMPLATE)
+    tokenizer.save_pretrained(test_dir)
+
+    train_config = TrainConfig(
+        strategy="online_grpo",
+        model_fn=partial(_model_fn, model_config),
+        dataset=InstructionDataset(),
+        optimizer_fn=_optimizer_fn,
+        scheduler_fn=_scheduler_fn,
+        ckpt_dir=os.path.join(test_dir, "dynamic_ckpt"),
+        n_epoch=1,
+        batch_per_device=2,
+        ckpt_interval=100,
+        grad_accum_steps=1,
+        random_seed=42,
+        device_type=device,
+        nprocs=1,
+        parallel_mode="none",
+        strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
+        rollout_interval=1,
+        rollout_max_policy_lag=0,
+        rollout_temperature=1.0,
+        rollout_top_k=0,
+        rollout_top_p=1.0,
+        rollout_max_tokens=4,
+        rollout_dynamic_sampling=True,
+        rollout_dynamic_max_refill_rounds=1,
+        rollout_dynamic_max_generated_tokens_per_group=16,
+        rollout_dynamic_max_total_tokens_per_step=32,
+        rollout_dynamic_max_pending_groups=2,
+        reward_model_fn=RankRewardModel,
+        collate_fn=instruction_collate_fn,
+    )
+
+    Trainer(train_config).train(param_path=test_dir)
+
+    checkpoint = Checkpoint.load(
+        os.path.join(test_dir, "dynamic_ckpt", "epoch_0_step_2")
+    )
+    assert checkpoint.meta["policy_version"] == 2

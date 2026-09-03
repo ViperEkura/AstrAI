@@ -625,7 +625,7 @@ classDiagram
             +supports_online() bool
             +set_rollout_runner(runner)
             +prepare_from_rollout(result) Dict
-            +on_optimizer_step()
+            +optimizer_step(optimizer)
         }
 
         class LossOutput {
@@ -698,12 +698,15 @@ classDiagram
             +int rep_window
             +int policy_version
             +update_weights(policy_version) int
+            +apply_weight_update(policy_version, update)
             +generate(batch) RawRollout
         }
 
         class RolloutRunner {
             +int policy_version
+            +int max_policy_lag
             +update_weights(policy_version) int
+            +apply_weight_update(policy_version, update)
             +step()
             +clear_cache()
             +__call__(batch) Tuple[RolloutResult, bool]

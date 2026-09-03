@@ -334,6 +334,13 @@ _START_METHODS = sorted(START_METHODS)
     help="Steps between rollouts.",
 )
 @opt(
+    "--rollout_max_policy_lag",
+    type=int,
+    default=None,
+    group="Algorithm",
+    help="Maximum accepted rollout/live policy-version gap.",
+)
+@opt(
     "--rollout_temperature",
     type=float,
     default=0.7,
@@ -360,6 +367,61 @@ _START_METHODS = sorted(START_METHODS)
     default=1024,
     group="Algorithm",
     help="Max tokens per rollout response.",
+)
+@opt(
+    "--rollout_dynamic_sampling/--no-rollout_dynamic_sampling",
+    default=False,
+    group="Algorithm",
+    help="Refill low-variance online GRPO prompt groups.",
+)
+@opt(
+    "--rollout_dynamic_variance_threshold",
+    type=float,
+    default=0.0,
+    group="Algorithm",
+    help="Minimum population reward variance for group acceptance.",
+)
+@opt(
+    "--rollout_dynamic_max_refill_rounds",
+    type=int,
+    default=2,
+    group="Algorithm",
+    help="Maximum low-variance refill rounds per prompt group.",
+)
+@opt(
+    "--rollout_dynamic_max_generated_tokens_per_group",
+    type=int,
+    default=32768,
+    group="Algorithm",
+    help="Hard generated-token budget per prompt group.",
+)
+@opt(
+    "--rollout_dynamic_max_wall_time_per_group",
+    type=float,
+    default=300.0,
+    group="Algorithm",
+    help="Hard wall-clock budget in seconds per prompt group.",
+)
+@opt(
+    "--rollout_dynamic_max_total_tokens_per_step",
+    type=int,
+    default=262144,
+    group="Algorithm",
+    help="Hard generated-token budget per training step.",
+)
+@opt(
+    "--rollout_dynamic_max_pending_groups",
+    type=int,
+    default=128,
+    group="Algorithm",
+    help="Maximum prompt groups admitted into one sampling step.",
+)
+@opt(
+    "--rollout_dynamic_seed",
+    type=int,
+    default=None,
+    group="Algorithm",
+    help="Base refill seed (defaults to random_seed).",
 )
 @opt(
     "--gradient_checkpointing/--no-gradient_checkpointing",
@@ -684,10 +746,31 @@ def train(
     }
 
     rollout_interval = kwargs.pop("rollout_interval", 512)
+    rollout_max_policy_lag = kwargs.pop("rollout_max_policy_lag", None)
     rollout_temperature = kwargs.pop("rollout_temperature", 0.7)
     rollout_top_k = kwargs.pop("rollout_top_k", 0)
     rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
     rollout_max_tokens = kwargs.pop("rollout_max_tokens", 1024)
+    rollout_dynamic_sampling = kwargs.pop("rollout_dynamic_sampling", False)
+    rollout_dynamic_variance_threshold = kwargs.pop(
+        "rollout_dynamic_variance_threshold", 0.0
+    )
+    rollout_dynamic_max_refill_rounds = kwargs.pop(
+        "rollout_dynamic_max_refill_rounds", 2
+    )
+    rollout_dynamic_max_generated_tokens_per_group = kwargs.pop(
+        "rollout_dynamic_max_generated_tokens_per_group", 32768
+    )
+    rollout_dynamic_max_wall_time_per_group = kwargs.pop(
+        "rollout_dynamic_max_wall_time_per_group", 300.0
+    )
+    rollout_dynamic_max_total_tokens_per_step = kwargs.pop(
+        "rollout_dynamic_max_total_tokens_per_step", 262144
+    )
+    rollout_dynamic_max_pending_groups = kwargs.pop(
+        "rollout_dynamic_max_pending_groups", 128
+    )
+    rollout_dynamic_seed = kwargs.pop("rollout_dynamic_seed", None)
     reward_model_fn: Callable[[], BaseRewardModel] | None = None
 
     executor_kwargs = {}
@@ -840,10 +923,25 @@ def train(
         neftune_alpha=neftune_alpha,
         collate_fn=collate_fn,
         rollout_interval=rollout_interval,
+        rollout_max_policy_lag=rollout_max_policy_lag,
         rollout_temperature=rollout_temperature,
         rollout_top_k=rollout_top_k,
         rollout_top_p=rollout_top_p,
         rollout_max_tokens=rollout_max_tokens,
+        rollout_dynamic_sampling=rollout_dynamic_sampling,
+        rollout_dynamic_variance_threshold=rollout_dynamic_variance_threshold,
+        rollout_dynamic_max_refill_rounds=rollout_dynamic_max_refill_rounds,
+        rollout_dynamic_max_generated_tokens_per_group=(
+            rollout_dynamic_max_generated_tokens_per_group
+        ),
+        rollout_dynamic_max_wall_time_per_group=(
+            rollout_dynamic_max_wall_time_per_group
+        ),
+        rollout_dynamic_max_total_tokens_per_step=(
+            rollout_dynamic_max_total_tokens_per_step
+        ),
+        rollout_dynamic_max_pending_groups=rollout_dynamic_max_pending_groups,
+        rollout_dynamic_seed=rollout_dynamic_seed,
         reward_model_fn=reward_model_fn,
         moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),
     )

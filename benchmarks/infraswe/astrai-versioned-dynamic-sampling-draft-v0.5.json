@@ -1,0 +1,44 @@
+{
+  "schema_version": "0.5",
+  "draft": {
+    "id": "astrai-versioned-dynamic-sampling-2026q3",
+    "revision": 1,
+    "state": "D1-target-bound",
+    "created_by": "0z5a"
+  },
+  "target": {
+    "mode": "repository",
+    "repository": "https://github.com/ViperEkura/AstrAI",
+    "revision": "sha256:d5960c9b0e25c96a2020771fa605f0ff671689791340993cd0850193062e7c5f",
+    "project_profile_sha256": "sha256:96613aff5466a56f69f3cbeb6216a70e736f41a46b615fc4fe6484ef96770d58",
+    "catalog_profile": null
+  },
+  "candidate": {
+    "kind": "git-diff",
+    "revision": "sha256:61f07e320490749eeeef0efb87948b3e7dc3fd95a0b34ab354b34e770ab33b0a",
+    "intent": "integrate",
+    "implementation_kind": "framework",
+    "entrypoints": [
+      "astrai.trainer.rollout.DynamicSamplingGroup",
+      "astrai.trainer.rollout.RolloutRunner.run",
+      "astrai.trainer.train_context.TrainContext",
+      "scripts.tools.train"
+    ],
+    "operator_family": "generic",
+    "phase": "training",
+    "backend": "cuda",
+    "primary_host_candidate": "AstrAI"
+  },
+  "baseline": {
+    "mode": "target-head",
+    "revision": "sha256:d5960c9b0e25c96a2020771fa605f0ff671689791340993cd0850193062e7c5f",
+    "advisory_reference_profile": null
+  },
+  "default_candidates": null,
+  "deployment": null,
+  "retrieval": null,
+  "acceptance_contract": null,
+  "project_objectives": null,
+  "benchmark_loop": null,
+  "scoring": null
+}

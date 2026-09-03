@@ -1,0 +1,98 @@
+{
+  "schema_version": "0.5",
+  "id": "astrai-online-rl-training-v1",
+  "version": "astrai-2026q3-proposed.1",
+  "status": "proposed",
+  "repository": "https://github.com/ViperEkura/AstrAI",
+  "supported_revision_policy": "pinned:f87ac4592d25cd98096d3a628e2747f668bc4d96; update by pull request after the rollout-version prerequisite changes",
+  "ownership": {
+    "maintainers": [
+      "UNASSIGNED:ViperEkura/AstrAI-maintainer"
+    ],
+    "review_required": 1,
+    "last_reviewed_at": null,
+    "update_policy": "pull-request"
+  },
+  "component_ownership": {
+    "online-rl-rollout": [
+      "upstream-codeowner-review-required"
+    ],
+    "training-configuration": [
+      "upstream-codeowner-review-required"
+    ]
+  },
+  "allowed_integration_points": [
+    "astrai/trainer/rollout.py",
+    "astrai/trainer/train_context.py",
+    "astrai/trainer/strategy.py",
+    "astrai/config/train_config.py",
+    "scripts/tools/train.py",
+    "tests/trainer"
+  ],
+  "api_abi_contract": {
+    "id": "astrai-online-rl-training-v1:api-abi",
+    "sha256": "sha256:74a63c01657124356fd4ee43f4a9ab30f068db5bf784e866c8b88c2148c36371",
+    "path": "astrai/trainer/rollout.py"
+  },
+  "lifecycle_contract": {
+    "id": "astrai-online-rl-training-v1:lifecycle",
+    "sha256": "sha256:74a63c01657124356fd4ee43f4a9ab30f068db5bf784e866c8b88c2148c36371",
+    "path": "astrai/trainer/rollout.py"
+  },
+  "build_test_matrix": {
+    "id": "astrai-online-rl-training-v1:build-test-matrix",
+    "sha256": "sha256:9ada3113b92f5fc46b610bb5b539344ba971479e658c175785aec2371ddc3974",
+    "path": "pyproject.toml"
+  },
+  "dependency_policy": {
+    "id": "astrai-online-rl-training-v1:dependency-policy",
+    "sha256": "sha256:9ada3113b92f5fc46b610bb5b539344ba971479e658c175785aec2371ddc3974",
+    "path": "pyproject.toml"
+  },
+  "fallback_policy": {
+    "id": "astrai-online-rl-training-v1:fallback-policy",
+    "sha256": "sha256:74a63c01657124356fd4ee43f4a9ab30f068db5bf784e866c8b88c2148c36371",
+    "path": "astrai/trainer/rollout.py"
+  },
+  "deployment_workload_portfolio": {
+    "id": "astrai-online-rl-training-v1:deployment-workload-portfolio",
+    "sha256": "sha256:40e8f77c15bd2dc3cb7759edcdca02531330ab64197f64c1fdedc49ee4b7f70e",
+    "path": "benchmarks/training_consistency/benchmark_dynamic_sampling.py"
+  },
+  "performance_acceptance_targets": {
+    "id": "astrai-online-rl-training-v1:performance-acceptance-targets",
+    "sha256": "sha256:ec46813c89c32393c770e1739538e695872510eb3e2d0215d000ca398a68be28",
+    "path": "benchmarks/results/versioned_dynamic_sampling_l20_sm89.json"
+  },
+  "maintainability_probes": {
+    "id": "astrai-online-rl-training-v1:maintainability-probes",
+    "sha256": "sha256:c4d28a2be82cdb56674e179d3ed55799d4f28730f0d2ffc567a347b57d33ea9e",
+    "path": "tests/trainer/test_rollout.py"
+  },
+  "project_objectives": {
+    "edge_ecosystem": {
+      "owner": "UNASSIGNED:ViperEkura/AstrAI-maintainer",
+      "policy": "roadmap",
+      "profiles": [
+        {
+          "id": "cuda-sm89-l20",
+          "status": "active",
+          "target_release": null,
+          "required_for_release": true
+        },
+        {
+          "id": "cpu",
+          "status": "planned",
+          "target_release": null,
+          "required_for_release": false
+        }
+      ]
+    }
+  },
+  "scoring_template_id": "project-fit-kernel-v0.5",
+  "triton_portability": {
+    "enabled": false,
+    "owner": null,
+    "profile_weights": {}
+  }
+}

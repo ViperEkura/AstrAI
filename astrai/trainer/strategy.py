@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.optim import Optimizer
 
 from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
@@ -279,10 +280,22 @@ class BaseStrategy(ABC):
         self._moe_metrics["aux_loss"] = float(aux_loss.detach().cpu().item())
 
     def on_optimizer_step(self):
-        """Advance online rollout state after a successful optimizer step."""
+        """Reject unsafe post-hoc publication for an online shared model."""
         if self._rollout_runner is not None:
-            self._rollout_runner.update_weights(self.policy_version + 1)
-            self._rollout_runner.step()
+            raise RuntimeError(
+                "online training must call strategy.optimizer_step(optimizer) "
+                "so weight mutation and policy-version publication are atomic"
+            )
+
+    def optimizer_step(self, optimizer: Optimizer):
+        """Step the optimizer at an atomic online-rollout version boundary."""
+        if self._rollout_runner is None:
+            return optimizer.step()
+
+        next_version = self.policy_version + 1
+        result = self._rollout_runner.apply_weight_update(next_version, optimizer.step)
+        self._rollout_runner.step()
+        return result
 
     def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:
         """Run offline or online forward depending on runner injection."""
@@ -294,7 +307,17 @@ class BaseStrategy(ABC):
             self._on_rollout_refresh()
 
         train_batch = self.prepare_from_rollout(result)
-        return self.compute_loss_output(train_batch)
+        output = self.compute_loss_output(train_batch)
+        if is_fresh:
+            output["metrics"].update(
+                {
+                    f"dynamic_sampling/{name}": value
+                    for name, value in getattr(
+                        self._rollout_runner, "last_sampling_metrics", {}
+                    ).items()
+                }
+            )
+        return output
 
 
 class StrategyFactory(BaseFactory["BaseStrategy"]):

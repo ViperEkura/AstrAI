@@ -71,8 +71,7 @@ on_train_begin
 
         if executor.sync_gradients:
           before_optimizer_step
-          optimizer.step()
-          strategy.on_optimizer_step()
+          strategy.optimizer_step(optimizer)
           optimizer.zero_grad()
           if scheduler:
             scheduler.step()
@@ -171,12 +170,51 @@ them with a `BaseRewardModel`. It refreshes cached rollouts every
 behaviour log-probabilities into the loss, so it does not allocate or synchronize
 a separate old-policy model.
 
-Every successful optimizer step advances a monotonic `policy_version` and
-acknowledges the shared-model weight update to the rollout scheduler. The
-scheduler invalidates reusable KV prefixes before accepting the new version.
+Every successful optimizer step mutates the shared model and advances its
+monotonic `policy_version` under the same generation lock. The scheduler
+invalidates reusable KV prefixes before accepting the new version, so an async
+rollout cannot observe partially updated weights under the previous version.
 `RawRollout` and `RolloutResult` retain the version that actually generated
 their behavior log-probabilities, so cached rollout samples remain attributable
-even while later optimizer steps advance the live policy.
+even while later optimizer steps advance the live policy. Results from a future
+version or beyond `rollout_max_policy_lag` are rejected before training. The
+final version check and rollout-cache publication share that policy lock, so a
+concurrent update cannot land between validation and cache insertion.
+
+Online GRPO can additionally enable a versioned dynamic-sampling buffer with
+`rollout_dynamic_sampling`. Each prompt group moves through
+`pending -> generating -> scoring` and is either accepted, refilled,
+invalidated, or dropped. Only low-variance groups are regenerated. Accepted
+rows are reassembled in the original prompt order, so refill completion order
+cannot reorder the training batch.
+
+Every attempt records a stable prompt ID, attempt ID, generation seed,
+behaviour-policy version, reward vector and variance, refill round, token count,
+timestamps, and terminal reason. Acceptance is provisional until the entire
+batch commits: if the policy version changes while any group is being
+refilled, all accepted rows from the old version are invalidated and the full
+batch restarts on the new version. Samples from different behaviour-policy
+versions are never combined into one training batch.
+
+Refill is bounded by per-group round, token, and wall-time budgets plus
+per-step generated-token and pending-group limits. Exhausting any budget raises
+`DynamicSamplingBudgetError` instead of returning a partial batch. When
+`torch.distributed` is initialized, policy versions, group acceptance, and
+budget failure are reduced across ranks before the next generation round,
+which keeps every rank on the same training step. Per-refresh counters are
+reported under `dynamic_sampling/*`, including accepted and zero-variance
+groups, refill rounds/tokens, invalidations, budget exhaustion, effective
+groups per million generated tokens, and rollout waste ratio.
+
+On an NVIDIA L20 with eight prompts, group size four, and a controlled workload
+where half of first attempts have zero variance, dynamic refill accepted twice
+as many useful groups and improved effective groups per million generated
+tokens by 33.37%. The cost was 49.95% more generated tokens, 55.80% higher
+median rollout latency, and a 33.23% waste ratio. A 100-step, three-rank NCCL
+soak with rank-skewed rewards and policy-version jitter produced zero mixed
+version batches, incomplete batches, or generation-schedule mismatches. Full
+parameters and raw measurements are in
+`benchmarks/results/versioned_dynamic_sampling_l20_sm89.json`.
 
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward

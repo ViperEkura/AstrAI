@@ -1,0 +1,111 @@
+{
+  "schema_version": "0.5.1",
+  "score_kind": "diagnostic-project-fit",
+  "score_is_official": false,
+  "candidate_revision": "sha256:35c11e2547082bf30daf9d39feaa6e1336115dba5abf668ed103e8b1453123b8",
+  "formula_template_id": "project-fit-system-path-v0.5.1",
+  "diagnostic_project_fit_100": 92.40836866232375,
+  "component_values": {
+    "evolutionary_maintainability": 0.89117283614121,
+    "project_contract_fit": 0.9740037464252967,
+    "performance_reuse_utilization": 0.9451290407777138,
+    "operational_fit": 0.87217006329394
+  },
+  "component_floors": {
+    "evolutionary_maintainability": 0.6,
+    "project_contract_fit": 0.6,
+    "performance_reuse_utilization": 0.4,
+    "operational_fit": 0.6
+  },
+  "subcomponent_inputs": {
+    "evolutionary_maintainability": {
+      "evolution": 0.82,
+      "locality": 0.85,
+      "tests": 1.0,
+      "failure": 1.0,
+      "contract": 0.95
+    },
+    "project_contract_fit": {
+      "integration": 1.0,
+      "interface": 0.9,
+      "lifecycle": 1.0,
+      "buildtest": 1.0,
+      "policy": 1.0
+    },
+    "performance_reuse_utilization": {
+      "attainment": 1.0,
+      "coverage": 0.85,
+      "retention": 1.0,
+      "family": 0.9,
+      "compile": 1.0
+    },
+    "operational_fit": {
+      "replay": 0.85,
+      "load": 0.8,
+      "resource": 1.0,
+      "coldsteady": 0.9
+    }
+  },
+  "input_rationale": {
+    "evolution": "The change adds an explicit rollout-version contract but has no upstream maintenance history yet.",
+    "locality": "The implementation follows existing scheduler, rollout, strategy, trainer, configuration, and checkpoint boundaries with focused tests.",
+    "tests": "The complete local suite passed 641 tests with 171 environment-dependent skips; 91 focused tests passed on NVIDIA L20 GPU5.",
+    "failure": "Non-monotonic updates, queued updates, future rollouts, excessive lag, and unsafe post-hoc online optimizer publication fail explicitly.",
+    "contract": "Implementation, tests, documentation, benchmark tooling, and raw L20 output are digest-bound, but the artifact is not sealed or maintainer-reviewed.",
+    "integration": "The serialized boundary spans InferenceScheduler, RolloutGenerator, RolloutRunner, BaseStrategy, Trainer, TrainConfig, CLI construction, and checkpoints.",
+    "interface": "Additive apply_weight_update and rollout_max_policy_lag interfaces preserve offline training and the default rollout reuse window.",
+    "lifecycle": "Optimizer mutation and version publication share the generation lock; validation runs after generation, after reward scoring, and during cache publication or reuse.",
+    "buildtest": "The full local suite, Ruff formatting/import checks, InfraSWE engine tests, focused L20 suite, and L20 race replay passed.",
+    "policy": "No dependency is added; policy lag defaults to rollout_interval minus one for compatibility and strict zero-lag is opt-in.",
+    "attainment": "The baseline accepted all 50 forced-stale rollouts while the candidate rejected all 50; median latency changed by only 0.50% against a 2% ceiling.",
+    "coverage": "Generation, scoring, cache publication/reuse, optimizer publication, direct scheduler updates, checkpoints, GRPO, and DPO are covered; a multiprocess soak is not.",
+    "retention": "The complete regression suite passed after the final concurrency and checkpoint fixes.",
+    "family": "The contract is shared by online GRPO and online DPO and serializes wrapper-level and direct scheduler updates.",
+    "compile": "The Python lifecycle change introduces no compilation step and does not compile during measured trials.",
+    "replay": "Each revision used five warmups and 50 trials, but only one fresh candidate process was recorded.",
+    "load": "The probe uses a real CUDA rollout and forced scoring-time policy advances but is not a sustained multiprocess training workload.",
+    "resource": "Only GPU5's remaining capacity was used; existing GPU processes and containers were left untouched.",
+    "coldsteady": "Warm trial latency is reported; cold startup and a sustained external reward-service soak are deliberately excluded."
+  },
+  "benchmark_trust": {
+    "formula_version": "benchmark-trust-v0.5",
+    "status": "scored",
+    "score_100": 97.40037464252967,
+    "components": {
+      "reproducibility": 1.0,
+      "evidence": 1.0,
+      "statistics": 0.9,
+      "environment": 1.0
+    },
+    "failure_codes": [
+      "DRAFT_UNSEALED",
+      "FRESH_PROCESS_REPLAY_INCOMPLETE",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED",
+      "ASYNC_MULTIPROCESS_SOAK_UNTESTED"
+    ]
+  },
+  "official_project_fit": {
+    "status": "unresolved",
+    "score_100": null,
+    "failure_codes": [
+      "DRAFT_SEAL_MISSING",
+      "FRESH_PROCESS_REPLAYS_BELOW_MINIMUM",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "comparison_cell_path": "benchmarks/infraswe/astrai-async-rollout-version-comparison-cell.json",
+  "execution": {
+    "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
+    "comparison_cell_validation": "pass",
+    "infraswe_engine_tests": "41 passed",
+    "astrai_implementation_commit": "3483c3a578832c9c2e4e6f93b3a16c700c7600e1",
+    "astrai_local_tests": "641 passed, 171 skipped",
+    "astrai_l20_focused_tests": "91 passed in 11.87s",
+    "astrai_l20_race_replay": "baseline accepted 50/50 stale rollouts; candidate rejected 50/50",
+    "astrai_lint": "passed"
+  }
+}

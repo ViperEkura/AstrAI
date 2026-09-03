@@ -30,7 +30,11 @@ from astrai.serialization import (
 )
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.metric_util import GradSNRTracker
-from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
+from astrai.trainer.rollout import (
+    DynamicSamplingConfig,
+    RolloutGenerator,
+    RolloutRunner,
+)
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 
 logger = logging.getLogger(__name__)
@@ -355,5 +359,26 @@ class TrainContextBuilder:
                 generator=generator,
                 reward_model=cfg.reward_model_fn(),
                 rollout_interval=cfg.rollout_interval,
+                max_policy_lag=cfg.rollout_max_policy_lag,
+                dynamic_sampling=DynamicSamplingConfig(
+                    enabled=cfg.rollout_dynamic_sampling,
+                    variance_threshold=cfg.rollout_dynamic_variance_threshold,
+                    max_refill_rounds=cfg.rollout_dynamic_max_refill_rounds,
+                    max_generated_tokens_per_group=(
+                        cfg.rollout_dynamic_max_generated_tokens_per_group
+                    ),
+                    max_wall_time_per_group=(
+                        cfg.rollout_dynamic_max_wall_time_per_group
+                    ),
+                    max_total_rollout_tokens_per_step=(
+                        cfg.rollout_dynamic_max_total_tokens_per_step
+                    ),
+                    max_pending_groups=cfg.rollout_dynamic_max_pending_groups,
+                    base_seed=(
+                        cfg.random_seed
+                        if cfg.rollout_dynamic_seed is None
+                        else cfg.rollout_dynamic_seed
+                    ),
+                ),
             )
         )

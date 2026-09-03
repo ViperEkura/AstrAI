@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0",
+  "candidate_source_commit": "3483c3a578832c9c2e4e6f93b3a16c700c7600e1",
+  "baseline_commit": "ce2f9d13b32f729c561d0175fd46927a37d9b0a2",
+  "recorded_at": "2026-09-03T09:17:00+08:00",
+  "workload": "policy version advances once during reward scoring of each real one-token CUDA rollout",
+  "gpu": "NVIDIA L20",
+  "gpu_index": 5,
+  "torch": "2.11.0+cu128",
+  "cuda": "12.8",
+  "seed": 3407,
+  "warmup": 5,
+  "trials": 50,
+  "baseline": {
+    "accepted_stale_rollouts": 50,
+    "rejected_stale_rollouts": 0,
+    "median_trial_ms": 3.2958545,
+    "p99_trial_ms": 5.056941,
+    "final_policy_version": 55
+  },
+  "candidate": {
+    "accepted_stale_rollouts": 0,
+    "rejected_stale_rollouts": 50,
+    "median_trial_ms": 3.3121875,
+    "p99_trial_ms": 4.441436,
+    "final_policy_version": 55
+  },
+  "candidate_vs_baseline": {
+    "median_delta_percent": 0.49556192483617423,
+    "p99_delta_percent": -12.171488652922779
+  },
+  "integrated_ddp_soak": {
+    "status": "pass",
+    "recorded_at": "2026-09-03T10:59:43+08:00",
+    "integration_revision": "fe81f17772db7acb8d7575b3f617a454a83ca58d",
+    "scope": "PR #59 rollout-version fencing combined with PR #55 DDP rollout path",
+    "world_sizes": [1, 2, 3],
+    "runs": [
+      {
+        "world_size": 1,
+        "steps": 200,
+        "stale_reject_total": 20,
+        "future_version_reject_total": 10,
+        "version_mismatch_total": 0
+      },
+      {
+        "world_size": 2,
+        "steps": 400,
+        "stale_reject_total": 80,
+        "future_version_reject_total": 20,
+        "version_mismatch_total": 0
+      },
+      {
+        "world_size": 3,
+        "steps": 1000,
+        "stale_reject_total": 300,
+        "future_version_reject_total": 75,
+        "version_mismatch_total": 0
+      }
+    ],
+    "long_soak": {
+      "world_size": 3,
+      "steps": 100000,
+      "elapsed_seconds": 2486.142,
+      "allocated_memory_drift_mib": 0.0,
+      "reserved_memory_drift_mib": 0.0,
+      "parameter_digest_mismatches": 0
+    }
+  },
+  "scope_limit": "The deterministic stale-rollout comparison is single-process; the additional DDP runs validate cross-rank integration and rejection contracts rather than an external reward service."
+}

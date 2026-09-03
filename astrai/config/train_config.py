@@ -64,10 +64,19 @@ class TrainConfig(BaseConfig):
         neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
         moe_aux_loss_coef (float): Weight applied to the MoE load-balancing loss. Defaults to 0.01.
         rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
+        rollout_max_policy_lag (Optional[int]): Maximum accepted gap between rollout and live policy versions. None derives ``rollout_interval - 1``. Defaults to None.
         rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
         rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
         rollout_top_p (float): Top-p (nucleus) filtering for online rollout. Defaults to 0.9.
         rollout_max_tokens (int): Maximum generated tokens per response in rollout. Defaults to 1024.
+        rollout_dynamic_sampling (bool): Refill low-variance online GRPO prompt groups. Defaults to False.
+        rollout_dynamic_variance_threshold (float): Minimum population reward variance for group acceptance. Defaults to 0.0.
+        rollout_dynamic_max_refill_rounds (int): Maximum refill attempts after initial generation. Defaults to 2.
+        rollout_dynamic_max_generated_tokens_per_group (int): Hard per-group generation budget. Defaults to 32768.
+        rollout_dynamic_max_wall_time_per_group (float): Hard per-group wall-clock budget in seconds. Defaults to 300.
+        rollout_dynamic_max_total_tokens_per_step (int): Hard generated-token budget per training step. Defaults to 262144.
+        rollout_dynamic_max_pending_groups (int): Maximum groups admitted into a sampling step. Defaults to 128.
+        rollout_dynamic_seed (Optional[int]): Base refill seed; None derives from random_seed. Defaults to None.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
         executor_kwargs (Dict[str, Any]): Extra kwargs passed to ExecutorFactory.create(). Defaults to {}.
         strategy_kwargs (Dict[str, Any]): Extra strategy arguments. Defaults to {}.
@@ -118,10 +127,19 @@ class TrainConfig(BaseConfig):
     moe_aux_loss_coef: float = 0.01
 
     rollout_interval: int = 512
+    rollout_max_policy_lag: Optional[int] = None
     rollout_temperature: float = 0.7
     rollout_top_k: int = 0
     rollout_top_p: float = 0.9
     rollout_max_tokens: int = 1024
+    rollout_dynamic_sampling: bool = False
+    rollout_dynamic_variance_threshold: float = 0.0
+    rollout_dynamic_max_refill_rounds: int = 2
+    rollout_dynamic_max_generated_tokens_per_group: int = 32_768
+    rollout_dynamic_max_wall_time_per_group: float = 300.0
+    rollout_dynamic_max_total_tokens_per_step: int = 262_144
+    rollout_dynamic_max_pending_groups: int = 128
+    rollout_dynamic_seed: Optional[int] = None
     reward_model_fn: Optional[Callable] = None
 
     executor_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -173,13 +191,16 @@ class TrainConfig(BaseConfig):
         "val_step",
         "rollout_interval",
         "rollout_max_tokens",
+        "rollout_dynamic_max_generated_tokens_per_group",
+        "rollout_dynamic_max_total_tokens_per_step",
+        "rollout_dynamic_max_pending_groups",
     )
     def _validate_positive_int(cls, v: int) -> int:
         if v <= 0:
             raise ValueError(f"must be positive, got {v}")
         return v
 
-    @field_validator("rollout_temperature")
+    @field_validator("rollout_temperature", "rollout_dynamic_max_wall_time_per_group")
     def _validate_positive_float(cls, v: float) -> float:
         if v <= 0:
             raise ValueError(f"must be positive, got {v}")
@@ -192,11 +213,22 @@ class TrainConfig(BaseConfig):
         return v
 
     @field_validator(
-        "rollout_top_k", "num_workers", "neftune_alpha", "moe_aux_loss_coef"
+        "rollout_top_k",
+        "rollout_dynamic_max_refill_rounds",
+        "rollout_dynamic_variance_threshold",
+        "num_workers",
+        "neftune_alpha",
+        "moe_aux_loss_coef",
     )
     def _validate_non_negative(cls, v):
         if v < 0:
             raise ValueError(f"must be non-negative, got {v}")
+        return v
+
+    @field_validator("rollout_max_policy_lag", "rollout_dynamic_seed")
+    def _validate_optional_non_negative_int(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError(f"must be non-negative or None, got {v}")
         return v
 
     @field_validator("max_grad_norm")
@@ -225,5 +257,15 @@ class TrainConfig(BaseConfig):
                     f"training (nprocs=1): per-rank rollouts issue different "
                     f"numbers of forward passes and desynchronize the "
                     f"ddp/fsdp collectives, deadlocking NCCL"
+                )
+        if self.rollout_dynamic_sampling:
+            if self.strategy != "online_grpo":
+                raise ValueError(
+                    "rollout_dynamic_sampling is supported only for "
+                    "strategy='online_grpo'"
+                )
+            if self.strategy_kwargs.get("group_size", 1) < 2:
+                raise ValueError(
+                    "rollout_dynamic_sampling requires strategy_kwargs.group_size >= 2"
                 )
         return self

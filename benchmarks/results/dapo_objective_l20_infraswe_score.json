@@ -1,0 +1,110 @@
+{
+  "schema_version": "0.5.1",
+  "score_kind": "diagnostic-project-fit",
+  "score_is_official": false,
+  "candidate_revision": "sha256:bdf90ab8bcde559649302e5721c9db9eb97439210ac2eb491aa4b3a03ac377ad",
+  "formula_template_id": "project-fit-system-path-v0.5.1",
+  "diagnostic_project_fit_100": 92.14567151684916,
+  "component_values": {
+    "evolutionary_maintainability": 0.8993737273809536,
+    "project_contract_fit": 0.9592635533087708,
+    "performance_reuse_utilization": 0.9451290407777138,
+    "operational_fit": 0.8554459186535495
+  },
+  "component_floors": {
+    "evolutionary_maintainability": 0.6,
+    "project_contract_fit": 0.6,
+    "performance_reuse_utilization": 0.4,
+    "operational_fit": 0.6
+  },
+  "subcomponent_inputs": {
+    "evolutionary_maintainability": {
+      "evolution": 0.82,
+      "locality": 0.9,
+      "tests": 1.0,
+      "failure": 0.95,
+      "contract": 0.95
+    },
+    "project_contract_fit": {
+      "integration": 0.95,
+      "interface": 1.0,
+      "lifecycle": 0.9,
+      "buildtest": 1.0,
+      "policy": 0.95
+    },
+    "performance_reuse_utilization": {
+      "attainment": 1.0,
+      "coverage": 0.85,
+      "retention": 1.0,
+      "family": 0.9,
+      "compile": 1.0
+    },
+    "operational_fit": {
+      "replay": 0.85,
+      "load": 0.75,
+      "resource": 1.0,
+      "coldsteady": 0.9
+    }
+  },
+  "input_rationale": {
+    "evolution": "The additive objective controls preserve the existing default but have no upstream maintenance history yet.",
+    "locality": "Implementation is confined to GRPOStrategy, CLI strategy arguments, focused tests, documentation, and benchmark evidence.",
+    "tests": "The complete local suite passed 635 tests with 103 environment-dependent skips; 26 focused tests passed on NVIDIA L20 GPU5.",
+    "failure": "Non-finite or invalid clip bounds, unsupported aggregation modes, incomplete overlong windows, and invalid penalty scales fail explicitly.",
+    "contract": "Implementation, tests, documentation, benchmark tooling, and raw L20 output are digest-bound, but the artifact is not sealed or maintainer-reviewed.",
+    "integration": "All options flow through the existing train CLI strategy_kwargs boundary into offline and online GRPO without a parallel strategy implementation.",
+    "interface": "Unset clip bounds inherit the symmetric epsilon, token aggregation remains the default, and soft-overlong shaping is opt-in.",
+    "lifecycle": "Reward shaping creates a new tensor before group normalization and does not mutate reward-model output or rollout cache state.",
+    "buildtest": "The full local suite, focused L20 suite, Ruff checks, and InfraSWE engine tests passed.",
+    "policy": "No dependency is added and the PR explicitly excludes dynamic sampling rather than approximating its refill semantics.",
+    "attainment": "Default objective values exactly match baseline in all measured cases and default median latency shows no regression.",
+    "coverage": "The probe spans batch/group 4x8 and 8x8 with response lengths from 256 to 4096, and tests cover formula, validation, masks, backward, CLI, and online integration.",
+    "retention": "Default symmetric clipping and token aggregation retain prior behavior while all existing regressions pass.",
+    "family": "The options reuse GRPOStrategy for offline and online rollout paths and expose both original-GRPO and DAPO reductions.",
+    "compile": "The objective changes introduce no compilation step and do not compile during timed operations.",
+    "replay": "Each L20 case uses 20 warmups and 100 timed iterations, but five independent fresh-process runs were not performed.",
+    "load": "The L20 probe executes the real tensor objective shapes, but excludes model forward/backward and downstream reward-quality evaluation.",
+    "resource": "Only the explicitly available GPU5 was used; all other users' GPU processes and containers were left untouched.",
+    "coldsteady": "Warm objective latency is measured; end-to-end cold startup and long training stability are outside this evidence."
+  },
+  "benchmark_trust": {
+    "formula_version": "benchmark-trust-v0.5",
+    "status": "scored",
+    "score_100": 97.40037464252967,
+    "components": {
+      "reproducibility": 1.0,
+      "evidence": 1.0,
+      "statistics": 0.9,
+      "environment": 1.0
+    },
+    "failure_codes": [
+      "DRAFT_UNSEALED",
+      "FRESH_PROCESS_REPLAY_INCOMPLETE",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED",
+      "END_TO_END_REWARD_QUALITY_UNMEASURED"
+    ]
+  },
+  "official_project_fit": {
+    "status": "unresolved",
+    "score_100": null,
+    "failure_codes": [
+      "DRAFT_SEAL_MISSING",
+      "FRESH_PROCESS_REPLAYS_BELOW_MINIMUM",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "comparison_cell_path": "benchmarks/infraswe/astrai-dapo-comparison-cell.json",
+  "execution": {
+    "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
+    "comparison_cell_validation": "pass",
+    "infraswe_engine_tests": "53 passed",
+    "astrai_implementation_commit": "bd10b800018794db742cbfe6cf7bcc7c32ea6f44",
+    "astrai_local_tests": "635 passed, 103 skipped",
+    "astrai_l20_focused_tests": "26 passed in 2.04s",
+    "astrai_lint": "passed"
+  }
+}

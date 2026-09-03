@@ -1,0 +1,16 @@
+{
+  "schema_version": "0.5",
+  "target_project_profile_sha256": "sha256:953067c47f5298f06846c8fe873db55afae49b6588a81926e49d9ef6b0994e08",
+  "target_repository_or_baseline_sha256": "sha256:df1e79ff7151f89d036234564359857fcce3cb4b70e76c72f66d4900b07d17e5",
+  "change_intent": "integrate",
+  "semantic_contract_sha256": "sha256:d1a1c9eef4a8d03316f9b805b3f8e9b70c8b9c92f6778c8a8fa750b6562ce119",
+  "acceptance_contract_sha256": "sha256:9b23206e258c6ee6e3a122fe4925561cc550a28567a67489ada1c830e4ecb2dc",
+  "probe_set_sha256": "sha256:022b1c0460c9d53e7b2a7bbb0a354af2bfe114f03808d8909bd44386dcae272b",
+  "workload_portfolio_sha256": "sha256:cfdbe613b9ab7d1872031219783a52e97513db107af68ba2f06173e8338ccdad",
+  "performance_target_sha256": "sha256:232ef0c0dba913d2333c671203ac41e269e07a18824a8c5200c660d3abc0da0c",
+  "required_deployment_cell_set_sha256": "sha256:3b17d79e40c95dbc7d9c03c069166a295a08523f867a6fea334bc41a5f7f4448",
+  "formula_template_id": "project-fit-system-path-v0.5.1",
+  "evidence_policy_id": "system-path-evidence-v1",
+  "project_season": "astrai-2026q3",
+  "cross_project_ranking_allowed": false
+}

@@ -306,6 +306,48 @@ _START_METHODS = sorted(START_METHODS)
     help="GRPO clip epsilon.",
 )
 @opt(
+    "--grpo_clip_eps_low",
+    type=float,
+    default=None,
+    group="Algorithm",
+    help="Optional lower GRPO clip epsilon; defaults to --grpo_clip_eps.",
+)
+@opt(
+    "--grpo_clip_eps_high",
+    type=float,
+    default=None,
+    group="Algorithm",
+    help="Optional upper GRPO clip epsilon for DAPO Clip-Higher.",
+)
+@opt(
+    "--grpo_loss_aggregation",
+    type=click.Choice(["token", "sequence"]),
+    default="token",
+    group="Algorithm",
+    help="Aggregate GRPO loss by token (DAPO) or equally by sequence.",
+)
+@opt(
+    "--grpo_overlong_max_len",
+    type=int,
+    default=None,
+    group="Algorithm",
+    help="Optional response length limit for DAPO soft overlong shaping.",
+)
+@opt(
+    "--grpo_overlong_buffer_len",
+    type=int,
+    default=0,
+    group="Algorithm",
+    help="Length of the linear DAPO overlong penalty window.",
+)
+@opt(
+    "--grpo_overlong_penalty_scale",
+    type=float,
+    default=1.0,
+    group="Algorithm",
+    help="Scale applied to the DAPO soft overlong penalty.",
+)
+@opt(
     "--grpo_kl_coef",
     type=float,
     default=0.01,
@@ -686,6 +728,12 @@ def train(
         "beta": kwargs.pop("dpo_beta"),
         "label_smoothing": kwargs.pop("label_smoothing"),
         "clip_eps": kwargs.pop("grpo_clip_eps"),
+        "clip_eps_low": kwargs.pop("grpo_clip_eps_low"),
+        "clip_eps_high": kwargs.pop("grpo_clip_eps_high"),
+        "loss_aggregation": kwargs.pop("grpo_loss_aggregation"),
+        "overlong_max_len": kwargs.pop("grpo_overlong_max_len"),
+        "overlong_buffer_len": kwargs.pop("grpo_overlong_buffer_len"),
+        "overlong_penalty_scale": kwargs.pop("grpo_overlong_penalty_scale"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
     }

@@ -141,6 +141,12 @@ with `--optimizer=muon_adamw`.
 | `--label_smoothing` | Label smoothing for cross-entropy loss | 0.0 | `seq`, `sft` |
 | `--group_size` | GRPO/rollout group size | 4 | `grpo`, `online_grpo`, `online_dpo` |
 | `--grpo_clip_eps` | GRPO clipping epsilon | 0.2 | `grpo`, `online_grpo` |
+| `--grpo_clip_eps_low` | Optional lower clip epsilon; defaults to `grpo_clip_eps` | None | `grpo`, `online_grpo` |
+| `--grpo_clip_eps_high` | Optional upper clip epsilon for DAPO Clip-Higher | None | `grpo`, `online_grpo` |
+| `--grpo_loss_aggregation` | Loss weighting: DAPO-style `token` or equal-weight `sequence` | token | `grpo`, `online_grpo` |
+| `--grpo_overlong_max_len` | Optional maximum response length for DAPO soft overlong shaping | None | `grpo`, `online_grpo` |
+| `--grpo_overlong_buffer_len` | Linear penalty window before `grpo_overlong_max_len` | 0 | `grpo`, `online_grpo` |
+| `--grpo_overlong_penalty_scale` | Scale for the soft overlong reward penalty | 1.0 | `grpo`, `online_grpo` |
 | `--grpo_kl_coef` | GRPO KL penalty coefficient | 0.01 | `grpo`, `online_grpo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
 

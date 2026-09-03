@@ -44,6 +44,27 @@ def test_broadcast_state_dict():
     spawn_parallel_fn(_broadcast_worker, world_size=2, backend="gloo")
 
 
+def _broadcast_into_local_worker():
+    """Non-source ranks retain compatible rank-local tensor storage."""
+    rank = get_rank()
+    state_dict = {
+        "layer.weight": torch.full((4, 8), float(rank)),
+        "layer.bias": torch.full((4,), float(rank)),
+    }
+    local_pointers = {key: value.data_ptr() for key, value in state_dict.items()}
+
+    received = broadcast_state_dict(state_dict, src=0)
+
+    assert received is not None
+    for key, value in received.items():
+        assert value.data_ptr() == local_pointers[key]
+        assert torch.equal(value, torch.zeros_like(value))
+
+
+def test_broadcast_state_dict_reuses_compatible_local_tensors():
+    spawn_parallel_fn(_broadcast_into_local_worker, world_size=2, backend="gloo")
+
+
 def _create_ref_model_worker():
     """Verify create_ref_model works when unwrap_model returns None on non-rank-0."""
 

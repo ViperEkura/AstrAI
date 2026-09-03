@@ -219,11 +219,11 @@ class TrainConfig(BaseConfig):
                     f"reward_model_fn is required for online RL strategy "
                     f"{self.strategy!r}"
                 )
-            if self.nprocs > 1:
+            if self.nprocs > 1 and self.parallel_mode != "ddp":
                 raise ValueError(
-                    f"online RL strategy {self.strategy!r} requires single-process "
-                    f"training (nprocs=1): per-rank rollouts issue different "
-                    f"numbers of forward passes and desynchronize the "
-                    f"ddp/fsdp collectives, deadlocking NCCL"
+                    f"multi-process online RL strategy {self.strategy!r} requires "
+                    f"parallel_mode='ddp', got {self.parallel_mode!r}: each rank "
+                    f"needs a replicated inference view that can run a different "
+                    f"number of rollout forwards without distributed collectives"
                 )
         return self

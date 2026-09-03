@@ -182,6 +182,16 @@ Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
 model factory.
 
+The training executor owns the model boundary used by rollout. Single-device
+training passes its model directly; DDP passes the replicated underlying module
+while keeping the wrapper for training and gradient synchronization.
+Because rollout uses the unwrapped, rank-local replica without DDP collectives,
+different ranks may generate different response lengths before returning to a
+synchronized wrapped training step. Multi-process online training therefore
+requires `parallel_mode="ddp"`. Distributed FSDP and `torch.compile` do not yet
+expose a supported in-process inference view, so online strategies reject those
+configurations before constructing the scheduler.
+
 ## LR Schedulers
 
 | Type | Class | Description |

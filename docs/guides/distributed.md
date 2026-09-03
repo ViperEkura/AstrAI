@@ -77,6 +77,14 @@ Wraps the model with `torch.nn.parallel.DistributedDataParallel`. Each rank has 
 
 During gradient accumulation, non-sync micro-steps use `model.no_sync()` to skip gradient all-reduce. Only the final micro-step triggers the all-reduce.
 
+For `online_grpo` and `online_dpo`, each rank gives the in-process inference
+scheduler an explicit view of the replicated `DDP.module`. Rollout never
+depends on DDP forwarding unknown attributes such as `config`, and training
+continues to use the wrapped model. The inference view does not issue DDP
+collectives, so ranks may generate different response lengths without
+deadlocking; the following training forward/backward step returns to the DDP
+wrapper and synchronizes gradients normally.
+
 ### FSDPExecutor (FSDP2 / `fully_shard`)
 
 Uses PyTorch's FSDP2 per-module API (`torch.distributed.fsdp.fully_shard`). Each model child (e.g., each `DecoderBlock`) is individually sharded — parameters become `DTensor`s distributed across ranks. No `FlatParameter`, original parameter names are preserved.
@@ -86,6 +94,14 @@ Key differences from DDP:
 - **Custom grad norm**: FSDP gradients are `DTensor`s, so `clip_grad_norm` computes the local norm, then all-reduces to get the global norm.
 - **Collective checkpoint ops**: `unshard()` and `full_tensor()` are collective — all ranks must call them even though only rank-0 saves. The executor handles this via `dist.barrier()` in `checkpoint_context`.
 - **Root skipped**: `fully_shard` is applied to direct children only (not the root model) due to an `ABC + Generic[T]` MRO incompatibility.
+
+Distributed FSDP cannot currently provide the in-process inference scheduler
+with a replicated model view. Online rollout therefore fails before tokenizer,
+KV-cache, or scheduler construction instead of passing sharded `DTensor`
+parameters into an unsupported generation path. `torch.compile` plus online
+rollout is likewise rejected before scheduler construction. These combinations
+need an explicit weight-materialization/lifecycle design before support can be
+enabled.
 
 ## Gradient Accumulation
 

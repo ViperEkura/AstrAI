@@ -107,6 +107,7 @@ class TrainContextBuilder:
 
         # Build the core training components and restore their persisted state.
         executor = self._create_executor()
+        self._validate_rollout_configuration(executor)
         context = self._create_context(preloaded_state, executor)
         self._prepare_model(context, executor, preloaded_state)
         self._restore_optimizer_state(context)
@@ -328,13 +329,17 @@ class TrainContextBuilder:
             raise ValueError(
                 f"Strategy '{cfg.strategy}' does not support online rollout"
             )
+        self._validate_rollout_configuration(context.executor)
+        inference_model = context.executor.model_for_inference(context.model)
         tokenizer = AutoTokenizer.from_pretrained(self._param_path)
         group_size = strategy_kwargs.get("group_size", 1)
         scheduler = InferenceScheduler(
-            model=context.model,
+            model=inference_model,
             tokenizer=tokenizer,
             max_batch_size=group_size * max(1, cfg.batch_per_device),
-            max_seq_len=getattr(context.model.config, "max_position_embeddings", None),
+            max_seq_len=getattr(
+                inference_model.config, "max_position_embeddings", None
+            ),
             policy_version=(
                 context.checkpoint.meta.get("policy_version", context.optimizer_step)
                 if context.checkpoint is not None
@@ -357,3 +362,15 @@ class TrainContextBuilder:
                 rollout_interval=cfg.rollout_interval,
             )
         )
+
+    def _validate_rollout_configuration(self, executor: BaseExecutor) -> None:
+        cfg = self.config
+        if not cfg.strategy.startswith("online_"):
+            return
+        if cfg.compile_mode is not None:
+            raise ValueError(
+                "Online rollout does not support torch.compile; set compile_mode=None"
+            )
+        capabilities = executor.rollout_capabilities()
+        if not capabilities.supports_in_process:
+            raise ValueError(capabilities.reason or "Online rollout is unsupported")

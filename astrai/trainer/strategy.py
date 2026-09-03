@@ -307,7 +307,17 @@ class BaseStrategy(ABC):
             self._on_rollout_refresh()
 
         train_batch = self.prepare_from_rollout(result)
-        return self.compute_loss_output(train_batch)
+        output = self.compute_loss_output(train_batch)
+        if is_fresh:
+            output["metrics"].update(
+                {
+                    f"dynamic_sampling/{name}": value
+                    for name, value in getattr(
+                        self._rollout_runner, "last_sampling_metrics", {}
+                    ).items()
+                }
+            )
+        return output
 
 
 class StrategyFactory(BaseFactory["BaseStrategy"]):

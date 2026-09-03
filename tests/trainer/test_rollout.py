@@ -9,6 +9,10 @@ from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import GenerationResult
 from astrai.trainer.rollout import (
     BaseRewardModel,
+    DynamicSamplingBudgetError,
+    DynamicSamplingConfig,
+    DynamicSamplingGroup,
+    DynamicSamplingState,
     RawRollout,
     RolloutGenerator,
     RolloutResult,
@@ -40,6 +44,18 @@ class NonFiniteRewardModel(BaseRewardModel):
         B = len(prompts)
         G = len(responses[0]) if B else 0
         return torch.full((B, G), float("nan"))
+
+
+class ScriptedRewardModel(BaseRewardModel):
+    """Returns one explicitly shaped reward matrix per scoring call."""
+
+    def __init__(self, outputs):
+        self.outputs = [torch.tensor(output, dtype=torch.float32) for output in outputs]
+
+    def score(self, prompts, responses):
+        output = self.outputs.pop(0)
+        assert output.shape == (len(prompts), len(responses[0]))
+        return output
 
 
 def _make_scheduler(model, tokenizer, max_batch_size=8, max_len=128):
@@ -352,16 +368,185 @@ def _make_runner(device, **kw):
         max_batch_size=kw.get("max_batch_size", 8),
         max_len=kw.get("max_position_embeddings", 128),
     )
-    rm = ConstantRewardModel(1.0)
+    rm = kw.get("reward_model", ConstantRewardModel(1.0))
     return (
         RolloutRunner(
             generator=generator,
             reward_model=rm,
             rollout_interval=kw.get("rollout_interval", 2),
             max_policy_lag=kw.get("max_policy_lag"),
+            dynamic_sampling=kw.get("dynamic_sampling"),
         ),
         model,
     )
+
+
+def test_dynamic_sampling_group_enforces_state_machine():
+    group = DynamicSamplingGroup(prompt_uid="prompt:0", attempt_id=1, generation_seed=7)
+    with pytest.raises(RuntimeError, match="pending -> accepted"):
+        group.transition(DynamicSamplingState.ACCEPTED)
+    group.transition(DynamicSamplingState.GENERATING)
+    group.transition(DynamicSamplingState.SCORING)
+    group.transition(DynamicSamplingState.ACCEPTED)
+    assert group.accepted is True
+    assert group.completed_at is not None
+
+
+def test_dynamic_sampling_refills_only_low_variance_groups(device):
+    rewards = ScriptedRewardModel(
+        [
+            [[0.0, 1.0], [1.0, 1.0]],
+            [[0.0, 2.0]],
+        ]
+    )
+    config = DynamicSamplingConfig(enabled=True, base_seed=19)
+    runner, _ = _make_runner(
+        device,
+        group_size=2,
+        max_tokens=2,
+        reward_model=rewards,
+        dynamic_sampling=config,
+    )
+    batch_sizes = []
+    seeds = []
+    original_generate = runner.generator.generate
+
+    def record_generate(batch, *, generation_seed=None):
+        batch_sizes.append(len(batch["instruction"]))
+        seeds.append(generation_seed)
+        return original_generate(batch, generation_seed=generation_seed)
+
+    runner.generator.generate = record_generate
+    result, is_fresh = runner(_make_instruction_batch(n=2))
+
+    assert is_fresh is True
+    assert batch_sizes == [2, 1]
+    assert len(set(seeds)) == 2
+    assert result.rewards.tolist() == [[0.0, 1.0], [0.0, 2.0]]
+    assert [group.refill_round for group in result.sampling_groups] == [0, 1]
+    assert {group.behavior_policy_version for group in result.sampling_groups} == {0}
+    assert all(
+        group.state is DynamicSamplingState.ACCEPTED for group in result.sampling_groups
+    )
+    assert runner.last_sampling_metrics["groups_accepted"] == 2.0
+    assert runner.last_sampling_metrics["zero_variance_groups"] == 1.0
+    assert runner.last_sampling_metrics["refill_rounds"] == 1.0
+    assert runner.last_sampling_metrics["rollout_waste_ratio"] > 0.0
+
+
+def test_dynamic_sampling_restarts_whole_batch_after_version_change(device):
+    rewards = ScriptedRewardModel(
+        [
+            [[0.0, 1.0], [1.0, 1.0]],
+            [[0.0, 1.0], [0.0, 2.0]],
+        ]
+    )
+    runner, _ = _make_runner(
+        device,
+        group_size=2,
+        max_tokens=2,
+        reward_model=rewards,
+        dynamic_sampling=DynamicSamplingConfig(enabled=True),
+    )
+    batch_sizes = []
+    original_generate = runner.generator.generate
+
+    def update_before_refill(batch, *, generation_seed=None):
+        batch_sizes.append(len(batch["instruction"]))
+        if len(batch_sizes) == 2:
+            runner.generator.update_weights(1)
+        return original_generate(batch, generation_seed=generation_seed)
+
+    runner.generator.generate = update_before_refill
+    result, _ = runner(_make_instruction_batch(n=2))
+
+    assert batch_sizes == [2, 1, 2]
+    assert result.policy_version == 1
+    assert {group.behavior_policy_version for group in result.sampling_groups} == {1}
+    invalidated = [
+        group
+        for group in runner.last_sampling_history
+        if group.state is DynamicSamplingState.INVALIDATED
+    ]
+    assert len(invalidated) == 2
+    assert runner.last_sampling_metrics["version_invalidated_groups"] == 2.0
+
+
+def test_dynamic_sampling_budget_exhaustion_refuses_partial_batch(device):
+    runner, _ = _make_runner(
+        device,
+        group_size=2,
+        max_tokens=2,
+        dynamic_sampling=DynamicSamplingConfig(
+            enabled=True,
+            max_refill_rounds=0,
+        ),
+    )
+
+    with pytest.raises(DynamicSamplingBudgetError, match="partial"):
+        runner(_make_instruction_batch(n=2))
+
+    assert runner.last_sampling_metrics["groups_accepted"] == 0.0
+    assert runner.last_sampling_metrics["dropped_groups"] == 2.0
+    assert runner.last_sampling_metrics["budget_exhausted_groups"] == 2.0
+    assert runner._cache is None
+
+
+def test_dynamic_sampling_pending_group_budget_fails_before_generation(device):
+    runner, _ = _make_runner(
+        device,
+        dynamic_sampling=DynamicSamplingConfig(enabled=True, max_pending_groups=1),
+    )
+    with pytest.raises(DynamicSamplingBudgetError, match="max_pending_groups=1"):
+        runner(_make_instruction_batch(n=2))
+
+
+def test_dynamic_sampling_generation_budget_is_reserved_before_attempt(device):
+    runner, _ = _make_runner(
+        device,
+        group_size=2,
+        max_tokens=4,
+        dynamic_sampling=DynamicSamplingConfig(
+            enabled=True,
+            max_generated_tokens_per_group=7,
+        ),
+    )
+    called = False
+
+    def should_not_generate(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    runner.generator.generate = should_not_generate
+    with pytest.raises(DynamicSamplingBudgetError, match="cannot start"):
+        runner(_make_instruction_batch(n=1))
+    assert called is False
+    assert runner.last_sampling_history[0].discard_reason == (
+        "max_generated_tokens_per_group"
+    )
+
+
+def test_dynamic_sampling_scoring_failure_drops_attempt(device):
+    runner, _ = _make_runner(
+        device,
+        group_size=2,
+        max_tokens=2,
+        reward_model=BadShapeRewardModel(),
+        dynamic_sampling=DynamicSamplingConfig(enabled=True),
+    )
+    with pytest.raises(ValueError, match="Reward model returned shape"):
+        runner(_make_instruction_batch(n=1))
+    assert runner.last_sampling_history[0].state is DynamicSamplingState.DROPPED
+    assert runner.last_sampling_history[0].discard_reason == "scoring_failed"
+
+
+def test_seeded_rollout_generation_restores_torch_rng(device):
+    generator, _ = _make_generator(device, group_size=2, max_tokens=2)
+    torch.manual_seed(1234)
+    before = torch.random.get_rng_state()
+    generator.generate(_make_instruction_batch(n=1), generation_seed=99)
+    after = torch.random.get_rng_state()
+    assert torch.equal(before, after)
 
 
 def test_rollout_runner_shapes(device):

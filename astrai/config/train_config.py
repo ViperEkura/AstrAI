@@ -64,6 +64,7 @@ class TrainConfig(BaseConfig):
         neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
         moe_aux_loss_coef (float): Weight applied to the MoE load-balancing loss. Defaults to 0.01.
         rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
+        rollout_max_policy_lag (Optional[int]): Maximum accepted gap between rollout and live policy versions. None derives ``rollout_interval - 1``. Defaults to None.
         rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
         rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
         rollout_top_p (float): Top-p (nucleus) filtering for online rollout. Defaults to 0.9.
@@ -118,6 +119,7 @@ class TrainConfig(BaseConfig):
     moe_aux_loss_coef: float = 0.01
 
     rollout_interval: int = 512
+    rollout_max_policy_lag: Optional[int] = None
     rollout_temperature: float = 0.7
     rollout_top_k: int = 0
     rollout_top_p: float = 0.9
@@ -197,6 +199,12 @@ class TrainConfig(BaseConfig):
     def _validate_non_negative(cls, v):
         if v < 0:
             raise ValueError(f"must be non-negative, got {v}")
+        return v
+
+    @field_validator("rollout_max_policy_lag")
+    def _validate_optional_non_negative_int(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError(f"rollout_max_policy_lag must be non-negative, got {v}")
         return v
 
     @field_validator("max_grad_norm")

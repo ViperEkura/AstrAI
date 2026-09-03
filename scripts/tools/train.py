@@ -334,6 +334,13 @@ _START_METHODS = sorted(START_METHODS)
     help="Steps between rollouts.",
 )
 @opt(
+    "--rollout_max_policy_lag",
+    type=int,
+    default=None,
+    group="Algorithm",
+    help="Maximum accepted rollout/live policy-version gap.",
+)
+@opt(
     "--rollout_temperature",
     type=float,
     default=0.7,
@@ -684,6 +691,7 @@ def train(
     }
 
     rollout_interval = kwargs.pop("rollout_interval", 512)
+    rollout_max_policy_lag = kwargs.pop("rollout_max_policy_lag", None)
     rollout_temperature = kwargs.pop("rollout_temperature", 0.7)
     rollout_top_k = kwargs.pop("rollout_top_k", 0)
     rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
@@ -840,6 +848,7 @@ def train(
         neftune_alpha=neftune_alpha,
         collate_fn=collate_fn,
         rollout_interval=rollout_interval,
+        rollout_max_policy_lag=rollout_max_policy_lag,
         rollout_temperature=rollout_temperature,
         rollout_top_k=rollout_top_k,
         rollout_top_p=rollout_top_p,

@@ -355,5 +355,6 @@ class TrainContextBuilder:
                 generator=generator,
                 reward_model=cfg.reward_model_fn(),
                 rollout_interval=cfg.rollout_interval,
+                max_policy_lag=cfg.rollout_max_policy_lag,
             )
         )

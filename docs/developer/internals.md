@@ -119,8 +119,7 @@ on_train_begin
 
         if executor.sync_gradients:
           before_optimizer_step
-          optimizer.step()
-          strategy.on_optimizer_step()
+          strategy.optimizer_step(optimizer)
           optimizer.zero_grad()
           if scheduler:
             scheduler.step()

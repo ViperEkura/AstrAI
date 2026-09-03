@@ -1,5 +1,7 @@
 """Unit tests for the online rollout module."""
 
+import threading
+
 import pytest
 import torch
 
@@ -11,6 +13,7 @@ from astrai.trainer.rollout import (
     RolloutGenerator,
     RolloutResult,
     RolloutRunner,
+    RolloutVersionError,
 )
 from tests.helpers import FakeTokenizer, make_model
 
@@ -151,6 +154,113 @@ def test_rollout_generator_uses_eval_and_restores_mode(device):
     assert model.training is True
 
 
+def test_rollout_generator_serializes_generation_and_policy_update(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    generation_started = threading.Event()
+    allow_generation_to_finish = threading.Event()
+    update_finished = threading.Event()
+    thread_errors = []
+    original = gen._generate_eval
+
+    def blocking_generate(batch, generation_version):
+        generation_started.set()
+        assert allow_generation_to_finish.wait(timeout=5)
+        return original(batch, generation_version)
+
+    gen._generate_eval = blocking_generate
+
+    def generate():
+        try:
+            gen.generate(_make_instruction_batch(n=1))
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    def apply_update():
+        try:
+            gen.apply_weight_update(1, update_finished.set)
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    generation_thread = threading.Thread(target=generate)
+    update_thread = threading.Thread(target=apply_update)
+    generation_thread.start()
+    assert generation_started.wait(timeout=5)
+    update_thread.start()
+    assert not update_finished.wait(timeout=0.1)
+
+    allow_generation_to_finish.set()
+    generation_thread.join(timeout=5)
+    update_thread.join(timeout=5)
+    assert not generation_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert thread_errors == []
+    assert update_finished.is_set()
+    assert gen.policy_version == 1
+
+
+def test_rollout_generator_serializes_direct_scheduler_update(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    generation_started = threading.Event()
+    allow_generation_to_finish = threading.Event()
+    update_finished = threading.Event()
+    thread_errors = []
+    original = gen._generate_eval
+
+    def blocking_generate(batch, generation_version):
+        generation_started.set()
+        assert allow_generation_to_finish.wait(timeout=5)
+        return original(batch, generation_version)
+
+    gen._generate_eval = blocking_generate
+    rollout = []
+
+    def generate():
+        try:
+            rollout.append(gen.generate(_make_instruction_batch(n=1)))
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    def update_scheduler_directly():
+        try:
+            gen.scheduler.update_weights(1)
+            update_finished.set()
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    generation_thread = threading.Thread(target=generate)
+    update_thread = threading.Thread(target=update_scheduler_directly)
+    generation_thread.start()
+    assert generation_started.wait(timeout=5)
+    update_thread.start()
+    assert not update_finished.wait(timeout=0.1)
+
+    allow_generation_to_finish.set()
+    generation_thread.join(timeout=5)
+    update_thread.join(timeout=5)
+    assert not generation_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert thread_errors == []
+    assert rollout[0].policy_version == 0
+    assert gen.policy_version == 1
+
+
+def test_rollout_generator_keeps_generation_start_version(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    original_run_batch = gen.scheduler.run_batch
+
+    def update_after_generation(*args, **kwargs):
+        result = original_run_batch(*args, **kwargs)
+        gen.scheduler.update_weights(1)
+        return result
+
+    gen.scheduler.run_batch = update_after_generation
+
+    rollout = gen.generate(_make_instruction_batch(n=1))
+
+    assert rollout.policy_version == 0
+    assert gen.policy_version == 1
+
+
 def test_rollout_generator_mask_matches_responses(device):
     """Positions beyond a response's length are pad (mask False)."""
     gen, _ = _make_generator(device, group_size=2, max_tokens=6)
@@ -248,6 +358,7 @@ def _make_runner(device, **kw):
             generator=generator,
             reward_model=rm,
             rollout_interval=kw.get("rollout_interval", 2),
+            max_policy_lag=kw.get("max_policy_lag"),
         ),
         model,
     )
@@ -295,6 +406,114 @@ def test_rollout_runner_tags_generation_version_and_preserves_cached_behavior(de
     refreshed, refreshed_fresh = runner(batch)
     assert refreshed_fresh is True
     assert refreshed.policy_version == 1
+
+
+def test_rollout_runner_rejects_future_generation_version(device):
+    runner, _ = _make_runner(device, rollout_interval=2)
+    raw = runner.generator.generate(_make_instruction_batch(n=1))
+    raw.policy_version = runner.policy_version + 1
+    runner.generator.generate = lambda _batch: raw
+
+    with pytest.raises(RolloutVersionError, match="future policy version"):
+        runner(_make_instruction_batch(n=1))
+
+
+def test_rollout_runner_rejects_result_beyond_max_policy_lag(device):
+    runner, _ = _make_runner(device, rollout_interval=4, max_policy_lag=1)
+    batch = _make_instruction_batch(n=1)
+    result, _ = runner(batch)
+    assert result.policy_version == 0
+
+    runner.update_weights(2)
+    with pytest.raises(RolloutVersionError, match="exceeds max_policy_lag=1"):
+        runner(batch)
+
+
+def test_rollout_runner_revalidates_version_after_async_scoring(device):
+    runner, _ = _make_runner(device, rollout_interval=4, max_policy_lag=0)
+    original_score = runner._score
+
+    def score_while_policy_advances(raw):
+        result = original_score(raw)
+        runner.update_weights(1)
+        return result
+
+    runner._score = score_while_policy_advances
+
+    with pytest.raises(RolloutVersionError, match="exceeds max_policy_lag=0"):
+        runner(_make_instruction_batch(n=1))
+    assert runner._cache is None
+
+
+def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
+    runner, _ = _make_runner(device, rollout_interval=4, max_policy_lag=1)
+    final_validation_started = threading.Event()
+    allow_final_validation_to_finish = threading.Event()
+    update_finished = threading.Event()
+    rollout_finished = threading.Event()
+    thread_errors = []
+    validation_calls = 0
+    original_validate = runner._validate_policy_version
+
+    def blocking_validate(result, *, live_version=None):
+        nonlocal validation_calls
+        validation_calls += 1
+        original_validate(result, live_version=live_version)
+        if validation_calls == 2:
+            final_validation_started.set()
+            assert allow_final_validation_to_finish.wait(timeout=5)
+
+    runner._validate_policy_version = blocking_validate
+
+    def produce_rollout():
+        try:
+            runner(_make_instruction_batch(n=1))
+            rollout_finished.set()
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    def apply_update():
+        try:
+            runner.apply_weight_update(1, update_finished.set)
+        except BaseException as exc:
+            thread_errors.append(exc)
+
+    rollout_thread = threading.Thread(target=produce_rollout)
+    update_thread = threading.Thread(target=apply_update)
+    rollout_thread.start()
+    assert final_validation_started.wait(timeout=5)
+    update_thread.start()
+    assert not update_finished.wait(timeout=0.1)
+
+    allow_final_validation_to_finish.set()
+    rollout_thread.join(timeout=5)
+    update_thread.join(timeout=5)
+    assert not rollout_thread.is_alive()
+    assert not update_thread.is_alive()
+    assert thread_errors == []
+    assert rollout_finished.is_set()
+    assert update_finished.is_set()
+    assert runner._cache is not None
+    assert runner._cache.policy_version == 0
+    assert runner.policy_version == 1
+
+
+def test_rollout_runner_derives_default_policy_lag_from_interval(device):
+    runner, _ = _make_runner(device, rollout_interval=4)
+    assert runner.max_policy_lag == 3
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"rollout_interval": 0}, "rollout_interval must be positive"),
+        ({"max_policy_lag": -1}, "max_policy_lag must be non-negative"),
+    ],
+)
+def test_rollout_runner_rejects_invalid_version_window(device, kwargs, message):
+    generator, _ = _make_generator(device)
+    with pytest.raises(ValueError, match=message):
+        RolloutRunner(generator, ConstantRewardModel(), **kwargs)
 
 
 def test_rollout_runner_refreshes_for_different_batch(device):

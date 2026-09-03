@@ -71,8 +71,7 @@ on_train_begin
 
         if executor.sync_gradients:
           before_optimizer_step
-          optimizer.step()
-          strategy.on_optimizer_step()
+          strategy.optimizer_step(optimizer)
           optimizer.zero_grad()
           if scheduler:
             scheduler.step()
@@ -171,12 +170,16 @@ them with a `BaseRewardModel`. It refreshes cached rollouts every
 behaviour log-probabilities into the loss, so it does not allocate or synchronize
 a separate old-policy model.
 
-Every successful optimizer step advances a monotonic `policy_version` and
-acknowledges the shared-model weight update to the rollout scheduler. The
-scheduler invalidates reusable KV prefixes before accepting the new version.
+Every successful optimizer step mutates the shared model and advances its
+monotonic `policy_version` under the same generation lock. The scheduler
+invalidates reusable KV prefixes before accepting the new version, so an async
+rollout cannot observe partially updated weights under the previous version.
 `RawRollout` and `RolloutResult` retain the version that actually generated
 their behavior log-probabilities, so cached rollout samples remain attributable
-even while later optimizer steps advance the live policy.
+even while later optimizer steps advance the live policy. Results from a future
+version or beyond `rollout_max_policy_lag` are rejected before training. The
+final version check and rollout-cache publication share that policy lock, so a
+concurrent update cannot land between validation and cache insertion.
 
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward

@@ -164,6 +164,9 @@ class CheckpointCallback(TrainCallback):
                     **context.config.to_dict(),
                     "optimizer_step": context.optimizer_step,
                 }
+                policy_version = context.strategy.policy_version
+                if policy_version is not None:
+                    meta["policy_version"] = policy_version
                 context.checkpoint = Checkpoint(
                     state_dict=state_dict,
                     epoch=context.epoch,

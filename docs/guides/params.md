@@ -156,6 +156,7 @@ provide a command-line option for configuring one.
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--rollout_interval` | Optimizer steps between rollout refreshes | 512 |
+| `--rollout_max_policy_lag` | Maximum accepted rollout/live policy-version gap (`None` derives `rollout_interval - 1`) | None |
 | `--rollout_temperature` | Rollout sampling temperature | 0.7 |
 | `--rollout_top_k` | Rollout top-k filtering (`0` disables) | 0 |
 | `--rollout_top_p` | Rollout nucleus sampling threshold | 0.9 |

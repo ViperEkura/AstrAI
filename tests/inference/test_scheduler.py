@@ -561,6 +561,70 @@ def test_scheduler_weight_versions_are_monotonic_and_acknowledged(device):
         scheduler.stop()
 
 
+def test_scheduler_release_resume_preserves_greedy_generation(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    prompt = [[10, 20, 30, 40]]
+    try:
+        expected = scheduler.run_batch(prompt, max_tokens=3, temperature=0)
+        old_cache = scheduler._cache
+        old_executor = scheduler._executor
+        scheduler.start()
+
+        assert scheduler.release() is True
+        assert scheduler.release() is False
+        assert scheduler.runtime_released is True
+        assert scheduler.cuda_graph_enabled is False
+        assert scheduler._cache is None
+        assert scheduler._task_cache is None
+        assert scheduler._executor is None
+        assert scheduler.get_stats()["runtime_released"] is True
+        assert scheduler.get_stats()["kv_cache_tasks"] == 0
+
+        with pytest.raises(RuntimeError, match="call resume"):
+            scheduler.add_task("released")
+        with pytest.raises(RuntimeError, match="call resume"):
+            scheduler.run_batch(prompt, max_tokens=1)
+        with pytest.raises(RuntimeError, match="call resume"):
+            scheduler.start()
+
+        assert scheduler.update_weights(1) == 1
+        assert scheduler.resume() is True
+        assert scheduler.resume() is False
+        assert scheduler.runtime_released is False
+        assert scheduler.policy_version == 1
+        assert scheduler._cache is not old_cache
+        assert scheduler._executor is not old_executor
+        assert scheduler._loop_thread is not None
+        assert scheduler._loop_thread.is_alive()
+
+        scheduler.stop()
+        actual = scheduler.run_batch(prompt, max_tokens=3, temperature=0)
+        assert actual == expected
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_release_rejects_externally_owned_cache(device):
+    scheduler, tokenizer, model = _make_real_scheduler(device)
+    external_cache = scheduler._cache
+    scheduler.stop()
+    external_scheduler = InferenceScheduler(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=external_cache.max_batch_size,
+        max_seq_len=external_cache.max_seq_len,
+        cache=external_cache,
+        enable_cuda_graph=False,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="externally owned cache"):
+            external_scheduler.release()
+        assert external_scheduler.runtime_released is False
+        assert external_scheduler._cache is external_cache
+    finally:
+        external_scheduler.stop()
+
+
 def test_scheduler_rejects_weight_update_with_queued_tasks(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     task_id = scheduler.add_task("queued")

@@ -246,6 +246,19 @@ class InferenceEngine:
     def cuda_graph_enabled(self) -> bool:
         return self.scheduler.cuda_graph_enabled
 
+    @property
+    def runtime_released(self) -> bool:
+        """Whether inference-only buffers are currently absent from the device."""
+        return self.scheduler.runtime_released
+
+    def release(self) -> bool:
+        """Release KV/workspace/graph memory while retaining model weights."""
+        return self.scheduler.release()
+
+    def resume(self) -> bool:
+        """Rebuild released inference buffers and resume request processing."""
+        return self.scheduler.resume()
+
     def shutdown(self):
         self.scheduler.stop()
         if torch.cuda.is_available():

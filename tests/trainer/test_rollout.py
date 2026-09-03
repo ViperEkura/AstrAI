@@ -342,6 +342,25 @@ def test_rollout_runner_clear_cache_forces_rerun(device):
     assert fresh2 is True
 
 
+def test_rollout_runner_release_clears_cache_and_resumes(device):
+    runner, _ = _make_runner(device, rollout_interval=100)
+    batch = _make_instruction_batch(n=1)
+    first, _ = runner(batch)
+    assert runner._cache is first
+
+    assert runner.release() is True
+    assert runner._cache is None
+    assert runner._cache_key is None
+    assert runner.generator.scheduler.runtime_released is True
+    with pytest.raises(RuntimeError, match="call resume"):
+        runner(batch)
+
+    assert runner.resume() is True
+    refreshed, is_fresh = runner(batch)
+    assert is_fresh is True
+    assert refreshed is not first
+
+
 def test_rollout_runner_step_resets_counter(device):
     runner, _ = _make_runner(device, rollout_interval=1)
     batch = _make_instruction_batch()

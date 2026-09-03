@@ -178,6 +178,12 @@ scheduler invalidates reusable KV prefixes before accepting the new version.
 their behavior log-probabilities, so cached rollout samples remain attributable
 even while later optimizer steps advance the live policy.
 
+For colocated phases, `RolloutRunner.release()` clears its cached rollout tensors
+and releases the scheduler's KV storage, decode workspace, and CUDA graphs while
+leaving the shared policy weights resident. Call `RolloutRunner.resume()` before
+the next rollout. The scheduler's monotonic `policy_version` survives the cycle,
+so the next generated batch remains attributable to the acknowledged weights.
+
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
 model factory.

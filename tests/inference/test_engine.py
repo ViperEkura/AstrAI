@@ -274,6 +274,23 @@ def test_engine_generate_zero_max_tokens_stream_is_empty():
         instance.add_task.assert_not_called()
 
 
+def test_engine_exposes_release_resume_lifecycle():
+    mock_model, mock_tokenizer = _make_engine_mocks()
+
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+        scheduler = MockSched.return_value
+        scheduler.runtime_released = False
+        scheduler.release.return_value = True
+        scheduler.resume.return_value = True
+        engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
+
+        assert engine.runtime_released is False
+        assert engine.release() is True
+        assert engine.resume() is True
+        scheduler.release.assert_called_once_with()
+        scheduler.resume.assert_called_once_with()
+
+
 def test_engine_passes_backend_to_scheduler():
     mock_model, mock_tokenizer = _make_engine_mocks()
 

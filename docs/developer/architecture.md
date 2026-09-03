@@ -817,6 +817,8 @@ classDiagram
             +generate(prompt, stream, max_tokens, temperature, top_p, top_k, frequency_penalty, rep_window) Union[Generator, str, List[str]]
             +generate_async(prompt, max_tokens, temperature, top_p, top_k, frequency_penalty, rep_window) AsyncGenerator
             +get_stats() Dict
+            +release() bool
+            +resume() bool
             +shutdown()
         }
 
@@ -860,12 +862,15 @@ classDiagram
             +str device
             +torch.dtype dtype
             +int policy_version
+            +bool runtime_released
             +add_task(prompt, **kwargs) str
             +remove_task(task_id)
             +start()
             +stop()
             +get_stats() Dict
             +update_weights(policy_version) int
+            +release() bool
+            +resume() bool
             +run_batch(prompt_ids_list, max_tokens, temperature, top_p, top_k, frequency_penalty, rep_window, return_logprobs) Union[List[List[int]], List[Tuple[List[int], List[float]]]]
         }
 

@@ -1,0 +1,16 @@
+{
+  "schema_version": "0.5",
+  "target_project_profile_sha256": "sha256:96613aff5466a56f69f3cbeb6216a70e736f41a46b615fc4fe6484ef96770d58",
+  "target_repository_or_baseline_sha256": "sha256:d5960c9b0e25c96a2020771fa605f0ff671689791340993cd0850193062e7c5f",
+  "change_intent": "integrate-versioned-dynamic-sampling",
+  "semantic_contract_sha256": "sha256:74a63c01657124356fd4ee43f4a9ab30f068db5bf784e866c8b88c2148c36371",
+  "acceptance_contract_sha256": "sha256:c4d28a2be82cdb56674e179d3ed55799d4f28730f0d2ffc567a347b57d33ea9e",
+  "probe_set_sha256": "sha256:c4d28a2be82cdb56674e179d3ed55799d4f28730f0d2ffc567a347b57d33ea9e",
+  "workload_portfolio_sha256": "sha256:40e8f77c15bd2dc3cb7759edcdca02531330ab64197f64c1fdedc49ee4b7f70e",
+  "performance_target_sha256": "sha256:ec46813c89c32393c770e1739538e695872510eb3e2d0215d000ca398a68be28",
+  "required_deployment_cell_set_sha256": "sha256:a69c87538f6b2dc066db721d3ee877b995466ef3d5518e359650f7bd8377f2c3",
+  "formula_template_id": "project-fit-kernel-v0.5",
+  "evidence_policy_id": "infraswe-v0.5-diagnostic-pre-pr",
+  "project_season": "astrai-2026q3",
+  "cross_project_ranking_allowed": false
+}

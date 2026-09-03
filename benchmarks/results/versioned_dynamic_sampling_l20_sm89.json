@@ -76,7 +76,7 @@
   },
   "validation": {
     "local_test_suite": "650 passed, 171 skipped",
-    "l20_targeted_tests": "64 passed",
+    "l20_targeted_tests": "42 passed",
     "format": "ruff format --check: pass",
     "import_order": "ruff check --select I: pass"
   },

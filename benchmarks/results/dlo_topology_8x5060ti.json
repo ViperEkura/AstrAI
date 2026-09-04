@@ -1,0 +1,157 @@
+{
+  "schema_version": "1",
+  "source_raw_sha256": "98fbb8966b7aa0a032ca1fa269ee1cd240d34b0bc4a5d918e3fdad31b040212f",
+  "environment": {
+    "timestamp_utc": "2026-09-02T08:11:38.370183+00:00",
+    "gpu": "8x NVIDIA GeForce RTX 5060 Ti 16 GiB",
+    "compute_capability": "12.0",
+    "torch": "2.11.0+cu128",
+    "cuda": "12.8",
+    "nccl": "2.28.9",
+    "topology": "PHB pairs (0,1), (2,3), (4,5), (6,7); all other pairs NODE; NUMA 0",
+    "dlo_full_payload_bytes": 268435456,
+    "sp_per_rank_payload_bytes": 67108864,
+    "warmup": 5,
+    "iterations_per_trial": 20,
+    "trials": 7,
+    "timing_scope": "worst-rank steady-state collective"
+  },
+  "results": [
+    {
+      "name": "dp1-sp8-natural",
+      "dp_size": 1,
+      "sp_size": 8,
+      "device_order": [0, 1, 2, 3, 4, 5, 6, 7],
+      "dlo_group_kind": "sp",
+      "dlo_all_gather_median_ms": 41.1263,
+      "dlo_all_gather_p99_ms": 41.1770,
+      "sp_all_to_all_median_ms": 20.7118,
+      "sp_all_to_all_p99_ms": 20.8178
+    },
+    {
+      "name": "dp2-sp4-natural",
+      "dp_size": 2,
+      "sp_size": 4,
+      "device_order": [0, 1, 2, 3, 4, 5, 6, 7],
+      "dlo_group_kind": "dp",
+      "dlo_all_gather_median_ms": 57.3858,
+      "dlo_all_gather_p99_ms": 67.7326,
+      "sp_all_to_all_median_ms": 18.4796,
+      "sp_all_to_all_p99_ms": 18.5259
+    },
+    {
+      "name": "dp2-sp4-topology",
+      "dp_size": 2,
+      "sp_size": 4,
+      "device_order": [0, 2, 4, 6, 1, 3, 5, 7],
+      "dlo_group_kind": "dp",
+      "dlo_all_gather_median_ms": 52.6750,
+      "dlo_all_gather_p99_ms": 52.8270,
+      "sp_all_to_all_median_ms": 18.8081,
+      "sp_all_to_all_p99_ms": 18.8933
+    },
+    {
+      "name": "dp4-sp2-natural",
+      "dp_size": 4,
+      "sp_size": 2,
+      "device_order": [0, 1, 2, 3, 4, 5, 6, 7],
+      "dlo_group_kind": "dp",
+      "dlo_all_gather_median_ms": 43.9203,
+      "dlo_all_gather_p99_ms": 43.9913,
+      "sp_all_to_all_median_ms": 11.3262,
+      "sp_all_to_all_p99_ms": 11.5051
+    },
+    {
+      "name": "dp4-sp2-topology",
+      "dp_size": 4,
+      "sp_size": 2,
+      "device_order": [0, 2, 1, 3, 4, 6, 5, 7],
+      "dlo_group_kind": "dp",
+      "dlo_all_gather_median_ms": 44.0285,
+      "dlo_all_gather_p99_ms": 44.0651,
+      "sp_all_to_all_median_ms": 16.5605,
+      "sp_all_to_all_p99_ms": 16.6675
+    },
+    {
+      "name": "dp8-sp1-natural",
+      "dp_size": 8,
+      "sp_size": 1,
+      "device_order": [0, 1, 2, 3, 4, 5, 6, 7],
+      "dlo_group_kind": "dp",
+      "dlo_all_gather_median_ms": 41.0465,
+      "dlo_all_gather_p99_ms": 41.0798,
+      "sp_all_to_all_median_ms": 0.3494,
+      "sp_all_to_all_p99_ms": 0.3497
+    }
+  ],
+  "selected": {
+    "single_request": "dp1-sp8-natural",
+    "two_requests": "dp2-sp4-topology",
+    "four_requests": "dp4-sp2-natural",
+    "eight_requests": "dp8-sp1-natural"
+  },
+  "end_to_end": {
+    "model": "MiniMax-H3",
+    "runtime": {
+      "vllm_omni_commit": "e51fe6ec1b9a9a0e14bb1fdb296d61b6593b93c6",
+      "torch": "2.13.0+cu132",
+      "cuda": "13.2",
+      "nccl": "2.29.7",
+      "quantization": "online-fp8",
+      "parallelism": "dp1-sp8-text-tp8-vae-tile8",
+      "distributed_layerwise_offload": "all-gather",
+      "engine_initialization_s": 306.46,
+      "idle_process_gpu_memory_gib": 1.86,
+      "maximum_full_fp8_block_mib": 615.6,
+      "maximum_shard_mib_per_rank": 76.9
+    },
+    "request": {
+      "task": "t2va",
+      "width": 832,
+      "height": 480,
+      "fps": 24,
+      "requested_duration_s": 4.0,
+      "generated_frames": 107,
+      "generated_audio_duration_s": 4.45,
+      "audio_sample_rate_hz": 32000,
+      "seed": 1101
+    },
+    "samples": [
+      {
+        "name": "first-valid-request",
+        "steps": 2,
+        "client_e2e_s": 17.317,
+        "server_e2e_s": 16.877134,
+        "denoise_step_latency_ms": 8437.763,
+        "peak_gpu_memory_mib": 13998,
+        "all_gpus_peak_utilization_percent": 100
+      },
+      {
+        "name": "warm-request",
+        "steps": 2,
+        "client_e2e_s": 13.714,
+        "server_e2e_s": 13.291982,
+        "denoise_step_latency_ms": 6645.439,
+        "peak_gpu_memory_mib": 14174,
+        "all_gpus_peak_utilization_percent": 100
+      },
+      {
+        "name": "stability-request",
+        "steps": 10,
+        "client_e2e_s": 71.719,
+        "server_e2e_s": 71.320681,
+        "denoise_step_latency_ms": 7131.966,
+        "peak_gpu_memory_mib": 14206,
+        "all_gpus_peak_utilization_percent": 100,
+        "output_bytes": 1022884,
+        "output_sha256": "1b3e2d9a13ed292c2bb16ab09fe795b9ec27e4038755ba70ca8c5d72dbc0fdfc",
+        "video_stream": "h264 832x480 24fps",
+        "audio_stream": "aac stereo 32000hz"
+      }
+    ],
+    "excluded_probe": {
+      "steps": 1,
+      "reason": "MiniMax-H3 sigma schedules require at least two entries"
+    }
+  }
+}

@@ -15,8 +15,18 @@ from astrai.parallel.setup import (
     get_rank,
     get_world_size,
     only_on_rank,
+    resolve_local_device_index,
     setup_parallel,
     spawn_parallel_fn,
+)
+from astrai.parallel.topology import (
+    DLOMeasurement,
+    DLOTopologyPlan,
+    GPUTopology,
+    build_parallel_groups,
+    parse_device_order,
+    parse_nvidia_topology,
+    select_dlo_plan,
 )
 
 __all__ = [
@@ -36,4 +46,12 @@ __all__ = [
     "FSDPExecutor",
     "create_ref_model",
     "broadcast_state_dict",
+    "DLOMeasurement",
+    "DLOTopologyPlan",
+    "GPUTopology",
+    "build_parallel_groups",
+    "parse_device_order",
+    "parse_nvidia_topology",
+    "resolve_local_device_index",
+    "select_dlo_plan",
 ]

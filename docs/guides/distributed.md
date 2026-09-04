@@ -8,6 +8,7 @@ AstrAI supports three parallel modes: **single GPU** (`none`), **Data Parallel**
 - [Parallel Modes](#parallel-modes)
 - [Gradient Accumulation](#gradient-accumulation)
 - [Process Launching](#process-launching)
+- [Topology-aware DP/SP Placement](#topology-aware-dpsp-placement)
 - [NCCL Troubleshooting](#nccl-troubleshooting)
 - [Checkpoint Saving](#checkpoint-saving)
 - [Total Steps Calculation](#total-steps-calculation)
@@ -143,6 +144,67 @@ When launched via `torchrun`, the launcher creates the worker processes. AstrAI 
 The current training CLI still uses `--nprocs` when calculating scheduler `total_steps`. Set it to the global `WORLD_SIZE` so the step count reflects data-parallel sharding, including multi-node runs.
 
 Raw Slurm variables such as `SLURM_PROCID`, `SLURM_NTASKS`, and `SLURM_LOCALID` are not recognized automatically. Launch through `torchrun`, or map the scheduler's variables to `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `MASTER_ADDR`, and `MASTER_PORT` before starting AstrAI. The same requirement applies to launchers that expose only OpenMPI-specific variables.
+
+## Topology-aware DP/SP Placement
+
+AstrAI can plan and apply a logical-rank-to-device mapping for runtimes that combine
+data parallelism (DP), sequence parallelism (SP), and distributed layerwise offload
+(DLO). The planner follows the SP-fastest rank layout used by vLLM-Omni diffusion
+workers. DLO uses the DP group when `DP > 1`, falls back to the SP group when
+`DP = 1` and `SP > 1`, and otherwise remains rank-local. Tensor-parallel groups are
+deliberately not treated as DLO weight-sharding groups.
+
+Capture the live topology and inspect a single-request plan:
+
+```bash
+nvidia-smi topo -m > topology.txt
+python scripts/tools/plan_dlo_topology.py \
+    --topology-file topology.txt \
+    --concurrent-requests 1 \
+    --output dlo-plan.json
+```
+
+A single request cannot select `DP > 1`; on eight visible GPUs the automatic plan is
+therefore DP1 x SP8. Multiple independent requests permit a larger DP dimension:
+
+```bash
+python scripts/tools/plan_dlo_topology.py \
+    --concurrent-requests 4 \
+    --measurements dlo-topology.json
+```
+
+Topology labels are only a fallback. PCIe labels do not include every relevant
+transport detail, so benchmark candidate mappings on the target host and feed the
+result back into the planner:
+
+```bash
+python scripts/tools/benchmark_dlo_topology.py \
+    --output dlo-topology.json \
+    --markdown-output dlo-topology.md \
+    --dp-sizes 1,2,4,8 \
+    --dlo-payload-mib 256 \
+    --sp-payload-mib 64
+```
+
+The DLO payload uses `uint8`, matching the byte width of finalized online INT8/FP8
+weights. The benchmark reports the slowest rank in each trial for both DLO AllGather
+and SP all-to-all. Measurements are compared only within the same DP/SP shape; the
+request concurrency determines the shape, while timings determine its device order.
+
+To apply the selected mapping to AstrAI's launcher, export the generated
+`ASTRAI_DEVICE_ORDER`. Values refer to indices within the current
+`CUDA_VISIBLE_DEVICES` set. AstrAI preserves the launcher's logical `LOCAL_RANK` and
+records the mapped accelerator separately in `LOCAL_DEVICE`:
+
+```bash
+export ASTRAI_DEVICE_ORDER=0,2,4,6,1,3,5,7
+python scripts/tools/train.py --nprocs=8 --parallel_mode=fsdp ...
+```
+
+The plan JSON also emits the equivalent `CUDA_VISIBLE_DEVICES` ordering and DP/SP
+flags for an external vLLM-Omni MiniMax-H3 launch. AstrAI does not implement the
+diffusion offloader itself; it owns the reusable placement, validation, and benchmark
+contract used to configure that runtime.
 
 ## NCCL Troubleshooting
 

@@ -322,7 +322,15 @@ class DDPExecutor(BaseExecutor):
         if not self.use_distributed:
             logger.warning("DDP backend selected but world_size=1, model not wrapped")
             return model
-        local_rank = int(os.environ.get("LOCAL_RANK", get_rank()))
+        local_device = os.environ.get("LOCAL_DEVICE")
+        device_index = (
+            torch.device(local_device).index if local_device is not None else None
+        )
+        local_rank = (
+            device_index
+            if device_index is not None
+            else int(os.environ.get("LOCAL_RANK", get_rank()))
+        )
         model = DDP(
             model,
             device_ids=[local_rank],

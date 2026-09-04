@@ -1,0 +1,105 @@
+{
+  "schema_version": "0.5",
+  "draft": {
+    "id": "astrai-topology-aware-dlo-dpsp-v1",
+    "revision": 1,
+    "state": "D3-contract-proposed",
+    "created_by": "0z5a"
+  },
+  "target": {
+    "mode": "repository",
+    "repository": "https://github.com/ViperEkura/AstrAI",
+    "revision": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74",
+    "project_profile_sha256": "sha256:1a013d117f58397189ba0f07b8bf417abf4905a165c3098a1957d2fcb228cbf6"
+  },
+  "candidate": {
+    "kind": "git-diff",
+    "revision": "sha256:9ef929c8f646ffebb319c0c5e559d269371261c8a789d20d7409112844f582a9",
+    "intent": "integrate",
+    "implementation_kind": "framework",
+    "entrypoints": [
+      "astrai.parallel.topology.select_dlo_plan",
+      "astrai.parallel.setup.resolve_local_device_index",
+      "astrai.parallel.executor.DDPExecutor._prepare_model",
+      "scripts/tools/benchmark_dlo_topology.py"
+    ],
+    "operator_family": "communication-collective",
+    "phase": "communication",
+    "backend": "cuda",
+    "primary_host_candidate": "astrai"
+  },
+  "baseline": {
+    "mode": "target-head",
+    "revision": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74"
+  },
+  "deployment": {
+    "workload_portfolio": {
+      "id": "astrai-topology-dlo-collectives-v1",
+      "sha256": "sha256:fa215b71961e452f1642dfaf2f53062715a6350f12ea011b36b404abaa461130",
+      "path": "benchmarks/results/dlo_topology_8x5060ti.json"
+    },
+    "required_cells": [
+      "cuda-sm120-8x-rtx5060ti"
+    ],
+    "optional_cells": [
+      "cuda-sm90-8x",
+      "cuda-sm100-8x"
+    ],
+    "request_or_step_protocol": {
+      "id": "astrai-topology-dlo-launch-v1",
+      "sha256": "sha256:e47fd486ddd2fe59959b5a0e585cd3a38c4c816e9fec1912fb71fed752765e05",
+      "path": "docs/guides/distributed.md"
+    }
+  },
+  "retrieval": {
+    "enabled": true,
+    "corpus_cutoff": "2026-09-02T00:00:00Z",
+    "sources": [
+      "target-code",
+      "merged-prs",
+      "rejected-prs",
+      "review-comments",
+      "ci-failures",
+      "release-notes"
+    ],
+    "precedent_set_sha256": "sha256:49d9686b940054dcf0b4414baf1c2d2cabb37382d129fbdecb9269d7d5121fd1"
+  },
+  "acceptance_contract": {
+    "status": "proposed",
+    "path": "tests/parallel/test_topology.py",
+    "sha256": "sha256:7ce14b99f74ca9fdb04c06a6c5225792535d412272996e3f89b7e486ac6bf93a",
+    "probe_set_sha256": "sha256:a43bdafee50ab450264c33ad8c655fb10c7f150a26a38cd21bba71791009e58f",
+    "hidden_probe_policy_sha256": "sha256:3a9abef329e13ba9da1d678abefcbc0953e19f128223a6797330b4a7d4e10ae8"
+  },
+  "project_objectives": {
+    "edge_ecosystem_policy": "experimental",
+    "profile_set_sha256": "sha256:f98050cb02f598b88b6819b288a0768af9c65d996e7684b1bbfb920198dd2005"
+  },
+  "benchmark_loop": {
+    "fast_stage_max_official_fraction": 0.05,
+    "affected_stage_max_official_fraction": 0.2,
+    "official_replays": 7,
+    "early_exit_on_hard_gate": true,
+    "affected_case_selection": "required",
+    "benchmark_budget_policy_id": "draft-staged-budget-v0.5",
+    "evidence_policy_id": "v0.4-evidence-ladder-plus-seal-v0.5",
+    "precompile": {
+      "mode": "auto",
+      "trigger": "when-compilation-required",
+      "cache_policy": "content-addressed-evidence-identity",
+      "cache_miss_action": "precompile-before-timed-cases",
+      "timing_phases": [
+        "precompile",
+        "cold-start",
+        "steady-state"
+      ],
+      "steady_state_compile_allowed": false
+    }
+  },
+  "scoring": {
+    "formula_template_id": "project-fit-kernel-v0.5",
+    "provisional_scoring_allowed": true,
+    "official_scoring_requires_seal": true,
+    "project_season": "astrai-2026q3"
+  }
+}

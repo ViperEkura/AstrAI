@@ -176,3 +176,50 @@ Before adding capture or replay, a follow-up must define how model revision,
 checkpoint revision, router-state version, kernel semantics, token boundaries,
 and parallel-layout digest are sourced atomically. That integration must remain
 opt-in and preserve the current model path when disabled.
+
+## Online rollout binding
+
+`astrai.trainer.route_trace.RolloutRouteTraceBatchV0` binds a rectangular
+`[batch, group]` grid of response traces to the exact rollout policy version,
+prompt tokens/mask, response tokens/mask, and behavior logprobs. `bind(...)`
+freezes each trace as immutable codec bytes and retains a verified lightweight
+header, so later cache checks do not decode the large route tensors again. The
+batch digest also binds ordered per-response artifact digests and a
+caller-provided rollout ID.
+
+The binding uses one canonical padded layout:
+
+- prompts are left padded with zero token IDs;
+- responses and route rows are right padded with zeros;
+- every response trace spans the complete padded response width;
+- `token_offset` and `prompt_token_count` equal that sample's valid prompt
+  length;
+- the trace validity mask exactly equals the corresponding response mask;
+- each sample ID is derived from the rollout ID and its exact batch/group
+  coordinate, preventing same-length responses from being silently swapped;
+- all traces in the batch share one behavior identity, router schema, payload
+  level, and policy version, and carry unique sample IDs.
+
+`RawRollout.route_trace_batch` and `RolloutResult.route_trace_batch` default to
+`None`, preserving the existing generation path. When populated, the runner
+validates the binding before scoring, after scoring, before cache publication,
+and on every cache reuse. Token mutation, a swapped trace, an overlaid policy
+version, or a boundary/mask mismatch fails closed. This layer does not capture
+routes, replay experts, or use route metrics to change sample admission.
+
+Measure immutable binding and cache-validation cost separately from model
+capture with:
+
+```bash
+python scripts/benchmark_rollout_route_binding.py \
+  --batch-size 2 --group-size 2 --prompt-tokens 512 \
+  --response-tokens 1024 --layers 40 --top-k 22 --num-experts 512 \
+  --level ids --device cpu --warmups 5 \
+  --bind-repeats 5 --validate-repeats 50
+```
+
+The reported bind time includes per-trace serialization and immutable-header
+verification. Validation hashes only the comparatively small rollout token,
+mask, and behavior-logprob tensors and checks cached headers; it does not
+decode route payloads. The benchmark excludes generation, model capture,
+transport, replay, scoring, and training.

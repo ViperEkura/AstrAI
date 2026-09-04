@@ -32,6 +32,11 @@ from astrai.tokenize import AutoTokenizer
 from astrai.trainer.metric_util import GradSNRTracker
 from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
+from astrai.trainer.training_telemetry import (
+    NullTrainingTelemetry,
+    TrainingTelemetry,
+    create_training_telemetry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,9 @@ class TrainContext:
     grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
     val_dataloader: Optional[DataLoader] = field(default=None)
     val_loss: Optional[float] = field(default=None)
+    training_telemetry: TrainingTelemetry | NullTrainingTelemetry = field(
+        default_factory=NullTrainingTelemetry
+    )
 
     world_size: int = field(default=1)
     rank: int = field(default=0)
@@ -182,6 +190,7 @@ class TrainContextBuilder:
             consumed_samples=state.consumed_samples,
             checkpoint=state.checkpoint,
             param_path=self._param_path,
+            training_telemetry=create_training_telemetry(self.config),
         )
 
     def _prepare_model(

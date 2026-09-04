@@ -63,6 +63,12 @@ class TrainConfig(BaseConfig):
         val_step (int): Number of optimizer steps between validation runs. Defaults to 1000.
         neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
         moe_aux_loss_coef (float): Weight applied to the MoE load-balancing loss. Defaults to 0.01.
+        training_telemetry_enabled (bool): Emit rank-local structured training work traces. Defaults to False.
+        training_cost_flops_per_token (float): Optional FLOP proxy coefficient. Zero reports the estimate as unknown. Defaults to 0.0.
+        training_cost_activation_bytes_per_token (int): Optional activation-memory proxy coefficient. Zero reports the estimate as unknown. Defaults to 0.
+        training_cost_communication_bytes_per_token (int): Optional communication proxy coefficient. Zero reports the estimate as unknown. Defaults to 0.
+        training_cost_duration_ms_per_token (float): Optional duration proxy coefficient. Zero reports the estimate as unknown. Defaults to 0.0.
+        training_cost_confidence (float): Confidence attached to configured cost proxies, in [0, 1]. Defaults to 1.0.
         rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
         rollout_max_policy_lag (Optional[int]): Maximum accepted gap between rollout and live policy versions. None derives ``rollout_interval - 1``. Defaults to None.
         rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
@@ -117,6 +123,13 @@ class TrainConfig(BaseConfig):
     val_step: int = 1000
     neftune_alpha: float = 0.0
     moe_aux_loss_coef: float = 0.01
+
+    training_telemetry_enabled: bool = False
+    training_cost_flops_per_token: float = 0.0
+    training_cost_activation_bytes_per_token: int = 0
+    training_cost_communication_bytes_per_token: int = 0
+    training_cost_duration_ms_per_token: float = 0.0
+    training_cost_confidence: float = 1.0
 
     rollout_interval: int = 512
     rollout_max_policy_lag: Optional[int] = None
@@ -194,11 +207,24 @@ class TrainConfig(BaseConfig):
         return v
 
     @field_validator(
-        "rollout_top_k", "num_workers", "neftune_alpha", "moe_aux_loss_coef"
+        "rollout_top_k",
+        "num_workers",
+        "neftune_alpha",
+        "moe_aux_loss_coef",
+        "training_cost_flops_per_token",
+        "training_cost_activation_bytes_per_token",
+        "training_cost_communication_bytes_per_token",
+        "training_cost_duration_ms_per_token",
     )
     def _validate_non_negative(cls, v):
         if v < 0:
             raise ValueError(f"must be non-negative, got {v}")
+        return v
+
+    @field_validator("training_cost_confidence")
+    def _validate_training_cost_confidence(cls, v: float) -> float:
+        if not 0 <= v <= 1:
+            raise ValueError(f"training_cost_confidence must be in [0, 1], got {v}")
         return v
 
     @field_validator("rollout_max_policy_lag")

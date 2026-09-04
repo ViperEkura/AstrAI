@@ -4,7 +4,7 @@ from typing import List, Optional
 import torch.distributed as dist
 
 from astrai.config import TrainConfig
-from astrai.parallel.setup import spawn_parallel_fn
+from astrai.parallel.setup import get_current_device, spawn_parallel_fn
 from astrai.signal_handler import (
     register_signal_handlers,
     unregister_signal_handlers,
@@ -80,7 +80,21 @@ class Trainer:
                 for batch in context.dataloader:
                     if context.stop_requested:
                         break
-                    with executor.accumulate(context.model):
+                    with (
+                        executor.accumulate(context.model),
+                        context.training_telemetry.observe_batch(
+                            batch,
+                            strategy=context.config.strategy,
+                            rank=context.rank,
+                            world_size=context.world_size,
+                            epoch=context.epoch,
+                            optimizer_step=context.optimizer_step,
+                            policy_version=getattr(
+                                context.strategy, "policy_version", None
+                            ),
+                            device=get_current_device(),
+                        ),
+                    ):
                         self._call_callbacks("on_batch_begin", context)
                         loss_output = context.strategy(batch)
                         context.loss = loss_output["loss"].item()

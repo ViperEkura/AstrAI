@@ -1,9 +1,11 @@
 """Tests for immutable RouteTraceV0 bindings at rollout cache boundaries."""
 
+import json
 from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from astrai.moe import (
     PaddingLayout,
@@ -17,6 +19,7 @@ from astrai.moe import (
     canonical_json_digest,
     pack_route_ids,
 )
+from astrai.parallel import get_rank, get_world_size, spawn_parallel_fn
 from astrai.trainer.rollout import (
     BaseRewardModel,
     RawRollout,
@@ -28,6 +31,12 @@ from astrai.trainer.route_trace import (
     RolloutRouteTraceError,
     RolloutRouteTraceItemV0,
     rollout_route_sample_id,
+)
+from astrai.trainer.route_trace_transport import (
+    ROLLOUT_ROUTE_TRACE_SHARD_SCHEMA_VERSION,
+    RolloutRouteTraceShardCodecV0,
+    RolloutRouteTraceShardManifestV0,
+    RolloutRouteTraceTransportV0,
 )
 
 
@@ -375,6 +384,16 @@ def test_binding_rejects_noncanonical_rollout_tensor_layout():
 
 def test_item_rejects_mutable_corrupt_or_mismatched_payload_headers():
     item = RolloutRouteTraceItemV0.from_trace(_trace_grid()[0][0])
+    restored = RolloutRouteTraceItemV0.from_payload(
+        item.payload,
+        max_serialized_bytes=len(item.payload),
+    )
+    assert restored == item
+    with pytest.raises(RolloutRouteTraceError, match="size limit"):
+        RolloutRouteTraceItemV0.from_payload(
+            item.payload,
+            max_serialized_bytes=len(item.payload) - 1,
+        )
     with pytest.raises(RolloutRouteTraceError, match="immutable bytes"):
         replace(item, payload=bytearray(item.payload))
     with pytest.raises(RolloutRouteTraceError, match="payload digest"):
@@ -486,3 +505,183 @@ def test_manifest_is_payload_free_and_digest_binds_rollout_order():
     assert manifest["payload_nbytes"] == first.payload_nbytes
     assert manifest["items"][0][0]["artifact_digest"]
     assert first.artifact_digest != second.artifact_digest
+
+
+def test_sharded_transport_is_deterministic_bounded_and_lossless():
+    raw = _raw_rollout()
+    bound = _bind(raw, _trace_grid(level=RouteTraceLevel.IDS_WEIGHTS_MARGIN))
+
+    transport = RolloutRouteTraceTransportV0.from_batch(
+        bound,
+        max_shard_bytes=1024 * 1024,
+        max_items_per_shard=2,
+    )
+    repeated = RolloutRouteTraceTransportV0.from_batch(
+        bound,
+        max_shard_bytes=1024 * 1024,
+        max_items_per_shard=2,
+    )
+
+    assert len(transport.shard_payloads) == 2
+    assert transport.shard_payloads == repeated.shard_payloads
+    assert transport.manifest == repeated.manifest
+    assert transport.manifest.schema_version == ROLLOUT_ROUTE_TRACE_SHARD_SCHEMA_VERSION
+    assert all(
+        descriptor.encoded_nbytes <= 1024 * 1024
+        for descriptor in transport.manifest.shards
+    )
+    restored_manifest = RolloutRouteTraceShardManifestV0.loads(
+        transport.manifest.dumps()
+    )
+    assert restored_manifest == transport.manifest
+    assert restored_manifest.artifact_digest == transport.manifest.artifact_digest
+
+    restored = restored_manifest.assemble(transport.shard_payloads)
+    assert restored.artifact_digest == bound.artifact_digest
+    assert restored.payload_nbytes == bound.payload_nbytes
+    assert tuple(item.payload for row in restored.items for item in row) == tuple(
+        item.payload for row in bound.items for item in row
+    )
+    restored.validate_against(
+        policy_version=raw.policy_version,
+        prompts=raw.prompts,
+        prompt_mask=raw.prompt_mask,
+        responses=raw.responses,
+        response_mask=raw.response_mask,
+        logprobs_old=raw.logprobs_old,
+    )
+
+
+def test_sharded_transport_fails_closed_on_missing_reordered_or_corrupt_frames():
+    raw = _raw_rollout()
+    bound = _bind(raw)
+    transport = RolloutRouteTraceTransportV0.from_batch(
+        bound,
+        max_items_per_shard=1,
+    )
+    manifest = transport.manifest
+
+    with pytest.raises(RolloutRouteTraceError, match="count"):
+        manifest.assemble(transport.shard_payloads[:-1])
+    reordered = list(transport.shard_payloads)
+    reordered[0], reordered[1] = reordered[1], reordered[0]
+    with pytest.raises(RolloutRouteTraceError, match="size|digest"):
+        manifest.assemble(reordered)
+
+    corrupt = bytearray(transport.shard_payloads[0])
+    corrupt[-1] ^= 1
+    with pytest.raises(RolloutRouteTraceError, match="digest"):
+        manifest.verify_shard(0, corrupt)
+    with pytest.raises(RolloutRouteTraceError, match="immutable bytes"):
+        replace(transport, shard_payloads=(corrupt, *transport.shard_payloads[1:]))
+
+    foreign = RolloutRouteTraceTransportV0.from_batch(
+        _bind(raw, rollout_id="rollout-other"),
+        max_items_per_shard=1,
+    )
+    with pytest.raises(RolloutRouteTraceError, match="size|digest"):
+        manifest.verify_shard(0, foreign.shard_payloads[0])
+
+
+def test_shard_manifest_and_frame_decoders_reject_schema_and_size_ambiguity():
+    transport = RolloutRouteTraceTransportV0.from_batch(
+        _bind(_raw_rollout()),
+        max_items_per_shard=1,
+    )
+    manifest_payload = transport.manifest.dumps()
+    manifest = json.loads(manifest_payload)
+
+    unknown = dict(manifest)
+    unknown["future"] = True
+    with pytest.raises(RolloutRouteTraceError, match="unknown"):
+        RolloutRouteTraceShardManifestV0.loads(
+            json.dumps(unknown, sort_keys=True, separators=(",", ":")).encode()
+        )
+    future = dict(manifest)
+    future["schema_version"] = 1
+    with pytest.raises(RolloutRouteTraceError, match="schema_version"):
+        RolloutRouteTraceShardManifestV0.loads(
+            json.dumps(future, sort_keys=True, separators=(",", ":")).encode()
+        )
+    with pytest.raises(RolloutRouteTraceError, match="canonical JSON"):
+        RolloutRouteTraceShardManifestV0.loads(
+            json.dumps(manifest, sort_keys=True, indent=2).encode()
+        )
+    with pytest.raises(RolloutRouteTraceError, match="size limit"):
+        RolloutRouteTraceShardManifestV0.loads(
+            manifest_payload,
+            max_manifest_bytes=len(manifest_payload) - 1,
+        )
+    with pytest.raises(RolloutRouteTraceError, match="max_shard_bytes"):
+        RolloutRouteTraceShardManifestV0.loads(
+            manifest_payload,
+            max_shard_bytes=transport.manifest.shards[0].encoded_nbytes - 1,
+        )
+    with pytest.raises(RolloutRouteTraceError, match="max_transport_bytes"):
+        RolloutRouteTraceShardManifestV0.loads(
+            manifest_payload,
+            max_transport_bytes=(
+                len(manifest_payload) + transport.manifest.encoded_nbytes - 1
+            ),
+        )
+
+    frame = transport.shard_payloads[0]
+    with pytest.raises(RolloutRouteTraceError, match="size limit"):
+        RolloutRouteTraceShardCodecV0.loads(
+            frame,
+            max_shard_bytes=len(frame) - 1,
+        )
+    with pytest.raises(RolloutRouteTraceError, match="magic"):
+        RolloutRouteTraceShardCodecV0.loads(b"badmagic" + frame[8:])
+    with pytest.raises(RolloutRouteTraceError, match="trailing bytes"):
+        RolloutRouteTraceShardCodecV0.loads(
+            frame + b"x",
+            max_shard_bytes=len(frame) + 1,
+        )
+
+
+def test_sharded_transport_rejects_an_item_larger_than_the_shard_cap():
+    transport = RolloutRouteTraceTransportV0.from_batch(
+        _bind(_raw_rollout()),
+        max_items_per_shard=1,
+    )
+    smallest_frame = min(
+        descriptor.encoded_nbytes for descriptor in transport.manifest.shards
+    )
+    with pytest.raises(RolloutRouteTraceError, match="one route trace item"):
+        RolloutRouteTraceTransportV0.from_batch(
+            _bind(_raw_rollout()),
+            max_shard_bytes=smallest_frame - 1,
+            max_items_per_shard=1,
+        )
+
+
+def _distributed_route_shard_worker():
+    rank = get_rank()
+    world_size = get_world_size()
+    transport = RolloutRouteTraceTransportV0.from_batch(
+        _bind(_raw_rollout()),
+        max_items_per_shard=1,
+    )
+    local = transport.payloads_for_rank(rank, world_size)
+    local_indices = tuple(index for index, _ in local)
+    assert local_indices == transport.manifest.shard_indices_for_rank(rank, world_size)
+    for index, payload in local:
+        shard = transport.manifest.verify_shard(index, payload)
+        assert shard.shard_index == index
+
+    gathered = [None for _ in range(world_size)]
+    dist.all_gather_object(gathered, local_indices)
+    flattened = [index for indices in gathered for index in indices]
+    assert sorted(flattened) == list(range(len(transport.shard_payloads)))
+    assert len(flattened) == len(set(flattened))
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_shard_assignment_is_complete_on_real_gloo_groups(world_size):
+    spawn_parallel_fn(
+        _distributed_route_shard_worker,
+        world_size=world_size,
+        backend="gloo",
+        device_type="cpu",
+    )

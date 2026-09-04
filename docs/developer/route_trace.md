@@ -223,3 +223,37 @@ verification. Validation hashes only the comparatively small rollout token,
 mask, and behavior-logprob tensors and checks cached headers; it does not
 decode route payloads. The benchmark excludes generation, model capture,
 transport, replay, scoring, and training.
+
+## Sharded transport frames
+
+`astrai.trainer.route_trace_transport.RolloutRouteTraceTransportV0` converts an
+already bound rollout batch into deterministic, row-major byte shards. The
+caller sets both an encoded-byte limit and an item-count limit; a single trace
+that cannot fit fails loudly instead of silently exceeding the configured
+bound. The small JSON manifest records the original batch digest and exact
+contiguous range, encoded size, payload size, and SHA-256 digest of every
+shard.
+
+Each shard is a non-executable length-prefixed frame containing canonical JSON
+metadata and the existing safe RouteTrace payloads. A receiver can validate
+only its assigned shard against the manifest. Decoders reject non-canonical
+JSON metadata. Complete reconstruction rejects missing, reordered, corrupt,
+cross-batch, or trailing data and must reproduce the original
+`RolloutRouteTraceBatchV0.artifact_digest`. Rank assignment is a generic
+deterministic round-robin over shards; CPU Gloo tests cover world sizes two and
+four. The codec does not choose a network or mutate rollout or training
+behavior.
+
+Measure CPU framing, verification, byte overhead, and reconstruction with:
+
+```bash
+python scripts/benchmark_rollout_route_transport.py \
+  --batch-size 8 --group-size 8 --prompt-tokens 512 \
+  --response-tokens 1024 --layers 40 --top-k 22 --num-experts 512 \
+  --level ids --max-shard-bytes 16777216 --max-items-per-shard 8 \
+  --warmups 2 --repeats 5
+```
+
+The result also reports the encoded-byte distribution for two and four
+consumer ranks. It deliberately excludes actual network throughput, model
+capture, generation, replay, scoring, and optimizer work.

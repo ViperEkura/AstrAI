@@ -281,6 +281,38 @@ class RolloutRouteTraceItemV0:
             ),
         )
 
+    @classmethod
+    def from_payload(
+        cls,
+        payload: bytes | bytearray | memoryview,
+        *,
+        max_serialized_bytes: int,
+    ) -> RolloutRouteTraceItemV0:
+        """Build a verified item from an untrusted serialized trace payload."""
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise RolloutRouteTraceError("route trace payload must be bytes-like")
+        payload = bytes(payload)
+        try:
+            trace = RouteTraceCodecV0.loads(
+                payload,
+                max_serialized_bytes=max_serialized_bytes,
+            )
+        except RouteTraceValidationError as exc:
+            raise RolloutRouteTraceError(
+                f"route trace payload is invalid: {exc}"
+            ) from exc
+        return cls(
+            payload=payload,
+            artifact_digest=hashlib.sha256(payload).hexdigest(),
+            identity=trace.identity,
+            router_schema=trace.router_schema,
+            token_layout=trace.token_layout,
+            level=trace.level,
+            valid_mask_digest=_tensor_digest(
+                "route trace valid mask", _effective_mask(trace)
+            ),
+        )
+
     def decode(self) -> RouteTraceV0:
         """Decode a fresh CPU trace after verifying immutable content identity."""
         if hashlib.sha256(self.payload).hexdigest() != self.artifact_digest:

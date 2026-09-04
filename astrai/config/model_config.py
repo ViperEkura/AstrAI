@@ -1,6 +1,6 @@
 from typing import Any, Dict, Optional
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic.dataclasses import dataclass
 
 from astrai.config.base import BaseConfig
@@ -118,6 +118,23 @@ class AutoRegressiveLMConfig(BaseModelConfig):
         if v < 1:
             raise ValueError(f"decoder_sparse_step must be at least 1, got {v}")
         return v
+
+    @model_validator(mode="after")
+    def _validate_moe_topology(self) -> "AutoRegressiveLMConfig":
+        if self.ffn_type != "moe":
+            return self
+
+        if self.n_routed_experts is None or self.n_routed_experts <= 0:
+            raise ValueError("n_routed_experts must be positive for MoE")
+        if self.n_shared_experts is None or self.n_shared_experts < 0:
+            raise ValueError("n_shared_experts must be non-negative for MoE")
+        if self.n_activated_experts is None or self.n_activated_experts <= 0:
+            raise ValueError("n_activated_experts must be positive for MoE")
+        if self.n_activated_experts > self.n_routed_experts:
+            raise ValueError("n_activated_experts cannot exceed n_routed_experts")
+        if self.topk_method not in (None, "greedy"):
+            raise ValueError(f"unsupported topk_method: {self.topk_method!r}")
+        return self
 
 
 @dataclass

@@ -374,6 +374,178 @@ def test_moe_component_forward_returns_ffn_output():
     assert torch.isfinite(output["aux_loss"])
 
 
+def test_moe_router_selects_experts_from_fp32_probabilities():
+    """BF16 storage must not collapse close router probabilities before top-k."""
+
+    class FixedRouter(torch.nn.Module):
+        def __init__(self, logits):
+            super().__init__()
+            self.register_buffer("logits", logits)
+
+        def forward(self, x):
+            return self.logits.expand(x.size(0), -1)
+
+    class IdentityExpert(torch.nn.Module):
+        def forward(self, x):
+            return {"hidden_states": x, "aux_loss": None, "router_stats": None}
+
+    moe = DeepSeekMoE(
+        dim=2,
+        dim_ffn=4,
+        n_routed_experts=8,
+        n_shared_experts=0,
+        n_activated_experts=2,
+    )
+    logits = (torch.arange(8, dtype=torch.float32) * 0.001).to(torch.bfloat16)
+    moe.router = FixedRouter(logits)
+    moe.routed_experts = torch.nn.ModuleList([IdentityExpert() for _ in range(8)])
+
+    routed = moe._routed_forward(torch.ones(1, 2, dtype=torch.bfloat16), True)
+    stats = routed["router_stats"]
+    expected = torch.topk(logits.float().softmax(-1), 2, sorted=False).indices
+
+    assert stats is not None
+    assert stats["probs"].dtype == torch.float32
+    assert routed["hidden_states"].dtype == torch.bfloat16
+    assert routed["aux_loss"].dtype == torch.float32
+    actual = torch.sort(stats["topk_indices"], dim=-1).values
+    expected = torch.sort(expected.unsqueeze(0), dim=-1).values
+    assert torch.equal(actual, expected)
+
+
+def test_moe_routing_replays_across_forward_recompute_and_reload(tmp_path):
+    """Actual expert dispatch stays stable across online-RL replay boundaries."""
+    from astrai.trainer.train_callback import GradientCheckpointingCallback
+
+    kwargs = {
+        "dim": 8,
+        "dim_ffn": 16,
+        "n_routed_experts": 8,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+    }
+    torch.manual_seed(3407)
+    moe = DeepSeekMoE(**kwargs).to(dtype=torch.bfloat16)
+    moe.apply(
+        lambda module: (
+            module.reset_parameters() if hasattr(module, "reset_parameters") else None
+        )
+    )
+    hidden_states = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+    routes = []
+    original_select = moe._select_experts
+
+    def record_selection(router_logits):
+        selected = original_select(router_logits)
+        routes.append(torch.sort(selected[2].detach(), dim=-1).values.clone())
+        return selected
+
+    moe._select_experts = record_selection
+
+    moe.eval()
+    with torch.no_grad():
+        rollout_output = moe(hidden_states)["hidden_states"].clone()
+    rollout_route = routes[-1]
+
+    moe.train()
+    train_input = hidden_states.clone().requires_grad_(True)
+    train_output = moe(train_input)["hidden_states"]
+    train_output.float().sum().backward()
+    training_route = routes[-1]
+    assert torch.equal(training_route, rollout_route)
+
+    moe.zero_grad(set_to_none=True)
+    checkpointing = GradientCheckpointingCallback(modules=[DeepSeekMoE])
+    checkpointing._enable(moe)
+    recompute_start = len(routes)
+    recompute_input = hidden_states.clone().requires_grad_(True)
+    recompute_output = moe(recompute_input)["hidden_states"]
+    recompute_output.float().sum().backward()
+    recompute_routes = routes[recompute_start:]
+    checkpointing._disable(moe)
+
+    assert len(recompute_routes) >= 2
+    assert all(torch.equal(route, rollout_route) for route in recompute_routes)
+
+    checkpoint = tmp_path / "moe-router.pt"
+    torch.save(moe.state_dict(), checkpoint)
+    resumed = DeepSeekMoE(**kwargs).to(dtype=torch.bfloat16)
+    resumed.load_state_dict(torch.load(checkpoint, weights_only=True))
+    resumed.eval()
+    resumed_routes = []
+    resumed_select = resumed._select_experts
+
+    def record_resumed_selection(router_logits):
+        selected = resumed_select(router_logits)
+        resumed_routes.append(torch.sort(selected[2].detach(), dim=-1).values.clone())
+        return selected
+
+    resumed._select_experts = record_resumed_selection
+    with torch.no_grad():
+        resumed_output = resumed(hidden_states)["hidden_states"]
+
+    assert torch.equal(resumed_routes[-1], rollout_route)
+    torch.testing.assert_close(resumed_output, rollout_output, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"n_routed_experts": 0}, "n_routed_experts must be positive"),
+        ({"n_shared_experts": -1}, "n_shared_experts must be non-negative"),
+        ({"n_activated_experts": 0}, "n_activated_experts must be positive"),
+        (
+            {"n_routed_experts": 2, "n_activated_experts": 3},
+            "cannot exceed n_routed_experts",
+        ),
+        ({"topk_method": "group_limited_greedy"}, "unsupported topk_method"),
+    ],
+)
+def test_moe_rejects_inconsistent_expert_topology(overrides, message):
+    from pydantic import ValidationError
+
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    kwargs = {
+        **TINY_CONFIG,
+        "ffn_type": "moe",
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+        "topk_method": "greedy",
+        **overrides,
+    }
+    with pytest.raises(ValidationError, match=message):
+        AutoRegressiveLMConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"n_routed_experts": 0}, "n_routed_experts must be positive"),
+        ({"n_shared_experts": -1}, "n_shared_experts must be non-negative"),
+        ({"n_activated_experts": 0}, "n_activated_experts must be positive"),
+        (
+            {"n_routed_experts": 2, "n_activated_experts": 3},
+            "cannot exceed n_routed_experts",
+        ),
+        ({"topk_method": "group_limited_greedy"}, "unsupported topk_method"),
+    ],
+)
+def test_moe_component_rejects_inconsistent_expert_topology(overrides, message):
+    kwargs = {
+        "dim": 8,
+        "dim_ffn": 16,
+        "n_routed_experts": 4,
+        "n_shared_experts": 1,
+        "n_activated_experts": 2,
+        "topk_method": "greedy",
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=message):
+        DeepSeekMoE(**kwargs)
+
+
 @pytest.mark.parametrize("decoder_sparse_step", [0, -1])
 def test_moe_rejects_invalid_decoder_sparse_step(decoder_sparse_step):
     from pydantic import ValidationError

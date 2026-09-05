@@ -117,49 +117,56 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
 // this constraint.
 // ---------------------------------------------------------------------------
 
-template <typename T, bool Trans = false>
-DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
-    const unsigned a = __cvta_generic_to_shared(p);
+// Per-lane-address cores: the caller supplies a raw shared-memory address
+// per lane instead of one common pointer. Use when the fragment tiles are
+// XOR-swizzled per 16B chunk so each lane must compute its own row and
+// chunk address (see gemm/gemm.cuh's frag_addr + lane selectors for the
+// m16n8k32 operand layouts). Trans selects the transposed load — the
+// gemm's crosswise 16-bit staging ([K][rows] tiles) reads its fragments
+// through it. (ldmatrix is a b16-only instruction: 8-bit crosswise
+// operands keep the PRMT staging + plain loads.)
+template <bool Trans = false>
+DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
+                                         unsigned addr) {
     if constexpr (Trans) {
         asm volatile(
             "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
             : "=r"(r[0]), "=r"(r[1])
-            : "r"(a));
+            : "r"(addr));
     } else {
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-            : "=r"(r[0]), "=r"(r[1])
-            : "r"(a));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                     : "=r"(r[0]), "=r"(r[1])
+                     : "r"(addr));
     }
 }
 
-// Four matrices at p, p+128, p+256, p+384 bytes (16-byte row stride).
-template <typename T>
-DEVICE_FORCEINLINE void ldmatrix_x4(unsigned r[4], const T* p) {
-    const unsigned a = __cvta_generic_to_shared(p);
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-        : "r"(a));
-}
-
-// Per-lane-address variants: the caller supplies a raw shared-memory address
-// per lane instead of one common pointer. Use when the fragment tiles are
-// XOR-swizzled per 16B chunk so each lane must compute its own row and chunk
-// address (see gemm/gemm.cuh's frag_addr + lane selectors for the m16n8k32
-// operand layouts).
-DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
-                                          unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-                 : "=r"(r[0]), "=r"(r[1])
-                 : "r"(addr));
-}
-
+template <bool Trans = false>
 DEVICE_FORCEINLINE void ldmatrix_x4_lane(unsigned r[4],
-                                          unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(addr));
+                                         unsigned addr) {
+    if constexpr (Trans) {
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+            : "r"(addr));
+    } else {
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+            : "r"(addr));
+    }
+}
+
+// Common-pointer wrappers over the per-lane cores (see the x2/x4 matrix
+// layout notes above).
+template <typename T, bool Trans = false>
+DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
+    ldmatrix_x2_lane<Trans>(r, __cvta_generic_to_shared(p));
+}
+
+// Four matrices at p, p+128, p+256, p+384 bytes (16-byte row stride).
+template <typename T, bool Trans = false>
+DEVICE_FORCEINLINE void ldmatrix_x4(unsigned r[4], const T* p) {
+    ldmatrix_x4_lane<Trans>(r, __cvta_generic_to_shared(p));
 }
 
 }  // namespace astrai

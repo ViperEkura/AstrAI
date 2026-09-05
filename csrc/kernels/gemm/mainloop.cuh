@@ -35,6 +35,14 @@ struct GemmCollectiveMainloop {
     static constexpr int kCtaThreads = Traits::kCtaThreads;
     static constexpr bool kDirectA = Smem::kDirectA;
     static constexpr bool kDirectB = Smem::kDirectB;
+    // Crosswise operands split by element width: 16-bit stages by cp.async
+    // into a transposed [kK][rows] tile read through ldmatrix.trans (async,
+    // pipelineable); 8-bit has no trans ldmatrix and keeps the synchronous
+    // LDG+PRMT path into the canonical tile.
+    static constexpr bool kSyncA = kDirectA && sizeof(ElemA) == 1;
+    static constexpr bool kTransA = kDirectA && sizeof(ElemA) == 2;
+    static constexpr bool kSyncB = kDirectB && sizeof(ElemB) == 1;
+    static constexpr bool kTransB = kDirectB && sizeof(ElemB) == 2;
     static_assert(kStages >= 1 && kStages <= 8,
                   "FP8 GEMM stages must be in [1, 8]");
     // CTA = (BlockM/WarpM) x (BlockN/WarpN) warps, each warp computing
@@ -83,7 +91,7 @@ struct GemmCollectiveMainloop {
           a_row0(warp_m * Traits::kWarpM),
           b_row0(warp_n * Traits::kWarpN),
           tile_count((k + kK - 1) / kK),
-          fast_cta(kFastLoop && !kDirectA && !kDirectB &&
+          fast_cta(kFastLoop && !kSyncA && !kSyncB &&
                    ((int64_t)block.x * kBlockM + kBlockM <= m) &&
                    ((int64_t)block.y * kBlockN + kBlockN <= n) &&
                    ((reinterpret_cast<uintptr_t>(a) | (uint64_t)a_ld) & 15) == 0 &&
@@ -99,30 +107,38 @@ struct GemmCollectiveMainloop {
     __device__ __forceinline__ ElemB* b_stage_of(int64_t tile) const {
         return b_base + (size_t)(tile % kBRing) * kBStageElems;
     }
-    // Asynchronous congruous loads for one k-tile: cp.async into the
-    // canonical rings; kFast selects the predication-free interior copy
-    // (fast_cta admits only congruous operands). Called after the
-    // post-compute barrier, alongside the commit.
+    // Asynchronous loads for one k-tile: congruous operands cp.async into
+    // the canonical rings, crosswise 16-bit operands cp.async into the
+    // transposed rings (kFast selects the predication-free interior copy —
+    // trans staging qualifies: it is cp.async like the congruous path).
+    // Called after the post-compute barrier, alongside the commit.
     template <bool kFast = false>
     __device__ __forceinline__ void load_async(ElemA* a_stage, ElemB* b_stage,
                                                int64_t k_base) const {
-        if constexpr (!kDirectA)
+        if constexpr (kTransA)
+            load_operand_tile_trans<ElemA, kBlockM, kK, kCtaThreads, kFast>(
+                a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+        else if constexpr (!kDirectA)
             load_operand_tile<ElemA, kK, kBlockM, kCtaThreads, kFast>(
                 a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
-        if constexpr (!kDirectB)
+        if constexpr (kTransB)
+            load_operand_tile_trans<ElemB, kBlockN, kK, kCtaThreads, kFast>(
+                b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
+        else if constexpr (!kDirectB)
             load_operand_tile<ElemB, kK, kBlockN, kCtaThreads, kFast>(
                 b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
-    // Synchronous direct-crosswise loads for one k-tile. In the steady
-    // state this runs right after barrier 1, so the LDG latency and the
-    // PRMT transpose overlap the MMA phase instead of stalling the
+    // Synchronous direct loads for one k-tile (8-bit crosswise operands
+    // only — 16-bit crosswise rides the async trans staging above). In the
+    // steady state this runs right after barrier 1, so the LDG latency and
+    // the PRMT transpose overlap the MMA phase instead of stalling the
     // inter-barrier window.
     __device__ __forceinline__ void load_direct(ElemA* a_stage, ElemB* b_stage,
                                                 int64_t k_base) const {
-        if constexpr (kDirectA)
+        if constexpr (kSyncA)
             load_crosswise_direct<ElemA, kK, kBlockM, kCtaThreads>(
                 a_stage, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
-        if constexpr (kDirectB)
+        if constexpr (kSyncB)
             load_crosswise_direct<ElemB, kK, kBlockN, kCtaThreads>(
                 b_stage, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
@@ -163,16 +179,19 @@ struct GemmCollectiveMainloop {
         // in, advanced one stage per iteration with an equality wrap —
         // replaces the per-k-tile (tile % ring) * stage_bytes
         // recomputation (a UIMAD.WIDE magic-division ladder in SASS).
-        PrefetchCarry<!kDirectA, ElemA, kK, kBlockM, kCtaThreads> carry_a(
-            a_base, kARing, kAStageBytes, a, a_ld, block_m * kBlockM, tid,
-            kStages);
-        PrefetchCarry<!kDirectB, ElemB, kK, kBlockN, kCtaThreads> carry_b(
-            b_base, kBRing, kBStageBytes, b, b_ld, block_n * kBlockN, tid,
-            kStages);
-        const unsigned a_rd0 = __cvta_generic_to_shared(a_base) + a_lane_off(lane);
+        PrefetchCarry<!kSyncA, ElemA, kK, kBlockM, kCtaThreads, kTransA>
+            carry_a(a_base, kARing, kAStageBytes, a, a_ld, block_m * kBlockM,
+                    tid, kStages);
+        PrefetchCarry<!kSyncB, ElemB, kK, kBlockN, kCtaThreads, kTransB>
+            carry_b(b_base, kBRing, kBStageBytes, b, b_ld, block_n * kBlockN,
+                    tid, kStages);
+        const unsigned a_rd0 = __cvta_generic_to_shared(a_base) +
+                               (kTransA ? a_trans_lane_off(lane)
+                                        : a_lane_off(lane));
         const unsigned b_rd0 =
             __cvta_generic_to_shared(b_base) +
-            (kPairB ? b4_lane_off(lane) : b_lane_off(lane));
+            (kTransB ? b_trans_lane_off(lane)
+                     : (kPairB ? b4_lane_off(lane) : b_lane_off(lane)));
         const unsigned a_rd_end = a_rd0 + (unsigned)(kARing * kAStageBytes);
         const unsigned b_rd_end = b_rd0 + (unsigned)(kBRing * kBStageBytes);
         unsigned a_rd = a_rd0, b_rd = b_rd0;
@@ -197,12 +216,16 @@ struct GemmCollectiveMainloop {
         const unsigned b_addr = b_rd;
         // Per-k_seg base pair (cuBLAS's scheme): seg s lives at the seg-0
         // base XOR (s * kSegXor) — one LOP3 per extra seg per k-tile, never
-        // per fragment. Every LDSM below addresses [base + immediate].
+        // per fragment. Trans tiles keep their k rows at kMmaK * RowsT-byte
+        // strides, so their seg step is a plain ADD (no XOR trick). Every
+        // LDSM below addresses [base + immediate].
         unsigned a_seg[kSegs], b_seg[kSegs];
 #pragma unroll
         for (int s = 0; s < kSegs; ++s) {
-            a_seg[s] = a_addr ^ (unsigned)(s * kSegXor);
-            b_seg[s] = b_addr ^ (unsigned)(s * kSegXor);
+            a_seg[s] = kTransA ? (a_addr + (unsigned)(s * kTransSegA))
+                               : (a_addr ^ (unsigned)(s * kSegXor));
+            b_seg[s] = kTransB ? (b_addr + (unsigned)(s * kTransSegB))
+                               : (b_addr ^ (unsigned)(s * kSegXor));
         }
 
         // kNt ldmatrix.x2 (B) + kMt ldmatrix.x4 (A) feed kMt*kNt*2 mma.sync
@@ -222,14 +245,25 @@ struct GemmCollectiveMainloop {
                                 k_seg + 1, b_seg[k_seg + 1], lane);
         // Software-pipelined A fragments: the ldmatrix.x4 for row mt+1 is
         // issued before the MMAs consuming row mt, so the LDS latency hides
-        // behind tensor-pipe work. Costs 4 extra registers.
+        // behind tensor-pipe work. Costs 4 extra registers. Trans tiles
+        // advance the m window by XOR (two 16B chunks), canonical tiles by
+        // the 16-row byte stride.
         unsigned a_frag[kMt + 1][4];
-        astrai::ldmatrix_x4_lane(a_frag[0], a_seg[k_seg]);
+        if constexpr (kTransA)
+            astrai::ldmatrix_x4_lane<true>(a_frag[0], a_seg[k_seg]);
+        else
+            astrai::ldmatrix_x4_lane(a_frag[0], a_seg[k_seg]);
 #pragma unroll
         for (int mt = 0; mt < kMt; ++mt) {
-            if (mt + 1 < kMt)
-                astrai::ldmatrix_x4_lane(a_frag[mt + 1],
-                                         a_seg[k_seg] + (mt + 1) * kMtStep);
+            if (mt + 1 < kMt) {
+                const unsigned a_next =
+                    kTransA ? (a_seg[k_seg] ^ (unsigned)((mt + 1) * kMtXor))
+                            : (a_seg[k_seg] + (mt + 1) * kMtStep);
+                if constexpr (kTransA)
+                    astrai::ldmatrix_x4_lane<true>(a_frag[mt + 1], a_next);
+                else
+                    astrai::ldmatrix_x4_lane(a_frag[mt + 1], a_next);
+            }
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const unsigned* bops =
@@ -333,9 +367,46 @@ struct GemmCollectiveMainloop {
     static constexpr unsigned kSegXor = (unsigned)Traits::kMmaK * sizeof(ElemA);
     static constexpr bool kPairB = !kDequantB && kK * sizeof(ElemB) / 16 <= 4;
     static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
+    static_assert(!kPairB || !kTransB,
+                  "2-byte crosswise B never pairs (chunk budget)");
     static constexpr unsigned kPairStep = 16u * kK * sizeof(ElemB);  // nt-pair row step
     __device__ __forceinline__ unsigned b4_lane_off(int lane) const {
         return b_lane_off(lane) + (lane >> 4) * kPairStep / 2;
+    }
+
+    // Trans-tile addressing (crosswise 16-bit operands): the LDSM row is a
+    // k line, the 16B chunk a window of the non-contract dim, chunks
+    // swizzled by the k-row bits (tile_at_trans). ldmatrix.trans lane
+    // contract: lanes 0-7 feed k rows 0-7, lanes 8-15 k rows 8-15 (the
+    // second k half of the fragment), lanes 16-31 (x4) step one column
+    // chunk (the +8 half of the m16/n8 tile); x2 ignores lanes 16-31.
+    // kMtXor/kNtXor: one m/n-tile step in chunks (16B each) — an XOR on
+    // the chunk field, not an add; kTransSeg*: one mma k-segment = kMmaK
+    // k rows.
+    static constexpr unsigned kMtXor = 32u;  // m16 = 2 chunks
+    static constexpr unsigned kNtXor = 16u;  // n8 = 1 chunk
+    static constexpr unsigned kTransSegA = (unsigned)Traits::kMmaK * kBlockM * sizeof(ElemA);
+    static constexpr unsigned kTransSegB = (unsigned)Traits::kMmaK * kBlockN * sizeof(ElemB);
+    __device__ __forceinline__ unsigned a_trans_lane_off(int lane) const {
+        // x4 matrix order must match the mma's A-register order (m+8 rides
+        // reg1, k+8 reg2): lanes 8-15 step the m+8 chunk, lanes 16-31 the
+        // k+8 row half.
+        const int krow = (lane & 7) + ((lane >> 4) << 3);
+        const int col = a_row0 + (((lane >> 3) & 1) << 3);
+        constexpr int kSwz = kBlockM / 8 < 8 ? kBlockM / 8 : 8;
+        return (unsigned)(((int64_t)krow * kBlockM +
+                           (((col >> 3) ^ (krow & (kSwz - 1))) << 3) +
+                           (col & 7)) *
+                          sizeof(ElemA));
+    }
+    __device__ __forceinline__ unsigned b_trans_lane_off(int lane) const {
+        const int krow = (lane & 7) + (((lane >> 3) & 1) << 3);
+        const int col = b_row0 + 0;  // nt windows step by kNtXor at call sites
+        constexpr int kSwz = kBlockN / 8 < 8 ? kBlockN / 8 : 8;
+        return (unsigned)(((int64_t)krow * kBlockN +
+                           (((col >> 3) ^ (krow & (kSwz - 1))) << 3) +
+                           (col & 7)) *
+                          sizeof(ElemB));
     }
 
     // One k_seg's B-fragment loads, shared by the initial fill and the
@@ -345,7 +416,15 @@ struct GemmCollectiveMainloop {
     load_b_frags(unsigned* frag2, unsigned* frag4, unsigned seg_base) const {
 #pragma unroll
         for (int p = 0; p < kNt / 2; ++p) {
-            if constexpr (kPairB) {
+            if constexpr (kTransB) {
+                // Trans tile: each x2.trans reads 16 k rows at one n
+                // chunk; the nt windows step by one XORed chunk.
+                astrai::ldmatrix_x2_lane<true>(
+                    frag2 + p * 4, seg_base ^ (unsigned)(p * 2 * kNtXor));
+                astrai::ldmatrix_x2_lane<true>(
+                    frag2 + p * 4 + 2,
+                    seg_base ^ (unsigned)((p * 2 + 1) * kNtXor));
+            } else if constexpr (kPairB) {
                 astrai::ldmatrix_x4_lane(frag4 + p * 4,
                                          seg_base + p * kPairStep);
             } else {

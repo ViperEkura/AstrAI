@@ -36,8 +36,30 @@ __device__ __forceinline__ ElemT* tile_at(ElemT* tile, int row, int col) {
     constexpr int kChunkShift = log2_const<kChunkElems>::value;
     return tile + row * K +
            ((((col >> kChunkShift) ^ ((row >> kShift) & (kChunks - 1)))
-                 << kChunkShift) +
-            (col & (kChunkElems - 1)));
+                  << kChunkShift) +
+             (col & (kChunkElems - 1)));
+}
+
+// Trans-tile mirror of tile_at for crosswise 16-bit operands: the tile is
+// [K][RowsT] (k rows, the non-contract dim contiguous), staged by cp.async
+// directly from the crosswise global layout and read through
+// ldmatrix.trans. The chunk XOR runs the other way — swizzled by the K-row
+// bits — so the 8 k-rows one ldmatrix matrix addresses at a fixed column
+// window land on distinct chunks (conflict-free). Only the low 3 row bits
+// can join the XOR (the LDSM contract gives 8 rows per matrix), so tiles
+// wider than 8 chunks leave the upper chunk bits unswizzled — each
+// matrix's rows stay conflict-free either way.
+template <int RowsT, typename ElemT>
+__device__ __forceinline__ ElemT* tile_at_trans(ElemT* tile, int k, int col) {
+    constexpr int kChunkElems = 16 / sizeof(ElemT);
+    constexpr int kChunks = RowsT / kChunkElems;
+    static_assert(kChunks >= 1 && (kChunks & (kChunks - 1)) == 0,
+                  "swizzle needs a power-of-two 16B-chunk count");
+    constexpr int kSwz = kChunks < 8 ? kChunks : 8;
+    constexpr int kChunkShift = log2_const<kChunkElems>::value;
+    return tile + (int64_t)k * RowsT +
+           ((((col >> kChunkShift) ^ (k & (kSwz - 1))) << kChunkShift) +
+             (col & (kChunkElems - 1)));
 }
 
 // Stage-load a CONGRUOUS operand (contract-contiguous storage — the only
@@ -45,9 +67,10 @@ __device__ __forceinline__ ElemT* tile_at(ElemT* tile, int row, int col) {
 // drops all predication: valid only for a fully interior CTA (whole rows,
 // 16B-aligned base|ld, k_base + K <= contract); the address math then folds
 // to one immediate XOR per chunk (see the design notes). Crosswise operands
-// go through load_crosswise_direct instead.
-template <typename ElemT, int K, int RowsTile, int kThreads,
-          bool kInterior = false>
+// go through load_operand_tile_trans (16-bit) or load_crosswise_direct
+// (8-bit) instead.
+template <typename ElemT, int K, int RowsTile,
+          int kThreads, bool kInterior = false>
 __device__ __forceinline__ void
 load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
                   int64_t contract, int64_t ld, int tid, int64_t k_base,
@@ -85,7 +108,7 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
                 astrai::cp_async_16(dst, src + c);
             } else {
                 // Tail chunk / misaligned base / OOB row: scalar fill.
-#pragma unroll
+# pragma unroll
                 for (int i = 0; i < kChunkElems; ++i)
                     dst[i] =
                         row_ok && k_base + c + i < contract ? src[c + i] : ElemT(0.0f);
@@ -94,27 +117,92 @@ load_operand_tile(ElemT* tile, const ElemT* __restrict__ operand, int64_t rows,
     }
 }
 
-// Loop-carried prefetch state for one congruous operand ring: per-thread
-// (r, c0) mapping with the swizzled stage destination and global source
-// pointer carried across k-tiles, so each prefetch chunk is one LDGSTS
-// issued straight from registers. The guard is a property of the operand's
-// layout, so it lives in the type: the false specialization (crosswise
-// operand) is an empty no-op.
-template <bool kAsync, typename ElemT, int kK, int kRowsTile, int kThreads>
+// Stage-load a CROSSWISE 16-bit operand by cp.async: the global runs along
+// the non-contract dim (row-contiguous 16B) copy straight into the
+// transposed [K][RowsT] tile, and ldmatrix.trans does the matrix turn at
+// fragment-extraction time (b16-only instruction — 8-bit crosswise
+// operands cannot take this path and keep the LDG+PRMT staging).
+// Role-swapped mirror of load_operand_tile: the tile's row dim is the
+// contract dim here, so the predication axes trade places.
+template <typename ElemT, int RowsTile, int kK, int kThreads,
+          bool kInterior = false>
+__device__ __forceinline__ void
+load_operand_tile_trans(ElemT* tile, const ElemT* __restrict__ operand,
+                        int64_t rows, int64_t contract, int64_t ld, int tid,
+                        int64_t k_base, int64_t block_row) {
+    constexpr int kChunkElems = 16 / sizeof(ElemT);
+    constexpr int kChunks = RowsTile / kChunkElems;
+    static_assert(sizeof(ElemT) == 2, "trans staging is 16-bit only");
+    static_assert(kK * kChunks % kThreads == 0,
+                  "tile chunks must divide evenly across threads");
+    constexpr int kCpt = kK * kChunks / kThreads;
+    constexpr int kCpr = kChunks / kCpt;  // n-chunk slices per k row
+    const int kr = tid / kCpr;            // k row within the tile
+    const int c0 = (tid % kCpr) * kCpt * kChunkElems;
+    if constexpr (kInterior) {
+        const char* src = reinterpret_cast<const char*>(
+            operand + (k_base + kr) * ld + block_row + c0);
+        const uintptr_t dst =
+            reinterpret_cast<uintptr_t>(tile_at_trans<RowsTile>(tile, kr, c0));
+#pragma unroll
+        for (int j = 0; j < kCpt; ++j)
+            astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)),
+                                src + j * 16);
+    } else {
+        // block_row and every c are multiples of kChunkElems; the
+        // alignment verdict is shared across each row's chunks only when
+        // ld is (see the scalar fallback).
+        const bool row_ok = k_base + kr < contract;
+#pragma unroll
+        for (int j = 0; j < kCpt; ++j) {
+            const int c = c0 + j * kChunkElems;
+            const int64_t col = block_row + c;
+            ElemT* dst = tile_at_trans<RowsTile>(tile, kr, c);
+            const bool col_ok = col < rows;
+            const auto* src = operand + (k_base + kr) * ld + col;
+            if (row_ok && col_ok &&
+                (reinterpret_cast<uintptr_t>(src) & 15) == 0 &&
+                col + kChunkElems <= rows) {
+                astrai::cp_async_16(dst, src);
+            } else {
+# pragma unroll
+                for (int i = 0; i < kChunkElems; ++i)
+                    dst[i] = row_ok && col + i < rows ? src[i] : ElemT(0.0f);
+            }
+        }
+    }
+}
+
+// Loop-carried prefetch state for one congruous-or-trans operand ring:
+// per-thread (r, c0) mapping with the swizzled stage destination and global
+// source pointer carried across k-tiles, so each prefetch chunk is one
+// LDGSTS issued straight from registers. The guard is a property of the
+// operand's layout, so it lives in the type: the false specialization
+// (synchronous 8-bit crosswise operand) is an empty no-op. kTrans selects
+// the crosswise 16-bit geometry: the tile is [kK][kRowsTile] (k rows), so
+// the thread's row is a k line and the per-tile source advance is
+// kK * ld instead of kK.
+template <bool kAsync, typename ElemT, int kK, int kRowsTile, int kThreads,
+          bool kTrans = false>
 struct PrefetchCarry;
 
-template <typename ElemT, int kK, int kRowsTile, int kThreads>
-struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads> {
+template <typename ElemT, int kK, int kRowsTile, int kThreads, bool kTrans>
+struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads, kTrans> {
     static constexpr int kChunkElems = 16 / sizeof(ElemT);
-    static constexpr int kCpt = kRowsTile * (kK / kChunkElems) / kThreads;
-    static constexpr int kCpr = (kK / kChunkElems) / kCpt;
+    static constexpr int kCpt =
+        (kTrans ? kK * (kRowsTile / kChunkElems)
+                : kRowsTile * (kK / kChunkElems)) /
+        kThreads;
+    static constexpr int kCpr =
+        (kTrans ? kRowsTile / kChunkElems : kK / kChunkElems) / kCpt;
     // All carried state is in BYTES: the smem write ring and the global
     // source pointer both advance by the byte-sized stage stride.
     static constexpr unsigned kKBytes = (unsigned)kK * sizeof(ElemT);
     unsigned wr = 0;    // current stage's swizzled destination offset
     unsigned wr0 = 0;   // slot-0 wrap base
     unsigned wrEnd = 0; // one-past-the-ring sentinel
-    const char* src = nullptr;  // current tile's global source bytes
+    const char* src = nullptr;      // current tile's global source bytes
+    int64_t srcStep = 0;            // per-tile source advance (bytes)
 
     __device__ __forceinline__ PrefetchCarry(
         const ElemT* ring, int ringSlots, int stageBytes, const ElemT* operand,
@@ -125,14 +213,23 @@ struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads> {
         const ElemT* slot0 =
             ring + (int64_t)(firstTile % ringSlots) * stageElems;
         const unsigned laneOff = static_cast<unsigned>(
-            (const char*)tile_at<kK>(slot0, r, c0) - (const char*)slot0);
+            (const char*)(kTrans ? tile_at_trans<kRowsTile>(slot0, r, c0)
+                                 : tile_at<kK>(slot0, r, c0)) -
+            (const char*)slot0);
         const unsigned base = __cvta_generic_to_shared(ring) + laneOff;
         wr = base + (unsigned)((int64_t)(firstTile % ringSlots) * stageBytes);
         wr0 = base;
         wrEnd = base + (unsigned)((int64_t)ringSlots * stageBytes);
-        src = reinterpret_cast<const char*>(
-                  operand + (blockRow + r) * ld + c0) +
-              (int64_t)firstTile * kKBytes;
+        if constexpr (kTrans) {
+            src = reinterpret_cast<const char*>(
+                operand + ((int64_t)firstTile * kK + r) * ld + blockRow + c0);
+            srcStep = (int64_t)kK * ld * sizeof(ElemT);  // k advances rows
+        } else {
+            src = reinterpret_cast<const char*>(
+                      operand + (blockRow + r) * ld + c0) +
+                  (int64_t)firstTile * kKBytes;
+            srcStep = kKBytes;  // k advances the contiguous columns
+        }
     }
 
     // Emit this thread's chunks for the current tile; pf false (loop tail)
@@ -146,12 +243,12 @@ struct PrefetchCarry<true, ElemT, kK, kRowsTile, kThreads> {
     __device__ __forceinline__ void advance(int stageBytes) {
         wr += (unsigned)stageBytes;
         if (wr == wrEnd) wr = wr0;
-        src += kKBytes;
+        src += srcStep;
     }
 };
 
-template <typename ElemT, int kK, int kRowsTile, int kThreads>
-struct PrefetchCarry<false, ElemT, kK, kRowsTile, kThreads> {
+template <typename ElemT, int kK, int kRowsTile, int kThreads, bool kTrans>
+struct PrefetchCarry<false, ElemT, kK, kRowsTile, kThreads, kTrans> {
     __device__ __forceinline__ PrefetchCarry(
         const ElemT*, int, int, const ElemT*, int64_t, int64_t, int, int) {}
     __device__ __forceinline__ void emit(bool) const {}

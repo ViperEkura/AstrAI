@@ -19,6 +19,7 @@ DP_MODES = frozenset({"none", "ddp", "fsdp"})
 BACKENDS = frozenset({"nccl", "gloo"})
 START_METHODS = frozenset({"spawn", "fork", "forkserver"})
 _COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
+_ROUTE_RECOMPUTE_VALIDATION_MODES = frozenset({"off", "record", "error"})
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -41,6 +42,7 @@ class TrainConfig(BaseConfig):
         grad_accum_steps (int): Number of iterations between optimizer steps. Defaults to 1.
         max_grad_norm (Optional[float]): Maximum gradient norm. None disables clipping. Defaults to 1.0.
         gradient_checkpointing_modules (List[type]): Module types to enable activation checkpointing for. Defaults to [].
+        gradient_checkpointing_route_validation (str): Optional forward/recompute MoE route diagnostic mode: off, record, or error. Defaults to off.
         compile_mode (Optional[str]): torch.compile mode: 'default', 'reduce-overhead', 'max-autotune', or None. Defaults to None.
         start_epoch (int): Start epoch for training. Defaults to 0.
         start_samples (int): Start samples count (per rank). Superseded by checkpoint consumed_samples. Defaults to 0.
@@ -93,6 +95,7 @@ class TrainConfig(BaseConfig):
     grad_accum_steps: int = 1
     max_grad_norm: Optional[float] = 1.0
     gradient_checkpointing_modules: List[type] = field(default_factory=list)
+    gradient_checkpointing_route_validation: str = "off"
     compile_mode: Optional[str] = None
 
     start_epoch: int = 0
@@ -205,6 +208,15 @@ class TrainConfig(BaseConfig):
             )
         return v
 
+    @field_validator("gradient_checkpointing_route_validation")
+    def _validate_route_recompute_validation(cls, v: str) -> str:
+        if v not in _ROUTE_RECOMPUTE_VALIDATION_MODES:
+            raise ValueError(
+                "gradient_checkpointing_route_validation must be one of "
+                f"{sorted(_ROUTE_RECOMPUTE_VALIDATION_MODES)}, got {v!r}"
+            )
+        return v
+
     @field_validator(
         "n_epoch",
         "batch_per_device",
@@ -256,6 +268,21 @@ class TrainConfig(BaseConfig):
         if v is not None and not 0 < v < 1:
             raise ValueError(f"val_split must be in (0, 1) or None, got {v}")
         return v
+
+    @model_validator(mode="after")
+    def _validate_route_recompute_configuration(self) -> "TrainConfig":
+        if self.gradient_checkpointing_route_validation != "off":
+            if not self.gradient_checkpointing_modules:
+                raise ValueError(
+                    "gradient_checkpointing_route_validation requires "
+                    "gradient_checkpointing_modules"
+                )
+            if self.compile_mode is not None:
+                raise ValueError(
+                    "gradient checkpoint route validation is not supported with "
+                    "torch.compile"
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":

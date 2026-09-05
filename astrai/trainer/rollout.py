@@ -23,6 +23,10 @@ from torch import Tensor
 
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import GenerationResult
+from astrai.trainer.route_trace import (
+    RolloutRouteTraceBatchV0,
+    RolloutRouteTraceError,
+)
 
 
 @dataclass(kw_only=True)
@@ -47,6 +51,8 @@ class RawRollout:
             need text).
         response_texts: Decoded response strings, shape ``[B, G]``
             (for reward models).
+        route_trace_batch: Optional immutable MoE route artifacts bound to the
+            exact policy version and prompt/response token tensors.
     """
 
     prompts: Tensor
@@ -57,6 +63,7 @@ class RawRollout:
     policy_version: int = 0
     prompt_texts: List[str] = field(default_factory=list)
     response_texts: List[List[str]] = field(default_factory=list)
+    route_trace_batch: Optional[RolloutRouteTraceBatchV0] = None
 
 
 @dataclass(kw_only=True)
@@ -492,6 +499,7 @@ class RolloutRunner:
             policy_version=raw.policy_version,
             prompt_texts=raw.prompt_texts,
             response_texts=raw.response_texts,
+            route_trace_batch=raw.route_trace_batch,
         )
 
     def _validate_policy_version(
@@ -512,6 +520,20 @@ class RolloutRunner:
             raise RolloutVersionError(
                 f"rollout policy lag {lag} exceeds max_policy_lag="
                 f"{self.max_policy_lag} (rollout={version}, live={live_version})"
+            )
+        route_trace_batch = result.route_trace_batch
+        if route_trace_batch is not None:
+            if not isinstance(route_trace_batch, RolloutRouteTraceBatchV0):
+                raise RolloutRouteTraceError(
+                    "route_trace_batch must use RolloutRouteTraceBatchV0"
+                )
+            route_trace_batch.validate_against(
+                policy_version=version,
+                prompts=result.prompts,
+                prompt_mask=result.prompt_mask,
+                responses=result.responses,
+                response_mask=result.response_mask,
+                logprobs_old=result.logprobs_old,
             )
 
     def __call__(self, batch: Dict[str, Tensor]) -> Tuple[RolloutResult, bool]:

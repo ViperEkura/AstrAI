@@ -256,6 +256,23 @@ def _is_external_launcher() -> bool:
     return False
 
 
+def resolve_launch_world_size(nprocs: int) -> int:
+    if not _is_external_launcher():
+        return nprocs
+    raw_world_size = os.environ.get("WORLD_SIZE")
+    try:
+        world_size = int(raw_world_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "WORLD_SIZE must be a positive integer for an external launcher"
+        ) from exc
+    if world_size <= 0:
+        raise ValueError(
+            "WORLD_SIZE must be a positive integer for an external launcher"
+        )
+    return world_size
+
+
 def spawn_parallel_fn(
     func: Callable,
     world_size: int,

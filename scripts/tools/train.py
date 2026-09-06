@@ -24,6 +24,7 @@ from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM, ValueModel
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.optim import OptimizerFactory
+from astrai.parallel.setup import resolve_launch_world_size
 from astrai.trainer import SchedulerFactory, Trainer
 from astrai.trainer.rollout import BaseRewardModel
 
@@ -617,8 +618,9 @@ def train(
             )
         }
 
+    effective_world_size = resolve_launch_world_size(nprocs)
     total_steps = compute_total_steps(
-        len(dataset), n_epoch, batch_per_device, nprocs, grad_accum_steps
+        len(dataset), n_epoch, batch_per_device, effective_world_size, grad_accum_steps
     )
     warmup_steps = int(warmup_ratio * total_steps)
     warmup_steps = min(warmup_steps, total_steps)

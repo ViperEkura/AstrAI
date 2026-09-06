@@ -3,7 +3,9 @@ import typing as t
 
 import click
 import pytest
+import torch
 from click.testing import CliRunner
+from torch.utils.data import TensorDataset
 
 from astrai.config import TrainConfig, merge_yaml_into_kwargs
 from astrai.config.cli import (
@@ -12,6 +14,8 @@ from astrai.config.cli import (
     apply_specs,
     option_from_spec,
 )
+from scripts.tools import train as train_cli
+from tests.helpers import make_tiny_config
 
 
 def test_merge_yaml_overrides_defaults_but_not_explicit_cli(tmp_path):
@@ -228,3 +232,82 @@ def test_help_order_follows_spec_table():
     result = CliRunner().invoke(cmd, ["--help"])
     assert result.exit_code == 0
     assert result.output.index("--first") < result.output.index("--second")
+
+
+@pytest.mark.parametrize("schedule_type", ["cosine", "sgdr", "wsd"])
+@pytest.mark.parametrize(
+    ("world_size", "cli_nprocs", "expected_steps"),
+    [(None, 1, 400), (None, 2, 200), (4, None, 100), (4, 2, 100), (1, 2, 400)],
+)
+def test_train_cli_scheduler_uses_launch_world_size(
+    monkeypatch, tmp_path, schedule_type, world_size, cli_nprocs, expected_steps
+):
+    for name in (
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "TORCHELASTIC_RUN_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    if world_size is not None:
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("WORLD_SIZE", str(world_size))
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+
+    dataset = TensorDataset(torch.zeros(3200, 1))
+    monkeypatch.setattr(
+        train_cli.AutoRegressiveLMConfig, "from_file", lambda path: make_tiny_config()
+    )
+    monkeypatch.setattr(train_cli.DatasetFactory, "load", lambda **kwargs: dataset)
+    captured_configs = []
+
+    def capture_training(trainer, **kwargs):
+        captured_configs.append(trainer.train_config)
+
+    monkeypatch.setattr(train_cli.Trainer, "train", capture_training)
+    arguments = [
+        "--train_type",
+        "seq",
+        "--param_path",
+        str(tmp_path),
+        "--data_root_path",
+        str(tmp_path),
+        "--parallel_mode",
+        "ddp",
+        "--device_type",
+        "cpu",
+        "--backend",
+        "gloo",
+        "--batch_per_device",
+        "2",
+        "--grad_accum_steps",
+        "4",
+        "--n_epoch",
+        "1",
+        "--warmup_ratio",
+        "0.1",
+        "--schedule_type",
+        schedule_type,
+    ]
+    if cli_nprocs is not None:
+        arguments.extend(["--nprocs", str(cli_nprocs)])
+
+    result = CliRunner().invoke(train_cli.train_command, arguments)
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert len(captured_configs) == 1
+    config = captured_configs[0]
+    assert config.nprocs == (1 if cli_nprocs is None else cli_nprocs)
+    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.1)
+    scheduler = config.scheduler_fn(optimizer)
+    expected_warmup = expected_steps // 10
+    assert scheduler.warmup_steps == expected_warmup
+    if schedule_type == "cosine":
+        assert scheduler.lr_decay_steps == expected_steps - expected_warmup
+    elif schedule_type == "sgdr":
+        assert scheduler.cycle_length == expected_steps - expected_warmup
+    else:
+        assert scheduler.stable_steps == int((expected_steps - expected_warmup) * 0.8)
+        assert scheduler.total_steps == expected_steps

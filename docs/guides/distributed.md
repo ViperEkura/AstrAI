@@ -140,7 +140,11 @@ torchrun --nproc_per_node=4 scripts/tools/train.py \
 
 When launched via `torchrun`, the launcher creates the worker processes. AstrAI reads `RANK`, `WORLD_SIZE`, and `LOCAL_RANK` from the environment and uses `TorchrunStrategy`; `--nprocs` does not control process creation in this mode.
 
-The current training CLI still uses `--nprocs` when calculating scheduler `total_steps`. Set it to the global `WORLD_SIZE` so the step count reflects data-parallel sharding, including multi-node runs.
+For scheduler `total_steps`, the training CLI uses the global `WORLD_SIZE`
+automatically under an external launcher, including multi-node runs. Local
+launches use `--nprocs`. External `WORLD_SIZE` must be present and a positive
+integer. This selection only affects the learning-rate schedule; it does not
+rewrite `TrainConfig.nprocs` or change existing configuration validation.
 
 Raw Slurm variables such as `SLURM_PROCID`, `SLURM_NTASKS`, and `SLURM_LOCALID` are not recognized automatically. Launch through `torchrun`, or map the scheduler's variables to `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `MASTER_ADDR`, and `MASTER_PORT` before starting AstrAI. The same requirement applies to launchers that expose only OpenMPI-specific variables.
 
@@ -176,7 +180,8 @@ Checkpoints are saved by **rank-0 only**. The flow:
 The scheduler's total step count accounts for data-parallel sharding:
 
 ```
-samples_per_replica = ceil(dataset_len / nprocs)
+effective_world_size = WORLD_SIZE (external launch) or nprocs (local launch)
+samples_per_replica = ceil(dataset_len / effective_world_size)
 batches_per_replica  = ceil(samples_per_replica / batch_per_device)
 total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
 ```
@@ -250,7 +255,7 @@ python scripts/tools/train.py \
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--nprocs` | 1 | Local process count for AstrAI's launcher; under `torchrun`, set it to global `WORLD_SIZE` for total-step calculation |
+| `--nprocs` | 1 | Local launcher process count; scheduler total steps use global `WORLD_SIZE` under external launchers instead |
 | `--parallel_mode` | `fsdp` | `none`, `ddp`, or `fsdp` |
 | `--start_method` | `spawn` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) |
 | `--backend` | `nccl` | Distributed backend (`nccl`, `gloo`) |

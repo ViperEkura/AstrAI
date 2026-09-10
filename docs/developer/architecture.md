@@ -6,6 +6,8 @@
 - [Module Overview](#module-overview) — Component inventory per module
 - [Design Patterns](#design-patterns) — 16 documented patterns with classes
 - [Core Relationships](#core-relationships) — 11 key inter-component relationships
+- [MoE route trace contract](route_trace.md) — versioned behavior identity,
+  safe serialization, and diagnostics
 
 ## Class Diagram
 

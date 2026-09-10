@@ -219,6 +219,25 @@ config = TrainConfig(..., gradient_checkpointing_modules=[DecoderBlock])
 
 Callback wraps each `DecoderBlock.forward` with `torch.utils.checkpoint.checkpoint(use_reentrant=False)`, compatible with `torch.compile`. Uses `nn.Module.apply()` for traversal — works through DDP wrappers without manual unwrap. Empty list (default) means no-op.
 
+For opt-in MoE diagnostics, set
+`gradient_checkpointing_route_validation="record"` to compare the ordered
+top-k route from each original forward with its recomputation. Use `"error"`
+to stop before the optimizer step when any rank reports a mismatch, invalid
+observation, or missing recomputation:
+
+```python
+config = TrainConfig(
+    ...,
+    gradient_checkpointing_modules=[DecoderBlock],
+    gradient_checkpointing_route_validation="error",
+)
+```
+
+The default is `"off"` and preserves the existing callback. Route validation
+forces complete recomputation so the second route can be observed; it cannot
+currently be combined with `torch.compile`. It records bounded counters only
+and does not replay or alter expert choices.
+
 ## Checkpoint
 
 ```

@@ -15,6 +15,13 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from tqdm import tqdm
 
 from astrai.factory import BaseFactory
+from astrai.moe import (
+    RecomputeRouteMismatchError,
+    RouteCheckpointPairV0,
+    RouteRecomputeDiagnosticsV0,
+    RouteRecomputeSummaryV0,
+    synchronize_route_recompute_summary,
+)
 from astrai.parallel import only_on_rank
 from astrai.parallel.setup import get_current_device
 from astrai.serialization import Checkpoint
@@ -126,18 +133,55 @@ class GradientCheckpointingCallback(TrainCallback):
 
     Args:
         modules: Module types to apply checkpointing to.
+        route_validation: ``"off"`` preserves the existing checkpoint path,
+            ``"record"`` publishes diagnostics, and ``"error"`` also aborts
+            before the optimizer step if a route differs or is incomplete.
     """
 
-    def __init__(self, modules: Optional[List[type]] = None):
+    _ROUTE_VALIDATION_MODES = frozenset(("off", "record", "error"))
+
+    def __init__(
+        self,
+        modules: Optional[List[type]] = None,
+        route_validation: str = "off",
+    ):
+        if route_validation not in self._ROUTE_VALIDATION_MODES:
+            raise ValueError(
+                "route_validation must be one of "
+                f"{sorted(self._ROUTE_VALIDATION_MODES)}, got {route_validation!r}"
+            )
         self.modules = tuple(modules) if modules else ()
+        self.route_validation = route_validation
+        self.route_diagnostics = RouteRecomputeDiagnosticsV0()
+        self.last_route_summary = RouteRecomputeSummaryV0()
+
+    def _checkpoint_forward(self, fn, *args, **kwargs):
+        if self.route_validation == "off":
+            return torch_checkpoint(fn, *args, use_reentrant=False, **kwargs)
+
+        pair = RouteCheckpointPairV0(self.route_diagnostics)
+
+        def observed_forward(*inner_args, **inner_kwargs):
+            output = fn(*inner_args, **inner_kwargs)
+            pair.observe(output)
+            return output
+
+        # Full recomputation is required so the observer after ``fn`` always
+        # sees the second route. This changes work only in the opt-in modes.
+        return torch_checkpoint(
+            observed_forward,
+            *args,
+            use_reentrant=False,
+            context_fn=pair.context_fn,
+            early_stop=False,
+            **kwargs,
+        )
 
     def _enable(self, module: nn.Module):
         if self.modules and isinstance(module, self.modules):
             fn = module.forward
             module._original_forward = fn
-            module.forward = lambda *a, **kw: torch_checkpoint(
-                fn, *a, use_reentrant=False, **kw
-            )
+            module.forward = lambda *a, **kw: self._checkpoint_forward(fn, *a, **kw)
 
     @staticmethod
     def _disable(module: nn.Module):
@@ -148,8 +192,47 @@ class GradientCheckpointingCallback(TrainCallback):
     def on_train_begin(self, context: TrainContext):
         if not self.modules:
             return
+        self.route_diagnostics.reset()
+        self.last_route_summary = RouteRecomputeSummaryV0()
         context.model.apply(self._enable)
-        logger.info("Gradient checkpointing enabled")
+        logger.info(
+            "Gradient checkpointing enabled (route validation: %s)",
+            self.route_validation,
+        )
+
+    def on_batch_begin(self, context: TrainContext):
+        _ = context
+        if self.route_validation != "off":
+            self.route_diagnostics.reset()
+
+    def on_batch_end(self, context: TrainContext):
+        if self.route_validation == "off":
+            return
+        local_summary = self.route_diagnostics.snapshot()
+        summary = synchronize_route_recompute_summary(
+            local_summary,
+            device=(
+                get_current_device()
+                if dist.is_available() and dist.is_initialized()
+                else None
+            ),
+        )
+        self.last_route_summary = summary
+        context.metrics.update(summary.to_metrics())
+        if not summary.has_failure:
+            return
+
+        message = (
+            "MoE route mismatch across checkpoint recomputation: "
+            f"mismatch_pairs={summary.mismatch_pair_count}, "
+            f"invalid_pairs={summary.invalid_pair_count}, "
+            f"unrecomputed_pairs={summary.unrecomputed_pair_count}, "
+            f"rank_inconsistent={summary.rank_observation_inconsistent}"
+        )
+        if self.route_validation == "error":
+            raise RecomputeRouteMismatchError(message)
+        if context.rank == 0:
+            logger.warning(message)
 
     def on_train_end(self, context: TrainContext):
         context.model.apply(self._disable)

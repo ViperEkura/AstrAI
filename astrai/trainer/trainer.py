@@ -34,6 +34,7 @@ class Trainer:
             CallbackFactory.create(
                 "gradient_checkpointing",
                 modules=cfg.gradient_checkpointing_modules,
+                route_validation=cfg.gradient_checkpointing_route_validation,
             ),
             CallbackFactory.create(
                 "checkpoint",

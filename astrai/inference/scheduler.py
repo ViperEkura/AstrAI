@@ -1,3 +1,4 @@
+import gc
 import logging
 import threading
 import uuid
@@ -64,6 +65,11 @@ class InferenceScheduler:
         ):
             raise ValueError("policy_version must be a non-negative integer")
         config = model.config
+        self._model = model
+        self._enable_cuda_graph = enable_cuda_graph
+        self._owns_cache = cache is None
+        self._released = False
+        self._resume_running = False
 
         if max_seq_len is not None:
             self.max_seq_len = max_seq_len
@@ -79,10 +85,18 @@ class InferenceScheduler:
 
         head_dim = config.hidden_size // config.num_attention_heads
 
-        if cache is not None:
-            self._cache = cache
-        else:
-            self._cache = PagePool(
+        self._cache_spec = {
+            "n_layers": config.num_hidden_layers,
+            "n_kv_heads": config.num_key_value_heads,
+            "head_dim": head_dim,
+            "max_batch_size": max_batch_size,
+            "max_seq_len": self.max_seq_len,
+            "device": self.device,
+            "dtype": self.dtype,
+        }
+
+        if cache is None:
+            cache = PagePool(
                 n_layers=config.num_hidden_layers,
                 n_kv_heads=config.num_key_value_heads,
                 head_dim=head_dim,
@@ -91,6 +105,7 @@ class InferenceScheduler:
                 device=self.device,
                 dtype=self.dtype,
             )
+        self._cache = cache
 
         self._metrics = MetricsCollector()
 
@@ -111,9 +126,10 @@ class InferenceScheduler:
         with attn_backend(active_backend):
             if backend is not None:
                 self._backend = get_backend()
-            self._backend_name = type(get_backend()).__name__
+            self._runtime_backend = get_backend()
+            self._backend_name = type(self._runtime_backend).__name__
             self._executor = Executor(
-                model=model,
+                model=self._model,
                 kv_cache=self._cache,
                 task_cache=self._task_cache,
                 device=self.device,
@@ -130,7 +146,7 @@ class InferenceScheduler:
         self._policy_guard = PolicyVersionGuard(
             policy_version,
             ensure_ready=self._ensure_weight_update_ready,
-            on_commit=self._task_cache.invalidate_cache,
+            on_commit=self._invalidate_runtime_cache,
         )
         # Synchronous generation shares the guard's generation/weight mutex.
         self._weight_lock = self._policy_guard.lock
@@ -139,6 +155,24 @@ class InferenceScheduler:
     def policy_version(self) -> int:
         """Version of the model weights used for subsequent generations."""
         return self._policy_guard.policy_version
+
+    @property
+    def model(self) -> AutoModel:
+        """Model whose weights survive inference-runtime release/resume cycles."""
+        return self._model
+
+    @property
+    def runtime_released(self) -> bool:
+        """Whether KV, workspace, and CUDA-graph runtime memory is released."""
+        return self._released
+
+    def _require_runtime(self) -> None:
+        if self._released:
+            raise RuntimeError("Inference runtime is released; call resume() first")
+
+    def _invalidate_runtime_cache(self) -> None:
+        if not self._released:
+            self._task_cache.invalidate_cache()
 
     def _ensure_weight_update_ready(self) -> None:
         """Check weight update preconditions. Must be called under the lock."""
@@ -173,6 +207,7 @@ class InferenceScheduler:
         return self._policy_guard.with_policy_snapshot(inspect)
 
     def add_task(self, prompt: str, **kwargs) -> str:
+        self._require_runtime()
         return self._task_mgr.add_task(prompt, **kwargs)
 
     def cancel_task(self, task_id: str) -> bool:
@@ -192,7 +227,10 @@ class InferenceScheduler:
 
     def get_stats(self) -> Dict[str, Any]:
         stats = self._task_mgr.get_stats()
-        stats["kv_cache_tasks"] = self._task_cache.task_count
+        stats["kv_cache_tasks"] = (
+            0 if self._task_cache is None else self._task_cache.task_count
+        )
+        stats["runtime_released"] = self._released
         stats["policy_version"] = self._policy_guard.policy_version
         return stats
 
@@ -202,7 +240,7 @@ class InferenceScheduler:
 
     @property
     def cuda_graph_enabled(self) -> bool:
-        return self._executor.cuda_graph_enabled
+        return self._executor is not None and self._executor.cuda_graph_enabled
 
     def _backend_context(self):
         if self._backend is None:
@@ -284,6 +322,7 @@ class InferenceScheduler:
             self._abort_and_clear(free_waiting=False)
 
     def start(self):
+        self._require_runtime()
         if self._loop_thread is not None and self._loop_thread.is_alive():
             return
         self._stop_event.clear()
@@ -301,20 +340,101 @@ class InferenceScheduler:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    @_with_weight_lock
+    def release(self) -> bool:
+        """Release inference-only GPU memory while preserving model weights.
+
+        The scheduler must own its cache (the default).  Releasing an injected
+        cache would have ambiguous ownership and could invalidate another
+        consumer, so that configuration fails before changing scheduler state.
+
+        Active and waiting requests are cancelled using the normal ``stop``
+        path.  Prefix-cache entries, KV storage, decode workspace, and captured
+        CUDA graphs are then dropped.  ``resume`` reconstructs them from the
+        original bounds and restarts the loop when it was running before the
+        release.
+
+        Returns ``True`` when resources were released and ``False`` when the
+        scheduler was already released.
+        """
+        if self._released:
+            return False
+        if not self._owns_cache:
+            raise RuntimeError(
+                "Cannot release a scheduler backed by an externally owned cache"
+            )
+
+        self._resume_running = (
+            self._loop_thread is not None and self._loop_thread.is_alive()
+        )
+        loop_thread = self._loop_thread
+        self.stop()
+        if loop_thread is not None and loop_thread.is_alive():
+            self._loop_thread = loop_thread
+            raise RuntimeError("Scheduler loop did not stop; runtime remains resident")
+        self._task_cache.invalidate_cache()
+
+        if torch.cuda.is_available() and torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._stepper = None
+        self._executor = None
+        self._task_cache = None
+        self._cache = None
+        self._released = True
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return True
+
+    @_with_weight_lock
+    def resume(self) -> bool:
+        """Recreate released inference memory and restore the prior loop state.
+
+        Returns ``True`` when resources were reconstructed and ``False`` when
+        the runtime was already resident.
+        """
+        if not self._released:
+            return False
+
+        cache = PagePool(**self._cache_spec)
+        task_cache = TaskCacheManager(cache)
+        with attn_backend(self._runtime_backend):
+            executor = Executor(
+                model=self._model,
+                kv_cache=cache,
+                task_cache=task_cache,
+                device=self.device,
+                dtype=self.dtype,
+                enable_cuda_graph=self._enable_cuda_graph,
+            )
+
+        self._cache = cache
+        self._task_cache = task_cache
+        self._executor = executor
+        self._stepper = Stepper(cache, task_cache, executor, self._metrics)
+        self._released = False
+        restart = self._resume_running
+        self._resume_running = False
+        if restart:
+            self.start()
+        return True
+
     def _abort_and_clear(self, free_waiting: bool):
         """Invoke STOP callbacks, release cache slots, and clear task queues."""
         active = self._task_mgr.get_active_tasks()
         waiting = self._task_mgr.get_waiting_tasks()
         for task in active:
             self._task_mgr.invoke_callback(task.task_id, STOP)
-            self._task_cache.task_free(task.task_id)
+            if self._task_cache is not None:
+                self._task_cache.task_free(task.task_id)
             self._metrics.mark_finished(
                 task.task_id, task.input_tokens, task.output_tokens
             )
         for task in waiting:
             self._task_mgr.invoke_callback(task.task_id, STOP)
             if free_waiting:
-                self._task_cache.task_free(task.task_id)
+                if self._task_cache is not None:
+                    self._task_cache.task_free(task.task_id)
             self._metrics.mark_finished(
                 task.task_id, task.input_tokens, task.output_tokens
             )
@@ -358,6 +478,7 @@ class InferenceScheduler:
             otherwise generated token IDs per prompt, or token/logprob tuples
             when ``return_logprobs`` is ``True``.
         """
+        self._require_runtime()
         stop_ids = self._task_mgr.tokenizer.stop_ids
         seq_cap = self.max_seq_len
         request_backend = get_backend(use_default=False)

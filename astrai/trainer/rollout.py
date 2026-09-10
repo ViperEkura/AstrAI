@@ -154,6 +154,16 @@ class RolloutGenerator:
         with self._weight_lock:
             return self.scheduler.update_weights(policy_version)
 
+    def release(self) -> bool:
+        """Release inference-only memory between colocated rollout phases."""
+        with self._weight_lock:
+            return self.scheduler.release()
+
+    def resume(self) -> bool:
+        """Restore inference-only memory before the next rollout phase."""
+        with self._weight_lock:
+            return self.scheduler.resume()
+
     def apply_weight_update(
         self, policy_version: Optional[int], update: Callable[[], T]
     ) -> T:
@@ -190,9 +200,11 @@ class RolloutGenerator:
         format the policy was SFT-trained on.
         """
         with self._weight_lock:
+            if self.scheduler.runtime_released:
+                raise RuntimeError("Rollout runtime is released; call resume() first")
 
             def generate_snapshot(generation_version: int) -> RawRollout:
-                model = self.scheduler._executor.model
+                model = self.scheduler.model
                 was_training = model.training
                 model.eval()
                 try:
@@ -437,6 +449,15 @@ class RolloutRunner:
     def update_weights(self, policy_version: int) -> int:
         """Publish the shared policy's new version to the rollout backend."""
         return self.generator.update_weights(policy_version)
+
+    def release(self) -> bool:
+        """Drop cached rollout tensors and release inference-only GPU memory."""
+        self.clear_cache()
+        return self.generator.release()
+
+    def resume(self) -> bool:
+        """Restore inference-only GPU memory for the next rollout."""
+        return self.generator.resume()
 
     def apply_weight_update(
         self, policy_version: Optional[int], update: Callable[[], T]

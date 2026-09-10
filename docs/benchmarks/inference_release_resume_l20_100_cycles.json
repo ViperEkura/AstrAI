@@ -1,0 +1,59 @@
+{
+  "schema_version": "1.0",
+  "recorded_at": "2026-09-03T11:00:00+08:00",
+  "candidate_source_commit": "5900c786322b522162af0bef0674464806f1628a",
+  "environment": {
+    "gpu": "NVIDIA L20",
+    "accelerator_count": 3,
+    "torch": "2.11.0+cu128",
+    "cuda": "12.8",
+    "dtype": "bfloat16"
+  },
+  "workload": {
+    "preset": "tiny",
+    "batch_size": 4,
+    "prompt_len": 128,
+    "max_tokens": 4,
+    "trials_per_context": 100,
+    "cuda_graph": false
+  },
+  "cases": [
+    {
+      "max_seq_len": 2048,
+      "runtime_footprint_mib": 8.697265625,
+      "reclaimed_mib": 0.572265625,
+      "reclaimed_fraction": 0.065798338198967,
+      "release_median_ms": 72.20117250000001,
+      "release_p99_ms": 88.86921,
+      "resume_median_ms": 0.410228,
+      "resume_p99_ms": 0.552719,
+      "greedy_match_cycles": 100
+    },
+    {
+      "max_seq_len": 8192,
+      "runtime_footprint_mib": 10.3642578125,
+      "reclaimed_mib": 2.2392578125,
+      "reclaimed_fraction": 0.2160557806463771,
+      "release_median_ms": 74.53045449999999,
+      "release_p99_ms": 100.49503,
+      "resume_median_ms": 0.5807635,
+      "resume_p99_ms": 6.292507,
+      "greedy_match_cycles": 100
+    },
+    {
+      "max_seq_len": 32768,
+      "runtime_footprint_mib": 17.0322265625,
+      "reclaimed_mib": 8.9072265625,
+      "reclaimed_fraction": 0.5229631328478872,
+      "release_median_ms": 68.25744900000001,
+      "release_p99_ms": 93.088615,
+      "resume_median_ms": 0.44078249999999997,
+      "resume_p99_ms": 0.556926,
+      "greedy_match_cycles": 100
+    }
+  ],
+  "correctness": {
+    "total_cycles": 300,
+    "greedy_output_mismatches": 0
+  }
+}

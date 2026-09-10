@@ -1,0 +1,109 @@
+{
+  "schema_version": "0.5.1",
+  "score_kind": "diagnostic-project-fit",
+  "score_is_official": false,
+  "candidate_revision": "sha256:b6423c916b48d8eead00eb3f2250143c7945223c4fa77daad965040e65bcc9d6",
+  "formula_template_id": "project-fit-system-path-v0.5.1",
+  "diagnostic_project_fit_100": 92.2938210486744,
+  "component_values": {
+    "evolutionary_maintainability": 0.8717195592623469,
+    "project_contract_fit": 0.9948838031081763,
+    "performance_reuse_utilization": 0.9370603681176802,
+    "operational_fit": 0.8981872397776689
+  },
+  "component_floors": {
+    "evolutionary_maintainability": 0.6,
+    "project_contract_fit": 0.6,
+    "performance_reuse_utilization": 0.4,
+    "operational_fit": 0.6
+  },
+  "subcomponent_inputs": {
+    "evolutionary_maintainability": {
+      "evolution": 0.75,
+      "locality": 0.9,
+      "tests": 1.0,
+      "failure": 0.95,
+      "contract": 0.95
+    },
+    "project_contract_fit": {
+      "integration": 1.0,
+      "interface": 1.0,
+      "lifecycle": 1.0,
+      "buildtest": 1.0,
+      "policy": 0.95
+    },
+    "performance_reuse_utilization": {
+      "attainment": 1.0,
+      "coverage": 0.85,
+      "retention": 1.0,
+      "family": 0.85,
+      "compile": 1.0
+    },
+    "operational_fit": {
+      "replay": 1.0,
+      "load": 0.75,
+      "resource": 1.0,
+      "coldsteady": 0.9
+    }
+  },
+  "input_rationale": {
+    "evolution": "The additive lifecycle API follows existing scheduler ownership boundaries but has no upstream release history yet.",
+    "locality": "Runtime changes are confined to the scheduler, engine, and rollout layers, with separate focused tests, benchmark tooling, and documentation.",
+    "tests": "The complete local suite passed 624 tests with 103 environment-dependent skips; 71 focused tests passed on NVIDIA L20 GPU5.",
+    "failure": "Inference entry points fail explicitly while released, external cache ownership is rejected, and repeated release/resume calls are idempotent.",
+    "contract": "Implementation, tests, documentation, benchmark tooling, and raw L20 outputs are digest-bound, but the artifact is not sealed or maintainer-reviewed.",
+    "integration": "Release and resume are exposed through InferenceScheduler, InferenceEngine, RolloutGenerator, and RolloutRunner.",
+    "interface": "The additive release(), resume(), and runtime_released interfaces preserve existing behavior while the runtime is active.",
+    "lifecycle": "Release drops scheduler-owned KV pages, task caches, executor workspaces, and graph state while retaining model weights and policy version; resume reconstructs the runtime.",
+    "buildtest": "The full local test suite, Ruff formatting/import checks, and focused L20 GPU suite passed.",
+    "policy": "No dependency is added, caller-owned caches are never silently discarded, and unsupported ownership fails closed.",
+    "attainment": "The L20 probe reclaimed 95.96%, 98.95%, and 99.74% of scheduler-owned runtime memory at 2K, 8K, and 32K context capacities.",
+    "coverage": "Three context capacities, batch four, five cycles per capacity, scheduler/engine/rollout tests, and policy-version retention are covered; CUDA Graph lifecycle and concurrent serving load are not.",
+    "retention": "All fifteen release/resume cycles preserved exact greedy-output parity, and the full local regression suite passed.",
+    "family": "The lifecycle boundary is shared by direct inference and trainer rollout paths, but the hardware benchmark uses the AstrAI 1B preset only.",
+    "compile": "The lifecycle code introduces no compilation step and does not compile during timed release/resume operations.",
+    "replay": "Each of the three L20 context capacities was measured over five release/resume cycles with raw per-cycle results checked in.",
+    "load": "The hardware probe uses a real BF16 model and batch-four decode, but not a long-lived HTTP service or concurrent arrival distribution.",
+    "resource": "Only the explicitly available GPU5 was used; all other users' GPU processes and containers were left untouched.",
+    "coldsteady": "Repeated release and resume latency is reported, but CUDA Graph recapture and a long serving soak were deliberately excluded."
+  },
+  "benchmark_trust": {
+    "formula_version": "benchmark-trust-v0.5",
+    "status": "scored",
+    "score_100": 97.40037464252967,
+    "components": {
+      "reproducibility": 1.0,
+      "evidence": 1.0,
+      "statistics": 0.9,
+      "environment": 1.0
+    },
+    "failure_codes": [
+      "DRAFT_UNSEALED",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED",
+      "CUDA_GRAPH_LIFECYCLE_UNMEASURED",
+      "CONCURRENT_SERVICE_LOAD_UNTESTED"
+    ]
+  },
+  "official_project_fit": {
+    "status": "unresolved",
+    "score_100": null,
+    "failure_codes": [
+      "DRAFT_SEAL_MISSING",
+      "SYSTEM_TRACE_EVIDENCE_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "comparison_cell_path": "benchmarks/infraswe/astrai-inference-release-resume-comparison-cell.json",
+  "execution": {
+    "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
+    "comparison_cell_validation": "pass",
+    "infraswe_engine_tests": "53 passed",
+    "astrai_implementation_commit": "5900c786322b522162af0bef0674464806f1628a",
+    "astrai_local_tests": "628 passed, 103 skipped",
+    "astrai_l20_focused_tests": "71 passed in 2.27s",
+    "astrai_lint": "passed"
+  }
+}

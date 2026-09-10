@@ -193,6 +193,12 @@ version or beyond `rollout_max_policy_lag` are rejected before training. The
 final version check and rollout-cache publication share that policy lock, so a
 concurrent update cannot land between validation and cache insertion.
 
+For colocated phases, `RolloutRunner.release()` clears its cached rollout tensors
+and releases the scheduler's KV storage, decode workspace, and CUDA graphs while
+leaving the shared policy weights resident. Call `RolloutRunner.resume()` before
+the next rollout. The scheduler's monotonic `policy_version` survives the cycle,
+so the next generated batch remains attributable to the acknowledged weights.
+
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
 model factory.

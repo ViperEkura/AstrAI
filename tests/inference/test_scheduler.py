@@ -540,102 +540,81 @@ def test_scheduler_weight_versions_are_monotonic_and_acknowledged(device):
         scheduler.stop()
 
 
-def test_scheduler_applies_weight_mutation_and_version_atomically(device):
-    scheduler, _tok, model = _make_real_scheduler(device)
-    before = next(model.parameters()).detach().clone()
-
-    def mutate():
-        with torch.no_grad():
-            next(model.parameters()).add_(1)
-        return "updated"
-
-    try:
-        assert scheduler.apply_weight_update(1, mutate) == "updated"
-        assert scheduler.policy_version == 1
-        assert not torch.equal(next(model.parameters()), before)
-        with pytest.raises(ValueError, match="must advance"):
-            scheduler.apply_weight_update(1, mutate)
-
-        def failed_mutation():
-            raise RuntimeError("optimizer failed")
-
-        with pytest.raises(RuntimeError, match="optimizer failed"):
-            scheduler.apply_weight_update(2, failed_mutation)
-        assert scheduler.policy_version == 1
-
-        # None derives live+1 under the lock: no read-compute-write race
-        # on the current version for advance-by-one callers.
-        assert scheduler.apply_weight_update(None, mutate) == "updated"
-        assert scheduler.policy_version == 2
-    finally:
-        scheduler.stop()
-
-
-def test_scheduler_atomic_advance_survives_interleaved_publish(device):
-    """A concurrent publish between reading the live version and applying
-    the update must not fail ``require_advance`` (regression: callers
-    computed live+1 outside the lock, a TOCTOU that raised spuriously)."""
+def test_scheduler_release_resume_preserves_greedy_generation(device, monkeypatch):
     scheduler, _tok, _model = _make_real_scheduler(device)
-
+    prompt = [[10, 20, 30, 40]]
     try:
-        # Simulate the race directly: a version read that goes stale before
-        # apply_weight_update acquires the lock. With None the scheduler
-        # re-derives live+1 inside the critical section.
-        stale_read = scheduler.policy_version + 1
-        scheduler.update_weights(1)
-        assert stale_read == 1  # now equals live -> explicit form would raise
-        with pytest.raises(ValueError, match="must advance"):
-            scheduler.apply_weight_update(stale_read, lambda: "ok")
-        assert scheduler.apply_weight_update(None, lambda: "ok") == "ok"
-        assert scheduler.policy_version == 2
-    finally:
-        scheduler.stop()
+        expected = scheduler.run_batch(prompt, max_tokens=3, temperature=0)
+        old_cache = scheduler._cache
+        old_executor = scheduler._executor
+        scheduler.start()
 
+        assert scheduler.release() is True
+        assert scheduler.release() is False
+        assert scheduler.runtime_released is True
+        assert scheduler.cuda_graph_enabled is False
+        assert scheduler._cache is None
+        assert scheduler._task_cache is None
+        assert scheduler._executor is None
+        assert scheduler._stepper is None
+        assert scheduler.get_stats()["runtime_released"] is True
+        assert scheduler.get_stats()["kv_cache_tasks"] == 0
 
-def test_scheduler_serializes_policy_snapshot_and_direct_update(device):
-    scheduler, _tok, _model = _make_real_scheduler(device)
-    snapshot_started = threading.Event()
-    release_snapshot = threading.Event()
-    update_finished = threading.Event()
-    errors = []
+        with pytest.raises(RuntimeError, match="call resume"):
+            scheduler.add_task("released")
+        with pytest.raises(RuntimeError, match="call resume"):
+            scheduler.run_batch(prompt, max_tokens=1)
+        with pytest.raises(RuntimeError, match="call resume"):
+            scheduler.start()
 
-    def inspect(version):
-        assert version == 0
-        snapshot_started.set()
-        assert release_snapshot.wait(timeout=5)
-
-    def take_snapshot():
-        try:
-            scheduler.with_policy_snapshot(inspect)
-        except BaseException as exc:
-            errors.append(exc)
-
-    def update():
-        try:
-            scheduler.update_weights(1)
-            update_finished.set()
-        except BaseException as exc:
-            errors.append(exc)
-
-    snapshot_thread = threading.Thread(target=take_snapshot)
-    update_thread = threading.Thread(target=update)
-    try:
-        snapshot_thread.start()
-        assert snapshot_started.wait(timeout=5)
-        update_thread.start()
-        assert not update_finished.wait(timeout=0.1)
-        release_snapshot.set()
-        snapshot_thread.join(timeout=5)
-        update_thread.join(timeout=5)
-        assert not snapshot_thread.is_alive()
-        assert not update_thread.is_alive()
-        assert errors == []
+        assert scheduler.update_weights(1) == 1
+        assert scheduler.resume() is True
+        assert scheduler.resume() is False
+        assert scheduler.runtime_released is False
         assert scheduler.policy_version == 1
-    finally:
-        release_snapshot.set()
-        snapshot_thread.join(timeout=5)
-        update_thread.join(timeout=5)
+        assert scheduler._cache is not old_cache
+        assert scheduler._executor is not old_executor
+        assert scheduler._loop_thread is not None
+        assert scheduler._loop_thread.is_alive()
+
         scheduler.stop()
+        invalidated = []
+        invalidate_cache = scheduler._task_cache.invalidate_cache
+
+        def invalidate_resumed_cache():
+            invalidated.append(scheduler._task_cache)
+            invalidate_cache()
+
+        monkeypatch.setattr(
+            scheduler._task_cache, "invalidate_cache", invalidate_resumed_cache
+        )
+        assert scheduler.update_weights(2) == 2
+        assert invalidated == [scheduler._task_cache]
+        actual = scheduler.run_batch(prompt, max_tokens=3, temperature=0)
+        assert actual == expected
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_release_rejects_externally_owned_cache(device):
+    scheduler, tokenizer, model = _make_real_scheduler(device)
+    external_cache = scheduler._cache
+    scheduler.stop()
+    external_scheduler = InferenceScheduler(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=external_cache.max_batch_size,
+        max_seq_len=external_cache.max_seq_len,
+        cache=external_cache,
+        enable_cuda_graph=False,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="externally owned cache"):
+            external_scheduler.release()
+        assert external_scheduler.runtime_released is False
+        assert external_scheduler._cache is external_cache
+    finally:
+        external_scheduler.stop()
 
 
 def test_scheduler_rejects_weight_update_with_queued_tasks(device):
@@ -817,3 +796,101 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     assert workspace.position_ids.tolist() == [3]
     assert executor._decode_cache.task_sig == ("t1",)
     assert executor._decode_cache.last_tokens is tokens
+
+
+def test_scheduler_applies_weight_mutation_and_version_atomically(device):
+    scheduler, _tok, model = _make_real_scheduler(device)
+    before = next(model.parameters()).detach().clone()
+
+    def mutate():
+        with torch.no_grad():
+            next(model.parameters()).add_(1)
+        return "updated"
+
+    try:
+        assert scheduler.apply_weight_update(1, mutate) == "updated"
+        assert scheduler.policy_version == 1
+        assert not torch.equal(next(model.parameters()), before)
+        with pytest.raises(ValueError, match="must advance"):
+            scheduler.apply_weight_update(1, mutate)
+
+        def failed_mutation():
+            raise RuntimeError("optimizer failed")
+
+        with pytest.raises(RuntimeError, match="optimizer failed"):
+            scheduler.apply_weight_update(2, failed_mutation)
+        assert scheduler.policy_version == 1
+
+        # None derives live+1 under the lock: no read-compute-write race
+        # on the current version for advance-by-one callers.
+        assert scheduler.apply_weight_update(None, mutate) == "updated"
+        assert scheduler.policy_version == 2
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_atomic_advance_survives_interleaved_publish(device):
+    """A concurrent publish between reading the live version and applying
+    the update must not fail ``require_advance`` (regression: callers
+    computed live+1 outside the lock, a TOCTOU that raised spuriously)."""
+    scheduler, _tok, _model = _make_real_scheduler(device)
+
+    try:
+        # Simulate the race directly: a version read that goes stale before
+        # apply_weight_update acquires the lock. With None the scheduler
+        # re-derives live+1 inside the critical section.
+        stale_read = scheduler.policy_version + 1
+        scheduler.update_weights(1)
+        assert stale_read == 1  # now equals live -> explicit form would raise
+        with pytest.raises(ValueError, match="must advance"):
+            scheduler.apply_weight_update(stale_read, lambda: "ok")
+        assert scheduler.apply_weight_update(None, lambda: "ok") == "ok"
+        assert scheduler.policy_version == 2
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_serializes_policy_snapshot_and_direct_update(device):
+    scheduler, _tok, _model = _make_real_scheduler(device)
+    snapshot_started = threading.Event()
+    release_snapshot = threading.Event()
+    update_finished = threading.Event()
+    errors = []
+
+    def inspect(version):
+        assert version == 0
+        snapshot_started.set()
+        assert release_snapshot.wait(timeout=5)
+
+    def take_snapshot():
+        try:
+            scheduler.with_policy_snapshot(inspect)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def update():
+        try:
+            scheduler.update_weights(1)
+            update_finished.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    snapshot_thread = threading.Thread(target=take_snapshot)
+    update_thread = threading.Thread(target=update)
+    try:
+        snapshot_thread.start()
+        assert snapshot_started.wait(timeout=5)
+        update_thread.start()
+        assert not update_finished.wait(timeout=0.1)
+        release_snapshot.set()
+        snapshot_thread.join(timeout=5)
+        update_thread.join(timeout=5)
+        assert not snapshot_thread.is_alive()
+        assert not update_thread.is_alive()
+        assert errors == []
+        assert scheduler.policy_version == 1
+    finally:
+        release_snapshot.set()
+        snapshot_thread.join(timeout=5)
+        update_thread.join(timeout=5)
+        scheduler.stop()

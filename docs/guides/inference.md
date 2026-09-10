@@ -145,6 +145,29 @@ the scheduler rejects updates while requests are queued and invalidates reusable
 prefix KV pages before exposing the new version. Synchronous `run_batch()` and
 weight updates are serialized so a generation cannot straddle two versions.
 
+### Releasing Inference Runtime Memory
+
+Colocated training can keep the shared model weights resident while returning
+inference-only allocations to CUDA between rollout phases:
+
+```python
+engine.release()  # cancels requests; drops KV, workspace, and CUDA graphs
+# run the memory-heavy training phase
+engine.resume()   # rebuilds the original runtime and restarts the scheduler
+```
+
+`InferenceScheduler.release()` is idempotent and preserves both model weights
+and `policy_version`. It first stops the scheduling loop, cancels queued work,
+and invalidates reusable prefix pages. `resume()` reconstructs the cache and
+executor with the original batch/sequence bounds; a scheduler that was running
+before release is restarted automatically. New generation requests fail with a
+clear error while the runtime is released.
+
+The lifecycle is available only when the scheduler owns its cache (the default).
+An externally injected `PagePool` has ambiguous ownership, so release fails
+before changing state rather than invalidating a cache that another component
+might share.
+
 ## Sampling (Strategy Pattern)
 
 ```
@@ -183,8 +206,14 @@ InferenceEngine
   ├── generate(prompt, stream, ...) → str | List[str] | Generator
   ├── generate_async(prompt, ...)   → AsyncGenerator
   ├── get_stats()                   → Dict
+  ├── release() / resume()          → bool
   └── shutdown()
 ```
+
+Use `scripts/tools/benchmark_inference_lifecycle.py` to measure reclaimed memory,
+release/resume latency, and greedy-output parity for the AstrAI 1B preset. The
+[L20 results](../benchmarks/inference_release_resume_l20.md) include raw JSON for
+2K, 8K, and 32K context bounds.
 
 `GenerateResult` uses `Condition` for non-streaming (`wait_completion()`) and `Event` for streaming (`wait()`). Stream callback is `cb(token)`.
 

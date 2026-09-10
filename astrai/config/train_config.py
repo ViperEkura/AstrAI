@@ -11,8 +11,11 @@ from torch.utils.data import Dataset
 from astrai.config.base import BaseConfig
 from astrai.model.components.lora import LoRAConfig
 
-TRAIN_TYPES = frozenset({"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo"})
-PARALLEL_MODES = frozenset({"none", "ddp", "fsdp"})
+TRAIN_TYPES = frozenset(
+    {"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"}
+)
+# Data-parallel gradient-sync strategies.
+DP_MODES = frozenset({"none", "ddp", "fsdp"})
 BACKENDS = frozenset({"nccl", "gloo"})
 START_METHODS = frozenset({"spawn", "fork", "forkserver"})
 _COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
@@ -51,11 +54,13 @@ class TrainConfig(BaseConfig):
         persistent_workers (bool): Keep DataLoader workers alive between epochs. Defaults to False.
         pin_memory (bool): Pin memory for dataloader. Defaults to False.
         collate_fn (Optional[Callable[[List[Any]], Any]]): Collate function for dataloader (e.g. dpo_collate_fn). Defaults to None.
-        nprocs (int): Number of processes for distributed training. Defaults to 1.
+        dp_size (int): Data-parallel replicas; total training processes (``nprocs``) are derived as ``dp_size * cp_size * tp_size``. Defaults to 1.
+        cp_size (int): Context-parallel group size: shards the sequence across contiguous ranks (seq pretraining, torch-native attention only). Defaults to 1.
+        tp_size (int): Tensor-parallel group size: shards Linear projections over features (attention heads / ffn channels) using the default plan over the standard module layout. Defaults to 1.
+        dp_mode (str): Data-parallel gradient-sync strategy: none, ddp, fsdp. Defaults to "none".
         backend (str): Distributed training backend. Defaults to "nccl".
         master_addr (str): Master address for distributed training. Defaults to "localhost".
         master_port (str): Master port for distributed training. Defaults to "29500".
-        parallel_mode (str): Parallel strategy: none, ddp, fsdp. Defaults to "none".
         start_method (str): Multiprocessing start method: spawn/fork/forkserver. Defaults to "spawn".
         device_type (str): Device type for distributed training. Defaults to "cuda".
         val_dataset (Optional[Dataset]): Dataset for validation. Defaults to None.
@@ -78,6 +83,8 @@ class TrainConfig(BaseConfig):
         rollout_dynamic_max_pending_groups (int): Maximum groups admitted into a sampling step. Defaults to 128.
         rollout_dynamic_seed (Optional[int]): Base refill seed; None derives from random_seed. Defaults to None.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
+        critic_model_fn (Optional[Callable]): Factory for the value (critic) model, required for online_ppo. Defaults to None.
+        critic_optimizer_fn (Optional[Callable]): Factory for the critic optimizer; None reuses optimizer_fn. Defaults to None.
         executor_kwargs (Dict[str, Any]): Extra kwargs passed to ExecutorFactory.create(). Defaults to {}.
         strategy_kwargs (Dict[str, Any]): Extra strategy arguments. Defaults to {}.
     """
@@ -112,11 +119,13 @@ class TrainConfig(BaseConfig):
     pin_memory: bool = False
     collate_fn: Optional[Callable[[List[Any]], Any]] = None
 
-    nprocs: int = 1
+    dp_size: int = 1
+    cp_size: int = 1
+    tp_size: int = 1
+    dp_mode: str = "none"
     backend: str = "nccl"
     master_addr: str = "localhost"
     master_port: str = "29500"
-    parallel_mode: str = "none"
     start_method: str = "spawn"
 
     device_type: str = "cuda"
@@ -141,6 +150,8 @@ class TrainConfig(BaseConfig):
     rollout_dynamic_max_pending_groups: int = 128
     rollout_dynamic_seed: Optional[int] = None
     reward_model_fn: Optional[Callable] = None
+    critic_model_fn: Optional[Callable] = None
+    critic_optimizer_fn: Optional[Callable] = None
 
     executor_kwargs: Dict[str, Any] = field(default_factory=dict)
     strategy_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -153,12 +164,39 @@ class TrainConfig(BaseConfig):
             )
         return v
 
-    @field_validator("parallel_mode")
-    def _validate_parallel_mode(cls, v: str) -> str:
-        if v not in PARALLEL_MODES:
-            raise ValueError(
-                f"parallel_mode must be one of {sorted(PARALLEL_MODES)}, got {v!r}"
-            )
+    @field_validator("dp_mode")
+    def _validate_dp_mode(cls, v: str) -> str:
+        if v not in DP_MODES:
+            raise ValueError(f"dp_mode must be one of {sorted(DP_MODES)}, got {v!r}")
+        return v
+
+    @field_validator("dp_size")
+    def _validate_dp_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"dp_size must be >= 1, got {v}")
+        return v
+
+    @property
+    def nprocs(self) -> int:
+        """Total training processes: dp_size x cp_size x tp_size.
+
+        The world size follows from the parallelism degrees the user
+        configures, not the other way around — the sampler shards data over
+        dp replicas only, so every batch-scaling formula wants dp_size, and
+        divisibility by cp_size holds by construction.
+        """
+        return self.dp_size * self.cp_size * self.tp_size
+
+    @field_validator("cp_size")
+    def _validate_cp_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"cp_size must be >= 1, got {v}")
+        return v
+
+    @field_validator("tp_size")
+    def _validate_tp_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"tp_size must be >= 1, got {v}")
         return v
 
     @field_validator("backend")
@@ -251,12 +289,27 @@ class TrainConfig(BaseConfig):
                     f"reward_model_fn is required for online RL strategy "
                     f"{self.strategy!r}"
                 )
+            if self.strategy == "online_ppo" and self.critic_model_fn is None:
+                raise ValueError(
+                    "critic_model_fn is required for online RL strategy 'online_ppo'"
+                )
             if self.nprocs > 1:
                 raise ValueError(
                     f"online RL strategy {self.strategy!r} requires single-process "
                     f"training (nprocs=1): per-rank rollouts issue different "
                     f"numbers of forward passes and desynchronize the "
                     f"ddp/fsdp collectives, deadlocking NCCL"
+                )
+            if (
+                self.rollout_max_policy_lag is not None
+                and self.rollout_max_policy_lag < self.rollout_interval - 1
+            ):
+                raise ValueError(
+                    f"rollout_max_policy_lag={self.rollout_max_policy_lag} "
+                    f"cannot be below rollout_interval - 1 = "
+                    f"{self.rollout_interval - 1}: the replay cache reuses "
+                    f"rollouts up to that lag, so a tighter bound guarantees "
+                    f"a fatal RolloutVersionError mid-training"
                 )
         if self.rollout_dynamic_sampling:
             if self.strategy != "online_grpo":

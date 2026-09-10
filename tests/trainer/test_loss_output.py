@@ -58,6 +58,7 @@ def test_metric_callback_includes_dynamic_strategy_metrics(tmp_path):
         grad_norm=None,
         grad_snr_tracker=None,
         world_size=1,
+        dp_size=1,
     )
 
     metrics = callback._metrics(context, callback.metrics)
@@ -85,6 +86,7 @@ def test_metric_callback_only_computes_requested_metrics(tmp_path):
         metrics={},
         loss=2.0,
         world_size=1,
+        dp_size=1,
     )
 
     metrics = callback._metrics(context, callback.metrics)

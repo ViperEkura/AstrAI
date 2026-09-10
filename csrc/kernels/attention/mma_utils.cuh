@@ -3,8 +3,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "common/cp_async.cuh"
+#include "common/pipeline.cuh"
 #include "common/mma.cuh"
+#include "softmax.cuh"
 
 // Predicated cp.async (4-operand form) requires CUDA 11.2+.
 // bf16 mma.sync requires sm_80+ (guarded at build time by ASTRAI_NO_MMA).
@@ -79,7 +80,7 @@ __device__ __forceinline__ int swiz_col(int d, int r, int mask = 7) {
     return ((d >> 3) ^ (r & mask)) << 3 | (d & 7);
 }
 
-// cp.async primitives live in the shared template (common/cp_async.cuh):
+// cp.async primitives live in the shared template (common/pipeline.cuh):
 // `astrai::cp_async_16` (predicated), `astrai::cp_async_commit_group`,
 // `astrai::cp_async_wait_group<N>` / `_wait_all` stage the K/V tiles.
 
@@ -114,14 +115,46 @@ __device__ inline void load_q_mma_frags(
 }
 
 // ---------------------------------------------------------------------------
-// S = Q @ K^T  (Qa pre-loaded by the caller; scale applied post-mma in the
-// caller to avoid bf16 precision loss).
+// K/V tile loader shared by the MMA kernels: stages one BC×HEAD_DIM tile
+// into the double-buffered K/V rings via predicated cp.async with the XOR
+// swizzle.  AddrFn maps (kc, d, valid) -> {k, v, valid} (KVAddr); the two
+// kernels differ only in addressing (decode: KV::decode_addr with new-K/V
+// persistence; prefill: resolve_token + kv_addr_from_token).
+// ---------------------------------------------------------------------------
+template <typename Traits, typename AddrFn>
+__device__ inline void load_kv_tile(
+    bf16* sK, bf16* sV,   // ring bases (STAGES * BC * LD each)
+    int ti, int buf,      // tile index, ring slot
+    int seq_len,
+    const AddrFn& addr)
+{
+    int kv0 = ti * Traits::BC;
+    bf16* dK = sK + buf * Traits::BC * Traits::LD;
+    bf16* dV = sV + buf * Traits::BC * Traits::LD;
+    #pragma unroll
+    for (int i = threadIdx.x * Traits::VEC; i < Traits::TOTAL;
+         i += Traits::NUM_THREADS * Traits::VEC) {
+        int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
+        int kc = kv0 + r;
+        bool valid = kc < seq_len;
+        auto a = addr(kc, d, valid);
+        int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
+        astrai::cp_async_16(&dK[off], a.k, a.valid);
+        astrai::cp_async_16(&dV[off], a.v, a.valid);
+    }
+    astrai::cp_async_commit_group();
+}
+
+// ---------------------------------------------------------------------------
+// S = Q @ K^T  (Qa pre-loaded by the caller; `scale` applied post-mma in
+// float to avoid bf16 precision loss).
 // Traits provides KD, NC8, LD, and SWIZ_MASK.
 // ---------------------------------------------------------------------------
 template <typename Traits>
 __device__ inline void mma_compute_scores(
     const unsigned Qa[Traits::KD][4],
     const bf16* __restrict__ sK,
+    float scale,
     int lane,
     float Sacc[Traits::NC8][4])
 {
@@ -137,6 +170,8 @@ __device__ inline void mma_compute_scores(
                 + swiz_col(kt * 16 + kcol_h, krow_l, Traits::SWIZ_MASK)]);
             astrai::mma_sync<bf16>(Sacc[n8], Qa[kt], b, Sacc[n8]);
         }
+        Sacc[n8][0] *= scale; Sacc[n8][1] *= scale;
+        Sacc[n8][2] *= scale; Sacc[n8][3] *= scale;
     }
 }
 
@@ -188,11 +223,9 @@ __device__ inline void mma_softmax_tile(
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
     rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
 
-    float nm0 = fmaxf(m0, rmax0), nm1 = fmaxf(m1, rmax1);
-    float corr0 = __expf(m0 - nm0);
-    float corr1 = __expf(m1 - nm1);
-    float pn0 = (nm0 == -FLT_MAX) ? 0.0f : 1.0f;
-    float pn1 = (nm1 == -FLT_MAX) ? 0.0f : 1.0f;
+    float corr0, corr1, pn0, pn1;
+    float nm0 = softmax_remax(m0, rmax0, corr0, pn0);
+    float nm1 = softmax_remax(m1, rmax1, corr1, pn1);
 
     float rsum0 = 0.0f, rsum1 = 0.0f;
     #pragma unroll
@@ -212,7 +245,6 @@ __device__ inline void mma_softmax_tile(
     rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 2);
     l0 = l0 * corr0 + rsum0;
     l1 = l1 * corr1 + rsum1;
-    m0 = nm0; m1 = nm1;
 
     #pragma unroll
     for (int j = 0; j < Traits::DN8; j++) {

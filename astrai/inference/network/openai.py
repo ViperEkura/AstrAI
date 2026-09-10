@@ -204,10 +204,31 @@ class OpenAIResponseBuilder(ResponseBuilder):
         )
 
     def format_stream_end(self, ctx: GenContext, stop: StopInfo) -> List[str]:
+        events: List[str] = []
+        if self._parser is not None:
+            for d in self._parser.finalize(stop.body):
+                if "content" in d:
+                    events.append(
+                        sse_event(
+                            {
+                                "id": self._resp_id,
+                                "object": "chat.completion.chunk",
+                                "created": ctx.created,
+                                "model": self._model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": d["content"]},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                        )
+                    )
         finish_reason = "stop"
         if self._parser is not None and self._parser.has_tool_calls:
             finish_reason = "tool_calls"
-        return [
+        return events + [
             sse_event(
                 {
                     "id": self._resp_id,

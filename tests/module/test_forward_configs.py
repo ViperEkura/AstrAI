@@ -369,7 +369,9 @@ def test_moe_component_forward_returns_ffn_output():
     output = moe(torch.randn(2, 8, 8))
 
     assert output["hidden_states"].shape == (2, 8, 8)
-    assert output["aux_loss"] is not None
+    assert output["aux_loss"].ndim == 0
+    assert output["aux_loss"].requires_grad
+    assert torch.isfinite(output["aux_loss"])
 
 
 @pytest.mark.parametrize("decoder_sparse_step", [0, -1])

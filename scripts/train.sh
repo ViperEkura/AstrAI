@@ -55,6 +55,7 @@ load_config() {
         die "Failed to load runtime configuration"
     eval "${exports}"
     validate_job_name "${TRAIN_JOB_NAME}"
+    export CHECKPOINT_EXTRA_FILES="$(checkpoint_extra_files "${CONFIG_FILE}")"
 }
 
 compose() {
@@ -140,7 +141,7 @@ preflight() {
     fi
 
     compose config --quiet
-    log_info "Preflight passed for ${TRAIN_JOB_NAME} (GPU request: ${TRAIN_GPU_COUNT}, parallel: ${TRAIN_PARALLEL_MODE})"
+    log_info "Preflight passed for ${TRAIN_JOB_NAME} (GPU request: ${TRAIN_GPU_COUNT}, dp_mode: ${TRAIN_DP_MODE})"
 }
 
 runtime_environment_args() {

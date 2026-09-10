@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
-
-from astrai.extension.backend.linear import linear
 
 
 class Linear(nn.Module):
@@ -22,4 +21,4 @@ class Linear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
-        return linear(x, self.weight, self.bias)
+        return F.linear(x, self.weight, self.bias)

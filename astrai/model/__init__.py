@@ -13,6 +13,7 @@ from astrai.model.components.mlp import MLP, DeepSeekMoE
 from astrai.model.components.norm import RMSNorm
 from astrai.model.encoder import EmbeddingEncoder
 from astrai.model.transformer import AutoRegressiveLM
+from astrai.model.value import ValueModel
 
 __all__ = [
     # Modules
@@ -26,6 +27,7 @@ __all__ = [
     "AutoRegressiveLM",
     "EmbeddingEncoder",
     "AutoModel",
+    "ValueModel",
     # LoRA
     "LoRAConfig",
     "inject_lora",

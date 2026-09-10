@@ -42,6 +42,22 @@ class BaseSamplingStrategy(ABC):
         """
         raise NotImplementedError
 
+    @property
+    def preserves_argmax(self) -> bool:
+        """Whether ``apply`` never moves the argmax token.
+
+        Conservative default: strategies must opt in. The greedy
+        short-circuit in :class:`SamplingPipeline` asks this
+        polymorphically, so a new strategy that can move the argmax
+        automatically disables it — no isinstance bookkeeping.
+        """
+        return False
+
+    @property
+    def is_greedy(self) -> bool:
+        """Whether this strategy collapses sampling onto the argmax token."""
+        return False
+
 
 class TemperatureStrategy(BaseSamplingStrategy):
     """Divides logits by temperature to control randomness.
@@ -52,6 +68,22 @@ class TemperatureStrategy(BaseSamplingStrategy):
 
     def __init__(self, temperature: Union[float, Tensor] = 1.0):
         self.temperature = temperature
+
+    @staticmethod
+    def is_greedy_temperature(temperature: Union[float, Tensor]) -> bool:
+        if isinstance(temperature, Tensor):
+            return bool((temperature == 0).all())
+        return temperature == 0
+
+    @property
+    def is_greedy(self) -> bool:
+        return self.is_greedy_temperature(self.temperature)
+
+    @property
+    def preserves_argmax(self) -> bool:
+        # Scaling by a positive constant (1/t, clamped away from zero)
+        # preserves logit order; t=0 degenerates onto the argmax itself.
+        return True
 
     def apply(
         self,
@@ -77,6 +109,11 @@ class TopKStrategy(BaseSamplingStrategy):
     Args:
         top_k: Scalar or ``[batch]`` tensor (0 disables).
     """
+
+    @property
+    def preserves_argmax(self) -> bool:
+        # The argmax token always ranks first, so any k >= 1 keeps it.
+        return True
 
     def __init__(self, top_k: Union[int, Tensor] = 0):
         self.top_k = top_k
@@ -120,6 +157,11 @@ class TopPStrategy(BaseSamplingStrategy):
     Args:
         top_p: Scalar or ``[batch]`` tensor (1.0 disables).
     """
+
+    @property
+    def preserves_argmax(self) -> bool:
+        # Nucleus filtering always keeps the highest-probability token.
+        return True
 
     def __init__(self, top_p: Union[float, Tensor] = 1.0):
         self.top_p = top_p
@@ -250,6 +292,22 @@ class SamplingPipeline(BaseSamplingStrategy):
     def __init__(self, strategies: List[BaseSamplingStrategy]):
         self.strategies = strategies
 
+    @property
+    def preserves_argmax(self) -> bool:
+        # A composite preserves the argmax iff every stage does.
+        return all(s.preserves_argmax for s in self.strategies)
+
+    @property
+    def is_greedy(self) -> bool:
+        """Whether sampling always yields the argmax of the raw logits.
+
+        True iff some stage forces greedy and no stage can move the
+        argmax before or after it. Both facts are declared
+        polymorphically by each strategy, so composing in a new strategy
+        type (or a nested pipeline) updates this automatically.
+        """
+        return any(s.is_greedy for s in self.strategies) and self.preserves_argmax
+
     def apply(
         self,
         logits: Tensor,
@@ -260,12 +318,6 @@ class SamplingPipeline(BaseSamplingStrategy):
         for strategy in self.strategies:
             logits = strategy.apply(logits, filter_value, input_ids, input_mask)
         return logits
-
-    @staticmethod
-    def _is_greedy(temperature: Union[float, Tensor]) -> bool:
-        if isinstance(temperature, Tensor):
-            return bool((temperature == 0).all())
-        return temperature == 0
 
     @torch.inference_mode()
     def sample(
@@ -294,13 +346,20 @@ class SamplingPipeline(BaseSamplingStrategy):
             Sampled token IDs ``[batch]``, or — when ``return_logprobs``
             is ``True`` — a ``(token_ids, chosen_logprobs)`` tuple.
         """
-        if self._is_greedy_pipeline():
+        if self.is_greedy:
             tokens = logits.argmax(dim=-1)
             if not return_logprobs:
                 return tokens
             log_probs = torch.log_softmax(logits.float(), dim=-1)
             chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
             return tokens, chosen
+
+        # Capture the raw distribution before the strategy pipeline runs:
+        # top-k/top-p mutate the logits tensor in place, so computing this
+        # after ``apply`` would read the filtered distribution instead of
+        # the raw model distribution the caller documented.
+        if return_logprobs:
+            raw_log_probs = torch.log_softmax(logits.float(), dim=-1)
 
         transformed = self.apply(logits, filter_value, input_ids, input_mask)
         tokens = torch.multinomial(
@@ -313,27 +372,8 @@ class SamplingPipeline(BaseSamplingStrategy):
         # logprobs recorded for online RL must live in the same
         # distribution the trainer differentiates, not the
         # temperature/top-p filtered one tokens were drawn from.
-        log_probs = torch.log_softmax(logits.float(), dim=-1)
-        chosen = torch.gather(log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
+        chosen = torch.gather(raw_log_probs, -1, tokens.unsqueeze(-1)).squeeze(-1)
         return tokens, chosen
-
-    def _is_greedy_pipeline(self) -> bool:
-        """True if sampling reduces to argmax over the raw logits.
-
-        A greedy temperature with only top-k/top-p strategies does: the
-        filters always keep the argmax token.  A frequency penalty can
-        change the argmax, so those pipelines must run the full
-        transformation even at ``temperature=0``.
-        """
-        if not self.strategies:
-            return False
-        first = self.strategies[0]
-        if not (
-            isinstance(first, TemperatureStrategy)
-            and self._is_greedy(first.temperature)
-        ):
-            return False
-        return not any(isinstance(s, FrequencyPenaltyStrategy) for s in self.strategies)
 
 
 @torch.inference_mode()

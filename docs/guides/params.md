@@ -14,7 +14,7 @@
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--config`, `-c` | YAML config file; explicit CLI options override YAML values | None |
-| `--train_type` | Training type (`seq`, `sft`, `dpo`, `grpo`, `online_grpo`, `online_dpo`) | required |
+| `--train_type` | Training type (`seq`, `sft`, `dpo`, `grpo`, `online_grpo`, `online_dpo`, `online_ppo`) | required |
 | `--data_root_path` | Dataset root directory | required |
 | `--param_path` | Model parameters or checkpoint path | required |
 | `--resume` | Resume training from `--param_path` | False |
@@ -124,14 +124,14 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--nprocs` | Number of GPUs / processes | 1 |
-| `--parallel_mode` | Parallel strategy (`none`, `ddp`, `fsdp`) | fsdp |
+| `--dp_size` | Data-parallel replicas; the launcher starts `dp_size × cp_size × tp_size` processes | 1 |
+| `--dp_mode` | Parallel strategy (`none`, `ddp`, `fsdp`) | fsdp |
 | `--device_type` | Device type | cuda |
 | `--start_method` | Multiprocessing start method (`spawn`, `fork`, `forkserver`) | spawn |
 | `--backend` | Distributed training backend | nccl |
 | `--master_addr` | Master node address | localhost |
 | `--master_port` | Master node port | 29500 |
-| `--tp_size` | Reserved tensor-parallel size; accepted but currently ignored | None |
+| `--tp_size` | Tensor-parallel group size: shards Linear projections over features (attention heads / ffn channels) | 1 |
 
 ### Strategy-specific
 
@@ -139,16 +139,22 @@ with `--optimizer=muon_adamw`.
 |-----------|-------------|---------|---------|
 | `--dpo_beta` | DPO beta value | 0.1 | `dpo`, `online_dpo` |
 | `--label_smoothing` | Label smoothing for cross-entropy loss | 0.0 | `seq`, `sft` |
-| `--group_size` | GRPO/rollout group size | 4 | `grpo`, `online_grpo`, `online_dpo` |
-| `--grpo_clip_eps` | GRPO clipping epsilon | 0.2 | `grpo`, `online_grpo` |
-| `--grpo_kl_coef` | GRPO KL penalty coefficient | 0.01 | `grpo`, `online_grpo` |
+| `--group_size` | GRPO/rollout group size | 4 | `grpo`, `online_grpo`, `online_dpo`, `online_ppo` |
+| `--grpo_clip_eps` | Clipping epsilon for the PPO-style surrogate loss | 0.2 | `grpo`, `online_grpo`, `online_ppo` |
+| `--grpo_kl_coef` | KL penalty coefficient | 0.01 | `grpo`, `online_grpo`, `online_ppo` |
+| `--ppo_gamma` | PPO reward discount factor | 1.0 | `online_ppo` |
+| `--ppo_gae_lambda` | PPO GAE bias/variance trade-off | 0.95 | `online_ppo` |
+| `--ppo_vf_coef` | PPO value-loss coefficient | 0.5 | `online_ppo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
 
 ### Online Rollout
 
 `online_grpo` and `online_dpo` are factory aliases for the existing `grpo` and
 `dpo` strategy classes; online behavior is enabled by rollout components rather
-than separate strategy subclasses. These options apply to the online aliases.
+than separate strategy subclasses. `online_ppo` is a dedicated actor-critic
+strategy: a `ValueModel` critic supplies GAE advantages, and its state persists
+as `value_model.pt`/`value_optimizer.pt` checkpoint extras (required for
+resume). These options apply to the online strategies.
 Online strategies require
 a `BaseRewardModel` factory in `TrainConfig`; `train.py` does not currently
 provide a command-line option for configuring one.
@@ -187,8 +193,8 @@ provide a command-line option for configuring one.
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 nohup python scripts/tools/train.py \
-    --nprocs=4 \
-    --parallel_mode=ddp \
+    --dp_size=4 \
+    --dp_mode=ddp \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=/path/to/model \

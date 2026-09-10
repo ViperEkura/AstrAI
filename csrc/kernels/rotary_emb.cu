@@ -1,7 +1,8 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
+
+#include "common/launch.cuh"
 
 __global__ void rotary_emb_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -89,7 +90,7 @@ torch::Tensor rotary_emb(
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
         n_tokens, n_heads, head_dim
     );
-    C10_CUDA_CHECK(cudaGetLastError());
+    ASTRAI_LAUNCH_CHECK();
 
     return out;
 }

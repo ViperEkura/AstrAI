@@ -6,9 +6,7 @@ import click
 import torch
 from tqdm import tqdm
 
-from astrai.inference import InferenceEngine
-from astrai.model import AutoModel
-from astrai.tokenize import AutoTokenizer
+from astrai.inference import build_engine
 
 
 def processor(
@@ -28,17 +26,13 @@ def processor(
 ):
     print(f"Loading model from {param_path} ...")
     t0 = time.time()
-    model = AutoModel.from_pretrained(param_path)
-    tokenizer = AutoTokenizer.from_pretrained(param_path)
-    model.to(device="cuda", dtype=torch.bfloat16)
-    print(f"  model loaded in {time.time() - t0:.1f}s")
-
-    engine = InferenceEngine(
-        model=model,
-        tokenizer=tokenizer,
+    engine = build_engine(
+        param_path=param_path,
         max_batch_size=batch_size * num_samples,
         max_seq_len=max_seq_len,
     )
+    tokenizer = engine.tokenizer
+    print(f"  model loaded in {time.time() - t0:.1f}s")
 
     print(f"Reading {input_json_file} ...")
     with open(input_json_file, "r", encoding="utf-8") as f:

@@ -80,7 +80,10 @@ class _CMakeBuildExt(_build_ext):
         if cmake is None:
             raise RuntimeError("cmake not found on PATH; install it to build kernels")
 
-        parallel = os.environ.get("BUILD_PARALLEL", "4")
+        # Job-level parallelism: one nvcc job per compile unit x arch pass;
+        # each job already pools its own ptxas via --threads. Default fills
+        # the box (capped), BUILD_PARALLEL overrides.
+        parallel = os.environ.get("BUILD_PARALLEL", str(min(os.cpu_count() or 4, 32)))
         cfg = [
             cmake,
             "-S",
@@ -92,25 +95,43 @@ class _CMakeBuildExt(_build_ext):
             f"-DPY_SOABI={_python_soabi()}",
         ]
         arch = os.environ.get("ASTRAI_CUDA_ARCH")
-        if not arch:
-            arch = _detect_cuda_arch()
+        max_arch = None
+        try:
+            if arch:
+                # Accept a semicolon list ("80;89;120"); the FP8 gate keys
+                # on the maximum, matching the CMake-side validation.
+                max_arch = max(int(a) for a in arch.split(";") if a.strip())
+            else:
+                # Native default: the build follows the local GPU (dev
+                # iteration — one arch; gemm adds its 'a' slice). The
+                # mixed fleet is the explicit release opt-in
+                # (ASTRAI_CUDA_ARCH="80;89;120"), and the CMake-side
+                # default serves GPU-less builds.
+                arch = _detect_cuda_arch()
+                max_arch = int(arch) if arch else None
+        except ValueError:
+            warnings.warn(
+                f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
+                "FP8 capability will be decided by CMake.",
+                stacklevel=2,
+            )
         if arch:
-            try:
-                if int(str(arch)) < 89:
-                    warnings.warn(
-                        f"FP8 operator disabled: CUDA compute capability {arch} "
-                        "requires 89 or newer.",
-                        stacklevel=2,
-                    )
-            except ValueError:
+            if max_arch is not None and max_arch < 89:
                 warnings.warn(
-                    f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
-                    "FP8 capability will be decided by CMake.",
+                    f"FP8 operator disabled: CUDA compute capability {arch} "
+                    "requires 89 or newer.",
                     stacklevel=2,
                 )
             cfg.append(f"-DASTRAI_CUDA_ARCH={arch}")
-        subprocess.run(cfg, check=True)
-        subprocess.run([cmake, "--build", str(build_dir), "-j", parallel], check=True)
+        # CUDACXX: a cold-cache configure cannot find nvcc when it is off
+        # PATH — and caches the failure.
+        env = dict(os.environ)
+        if (nvcc := _find_nvcc()) and not env.get("CUDACXX"):
+            env["CUDACXX"] = nvcc
+        subprocess.run(cfg, check=True, env=env)
+        subprocess.run(
+            [cmake, "--build", str(build_dir), "-j", parallel], check=True, env=env
+        )
 
         # After compilation finishes, verify mandatory CUDA kernels to confirm build succeeded.
         # CMake may report partial‑target success even if some architecture‑specific kernels are skipped.
@@ -121,8 +142,6 @@ class _CMakeBuildExt(_build_ext):
             "attn_prefill",
             "attn_paged_decode",
             "attn_paged_prefill",
-            "bf16_gemv",
-            "bf16_swiglu",
             "rotary_emb",
         )
         missing = [name for name in required if not any(lib_dir.glob(f"{name}.*.so"))]
@@ -132,11 +151,25 @@ class _CMakeBuildExt(_build_ext):
             )
 
 
+def _find_nvcc():
+    """nvcc path: PATH first, then the standard toolkit locations."""
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return nvcc
+    for root in (
+        os.environ.get("CUDA_HOME"),
+        os.environ.get("CUDA_PATH"),
+        "/usr/local/cuda",
+    ):
+        if root and (Path(root) / "bin" / "nvcc").is_file():
+            return str(Path(root) / "bin" / "nvcc")
+    return None
+
+
 def _cuda_toolkit_version():
-    import shutil
     import subprocess
 
-    nvcc = shutil.which("nvcc")
+    nvcc = _find_nvcc()
     if nvcc is None:
         return None
     try:

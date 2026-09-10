@@ -162,3 +162,34 @@ def test_grpo_sync_old_model(grpo_strategy):
         if k in old_sd_after
     )
     assert matches
+
+
+def test_grpo_optimizer_step_syncs_old_model(grpo_strategy):
+    """optimizer_step must refresh old_model after each update."""
+    strategy, device = grpo_strategy
+
+    class _SteppedOptimizer:
+        def step(self):
+            with torch.no_grad():
+                for p in strategy.model.parameters():
+                    p.add_(0.05)
+
+    strategy.optimizer_step(_SteppedOptimizer())
+
+    policy_sd = strategy.model.state_dict()
+    old_sd = strategy.old_model.state_dict()
+    assert all(
+        torch.allclose(policy_sd[k], old_sd[k]) for k in policy_sd if k in old_sd
+    )
+
+
+def test_online_grpo_optimizer_step_skips_sync(grpo_strategy):
+    """old_model=None (online) must not attempt a sync."""
+    strategy, device = grpo_strategy
+    strategy.old_model = None
+
+    class _SteppedOptimizer:
+        def step(self):
+            return None
+
+    strategy.optimizer_step(_SteppedOptimizer())

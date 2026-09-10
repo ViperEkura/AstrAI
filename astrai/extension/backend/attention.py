@@ -343,9 +343,11 @@ def attention(
 class AttentionBackend(ABC):
     """Abstract base for attention computation strategies.
 
-    Subclasses implement ``fwd_decode`` (q_len == 1, with cache) and
-    ``fwd_prefill`` (q_len > 1, with or without cache). The public
-    ``forward`` method dispatches based on q_len.
+    Subclasses implement a single ``forward`` and branch on ``fwd``
+    ("decode" / "prefill", or None for training) wherever their kernels
+    split — the mode taxonomy is the caller's, not the base class's, so
+    it lives in the implementations. ``_check_fwd`` is the shared guard
+    against unknown mode strings.
 
     Capability contract — every backend declares:
 
@@ -365,7 +367,6 @@ class AttentionBackend(ABC):
         with attn_backend(TorchNativeBackend):          # class
             ...
         with TorchNativeBackend():                       # instance
-            ...
     """
 
     def __enter__(self) -> "AttentionBackend":
@@ -398,7 +399,15 @@ class AttentionBackend(ABC):
         Called on the canonical singleton instance (or a caller-provided
         one); must be side-effect free.
         """
+        return True
 
+    @staticmethod
+    def _check_fwd(fwd: Optional[str]) -> None:
+        """Reject unknown forward modes loudly."""
+        if fwd not in (None, "prefill", "decode"):
+            raise ValueError(f"unsupported attention forward mode: {fwd}")
+
+    @abstractmethod
     def forward(
         self,
         q: Tensor,
@@ -410,7 +419,7 @@ class AttentionBackend(ABC):
         is_causal: bool = False,
         fwd: Optional[str] = None,
     ) -> Tensor:
-        """Dispatch to decode or extend based on q_len.
+        """Run one attention call; ``fwd`` selects the mode.
 
         Args:
             q: [batch, q_len, n_heads, head_dim]
@@ -420,41 +429,11 @@ class AttentionBackend(ABC):
             layer_id: transformer layer index for buffer access.
             attn_mask: pre-built attention mask compatible with SDPA.
             is_causal: whether to apply causal masking.
+            fwd: "prefill" / "decode" for inference, None for training.
 
         Returns:
             [batch, q_len, n_heads * head_dim]
         """
-        if fwd == "decode":
-            return self.fwd_decode(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-        if fwd == "prefill" or fwd is None:
-            return self.fwd_prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-        raise ValueError(f"unsupported attention forward mode: {fwd}")
-
-    @abstractmethod
-    def fwd_decode(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        """Single-token decode with KV cache."""
-
-    @abstractmethod
-    def fwd_prefill(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        """Multi-token prefill or training forward."""
 
     @staticmethod
     def supports_graph() -> bool:
@@ -480,6 +459,10 @@ class TorchNativeBackend(AttentionBackend):
     via ``req_to_token`` indirect indexing, then calls
     ``F.scaled_dot_product_attention``.
 
+    Packed inference (3-D q) pads the ragged batch to [B, max_q, max_kv]
+    and runs a single batched SDPA call with a combined causal+padding
+    mask, then unpacks back to the flat layout.
+
     For training (``kv_cache is None``), skips cache I/O entirely and
     runs SDPA directly on the projected q/k/v.
     """
@@ -498,7 +481,7 @@ class TorchNativeBackend(AttentionBackend):
     ) -> bool:
         return True
 
-    def fwd_decode(
+    def forward(
         self,
         q: Tensor,
         k: Tensor,
@@ -507,31 +490,9 @@ class TorchNativeBackend(AttentionBackend):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
-        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-
-    def fwd_prefill(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        return self._forward(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
-
-    def _forward(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
+        self._check_fwd(fwd)
         if q.ndim == 4:
             n_rep = q.size(2) // k.size(2)
             if n_rep > 1:
@@ -553,31 +514,46 @@ class TorchNativeBackend(AttentionBackend):
             raise ValueError("packed attention requires KV cache metadata")
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
         kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
-        outputs = []
+
+        # Pad the ragged batch to [B, max_q, max_kv] so one batched SDPA call
+        # replaces B per-request calls. The bool mask folds the per-request
+        # causal offset (seq_len - q_len) and the kv padding together; padded
+        # q rows gather slot/row 0 and are dropped by the [q_valid] unpack,
+        # which restores the packed qo_indptr order.
+        qo_indptr = kv_cache.qo_indptr
+        q_lens = qo_indptr[1:] - qo_indptr[:-1]
+        seq_lens = kv_cache.seq_lens
+        max_q = int(q_lens.max())
+        max_kv = int(seq_lens.max())
+
+        pos = torch.arange(max_kv, device=q.device)
+        kv_valid = pos.unsqueeze(0) < seq_lens.unsqueeze(1)
+        token_index = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_kv]
+        token_index = token_index.masked_fill(~kv_valid, 0)
+        k_b = kv_cache.k_buffer[layer_id, token_index]
+        v_b = kv_cache.v_buffer[layer_id, token_index]
         n_rep = q.size(1) // k.size(1)
-        for i in range(kv_cache.req_pool_indices.numel()):
-            q_start = int(kv_cache.qo_indptr[i])
-            q_end = int(kv_cache.qo_indptr[i + 1])
-            indices = kv_cache.req_to_token[
-                kv_cache.req_pool_indices[i], : kv_cache.seq_lens[i]
-            ]
-            k_i = kv_cache.k_buffer[layer_id, indices]
-            v_i = kv_cache.v_buffer[layer_id, indices]
-            if n_rep > 1:
-                k_i = repeat_kv(k_i, n_rep)
-                v_i = repeat_kv(v_i, n_rep)
-            q_len = q_end - q_start
-            kv_len = k_i.size(0)
-            q_pos = torch.arange(kv_len - q_len, kv_len, device=q.device)
-            causal_mask = q_pos[:, None] >= torch.arange(kv_len, device=q.device)
-            out = F.scaled_dot_product_attention(
-                q[q_start:q_end].transpose(0, 1).unsqueeze(0),
-                k_i.transpose(0, 1).unsqueeze(0),
-                v_i.transpose(0, 1).unsqueeze(0),
-                attn_mask=causal_mask,
-            )
-            outputs.append(out.squeeze(0).transpose(0, 1))
-        return torch.cat(outputs)
+        if n_rep > 1:
+            k_b = repeat_kv(k_b, n_rep)
+            v_b = repeat_kv(v_b, n_rep)
+
+        q_pos = torch.arange(max_q, device=q.device)
+        q_valid = q_pos.unsqueeze(0) < q_lens.unsqueeze(1)
+        q_index = (qo_indptr[:-1].unsqueeze(1) + q_pos.unsqueeze(0)).masked_fill(
+            ~q_valid, 0
+        )
+        causal = (
+            (seq_lens - q_lens).unsqueeze(1).unsqueeze(2) + q_pos.view(1, max_q, 1)
+        ) >= pos.view(1, 1, max_kv)
+        mask = (causal & kv_valid.unsqueeze(1)).unsqueeze(1)
+
+        out = F.scaled_dot_product_attention(
+            q[q_index].permute(0, 2, 1, 3),
+            k_b.permute(0, 2, 1, 3),
+            v_b.permute(0, 2, 1, 3),
+            attn_mask=mask,
+        )
+        return out.permute(0, 2, 1, 3)[q_valid]
 
 
 @AttentionBackendFactory.register(ATTN_BACKEND.CUDA.value)
@@ -633,7 +609,7 @@ class CudaBackend(AttentionBackend):
     def supports_graph() -> bool:
         return True
 
-    def fwd_decode(
+    def forward(
         self,
         q: Tensor,
         k: Tensor,
@@ -642,10 +618,23 @@ class CudaBackend(AttentionBackend):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
+        self._check_fwd(fwd)
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
+        if fwd == "decode":
+            return self._decode(q, k, v, kv_cache, layer_id)
+        return self._prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
 
+    def _decode(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        kv_cache: "KVCache",
+        layer_id: int,
+    ) -> Tensor:
         kv_indptr = kv_cache.kv_indptr
 
         out = attn_paged_decode(
@@ -664,19 +653,16 @@ class CudaBackend(AttentionBackend):
         )
         return out
 
-    def fwd_prefill(
+    def _prefill(
         self,
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        kv_cache: Optional["KVCache"],
+        kv_cache: "KVCache",
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
     ) -> Tensor:
-        if kv_cache is None:
-            raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
-
         loc = kv_cache.out_cache_loc
         kv_cache.k_buffer[layer_id, loc] = k
         kv_cache.v_buffer[layer_id, loc] = v
@@ -734,7 +720,7 @@ class FlashAttnBackend(AttentionBackend):
         # back to TorchNativeBackend instead of silently ignoring the mask.
         return attn_mask is None
 
-    def fwd_decode(
+    def forward(
         self,
         q: Tensor,
         k: Tensor,
@@ -743,20 +729,11 @@ class FlashAttnBackend(AttentionBackend):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        fwd: Optional[str] = None,
     ) -> Tensor:
-        return self._forward_packed(q, k, v, kv_cache, layer_id)
-
-    def fwd_prefill(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        kv_cache: Optional["KVCache"],
-        layer_id: int,
-        attn_mask: Optional[Tensor] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        if q.ndim == 3:
+        self._check_fwd(fwd)
+        # Decode is always packed; prefill/training split by layout.
+        if fwd == "decode" or q.ndim == 3:
             return self._forward_packed(q, k, v, kv_cache, layer_id)
         return self._forward_dense(q, k, v, attn_mask, is_causal)
 

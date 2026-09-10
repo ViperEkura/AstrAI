@@ -20,8 +20,10 @@ def sse_event(data: Dict[str, Any], event: Optional[str] = None) -> str:
     if event:
         lines.append(f"event: {event}")
     lines.append(f"data: {json.dumps(data, ensure_ascii=False)}")
-    lines.append("")
-    return "\n".join(lines)
+    # The SSE spec dispatches an event only at a blank line, so the frame
+    # must end with "\n\n" (a single trailing newline keeps clients waiting
+    # and concatenates consecutive events into one corrupt payload).
+    return "\n".join(lines) + "\n\n"
 
 
 def sse_done() -> str:

@@ -1,11 +1,7 @@
 from argparse import ArgumentParser
 from pathlib import Path
 
-import torch
-
-from astrai import InferenceEngine
-from astrai.model import AutoModel
-from astrai.tokenize import AutoTokenizer
+from astrai import build_engine
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -68,10 +64,8 @@ def chat():
     args = parse_args()
     model_path = args.model_path
 
-    model = AutoModel.from_pretrained(model_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model.to(device="cuda", dtype=torch.bfloat16)
-    engine = InferenceEngine(model=model, tokenizer=tokenizer)
+    engine = build_engine(model_path)
+    tokenizer = engine.tokenizer
 
     while True:
         query = input(">> ")

@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
+from astrai.config.inference_config import InferenceConfig
 from astrai.extension.backend.attention import (
     CudaBackend,
     get_backend,
@@ -19,6 +20,7 @@ from astrai.inference.workspace import InferenceWorkspace
 from astrai.model.automodel import AutoModel
 
 logger = logging.getLogger(__name__)
+_config = InferenceConfig()
 
 
 @contextmanager
@@ -114,7 +116,7 @@ def _warmup_cuda_graphs(
     # shapes on first call (F.linear is the dominant cost).  This also warms
     # up the CUDA context (driver init) and compiles the graph-capture trace
     # that follows.  Custom .so kernels do NOT need this — they are pre-built.
-    warmup_len = 64
+    warmup_len = _config.prefill_warmup_len
     tid = "_warmup_prefill"
     if task_cache.task_alloc(tid, list(range(warmup_len))):
         with (
@@ -129,6 +131,9 @@ def _warmup_cuda_graphs(
                 kv_cache=kv,
                 position_ids=pos_in,
                 fwd="prefill",
+                logits_positions=torch.tensor(
+                    [warmup_len - 1], dtype=torch.long, device=dev
+                ),
             )
         task_cache.task_free(tid)
 
@@ -312,9 +317,20 @@ class Executor:
     ):
         tasks = sorted(tasks, key=lambda t: t.task_id)
         batch_sz = len(tasks)
+
+        # Validate batch size bounds
+        if batch_sz > self._workspace.max_batch_size:
+            raise ValueError(
+                f"Batch size {batch_sz} exceeds max_batch_size "
+                f"{self._workspace.max_batch_size}"
+            )
+
         prompt_lens = [len(t.prompt_ids) for t in tasks]
+
+        # Validate inputs before any resource allocation
         if any(start_pos >= prompt_len for prompt_len in prompt_lens):
             raise ValueError("prefill start_pos must precede every prompt end")
+
         q_lens = [prompt_len - start_pos for prompt_len in prompt_lens]
 
         input_ids = torch.tensor(
@@ -331,6 +347,11 @@ class Executor:
                 )
                 for prompt_len in prompt_lens
             ]
+        )
+
+        # Last packed position per request; the model projects only these rows.
+        last_token_indices = (
+            torch.tensor(q_lens, dtype=torch.long, device=self.device).cumsum(0) - 1
         )
 
         with (
@@ -350,11 +371,9 @@ class Executor:
                     start_pos=start_pos,
                 ),
                 fwd="prefill",
+                logits_positions=last_token_indices,
             )
-            last_token_indices = (
-                torch.tensor(q_lens, dtype=torch.long, device=self.device).cumsum(0) - 1
-            )
-            logits = outputs["logits"][last_token_indices]
+            logits = outputs["logits"]
 
         step_out, _ = self._sample_logits(logits, tasks, return_logprobs)
         return tasks, step_out
@@ -380,10 +399,18 @@ class Executor:
             return []
 
         b = len(tasks)
+
+        # Validate batch size bounds
+        if b > self._workspace.max_batch_size:
+            raise ValueError(
+                f"Batch size {b} exceeds max_batch_size "
+                f"{self._workspace.max_batch_size}"
+            )
+
         ws = self._workspace
         task_ids = [t.task_id for t in tasks]
-        cur_positions = [t.next_pos for t in tasks]
         task_sig = tuple(task_ids)
+        cur_positions = [t.next_pos for t in tasks]
 
         # ---- pre-replay: update input buffers in-place ----
 
@@ -392,9 +419,16 @@ class Executor:
         # slots — fill input ids device-to-device.  inference_mode guards
         # the read because the source was produced under sampling's
         # inference-mode context.
+        #
+        # ``cache_valid`` checks the decode cache's own task signature:
+        # task ids are globally unique, so equality alone proves the cached
+        # tokens were sampled for exactly this ordered batch.  Req-index
+        # signatures in the cache manager are deliberately NOT consulted —
+        # they are recycled when freed slots are reallocated, which once
+        # let a fresh batch replay a previous generation's tokens.
         cached = self._decode_cache
-        sig_match = cached is not None and cached.task_sig == task_sig
-        if sig_match and cached.last_tokens is not None:
+        cache_valid = cached is not None and cached.task_sig == task_sig
+        if cache_valid and cached.last_tokens is not None:
             with torch.inference_mode():
                 input_ids = ws.fill_input_ids_from_device(cached.last_tokens)
         else:
@@ -404,9 +438,12 @@ class Executor:
 
         kv_cache = self.task_cache.bind(task_ids, ws)
 
-        reuse_decode_state = self.task_cache.bind_was_steady and sig_match
+        # Reuse sampling state only if all conditions hold:
+        # 1. The cached decode state belongs to THIS task set (task_sig)
+        # 2. KV bind detected steady increment (same req_indices, seq_lens +1)
+        reuse_decode_state = cache_valid and self.task_cache.bind_was_steady
         if reuse_decode_state:
-            info = self._decode_cache.sampling_info
+            info = cached.sampling_info
             ws.position_ids[:b] += 1
         else:
             info = _build_sampling_batch_info(tasks, self.device)

@@ -16,12 +16,10 @@ import os
 import re
 from typing import Callable, Dict, List, Optional
 
-import torch
 import tqdm
 from datasets import load_dataset
 
-from astrai.inference import InferenceEngine
-from astrai.model import AutoModel
+from astrai.inference import InferenceEngine, build_engine
 from astrai.tokenize import AutoTokenizer
 
 IFEVAL_HF_DATASET = "google/IFEval"
@@ -536,17 +534,12 @@ def main():
     print(f"Loaded {len(problems)} problems")
     print(f"Supported constraint types: {len(CONSTRAINT_VERIFIERS)}")
 
-    model = AutoModel.from_pretrained(args.param_path)
-    tokenizer = AutoTokenizer.from_pretrained(args.param_path)
-    model.to(device="cuda", dtype=torch.bfloat16)
-    model.eval()
-
-    engine = InferenceEngine(
-        model=model,
-        tokenizer=tokenizer,
+    engine = build_engine(
+        args.param_path,
         max_batch_size=args.batch_size,
         max_seq_len=args.max_seq_len,
     )
+    tokenizer = engine.tokenizer
 
     results = evaluate(
         engine=engine,

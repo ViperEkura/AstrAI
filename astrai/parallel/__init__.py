@@ -8,7 +8,6 @@ from astrai.parallel.executor import (
     GradientState,
     NoneExecutor,
     broadcast_state_dict,
-    create_ref_model,
 )
 from astrai.parallel.setup import (
     get_current_device,
@@ -34,6 +33,5 @@ __all__ = [
     "NoneExecutor",
     "DDPExecutor",
     "FSDPExecutor",
-    "create_ref_model",
     "broadcast_state_dict",
 ]

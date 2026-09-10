@@ -7,6 +7,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, Generator, List, Literal, Optional
 
+from astrai.config.inference_config import InferenceConfig
+
+_config = InferenceConfig()
+
 
 @dataclass
 class TaskTiming:
@@ -123,7 +127,7 @@ class MetricsCollector:
         stats = metrics.get_stats()
     """
 
-    def __init__(self, max_recent: int = 128):
+    def __init__(self, max_recent: int = _config.max_recent_tasks):
         self._timings: Dict[str, TaskTiming] = {}
         self._completed: Deque[TaskTiming] = deque(maxlen=max_recent)
         self._lock = threading.Lock()

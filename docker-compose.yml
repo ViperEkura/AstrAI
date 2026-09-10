@@ -77,7 +77,9 @@ services:
       - BASE_MODEL=${BASE_MODEL:-/models/base}
       - CHECKPOINT_ROOT=/checkpoints
       - TRAIN_GPU_COUNT=${TRAIN_GPU_COUNT:-all}
-      - TRAIN_PARALLEL_MODE=${TRAIN_PARALLEL_MODE:-auto}
+      - TRAIN_DP_MODE=${TRAIN_DP_MODE:-auto}
+      - TRAIN_CP_SIZE=${TRAIN_CP_SIZE:-1}
+      - TRAIN_TP_SIZE=${TRAIN_TP_SIZE:-1}
       - CUDA_VISIBLE_DEVICES
     entrypoint: ["bash", "/app/scripts/docker/train-entrypoint.sh"]
     ipc: ${TRAIN_IPC_MODE:-host}

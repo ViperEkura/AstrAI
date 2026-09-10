@@ -16,6 +16,7 @@ from astrai.extension import (
 from astrai.inference.cache import PagePool, TaskCacheManager
 from astrai.inference.metrics import MetricsCollector
 from astrai.inference.runtime.executor import Executor
+from astrai.inference.runtime.stepper import Stepper
 from astrai.inference.task import (
     STOP,
     GenerationResult,
@@ -23,6 +24,7 @@ from astrai.inference.task import (
     TaskManager,
     TaskStatus,
 )
+from astrai.inference.versioning import PolicyVersionGuard
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
@@ -119,48 +121,32 @@ class InferenceScheduler:
                 enable_cuda_graph=enable_cuda_graph,
             )
 
+        self._stepper = Stepper(
+            self._cache, self._task_cache, self._executor, self._metrics
+        )
+
         self._stop_event = threading.Event()
         self._loop_thread: Optional[threading.Thread] = None
-        self._weight_lock = threading.RLock()
-        self._policy_version = policy_version
+        self._policy_guard = PolicyVersionGuard(
+            policy_version,
+            ensure_ready=self._ensure_weight_update_ready,
+            on_commit=self._task_cache.invalidate_cache,
+        )
+        # Synchronous generation shares the guard's generation/weight mutex.
+        self._weight_lock = self._policy_guard.lock
 
     @property
     def policy_version(self) -> int:
         """Version of the model weights used for subsequent generations."""
-        return self._policy_version
-
-    def _validate_weight_version(
-        self, policy_version: int, *, require_advance: bool = False
-    ) -> None:
-        if (
-            isinstance(policy_version, bool)
-            or not isinstance(policy_version, int)
-            or policy_version < 0
-        ):
-            raise ValueError("policy_version must be a non-negative integer")
-        if policy_version < self._policy_version:
-            raise ValueError(
-                f"policy_version cannot move backwards from "
-                f"{self._policy_version} to {policy_version}"
-            )
-        if require_advance and policy_version == self._policy_version:
-            raise ValueError(
-                f"policy_version must advance beyond {self._policy_version} "
-                "when model weights are mutated"
-            )
+        return self._policy_guard.policy_version
 
     def _ensure_weight_update_ready(self) -> None:
+        """Check weight update preconditions. Must be called under the lock."""
         if self._loop_thread is not None and self._loop_thread.is_alive():
             raise RuntimeError("Stop the scheduler before updating model weights")
         if self._task_mgr.get_active_tasks() or self._task_mgr.get_waiting_tasks():
             raise RuntimeError("Cannot update model weights while tasks are queued")
 
-    def _commit_weight_version(self, policy_version: int) -> int:
-        self._task_cache.invalidate_cache()
-        self._policy_version = policy_version
-        return self._policy_version
-
-    @_with_weight_lock
     def update_weights(self, policy_version: int) -> int:
         """Acknowledge an in-place weight update and invalidate stale KV state.
 
@@ -169,30 +155,22 @@ class InferenceScheduler:
         version update makes that lifecycle visible and prevents prefix KV
         entries produced by older weights from being reused.
         """
-        self._validate_weight_version(policy_version)
-        if policy_version == self._policy_version:
-            return self._policy_version
-        self._ensure_weight_update_ready()
-        return self._commit_weight_version(policy_version)
+        return self._policy_guard.update_weights(policy_version)
 
-    @_with_weight_lock
-    def apply_weight_update(self, policy_version: int, update: Callable[[], T]) -> T:
-        """Mutate shared weights and publish their version without generation."""
-        if not callable(update):
-            raise TypeError("update must be callable")
-        self._validate_weight_version(policy_version, require_advance=True)
-        self._ensure_weight_update_ready()
+    def apply_weight_update(
+        self, policy_version: Optional[int], update: Callable[[], T]
+    ) -> T:
+        """Mutate shared weights and publish their version without generation.
 
-        result = update()
-        self._commit_weight_version(policy_version)
-        return result
+        ``policy_version=None`` derives ``live + 1`` under the same lock, for
+        callers that only need "advance by one" (e.g. ``optimizer.step()``)
+        without a read-compute-write race on the current version.
+        """
+        return self._policy_guard.apply_weight_update(policy_version, update)
 
-    @_with_weight_lock
     def with_policy_snapshot(self, inspect: Callable[[int], T]) -> T:
         """Inspect state while the scheduler's policy version remains stable."""
-        if not callable(inspect):
-            raise TypeError("inspect must be callable")
-        return inspect(self._policy_version)
+        return self._policy_guard.with_policy_snapshot(inspect)
 
     def add_task(self, prompt: str, **kwargs) -> str:
         return self._task_mgr.add_task(prompt, **kwargs)
@@ -215,7 +193,7 @@ class InferenceScheduler:
     def get_stats(self) -> Dict[str, Any]:
         stats = self._task_mgr.get_stats()
         stats["kv_cache_tasks"] = self._task_cache.task_count
-        stats["policy_version"] = self._policy_version
+        stats["policy_version"] = self._policy_guard.policy_version
         return stats
 
     @property
@@ -231,105 +209,11 @@ class InferenceScheduler:
             return nullcontext()
         return attn_backend(self._backend)
 
-    @staticmethod
-    def _task_backend_groups(tasks: List[Task]):
-        groups = {}
-        for task in tasks:
-            groups.setdefault(task.backend, (task.backend, []))[1].append(task)
-        return groups.values()
-
     def _step(
         self, tasks: List[Task], return_logprobs: bool = False
     ) -> Tuple[List[Task], List[Task]]:
-        """Advance every active task by one token (prefill + decode).
-
-        Single shared primitive for both the continuous-batching loop and
-        the synchronous ``run_batch`` path, so the two cannot drift.
-
-        Tasks must already be allocated in the KV cache. Tasks without output
-        are prefilled first and sample their first token from the final prompt
-        position. Tasks with output extend the cache by one position and decode
-        from their latest generated token.
-
-        Args:
-            tasks: Active tasks to advance by one token.
-            return_logprobs: Forwarded to ``execute_decode``; per-token
-                logprobs are recorded on each task's ``output_logprobs``.
-
-        Returns:
-            ``(decoded, aborted)``: tasks that produced a new token (its ID
-            already appended to ``output_ids``) and tasks that hit the
-            sequence cap and were marked ``ABORTED``.
-        """
-        to_prefill = [t for t in tasks if not t.prefill_done and t.prompt_ids]
-        prefilled_ids = set()
-        produced: List[Task] = []
-        if to_prefill:
-            for t in to_prefill:
-                t.input_tokens = len(t.prompt_ids)
-
-            groups: Dict[Tuple[int, Optional[AttentionBackend]], List[Task]] = {}
-            for t in to_prefill:
-                start_pos = min(
-                    self._task_cache.task_cached(t.task_id), len(t.prompt_ids) - 1
-                )
-                groups.setdefault((start_pos, t.backend), []).append(t)
-
-            for (start_pos, _), group in groups.items():
-                backend = group[0].backend
-                backend_context = (
-                    attn_backend(backend) if backend is not None else nullcontext()
-                )
-                with (
-                    backend_context,
-                    self._metrics.record([t.task_id for t in group], "prefill"),
-                ):
-                    prefilled, step_out = self._executor.execute_prefill(
-                        group, start_pos=start_pos, return_logprobs=return_logprobs
-                    )
-
-                for t, out in zip(prefilled, step_out):
-                    t.output_ids.append(out[0] if return_logprobs else out)
-                    t.output_tokens += 1
-                    t.mark_prefill_done()
-                    prefilled_ids.add(t.task_id)
-                    produced.append(t)
-
-                start_logical_page = start_pos // self._cache.page_size
-                for t in group:
-                    self._task_cache.task_record_hashes(
-                        t.task_id, t.prompt_ids, start_logical_page
-                    )
-
-        decoded: List[Task] = []
-        aborted: List[Task] = []
-        for t in tasks:
-            if t.task_id in prefilled_ids:
-                continue
-            if self._task_cache.task_extend(t.task_id, t.next_pos):
-                decoded.append(t)
-            else:
-                t.status = TaskStatus.ABORTED
-                aborted.append(t)
-
-        for backend, group in self._task_backend_groups(decoded):
-            backend_context = (
-                attn_backend(backend) if backend is not None else nullcontext()
-            )
-            with (
-                backend_context,
-                self._metrics.record([t.task_id for t in group], "decode"),
-            ):
-                step_out = self._executor.execute_decode(
-                    group, return_logprobs=return_logprobs
-                )
-            for t, out in zip(group, step_out):
-                t.output_ids.append(out[0] if return_logprobs else out)
-                t.output_tokens += 1
-                t.advance_kv()
-                produced.append(t)
-
-        return produced, aborted
+        """Advance every active task by one token; see :class:`Stepper`."""
+        return self._stepper.step(tasks, return_logprobs=return_logprobs)
 
     def _run_generation_loop(self):
         stop_ids = self._task_mgr.tokenizer.stop_ids
@@ -378,19 +262,21 @@ class InferenceScheduler:
                         if task.status != TaskStatus.ABORTED
                     ]
 
-                    decoded, aborted = self._step(active)
+                    decoded, aborted = self._stepper.step(active)
 
-                    for t in aborted:
-                        self._task_mgr.invoke_callback(t.task_id, STOP)
-
+                    # One dispatch per step: batch-aware sinks take their
+                    # lock (and wake waiters) once instead of once per token.
+                    events: List[Tuple[str, Any]] = [(t.task_id, STOP) for t in aborted]
                     for t in decoded:
                         if t.status == TaskStatus.ABORTED:
                             continue
                         new_text = t.decode_new_token(self._task_mgr.tokenizer)
                         if new_text:
-                            self._task_mgr.invoke_callback(t.task_id, new_text)
+                            events.append((t.task_id, new_text))
                         if t.is_finished(stop_ids):
-                            self._task_mgr.invoke_callback(t.task_id, STOP)
+                            events.append((t.task_id, STOP))
+                    if events:
+                        self._task_mgr.invoke_callbacks(events)
 
         except Exception as e:
             self._stop_event.set()
@@ -522,7 +408,9 @@ class InferenceScheduler:
 
             with self._backend_context():
                 while live:
-                    decoded, aborted = self._step(live, return_logprobs=return_logprobs)
+                    decoded, aborted = self._stepper.step(
+                        live, return_logprobs=return_logprobs
+                    )
                     for task in aborted:
                         runtime_errors[task.task_id] = "kv_cache_extension_failed"
                     live = [t for t in decoded if not t.is_finished(stop_ids)]

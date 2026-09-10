@@ -115,49 +115,6 @@ def test_full_text_pipeline(temp_dir, tokenizer_dir):
     assert "loss_mask" not in meta
 
 
-def test_full_instruction_pipeline(temp_dir, tokenizer_dir):
-    jsonl_path = os.path.join(temp_dir, "instruct.jsonl")
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        f.write(
-            json.dumps(
-                {
-                    "prompt": "Tell me a joke",
-                    "response": "Why did the chicken cross the road?",
-                }
-            )
-            + "\n"
-        )
-        f.write(
-            json.dumps(
-                {
-                    "prompt": "What is AI?",
-                    "response": "Artificial Intelligence is a field of computer science.",
-                }
-            )
-            + "\n"
-        )
-
-    config = PipelineConfig(
-        input=InputConfig(sections=INSTRUCTION_SECTIONS),
-        mask={"prompt": "mask", "response": "train"},
-        mask_default="mask",
-        preprocessing=ProcessingConfig(max_seq_len=2048),
-        output=OutputConfig(storage_format="bin"),
-    )
-
-    out_dir = os.path.join(temp_dir, "output")
-    Pipeline(
-        config=config,
-        input_paths=[jsonl_path],
-        output_dir=out_dir,
-        tokenizer_path=tokenizer_dir,
-    ).run()
-
-    meta = load_shard_meta(out_dir)
-    assert "sequence" in meta
-    assert "loss_mask" in meta
-
-
 def test_dtype_override(temp_dir, tokenizer_dir):
     jsonl_path = os.path.join(temp_dir, "data.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as f:

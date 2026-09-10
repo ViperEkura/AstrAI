@@ -64,26 +64,14 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int ti_begin = split * tiles_per_split;
     const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
 
-    // ---- Load tile lambda: predicated cp.async (addressing via KV policy) ----
+    // ---- Load tile lambda: predicated cp.async (addressing via KV policy;
+    // only the first GQA pass persists new K/V to the pool) ----
     auto load_tile = [&](int ti, int buf) {
-        int kv0 = ti * Traits::BC;
-        bf16* dK = sK + buf * Traits::BC * Traits::LD;
-        bf16* dV = sV + buf * Traits::BC * Traits::LD;
-        #pragma unroll
-        for (int i = lane * Traits::VEC; i < Traits::TOTAL;
-             i += Traits::NUM_THREADS * Traits::VEC) {
-            int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
-            int kc = kv0 + r;
-            bool valid = kc < seq_len;
-            // All GQA passes consume new K/V directly. Only the first pass
-            // persists it, so no cross-block synchronization is required.
-            KVAddr a = KV::template decode_addr<Traits::VEC>(
-                p, kctx, batch, kv_head, kc, d, valid, pass == 0);
-            int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
-            astrai::cp_async_16(&dK[off], a.k, a.valid);
-            astrai::cp_async_16(&dV[off], a.v, a.valid);
-        }
-        astrai::cp_async_commit_group();
+        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len,
+            [&](int kc, int d, bool valid) {
+                return KV::template decode_addr<Traits::VEC>(
+                    p, kctx, batch, kv_head, kc, d, valid, pass == 0);
+            });
     };
 
     // ---- Multi-stage cp.async pipeline ----
@@ -99,12 +87,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
         int kv0 = (ti_begin + it) * Traits::BC;
 
         float Sacc[Traits::NC8][4];
-        mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
-
-        #pragma unroll
-        for (int n8 = 0; n8 < Traits::NC8; n8++)
-            Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
-            Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
+        mma_compute_scores<Traits>(Qa, bK, p.scale, lane, Sacc);
 
         // Decode: q_len=1, so qrow0=qrow1=0.  Paged treats [0, seq_len) as
         // the causal range (query is the last token); contig clips to the

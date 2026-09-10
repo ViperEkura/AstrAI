@@ -4,7 +4,23 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from astrai.inference import STOP, Task, TaskManager, TaskStatus
+from astrai.inference import (
+    STOP,
+    BatchedStreamCallback,
+    Task,
+    TaskManager,
+    TaskStatus,
+)
+
+
+class RecordingSink(BatchedStreamCallback):
+    """Batch-aware callback capturing every dispatch as one batch."""
+
+    def __init__(self):
+        self.batches = []
+
+    def __call__(self, events):
+        self.batches.append(events)
 
 
 def _make_mock_tokenizer():
@@ -217,3 +233,46 @@ def test_task_manager_cancel_active_task_delivers_stop_callback():
     immediate, cancelled = tm.cancel_task(task_id)
     assert cancelled and immediate == []
     assert received == [STOP]
+
+
+def test_invoke_callbacks_batches_sink_events_and_keeps_plain_per_token():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    plain = []
+    tid_plain = tm.add_task("plain", stream_callback=plain.append)
+    sink = RecordingSink()
+    tid_a = tm.add_task("sink a", stream_callback=sink)
+    tid_b = tm.add_task("sink b", stream_callback=sink)
+
+    tm.invoke_callbacks(
+        [
+            (tid_a, "x"),
+            (tid_plain, "p"),
+            (tid_b, "y"),
+            ("unknown-task", "dropped"),
+            (tid_a, STOP),
+        ]
+    )
+
+    assert plain == ["p"]
+    assert sink.batches == [[(tid_a, "x"), (tid_b, "y"), (tid_a, STOP)]]
+
+
+def test_invoke_callback_delivers_single_event_to_batched_sink():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    sink = RecordingSink()
+    task_id = tm.add_task("test", stream_callback=sink)
+
+    tm.invoke_callback(task_id, STOP)
+
+    assert sink.batches == [[(task_id, STOP)]]
+
+
+def test_cancel_delivers_batched_stop_to_sink():
+    tm = TaskManager(tokenizer=_make_mock_tokenizer())
+    sink = RecordingSink()
+    task_id = tm.add_task("test", stream_callback=sink)
+
+    immediate, cancelled = tm.cancel_task(task_id)
+
+    assert cancelled
+    assert sink.batches == [[(task_id, STOP)]]

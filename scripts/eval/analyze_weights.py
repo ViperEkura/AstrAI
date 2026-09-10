@@ -267,7 +267,8 @@ def main():
             print(
                 f"  Iteration: {meta.get('iteration', '?')}, "
                 f"Strategy: {meta.get('strategy', '?')}, "
-                f"nprocs={meta.get('nprocs', '?')}"
+                f"dp_size={meta.get('dp_size', '?')}, "
+                f"cp_size={meta.get('cp_size', '?')}"
             )
         print(f"{'=' * 70}")
 

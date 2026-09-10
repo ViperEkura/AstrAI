@@ -16,7 +16,13 @@ from typing import Dict, List, Optional
 
 import torch
 
-from astrai.inference.cache.buffer import KVCache, KVStorage, ReqToTokenPool
+from astrai.inference.cache.buffer import (
+    DecodeKVCache,
+    KVCache,
+    KVStorage,
+    PrefillKVCache,
+    ReqToTokenPool,
+)
 from astrai.inference.cache.strategy import (
     AllocationStrategy,
     Allocator,
@@ -31,6 +37,8 @@ from astrai.inference.workspace import Q_TILE_ROWS, InferenceWorkspace
 # continues to work unchanged after the file split.
 __all__ = [
     "KVCache",
+    "PrefillKVCache",
+    "DecodeKVCache",
     "KVStorage",
     "ReqToTokenPool",
     "Allocator",
@@ -232,7 +240,20 @@ class PagePool:
             )
             q_tile_to_batch = workspace.q_tile_to_batch[:n_tiles]
             q_tile_to_index = workspace.q_tile_to_index[:n_tiles]
-            decode_o_part = decode_ml_part = decode_out = None
+
+            return PrefillKVCache(
+                k_buffer=self._storage.k_buffer,
+                v_buffer=self._storage.v_buffer,
+                req_to_token=self._req_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens_t,
+                max_len=max(seq_lens),
+                kv_indptr=kv_indptr,
+                out_cache_loc=out_cache_loc,
+                qo_indptr=qo_indptr,
+                q_tile_to_batch=q_tile_to_batch,
+                q_tile_to_index=q_tile_to_index,
+            )
         else:
             # ---- decode: out_cache_loc is a single column (last position) ----
             write_pos = seq_lens_t - 1
@@ -241,27 +262,24 @@ class PagePool:
             out_cache_loc = ocl_buf[:b].reshape(-1)
             workspace.qo_indptr[: b + 1].copy_(inc_buf[: b + 1])
             qo_indptr = workspace.qo_indptr[: b + 1]
-            q_tile_to_batch = q_tile_to_index = None
             decode_o_part = getattr(workspace, "decode_o_part", None)
             decode_ml_part = getattr(workspace, "decode_ml_part", None)
             decode_out = getattr(workspace, "decode_out", None)
 
-        return KVCache(
-            k_buffer=self._storage.k_buffer,
-            v_buffer=self._storage.v_buffer,
-            req_to_token=self._req_pool.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens_t,
-            out_cache_loc=out_cache_loc,
-            max_len=max(seq_lens),
-            kv_indptr=kv_indptr,
-            qo_indptr=qo_indptr,
-            q_tile_to_batch=q_tile_to_batch,
-            q_tile_to_index=q_tile_to_index,
-            decode_o_part=decode_o_part,
-            decode_ml_part=decode_ml_part,
-            decode_out=decode_out,
-        )
+            return DecodeKVCache(
+                k_buffer=self._storage.k_buffer,
+                v_buffer=self._storage.v_buffer,
+                req_to_token=self._req_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens_t,
+                max_len=max(seq_lens),
+                kv_indptr=kv_indptr,
+                out_cache_loc=out_cache_loc,
+                qo_indptr=qo_indptr,
+                decode_o_part=decode_o_part,
+                decode_ml_part=decode_ml_part,
+                decode_out=decode_out,
+            )
 
 
 class TaskCacheManager:
@@ -385,6 +403,7 @@ class TaskCacheManager:
 
     @property
     def bind_was_steady(self) -> bool:
+        """True if the last bind was a steady-state increment (same tasks, +1 seq_lens)."""
         return self._bind_was_steady
 
     # -- internals --

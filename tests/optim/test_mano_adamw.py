@@ -34,18 +34,32 @@ def test_mano_one_step_projects_to_tangent_space():
 
 
 def test_mano_alternates_projection_axis():
-    param = torch.nn.Parameter(torch.eye(4) * 3.0)
-    param.grad = torch.ones(4, 4)
+    """Step 0 projects along dim 0, step 1 along dim 1 (steps % 2)."""
+    original = torch.tensor([[3.0, 4.0], [0.0, 2.0]])
+    param = torch.nn.Parameter(original.clone())
+    eps = 1e-8
+    optimizer = Mano(
+        [param], lr=0.1, momentum=0.0, nesterov=False, eps=eps, weight_decay=0.0
+    )
 
-    optimizer = Mano([param], lr=0.1, momentum=0.0, nesterov=False)
+    param.grad = torch.ones(2, 2)
     optimizer.step()
-    dim_step0 = 0
+    after_step0 = param.detach().clone()
 
-    param.grad = torch.ones(4, 4)
+    param.grad = torch.ones(2, 2)
     optimizer.step()
-    dim_step1 = 1
 
-    assert dim_step0 != dim_step1
+    grad = torch.ones(2, 2)
+
+    def projected(after, dim):
+        tangent = grad - (torch.sum(grad * after, dim=dim, keepdim=True) * after)
+        direction = tangent / (torch.norm(tangent, p=2, dim=dim, keepdim=True) + eps)
+        adjusted_lr = 0.1 * 0.2 * math.sqrt(direction.shape[dim])
+        return after - adjusted_lr * direction
+
+    torch.testing.assert_close(param.detach(), projected(after_step0, dim=1))
+    # The dim=1 result is distinct, so the assertion above pins the axis.
+    assert not torch.allclose(param.detach(), projected(after_step0, dim=0))
 
 
 def test_mano_rejects_non_2d_parameters():

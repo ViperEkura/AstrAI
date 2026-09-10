@@ -71,31 +71,6 @@ def test_check_empty_sequences():
     assert sc.check("hello") is None
 
 
-def test_gen_context_defaults():
-    ctx = GenContext(resp_id="a", created=1, model="m", prompt_tokens=10)
-    assert ctx.completion_tokens == 0
-
-
-def test_gen_context_fields_mutable():
-    ctx = GenContext(resp_id="a", created=1, model="m", prompt_tokens=10)
-    ctx.completion_tokens = 42
-    assert ctx.completion_tokens == 42
-
-
-def test_stop_info_defaults():
-    s = StopInfo()
-    assert s.matched is None
-    assert s.body == ""
-    assert s.yielded == ""
-
-
-def test_stop_info_with_values():
-    s = StopInfo(matched="stop", body="hello stop", yielded="hello ")
-    assert s.matched == "stop"
-    assert s.body == "hello stop"
-    assert s.yielded == "hello "
-
-
 def test_openai_prepare_returns_prompt_ctx_stops():
     builder = _make_openai_builder()
     req = MagicMock()

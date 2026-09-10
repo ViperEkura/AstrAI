@@ -11,9 +11,7 @@ from astrai.extension.backend.attention import (
     attn_backend,
     get_backend,
 )
-from astrai.extension.backend.linear import linear
 from astrai.extension.backend.rotary import apply_rotary_emb
-from astrai.extension.backend.swiglu import swiglu
 
 __all__ = [
     "ATTN_BACKEND",
@@ -26,6 +24,4 @@ __all__ = [
     "attention",
     "attn_backend",
     "get_backend",
-    "linear",
-    "swiglu",
 ]

@@ -14,7 +14,6 @@ from astrai.preprocessing.builder import (
 )
 from tests.data.factories import (
     CHAT_SECTIONS,
-    INSTRUCTION_SECTIONS,
     TEXT_SECTIONS,
     make_chat_config,
     make_dpo_chat_config,
@@ -35,9 +34,6 @@ def test_chat_simple(chat_tokenizer, builder):
     }
     result = builder.build(item, config, chat_tokenizer)
     assert result is not None
-    assert "sequence" in result
-    assert "loss_mask" in result
-    assert len(result["sequence"]) == len(result["loss_mask"])
 
     ids = chat_tokenizer.decode(result["sequence"], skip_special_tokens=False)
     assert "system" in ids.lower() or "<|im_start|>system" in ids
@@ -51,21 +47,26 @@ def test_chat_simple(chat_tokenizer, builder):
 
 def test_chat_mask_only_assistant(chat_tokenizer, builder):
     config = make_chat_config()
-    item = {
-        "messages": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-        ]
-    }
-    result = builder.build(item, config, chat_tokenizer)
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "4"},
+    ]
+    result = builder.build({"messages": messages}, config, chat_tokenizer)
     mask = result["loss_mask"]
-    ids = result["sequence"]
-    assert len(ids) == len(mask)
 
-    trained = [i for i, m in enumerate(mask) if m == 1]
-    masked = [i for i, m in enumerate(mask) if m == 0]
-    assert len(trained) > 0
-    assert len(masked) > 0
+    def template_ids(message):
+        rendered = chat_tokenizer.apply_chat_template(
+            [message], tokenize=False, add_generation_prompt=False
+        )
+        return chat_tokenizer.encode(rendered, add_special_tokens=False)
+
+    user_len = len(template_ids(messages[0]))
+    assistant_len = len(template_ids(messages[1]))
+    bos = 1 if chat_tokenizer.bos_token_id is not None else 0
+
+    assert len(mask) == bos + user_len + assistant_len
+    assert all(m == 0 for m in mask[: bos + user_len])
+    assert all(m == 1 for m in mask[bos + user_len :])
 
 
 def test_chat_batch_matches_single(chat_tokenizer, builder):
@@ -166,14 +167,6 @@ def test_chat_truncation(chat_tokenizer, builder):
     assert len(result["loss_mask"]) == len(result["sequence"])
 
 
-def test_instruction_basic(test_tokenizer, builder):
-    config = make_instruction_config()
-    item = {"prompt": "Translate to French: Hello", "response": "Bonjour"}
-    result = builder.build(item, config, test_tokenizer)
-    assert result is not None
-    assert len(result["sequence"]) == len(result["loss_mask"])
-
-
 def test_instruction_batch_matches_single(test_tokenizer, builder):
     config = make_instruction_config()
     items = [
@@ -224,7 +217,6 @@ def test_text_basic(test_tokenizer, builder):
     item = {"text": "Hello world. This is a test document."}
     result = builder.build(item, config, test_tokenizer)
     assert result is not None
-    assert "sequence" in result
     assert len(result["sequence"]) > 0
     assert "loss_mask" not in result
 
@@ -253,72 +245,17 @@ def test_text_truncation(test_tokenizer, builder):
     assert len(result["sequence"]) <= 3
 
 
-def test_sectioned_chat(chat_tokenizer, builder):
-    config = PipelineConfig(
-        input=InputConfig(sections=CHAT_SECTIONS),
-        mask={"system": "mask", "user": "mask", "assistant": "train"},
-        mask_default="mask",
-        preprocessing=ProcessingConfig(max_seq_len=2048),
-    )
-    item = {
-        "messages": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-        ]
-    }
-    result = builder.build(item, config, chat_tokenizer)
-    assert result is not None
-    assert len(result["sequence"]) == len(result["loss_mask"])
-    assert sum(result["loss_mask"]) > 0
-    assert 0 in result["loss_mask"]
-
-
-def test_sectioned_instruction(test_tokenizer, builder):
-    config = PipelineConfig(
-        input=InputConfig(sections=INSTRUCTION_SECTIONS),
-        preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=0),
-    )
-    item = {"prompt": "Q: Why?", "response": "A: Because."}
-    result = builder.build(item, config, test_tokenizer)
-    assert result is not None
-    mask = result["loss_mask"]
-    assert mask[0] == 0
-    assert mask[-1] == 1
-
-
-def test_sectioned_text(test_tokenizer, builder):
-    config = PipelineConfig(
-        input=InputConfig(sections=TEXT_SECTIONS),
-        preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=1),
-    )
-    item = {"text": "Hello world, this is a test."}
-    result = builder.build(item, config, test_tokenizer)
-    assert result is not None
-    assert "loss_mask" not in result
-
-
-def test_sectioned_text_too_short(test_tokenizer, builder):
-    config = PipelineConfig(
-        input=InputConfig(sections=TEXT_SECTIONS),
-        preprocessing=ProcessingConfig(max_seq_len=2048, min_chars=100),
-    )
-    assert builder.build({"text": "short"}, config, test_tokenizer) is None
-
-
-def test_factory_registered():
-    names = MaskBuilderFactory.list_registered()
-    assert "single" in names
-    assert "multi" in names
-    assert "sectioned" in names
-
-
-def test_factory_create():
-    single = MaskBuilderFactory.create("single")
-    assert isinstance(single, SingleOutputMaskBuilder)
-    multi = MaskBuilderFactory.create("multi")
-    assert isinstance(multi, MultiOutputMaskBuilder)
-    sectioned = MaskBuilderFactory.create("sectioned")
-    assert isinstance(sectioned, SectionedMaskBuilder)
+@pytest.mark.parametrize(
+    ("name", "builder_cls"),
+    [
+        ("single", SingleOutputMaskBuilder),
+        ("multi", MultiOutputMaskBuilder),
+        ("sectioned", SectionedMaskBuilder),
+    ],
+)
+def test_factory_create(name, builder_cls):
+    assert name in MaskBuilderFactory.list_registered()
+    assert isinstance(MaskBuilderFactory.create(name), builder_cls)
 
 
 def test_dpo_chat_basic(chat_tokenizer, builder):

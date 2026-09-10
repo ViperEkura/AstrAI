@@ -22,13 +22,26 @@ validate_job_name() {
         die "Invalid TRAIN_JOB_NAME '$1'; use letters, numbers, dot, underscore, or dash"
 }
 
+checkpoint_extra_files() {
+    # Additional files a complete checkpoint must contain for the strategy
+    # configured in the given training YAML. PPO persists critic state as
+    # checkpoint extras (value_model.pt / value_optimizer.pt); a resume
+    # without them must not look complete.
+    local config="$1"
+
+    [[ -n "${config}" && -f "${config}" ]] || return 0
+    if grep -Eq '^[[:space:]]*train_type:[[:space:]]*["'\'']?online_ppo' "${config}"; then
+        printf 'value_model.pt value_optimizer.pt'
+    fi
+}
+
 checkpoint_is_complete() {
     local checkpoint="$1"
     local file
 
     [[ -d "${checkpoint}" ]] || return 1
 
-    for file in meta.json config.json model.safetensors optimizer.pt scheduler.pt; do
+    for file in meta.json config.json model.safetensors optimizer.pt scheduler.pt ${CHECKPOINT_EXTRA_FILES:-}; do
         [[ -s "${checkpoint}/${file}" ]] || return 1
     done
 

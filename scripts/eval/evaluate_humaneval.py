@@ -18,13 +18,10 @@ from math import prod
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 import tqdm
 from datasets import load_dataset
 
-from astrai.inference import InferenceEngine
-from astrai.model import AutoModel
-from astrai.tokenize import AutoTokenizer
+from astrai.inference import InferenceEngine, build_engine
 
 # ---------------------------------------------------------------------------
 # Config
@@ -89,20 +86,6 @@ def load_jsonl(path: str) -> List[dict]:
 def save_json(path: str, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def create_engine(
-    param_path: str, batch_size: int, max_seq_len: int
-) -> InferenceEngine:
-    model = AutoModel.from_pretrained(param_path)
-    tokenizer = AutoTokenizer.from_pretrained(param_path)
-    model.to(device="cuda", dtype=torch.bfloat16)
-    return InferenceEngine(
-        model=model,
-        tokenizer=tokenizer,
-        max_batch_size=batch_size,
-        max_seq_len=max_seq_len,
-    )
 
 
 def trim_stop(text: str) -> str:
@@ -322,7 +305,11 @@ def run_pipeline(cfg: EvalConfig) -> Dict:
         if cfg.problem_indices:
             problems = [problems[i] for i in cfg.problem_indices if i < len(problems)]
 
-        engine = create_engine(cfg.param_path, cfg.batch_size, cfg.max_seq_len)
+        engine = build_engine(
+            cfg.param_path,
+            max_batch_size=cfg.batch_size,
+            max_seq_len=cfg.max_seq_len,
+        )
 
         try:
             generated = generate_all(engine, problems, cfg)

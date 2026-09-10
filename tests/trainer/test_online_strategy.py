@@ -45,12 +45,19 @@ class _RecordingRunner:
         self._fresh = True
         self.policy_version = result.policy_version
         self.weight_updates = []
+        self.eval_calls = 0
 
     def __call__(self, batch):
         self.calls += 1
         fresh = self._fresh
         self._fresh = False
         return self.result, fresh
+
+    def evaluate(self, batch):
+        # Mirrors RolloutRunner.evaluate: one-off scoring that never
+        # touches the replay cache or freshness state.
+        self.eval_calls += 1
+        return self.result
 
     def step(self):
         self.step_calls += 1
@@ -62,6 +69,9 @@ class _RecordingRunner:
 
     def apply_weight_update(self, policy_version, update):
         result = update()
+        if policy_version is None:
+            # Mirror the scheduler: None derives live+1 under the lock.
+            policy_version = self.policy_version + 1
         self.update_weights(policy_version)
         return result
 
@@ -355,6 +365,26 @@ def test_loss_is_differentiable_dpo(device):
         p.grad is not None and p.grad.abs().sum() > 0 for p in strat.model.parameters()
     )
     assert has_grad
+
+
+def test_validate_online_returns_none_without_runner(device):
+    strat = _make_grpo(device)
+    batch = {"input_ids": torch.randint(3, 200, (2, 4), device=device)}
+    assert strat.validate_online(batch) is None
+
+
+def test_validate_online_uses_one_off_rollout_not_replay_cache(device):
+    strat = _make_grpo(device)
+    runner = _RecordingRunner(_make_rollout_result(device=device))
+    strat.set_rollout_runner(runner)
+
+    out = strat.validate_online(
+        {"input_ids": torch.randint(3, 200, (2, 4), device=device)}
+    )
+
+    assert torch.isfinite(out["loss"]).item()
+    assert runner.eval_calls == 1
+    assert runner.calls == 0  # replay cache path untouched
 
 
 def test_ref_model_not_updated_by_backward_dpo(device):

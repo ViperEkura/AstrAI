@@ -114,6 +114,55 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
         )
 
 
+def test_forward_logits_positions_projects_only_requested_rows():
+    """logits_positions gathers packed rows before the lm_head projection."""
+    from astrai.inference.cache import PagePool, TaskCacheManager
+    from astrai.inference.workspace import InferenceWorkspace
+
+    config = AutoRegressiveLMConfig(**TINY_CONFIG)
+    model = AutoRegressiveLM(config).eval()
+    prompts = [[1, 2, 3], [4, 5]]
+    last_rows = torch.tensor([len(prompts[0]) - 1, len(prompts) - 1 + len(prompts[1])])
+
+    pool = PagePool(
+        n_layers=config.num_hidden_layers,
+        n_kv_heads=config.num_key_value_heads,
+        head_dim=config.hidden_size // config.num_attention_heads,
+        max_batch_size=2,
+        max_seq_len=config.max_position_embeddings,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    cache = TaskCacheManager(pool)
+    workspace = InferenceWorkspace(
+        2,
+        config.max_position_embeddings,
+        config.num_attention_heads,
+        config.hidden_size // config.num_attention_heads,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    for tid, ids in zip(("t1", "t2"), prompts):
+        assert cache.task_alloc(tid, ids)
+    input_ids = torch.tensor(sum(prompts, []), dtype=torch.long)
+    position_ids = torch.cat([torch.arange(len(p)) for p in prompts])
+    with torch.inference_mode():
+        kwargs = dict(
+            position_ids=position_ids,
+            kv_cache=cache.bind(["t1", "t2"], workspace, start_pos=0),
+            fwd="prefill",
+        )
+        full = model(input_ids, **kwargs)
+        sliced = model(input_ids, logits_positions=last_rows, **kwargs)
+
+    assert full["logits"].shape == (5, config.vocab_size)
+    assert sliced["logits"].shape == (2, config.vocab_size)
+    # Projecting M=2 rows vs M=5 rows may pick different GEMM kernels and
+    # differ in the last float32 bits — assert_close, not bit equality.
+    torch.testing.assert_close(sliced["logits"], full["logits"][last_rows])
+    assert torch.equal(sliced["hidden_states"], full["hidden_states"][last_rows])
+
+
 def _router_stats(probs, topk_indices):
     return {"probs": probs, "topk_indices": topk_indices}
 

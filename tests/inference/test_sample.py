@@ -3,6 +3,7 @@
 import torch
 
 from astrai.inference.runtime.sample import (
+    BaseSamplingStrategy,
     FrequencyPenaltyStrategy,
     SamplingPipeline,
     TemperatureStrategy,
@@ -61,8 +62,9 @@ def test_top_p_nucleus_filtering():
     logits = torch.tensor([[10.0, 1.0, 1.0, 1.0, 1.0]])
     s = TopPStrategy(top_p=0.5)
     result = s.apply(logits.clone(), filter_value=-1e9)
+    # The dominant logit alone exceeds the nucleus mass; the rest are filtered.
     kept = (result > -1e9).sum().item()
-    assert kept >= 1
+    assert kept == 1
 
 
 def test_top_p_skip_when_one():
@@ -295,3 +297,45 @@ def test_greedy_respects_frequency_penalty():
     )
     # Token 0 saw four occurrences: 5 - 2*4 < 4, so the argmax flips.
     assert penalized.tolist() == [1]
+
+
+class _ArgmaxMovingStrategy(BaseSamplingStrategy):
+    """Custom strategy that can move the argmax — must disable greedy."""
+
+    def apply(
+        self, logits, filter_value=-float("inf"), input_ids=None, input_mask=None
+    ):
+        return torch.roll(logits, shifts=1, dims=-1)
+
+
+def test_greedy_detection_is_polymorphic():
+    """Greedy detection asks strategies polymorphically, no isinstance."""
+    base = [TemperatureStrategy(0.0), TopKStrategy(50), TopPStrategy(0.9)]
+    assert SamplingPipeline(list(base)).is_greedy is True
+    assert SamplingPipeline(base + [FrequencyPenaltyStrategy(0.5)]).is_greedy is False
+
+    # A custom argmax-moving strategy disables greedy even though the
+    # pipeline contains a greedy temperature — this is what isinstance
+    # bookkeeping in the old implementation could not see.
+    assert SamplingPipeline(base + [_ArgmaxMovingStrategy()]).is_greedy is False
+
+
+def test_greedy_detection_position_independent():
+    """Greedy temperature anywhere in the pipeline is detected."""
+    pipeline = SamplingPipeline([TopKStrategy(50), TemperatureStrategy(0.0)])
+    assert pipeline.is_greedy is True
+
+
+def test_greedy_detection_composes_across_nested_pipelines():
+    """A nested pipeline participates through the same interface."""
+    inner = SamplingPipeline([TemperatureStrategy(0.0), TopKStrategy(20)])
+    assert inner.is_greedy is True
+    assert SamplingPipeline([TopPStrategy(0.9), inner]).is_greedy is True
+    assert SamplingPipeline([inner, FrequencyPenaltyStrategy(0.5)]).is_greedy is False
+
+
+def test_nongreedy_temperature_is_not_greedy():
+    pipeline = SamplingPipeline(
+        [TemperatureStrategy(0.7), TopKStrategy(0), TopPStrategy(1.0)]
+    )
+    assert pipeline.is_greedy is False

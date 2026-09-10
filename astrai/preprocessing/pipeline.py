@@ -146,11 +146,17 @@ class Pipeline:
 
     @staticmethod
     def _align_bucket(bucket: dict, result: dict, ids: list):
-        """Pad previously-accumulated keys that are missing from *result*."""
+        """Pad previously-accumulated keys that are missing from *result*.
+
+        Builders omit all-ones masks (``loss_mask`` / ``*_mask``) to save
+        space, so an omitted mask means "train on every token" and is
+        back-filled with ones; every other missing key pads with zeros.
+        """
         for key in list(bucket.keys()):
             if key in result:
                 continue
-            bucket[key].append([0] * len(ids))
+            fill = 1 if key == "loss_mask" or key.endswith("_mask") else 0
+            bucket[key].append([fill] * len(ids))
 
     def _iter_items(self):
         for path in self.paths:

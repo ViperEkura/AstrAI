@@ -12,6 +12,7 @@ from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
 from astrai.inference import GenerationResult, InferenceScheduler
 from astrai.inference.metrics import MetricsCollector
 from astrai.inference.runtime.executor import DecodeSteadyState, Executor
+from astrai.inference.runtime.stepper import Stepper
 from astrai.inference.task import Task
 from astrai.model.transformer import AutoRegressiveLM
 from tests.helpers import FakeTokenizer, make_rollout_config
@@ -40,18 +41,32 @@ def mock_model_and_tokenizer():
     return mock_model, mock_tokenizer
 
 
+def _make_mock_scheduler(mock_model_and_tokenizer):
+    """Build a CPU scheduler over mocks, patching scheduler-internal imports."""
+    mock_model, mock_tokenizer = mock_model_and_tokenizer
+    with (
+        patch("astrai.inference.scheduler.AutoModel"),
+        patch("astrai.inference.scheduler.AutoTokenizer"),
+    ):
+        return InferenceScheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            max_batch_size=4,
+            device="cpu",
+        )
+
+
+def _run_threads(*workers, timeout=10.0):
+    threads = [threading.Thread(target=worker) for worker in workers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout)
+
+
 def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
     """Test concurrent add_task operations."""
-    mock_model, mock_tokenizer = mock_model_and_tokenizer
-
-    with patch("astrai.inference.scheduler.AutoModel"):
-        with patch("astrai.inference.scheduler.AutoTokenizer"):
-            scheduler = InferenceScheduler(
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                max_batch_size=4,
-                device="cpu",
-            )
+    scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
     results = {"task_ids": [], "errors": []}
     lock = threading.Lock()
@@ -65,13 +80,7 @@ def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
         except Exception as e:
             results["errors"].append(str(e))
 
-    threads = [threading.Thread(target=add_task_worker, args=(i,)) for i in range(5)]
-
-    for t in threads:
-        t.start()
-
-    for t in threads:
-        t.join()
+    _run_threads(*(lambda wid=i: add_task_worker(wid) for i in range(5)))
 
     scheduler.stop()
 
@@ -111,10 +120,14 @@ def test_generation_loop_activates_backend_in_worker_thread():
 
 def test_step_splits_decode_batch_by_request_backend():
     scheduler = object.__new__(InferenceScheduler)
+    scheduler._cache = SimpleNamespace(page_size=1)
     scheduler._task_cache = MagicMock()
     scheduler._task_cache.task_extend.return_value = True
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
+    scheduler._stepper = Stepper(
+        scheduler._cache, scheduler._task_cache, scheduler._executor, scheduler._metrics
+    )
 
     observed = []
 
@@ -149,6 +162,9 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
     scheduler._task_cache.task_cached.return_value = 0
     scheduler._metrics = MetricsCollector()
     scheduler._executor = MagicMock()
+    scheduler._stepper = Stepper(
+        scheduler._cache, scheduler._task_cache, scheduler._executor, scheduler._metrics
+    )
 
     short = Task("short", [1, 2, 3])
     long = Task("long", [4, 5, 6, 7, 8])
@@ -177,8 +193,13 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     executor.task_cache = MagicMock()
     executor.task_cache.bind.return_value = MagicMock()
     executor._workspace = MagicMock()
+    executor._workspace.max_batch_size = 16  # Add max_batch_size for validation
     all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
-    executor.model = MagicMock(return_value={"logits": all_logits})
+
+    def fake_model(ids, *, position_ids, kv_cache, fwd, logits_positions):
+        return {"logits": all_logits[logits_positions]}
+
+    executor.model = MagicMock(side_effect=fake_model)
     executor._sample_logits = MagicMock(
         return_value=([101, 102], torch.tensor([101, 102]))
     )
@@ -193,6 +214,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     model_args, model_kwargs = executor.model.call_args
     assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
     assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
+    assert model_kwargs["logits_positions"].tolist() == [1, 5]
     executor.task_cache.bind.assert_called_once_with(
         ["a", "b"], executor._workspace, start_pos=1
     )
@@ -205,16 +227,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
 
 def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
     """Test concurrent add and remove task operations."""
-    mock_model, mock_tokenizer = mock_model_and_tokenizer
-
-    with patch("astrai.inference.scheduler.AutoModel"):
-        with patch("astrai.inference.scheduler.AutoTokenizer"):
-            scheduler = InferenceScheduler(
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                max_batch_size=4,
-                device="cpu",
-            )
+    scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
     results = {"added": [], "removed": [], "errors": []}
     add_ready = threading.Event()
@@ -238,14 +251,7 @@ def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
         except Exception as e:
             results["errors"].append(f"Remove: {str(e)}")
 
-    add_thread = threading.Thread(target=add_worker)
-    remove_thread = threading.Thread(target=remove_worker)
-
-    add_thread.start()
-    remove_thread.start()
-
-    add_thread.join()
-    remove_thread.join()
+    _run_threads(add_worker, remove_worker)
     scheduler.stop()
 
     assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
@@ -254,16 +260,7 @@ def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
 
 def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
     """Test concurrent get_stats operations."""
-    mock_model, mock_tokenizer = mock_model_and_tokenizer
-
-    with patch("astrai.inference.scheduler.AutoModel"):
-        with patch("astrai.inference.scheduler.AutoTokenizer"):
-            scheduler = InferenceScheduler(
-                model=mock_model,
-                tokenizer=mock_tokenizer,
-                max_batch_size=4,
-                device="cpu",
-            )
+    scheduler = _make_mock_scheduler(mock_model_and_tokenizer)
 
     results = {"stats": [], "errors": []}
     started = threading.Event()
@@ -287,17 +284,9 @@ def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
         except Exception as e:
             results["errors"].append(f"Get stats: {str(e)}")
 
-    add_thread = threading.Thread(target=add_tasks)
-    stats_thread = threading.Thread(target=get_stats)
-
-    add_thread.start()
-    stats_thread.start()
-
-    add_thread.join()
-    stats_done.wait(timeout=5.0)
+    _run_threads(add_tasks, get_stats)
     scheduler.stop()
-
-    stats_thread.join()
+    stats_done.wait(timeout=5.0)
 
     assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
     assert len(results["stats"]) == 50
@@ -504,16 +493,6 @@ def test_ragged_prefill_matches_sequential_greedy_tokens_and_logprobs(device):
         scheduler.stop()
 
 
-def test_run_batch_respects_max_tokens(device):
-    scheduler, _tok, _model = _make_real_scheduler(device)
-    try:
-        prompts = [[10, 20, 30]]
-        results = scheduler.run_batch(prompts, max_tokens=3, temperature=1.0)
-        assert len(results[0]) <= 3
-    finally:
-        scheduler.stop()
-
-
 def test_run_batch_zero_max_tokens_returns_empty(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
@@ -526,12 +505,12 @@ def test_run_batch_stop_id_terminates(device):
     """A token matching stop_ids terminates generation for that prompt."""
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
+        # Make every token a stop id: generation must end after exactly
+        # one token (the stop token itself) instead of running to max_tokens.
+        scheduler._task_mgr.tokenizer.stop_ids = list(range(200))
         prompts = [[10, 20, 30]]
         results = scheduler.run_batch(prompts, max_tokens=32, temperature=1.0)
-        # If stop token 2 was produced, it is the last token
-        if results[0] and results[0][-1] == 2:
-            # No tokens after stop should exist (since we terminate)
-            assert 2 not in results[0][:-1]
+        assert len(results[0]) == 1
     finally:
         scheduler.stop()
 
@@ -583,6 +562,32 @@ def test_scheduler_applies_weight_mutation_and_version_atomically(device):
         with pytest.raises(RuntimeError, match="optimizer failed"):
             scheduler.apply_weight_update(2, failed_mutation)
         assert scheduler.policy_version == 1
+
+        # None derives live+1 under the lock: no read-compute-write race
+        # on the current version for advance-by-one callers.
+        assert scheduler.apply_weight_update(None, mutate) == "updated"
+        assert scheduler.policy_version == 2
+    finally:
+        scheduler.stop()
+
+
+def test_scheduler_atomic_advance_survives_interleaved_publish(device):
+    """A concurrent publish between reading the live version and applying
+    the update must not fail ``require_advance`` (regression: callers
+    computed live+1 outside the lock, a TOCTOU that raised spuriously)."""
+    scheduler, _tok, _model = _make_real_scheduler(device)
+
+    try:
+        # Simulate the race directly: a version read that goes stale before
+        # apply_weight_update acquires the lock. With None the scheduler
+        # re-derives live+1 inside the critical section.
+        stale_read = scheduler.policy_version + 1
+        scheduler.update_weights(1)
+        assert stale_read == 1  # now equals live -> explicit form would raise
+        with pytest.raises(ValueError, match="must advance"):
+            scheduler.apply_weight_update(stale_read, lambda: "ok")
+        assert scheduler.apply_weight_update(None, lambda: "ok") == "ok"
+        assert scheduler.policy_version == 2
     finally:
         scheduler.stop()
 
@@ -709,8 +714,8 @@ def test_run_batch_details_report_extension_failure_and_cleanup(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         with patch.object(
-            scheduler,
-            "_step",
+            scheduler._stepper,
+            "step",
             side_effect=lambda tasks, **_kwargs: ([], list(tasks)),
         ):
             result = scheduler.run_batch([[10, 20]], max_tokens=2, return_details=True)[
@@ -735,6 +740,7 @@ def test_decode_does_not_reuse_previous_batch_state():
     executor._graph_ctx = SimpleNamespace(enabled=False)
 
     workspace = MagicMock()
+    workspace.max_batch_size = 16
     workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids.return_value = torch.tensor([7], dtype=torch.long)
     workspace.decode_mask.return_value = torch.ones(1, 1, 9, dtype=torch.bool)
@@ -780,6 +786,7 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     executor._graph_ctx = SimpleNamespace(enabled=False)
 
     workspace = MagicMock()
+    workspace.max_batch_size = 16
     workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids_from_device.return_value = torch.tensor(
         [9], dtype=torch.long

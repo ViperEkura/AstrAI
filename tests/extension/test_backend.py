@@ -154,14 +154,18 @@ class _DummyBackend(AttentionBackend):
     def supports_call(self, q, kv_cache, attn_mask, is_causal, fwd) -> bool:
         return True
 
-    def fwd_decode(
-        self, q, k, v, kv_cache=None, layer_id=0, attn_mask=None, is_causal=False
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        kv_cache=None,
+        layer_id=0,
+        attn_mask=None,
+        is_causal=False,
+        fwd=None,
     ):
-        return q
-
-    def fwd_prefill(
-        self, q, k, v, kv_cache=None, layer_id=0, attn_mask=None, is_causal=False
-    ):
+        self._check_fwd(fwd)
         return q
 
 

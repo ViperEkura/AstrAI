@@ -113,7 +113,7 @@ on_train_begin
         stand_loss = loss_output["loss"] / executor.grad_accum_steps
         executor.backward(stand_loss)
         context.consumed_samples += (
-            context.config.batch_per_device * context.world_size
+            context.config.batch_per_device * context.dp_size
         )
         on_batch_end
 
@@ -131,6 +131,14 @@ on_train_end
 The loss is divided by `grad_accum_steps` before `backward()`, so accumulated gradients sum to the correct mean.
 Strategy metrics are detached and converted to Python `float` values before the
 `LossOutput` is returned; only `LossOutput.loss` remains a differentiable tensor.
+
+With `cp_size > 1`, `TrainContextBuilder` wraps the strategy in `CPStrategy`
+(`astrai/parallel/cp.py`): the same `strategy(batch)` call shards the batch
+across the cp group, runs the strategy's forward/reduction on the local slice,
+and rescales the local token loss to the global mean. Metric and validation
+reductions go through `ParallelTopology.reduce_mean`/`reduce_sum` over the dp
+group — cp peers hold values derived from the same batch, so summing them
+would double-count.
 
 ## Callback Lifecycle
 
@@ -179,8 +187,10 @@ Three-layer separation (SGLang-inspired):
 
 The extension package separates mechanism from policy:
 
-- `astrai/extension/ops/` contains stateless wrappers that invoke one exact compiled kernel and fail when it is unavailable.
-- `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O.
+- `astrai/extension/loader.py` discovers and lazily loads the compiled kernel modules (`.so` name = module name = pybind name).
+- `astrai/extension/ops/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
+- `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O (`dispatch.py` is the family-agnostic selection core it registers into).
+- `astrai/extension/quantize.py` holds every quantization scheme (int8 strategies, fp8 recipes and autocast); its `aten::linear` override installs lazily on the first fp8 activation, so plain imports stay dispatcher-neutral.
 - Model and inference code use the stable `astrai.extension` API instead of selecting ops directly.
 
 Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/backend/attention.py`):
@@ -247,20 +257,20 @@ Three cooperating layers enable gradient accumulation:
 
 3. **`AccumOptimizer` / `AccumScheduler`** — wrap the real optimizer/scheduler. `step()` and `zero_grad()` are gated on `sync_gradients` — they only forward to the inner optimizer when the sync flag is True.
 
-The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum to the correct mean across micro-steps. `consumed_samples` increments by `batch_per_device * world_size` every micro-batch.
+The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum to the correct mean across micro-steps. `consumed_samples` increments by `batch_per_device * dp_size` every micro-batch (cp ranks share a batch, so they do not scale it).
 
 ### Effective batch size
 
-$$ \text{Effective batch} = \text{nprocs} \times \text{batch\_per\_device} \times \text{grad\_accum\_steps} $$
+$$ \text{Effective batch} = \text{dp\_size} \times \text{batch\_per\_device} \times \text{grad\_accum\_steps} $$
 
 ### Total optimizer steps
 
 ```
-samples_per_replica = ceil(dataset_len / nprocs)
+samples_per_replica = ceil(dataset_len / dp_size)
 batches_per_replica  = ceil(samples_per_replica / batch_per_device)
 total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
 ```
 
-This accounts for data-parallel sharding — each rank processes `1/nprocs` of the dataset.
+This accounts for data-parallel sharding — each dp replica processes `1/dp_size` of the dataset.
 
-> Document Update Time: 2026-08-16
+> Document Update Time: 2026-09-05

@@ -69,6 +69,10 @@ class BaseToolParser(ABC):
     def has_tool_calls(self) -> bool:
         """True if the parser detected at least one tool call in the stream."""
 
+    def finalize(self, body: str) -> List[Dict]:
+        """Flush parser state once generation ended. Default: nothing."""
+        return []
+
 
 class ToolParserFactory(BaseFactory["BaseToolParser"]):
     pass
@@ -108,6 +112,30 @@ def _scan_json(text: str, start: int = 0):
     return len(text), False
 
 
+def _raw_arguments_span(json_str: str) -> Optional[str]:
+    """Extract the raw text span of the ``arguments`` value, if possible.
+
+    Streaming diffs emit the *source* text of ``arguments``; using the
+    same span here keeps the completed arguments a prefix-extension of
+    what was already streamed (``json.dumps`` would re-quote and
+    re-space the value and corrupt the concatenated result).
+    """
+    m = re.search(r'"arguments"\s*:\s*', json_str)
+    if not m:
+        return None
+    rest = json_str[m.end() :]
+    if rest[:1] in ("{", "["):
+        end, ok = _scan_json(rest, 0)
+        if ok:
+            return rest[1 : end - 1]
+        return None
+    str_match = re.match(r'"(?:[^"\\]|\\.)*"', rest)
+    if str_match:
+        return str_match.group(0)
+    bare = re.match(r"[^,}\s][^,}]*", rest)
+    return bare.group(0).rstrip() if bare else None
+
+
 def _parse_tool_call_json(json_str: str, complete: bool):
     """Extract *name* and *arguments* from a tool-call JSON string.
 
@@ -122,14 +150,23 @@ def _parse_tool_call_json(json_str: str, complete: bool):
         if not isinstance(name, str) or not name:
             return None, "", False
         args = obj.get("arguments")
+        raw = _raw_arguments_span(json_str)
         if isinstance(args, dict):
             if not args:
                 args = ""
             else:
-                args = json.dumps(args, ensure_ascii=False)
-                args = args[1:-1].rstrip()
+                # Prefer the source span: it matches what streaming
+                # already emitted (prefix-consistent completion).
+                args = (
+                    raw
+                    if raw is not None
+                    else json.dumps(args, ensure_ascii=False)[1:-1].rstrip()
+                )
         elif isinstance(args, list):
-            args = json.dumps(args, ensure_ascii=False) if args else ""
+            if not args:
+                args = ""
+            else:
+                args = raw if raw is not None else json.dumps(args, ensure_ascii=False)
         elif isinstance(args, str):
             pass
         else:
@@ -306,10 +343,52 @@ class SimpleJsonToolParser(BaseToolParser):
         return deltas
 
     def _emit_plain_content(self, body: str, deltas: List[Dict]) -> List[Dict]:
-        new_content = body[self._emitted_content_len :]
-        if new_content:
+        safe_end = self._safe_content_end(body)
+        if safe_end > self._emitted_content_len:
+            deltas.append({"content": body[self._emitted_content_len : safe_end]})
+            self._emitted_content_len = safe_end
+        return deltas
+
+    _POSSIBLE_NAME_PREFIX_RE = re.compile(r'^\s*"?(?:n|na|nam|name)?"?\s*:?\s*$')
+
+    @classmethod
+    def _safe_content_end(cls, body: str) -> int:
+        """End of *body* that is safe to emit as plain content.
+
+        A trailing unclosed ``{`` whose remainder could still grow into
+        ``{"name": ...`` (the name-prefix itself, or any further ``{``
+        opened after it) is withheld, otherwise a partial ``{"na`` prefix
+        would leak into user-visible content and never be retracted.
+        Anything withheld is flushed by :meth:`finalize` when generation
+        ends without a tool call, so plain text is never lost.
+        """
+        pos = 0
+        while True:
+            brace = body.find("{", pos)
+            if brace == -1:
+                return len(body)
+            end, complete = _scan_json(body, brace)
+            if complete:
+                pos = end
+                continue
+            tail = body[brace + 1 :]
+            if cls._POSSIBLE_NAME_PREFIX_RE.match(tail) or "{" in tail:
+                return brace
+            return len(body)
+
+    def finalize(self, body: str) -> List[Dict]:
+        """Flush content withheld as a possible tool-call prefix.
+
+        Called once generation completed: if no tool call materialised,
+        emit the withheld remainder so streamed content matches the
+        non-streaming response.
+        """
+        if self._has_tool_calls:
+            return []
+        deltas: List[Dict] = []
+        if len(body) > self._emitted_content_len:
+            deltas.append({"content": body[self._emitted_content_len :]})
             self._emitted_content_len = len(body)
-            deltas.append({"content": new_content})
         return deltas
 
     # -------------------------------------------------------- complete

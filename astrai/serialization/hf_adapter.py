@@ -36,6 +36,7 @@ HF_MODEL_TYPES = frozenset(
         "mixtral",
         "qwen2",
         "qwen2_moe",
+        "qwen3",
         "gemma",
         "gemma2",
         "phi3",
@@ -58,11 +59,27 @@ _MOE_EXPERTS = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(weight|bias)$"
 )
 _MOE_SHARED = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.shared_expert(?:s)?\.(\d+)\."
+    r"^model\.layers\.(\d+)\.mlp\.shared_expert(?:s)?(?:\.(\d+))?\."
     r"(gate|up|down)_proj\.(weight|bias)$"
 )
 
 _ASTR_PREFIXES = ("embed_tokens.", "layers.", "norm.", "lm_head.")
+
+
+def _half_to_interleaved(head_dim: int) -> torch.Tensor:
+    """Row permutation converting HF half-split RoPE coordinates to
+    AstrAI interleaved coordinates.
+
+    HF rotate_half pairs channels ``(i, i + head_dim/2)``; AstrAI pairs
+    ``(2i, 2i + 1)``. Both use frequency ``i`` for the pair, so AstrAI
+    channel ``2i`` takes the HF value at channel ``i`` and AstrAI
+    ``2i + 1`` takes HF ``i + head_dim/2``.
+    """
+    half = head_dim // 2
+    perm = torch.empty(head_dim, dtype=torch.long)
+    perm[0::2] = torch.arange(half)
+    perm[1::2] = torch.arange(half, head_dim)
+    return perm
 
 
 def looks_like_hf_state_dict(state_dict: Mapping[str, Any]) -> bool:
@@ -168,8 +185,11 @@ def convert_hf_config(raw: Dict[str, Any]) -> Dict[str, Any]:
             cfg["n_activated_experts"] = raw["n_activated_experts"]
         if "n_shared_experts" in raw:
             cfg["n_shared_experts"] = raw["n_shared_experts"]
+        elif raw.get("shared_expert_intermediate_size"):
+            # Qwen2-MoE exposes a single un-indexed shared expert.
+            cfg["n_shared_experts"] = 1
         else:
-            # Mixtral has no shared experts; AstrAI defaults to one.
+            # Mixtral has no shared experts.
             cfg["n_shared_experts"] = 0
         if cfg.get("moe_intermediate_size") is None and "intermediate_size" in raw:
             # MoE configs store the per-expert FFN size in intermediate_size.
@@ -201,6 +221,14 @@ def convert_hf_weights(
             )
 
     ffn_type = getattr(config, "ffn_type", "mlp")
+    permute_rope = getattr(config, "attn_type", "gqa") != "mla"
+    head_dim = None
+    if permute_rope:
+        head_dim = config.hidden_size // config.num_attention_heads
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim={head_dim} is odd; rotary permutation requires even"
+            )
     converted: Dict[str, torch.Tensor] = {}
     skipped: list[str] = []
     for key, tensor in state_dict.items():
@@ -223,8 +251,9 @@ def convert_hf_weights(
                 else:
                     m = _MOE_SHARED.match(key)
                     if m:
+                        shared_idx = m.group(2) if m.group(2) is not None else "0"
                         new_key = (
-                            f"layers.{m.group(1)}.mlp.shared_experts.{m.group(2)}."
+                            f"layers.{m.group(1)}.mlp.shared_experts.{shared_idx}."
                             f"{m.group(3)}.{m.group(4)}"
                         )
             if new_key is None:
@@ -242,10 +271,31 @@ def convert_hf_weights(
                 new_key = (
                     f"layers.{m.group(1)}.attention.{m.group(2)}_proj.{m.group(3)}"
                 )
+                if permute_rope and m.group(2) in ("q", "k"):
+                    rows = tensor.shape[0]
+                    if rows % head_dim != 0:
+                        raise ValueError(
+                            f"{key}: {rows} output rows not divisible by "
+                            f"head_dim={head_dim}"
+                        )
+                    base = _half_to_interleaved(head_dim).to(tensor.device)
+                    blocks = (
+                        torch.arange(rows // head_dim, device=tensor.device) * head_dim
+                    )
+                    perm = (blocks[:, None] + base[None, :]).flatten()
+                    tensor = tensor.index_select(0, perm)
             elif (m := _Q_NORM.match(key)) is not None:
                 new_key = f"layers.{m.group(1)}.attention.q_norm.weight"
+                if permute_rope and tensor.shape[0] == head_dim:
+                    tensor = tensor.index_select(
+                        0, _half_to_interleaved(head_dim).to(tensor.device)
+                    )
             elif (m := _K_NORM.match(key)) is not None:
                 new_key = f"layers.{m.group(1)}.attention.k_norm.weight"
+                if permute_rope and tensor.shape[0] == head_dim:
+                    tensor = tensor.index_select(
+                        0, _half_to_interleaved(head_dim).to(tensor.device)
+                    )
             elif (m := _INPUT_NORM.match(key)) is not None:
                 new_key = f"layers.{m.group(1)}.input_norm.weight"
             elif (m := _POST_NORM.match(key)) is not None:

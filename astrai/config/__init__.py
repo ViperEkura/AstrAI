@@ -1,3 +1,11 @@
+from astrai.config.cli import (
+    GroupedCommand,
+    GroupedOption,
+    OptSpec,
+    apply_specs,
+    merge_yaml_into_kwargs,
+    opt,
+)
 from astrai.config.model_config import (
     AutoRegressiveLMConfig,
     BaseModelConfig,
@@ -22,4 +30,10 @@ __all__ = [
     "OutputConfig",
     "PipelineConfig",
     "ProcessingConfig",
+    "GroupedCommand",
+    "GroupedOption",
+    "OptSpec",
+    "apply_specs",
+    "merge_yaml_into_kwargs",
+    "opt",
 ]

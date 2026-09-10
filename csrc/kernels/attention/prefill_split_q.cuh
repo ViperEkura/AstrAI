@@ -4,6 +4,7 @@
 #include "common.h"
 #include "common/reduce.cuh"
 #include "layout_policies.cuh"
+#include "softmax.cuh"
 
 namespace astrai {
 namespace attention {
@@ -62,7 +63,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
             qreg[i] = __bfloat162float(p.q_ptr[q_off + i * p.q_d_stride]);
     }
 
-    float m = -FLT_MAX, l = 0.0f;
+    SoftmaxState sm;
     float acc[DPT];
 #pragma unroll
     for (int i = 0; i < DPT; i++)
@@ -83,15 +84,11 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
 
         // Load K/V into shared memory (addressing via KV policy; paged
         // guards empty slots with zero-fill).
-        for (int i = lid; i < tlen * HEAD_DIM; i += tt) {
-            int s = i / HEAD_DIM;
-            int d_dim = i % HEAD_DIM;
-            int kc = kv0 + s;
-            int token = KV::resolve_token(p, kctx, kc, true);
-            KVAddr a = KV::kv_addr_from_token(p, kctx, token, d_dim);
-            sK[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
-            sV[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
-        }
+        fill_kv_smem(sK, sV, tlen * HEAD_DIM, HEAD_DIM, kv0, lid, tt,
+                     [&](int kc, int d) {
+                         int token = KV::resolve_token(p, kctx, kc, true);
+                         return KV::kv_addr_from_token(p, kctx, token, d);
+                     });
         __syncthreads();
 
         int lim = tlen;
@@ -125,10 +122,8 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
                     dot = -FLT_MAX;
             }
 
-            float nm = fmaxf(m, dot);
-            float al = __expf(m - nm);
-            float be = __expf(dot - nm);
-            l = l * al + be;
+            float al, be;
+            softmax_step(sm, dot, 1.0f, al, be);
 
             const bf16* vr = sV + s * HEAD_DIM + gpos * DPT;
 #pragma unroll
@@ -139,14 +134,13 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
                 for (int j = 0; j < 8; j++)
                     acc[i + j] = fmaf(v8[j], be, acc[i + j] * al);
             }
-            m = nm;
         }
         __syncthreads();
     }
 
     if (q_row < q_len) {
         int o_off = q_base + q_row * p.q_l_stride + gpos * DPT * p.q_d_stride;
-        float rl = (l > 1e-20f) ? (1.0f / l) : 0.0f;
+        float rl = (sm.l > 1e-20f) ? (1.0f / sm.l) : 0.0f;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
             p.o_ptr[o_off + i * p.q_d_stride] = __float2bfloat16(acc[i] * rl);

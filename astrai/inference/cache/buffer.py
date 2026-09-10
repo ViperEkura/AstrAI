@@ -2,7 +2,10 @@
 
 Layer 1 — ``KVStorage``:   flat token-level K/V GPU buffers [n_layers, size, n_kv_heads, head_dim]
 Layer 2 — ``ReqToTokenPool``: index table [req_idx, pos] → physical token slot
-Layer 3 — ``KVCache``:       pure dataclass passed to the model for direct buffer access
+Layer 3 — ``BaseKVCache``:    shared fields for all cache modes
+         ``PrefillKVCache``:  prefill-specific layout
+         ``DecodeKVCache``:   decode-specific layout
+         ``KVCache``:         union type for backward compatibility
 
 These classes have no knowledge of tasks, allocation policies, or scheduling.
 They are the "dumb" physical storage layer.
@@ -10,7 +13,7 @@ They are the "dumb" physical storage layer.
 
 import threading
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -74,8 +77,8 @@ class KVStorage:
 
 
 @dataclass
-class KVCache:
-    """Pure data struct passed to model for KV cache I/O.
+class BaseKVCache:
+    """Shared fields for all KV cache modes.
 
     The attention layer does raw buffer indexing — no methods, no abstraction.
     """
@@ -85,12 +88,36 @@ class KVCache:
     req_to_token: Tensor
     req_pool_indices: Tensor
     seq_lens: Tensor
-    out_cache_loc: Tensor
-    max_len: int = 0
-    kv_indptr: Optional[Tensor] = None
-    qo_indptr: Optional[Tensor] = None
-    q_tile_to_batch: Optional[Tensor] = None
-    q_tile_to_index: Optional[Tensor] = None
-    decode_o_part: Optional[Tensor] = None
-    decode_ml_part: Optional[Tensor] = None
-    decode_out: Optional[Tensor] = None
+    max_len: int
+    kv_indptr: Tensor  # Always present in both modes
+
+
+@dataclass
+class PrefillKVCache(BaseKVCache):
+    """Prefill-specific KV cache layout.
+
+    Handles packed ragged batching where prompts have variable lengths.
+    """
+
+    out_cache_loc: Tensor  # [total_q_tokens] - flattened write locations
+    qo_indptr: Tensor  # [B+1] - prefix sum of q_lens for unpacking
+    q_tile_to_batch: Tensor  # [num_q_tiles] - maps Q tiles to batch indices
+    q_tile_to_index: Tensor  # [num_q_tiles] - maps Q tiles to local indices
+
+
+@dataclass
+class DecodeKVCache(BaseKVCache):
+    """Decode-specific KV cache layout.
+
+    Single-token incremental generation with split-KV partial results.
+    """
+
+    out_cache_loc: Tensor  # [B] - one write position per request
+    qo_indptr: Tensor  # [B+1] - sequential [0, 1, 2, ..., B]
+    decode_o_part: Tensor  # [B, max_q_heads, MAX_SPLITS, head_dim]
+    decode_ml_part: Tensor  # [B, max_q_heads, MAX_SPLITS, 2]
+    decode_out: Tensor  # [B, max_q_heads, head_dim]
+
+
+# Backward compatibility: union type for existing code
+KVCache = Union[PrefillKVCache, DecodeKVCache]

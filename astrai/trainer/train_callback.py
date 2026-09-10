@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from functools import partial
@@ -28,6 +29,32 @@ from astrai.trainer.metric_util import (
 from astrai.trainer.train_context import TrainContext
 
 logger = logging.getLogger(__name__)
+
+_TOKENIZER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+)
+
+
+def _copy_tokenizer_files(param_path: Optional[str], save_path: str):
+    """Snapshot tokenizer files into the checkpoint directory.
+
+    ``param_path`` is the launch model directory (or, on resume, a
+    previous self-contained checkpoint), so the copy makes every
+    checkpoint independently resumable for online training, which
+    loads its tokenizer from ``param_path``.
+    """
+    if not param_path:
+        return
+    for name in _TOKENIZER_FILES:
+        src = os.path.join(param_path, name)
+        dst = os.path.join(save_path, name)
+        if not os.path.isfile(src) or (
+            os.path.isfile(dst) and os.path.samefile(src, dst)
+        ):
+            continue
+        shutil.copy2(src, dst)
 
 
 @runtime_checkable
@@ -148,6 +175,7 @@ class CheckpointCallback(TrainCallback):
         self.weight_only = weight_only
         self.save_extra_fn = save_extra_fn or CheckpointCallback.save_extra
         self.last_ckpt_step = None
+        self._saved = False
 
     def on_train_begin(self, context: TrainContext):
         self.last_ckpt_step = context.optimizer_step
@@ -176,7 +204,9 @@ class CheckpointCallback(TrainCallback):
                     meta=meta,
                 )
                 context.checkpoint.save(save_path)
+                _copy_tokenizer_files(context.param_path, save_path)
         self.last_ckpt_step = context.optimizer_step
+        self._saved = True
 
     def after_optimizer_step(self, context: TrainContext):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
@@ -187,7 +217,11 @@ class CheckpointCallback(TrainCallback):
             self._save_checkpoint(context)
 
     def on_error(self, context: TrainContext):
-        if context.optimizer_step != self.last_ckpt_step:
+        # An interrupted run must always leave at least one checkpoint
+        # behind: on a slow start the signal can be handled before the
+        # first optimizer step, where optimizer_step == last_ckpt_step
+        # and the change-based guard alone would skip the save entirely.
+        if not self._saved or context.optimizer_step != self.last_ckpt_step:
             self._save_checkpoint(context)
 
     @staticmethod
@@ -197,6 +231,12 @@ class CheckpointCallback(TrainCallback):
             obj = getattr(context, name, None)
             if obj:
                 extra[name] = obj.state_dict()
+        critic = getattr(context.strategy, "critic", None)
+        if critic is not None:
+            extra["value_model"] = critic.state_dict()
+            critic_optimizer = getattr(context.strategy, "critic_optimizer", None)
+            if critic_optimizer is not None:
+                extra["value_optimizer"] = critic_optimizer.state_dict()
         return extra
 
 
@@ -293,15 +333,16 @@ class MetricCallback(TrainCallback):
         selected = set(context.metrics) | set(names)
         selected.discard("*")
         result = {name: metrics[name] for name in selected if name in metrics}
-        if context.world_size > 1 and dist.is_initialized() and result:
+        if result and context.dp_size > 1 and dist.is_initialized():
             metric_names = sorted(result)
             values = torch.tensor(
                 [result[name] for name in metric_names],
                 dtype=torch.float32,
                 device=get_current_device(),
             )
-            dist.all_reduce(values, op=dist.ReduceOp.SUM)
-            values /= context.world_size
+            # dp-dimension average only: cp peers hold values derived from
+            # the same batch, so summing them in would double-count.
+            values = context.topology.reduce_mean(values)
             result.update(zip(metric_names, values.tolist()))
         return result
 
@@ -325,18 +366,23 @@ class MetricCallback(TrainCallback):
 
         with torch.no_grad():
             for batch in context.val_dataloader:
-                loss_output = context.strategy(batch)
+                # Online strategies evaluate a one-off rollout (leaving
+                # the replay cache untouched) via the public hook; None
+                # means offline — validate the batch directly.
+                loss_output = context.strategy.validate_online(batch)
+                if loss_output is None:
+                    loss_output = context.strategy(batch)
                 total_loss += loss_output["loss"].item()
                 num_batches += 1
 
-        if context.world_size > 1 and dist.is_initialized():
-            stats = torch.tensor(
-                [total_loss, float(num_batches)], device=get_current_device()
-            )
-            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            avg_loss = (stats[0] / stats[1]).item()
-        else:
-            avg_loss = total_loss / max(num_batches, 1)
+        # Sum (loss, batches) across dp replicas and take the ratio; the
+        # reduce is a no-op single-process, where the clamp preserves the
+        # local zero-batch behavior.
+        stats = torch.tensor(
+            [total_loss, float(num_batches)], device=get_current_device()
+        )
+        stats = context.topology.reduce_sum(stats)
+        avg_loss = (stats[0] / stats[1].clamp(min=1.0)).item()
 
         context.model.train()
         return avg_loss

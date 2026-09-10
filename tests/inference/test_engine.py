@@ -1,12 +1,21 @@
 """Unit tests for GenerateResult accumulator and InferenceEngine.generate()."""
 
 import asyncio
+import itertools
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from astrai.extension import TorchNativeBackend, attn_backend
 from astrai.inference import STOP
-from astrai.inference.engine import GenerateResult, InferenceEngine
+from astrai.inference.engine import (
+    GenerateResult,
+    InferenceEngine,
+    _ResultSink,
+    build_engine,
+)
+from tests.helpers import FakeTokenizer, make_model
 
 
 def _make_engine_mocks(decode=None):
@@ -18,12 +27,6 @@ def _make_engine_mocks(decode=None):
     if decode is not None:
         mock_tokenizer.decode.return_value = decode
     return mock_model, mock_tokenizer
-
-
-def test_result_append_single():
-    r = GenerateResult(count=1)
-    r.append("hello", 0)
-    assert r.results[0] == "hello"
 
 
 def test_result_append_multiple_tasks():
@@ -50,6 +53,33 @@ def test_result_stop_does_not_double_count():
     r = GenerateResult(count=1)
     r.append(STOP, 0)
     r.append(STOP, 0)
+    assert r._completed == 1
+
+
+def test_result_append_batch_updates_state_in_one_commit():
+    r = GenerateResult(count=2)
+    r.append_batch([(0, "he"), (1, "wo"), (0, "llo"), (1, "rld")])
+    r.append_batch([(0, STOP), (1, STOP)])
+    assert r.results == ["hello", "world"]
+    assert r._completed == 2
+    assert r.pop_all() == [
+        (0, "he"),
+        (1, "wo"),
+        (0, "llo"),
+        (1, "rld"),
+        (0, STOP),
+        (1, STOP),
+    ]
+
+
+def test_result_sink_replays_events_arriving_before_bind():
+    r = GenerateResult(count=1)
+    sink = _ResultSink(r)
+    sink([("t0", "he")])  # task id not bound yet: buffered, not applied
+    assert r.results == [""]
+    sink.bind("t0", 0)
+    sink([("t0", "llo"), ("t0", STOP)])
+    assert r.results == ["hello"]
     assert r._completed == 1
 
 
@@ -121,8 +151,8 @@ def test_engine_generate_non_streaming_single():
 
         def fake_add(prompt, **kw):
             cb = kw["stream_callback"]
-            cb("response")
-            cb(STOP)
+            cb([("task-1", "response"), ("task-1", STOP)])
+            return "task-1"
 
         instance.add_task.side_effect = fake_add
         instance.remove_task.return_value = []
@@ -139,6 +169,7 @@ def test_engine_generate_streaming_yields_tokens():
 
     def capture_cb(prompt, **kw):
         callbacks_saved.append(kw.get("stream_callback"))
+        return "task-0"
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
@@ -149,9 +180,9 @@ def test_engine_generate_streaming_yields_tokens():
         gen = eng.generate("hello", stream=True)
 
         cb = callbacks_saved[0]
-        cb("t1")
-        cb("t2")
-        cb(STOP)
+        cb([("task-0", "t1")])
+        cb([("task-0", "t2")])
+        cb([("task-0", STOP)])
 
         tokens = list(gen)
         assert tokens == ["t1", "t2"]
@@ -172,7 +203,7 @@ def test_engine_stream_close_cancels_unfinished_task():
         engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         stream = engine.generate("hello", stream=True)
 
-        callbacks_saved[0]("t1")
+        callbacks_saved[0]([("task-1", "t1")])
         assert next(stream) == "t1"
         stream.close()
 
@@ -185,6 +216,7 @@ def test_engine_generate_async_yields_tokens_until_stop():
 
     def capture_cb(prompt, **kw):
         callbacks_saved.append(kw.get("stream_callback"))
+        return "task-0"
 
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
@@ -201,9 +233,9 @@ def test_engine_generate_async_yields_tokens_until_stop():
             return out
 
         cb = callbacks_saved[0]
-        cb("t1")
-        cb("t2")
-        cb(STOP)
+        cb([("task-0", "t1")])
+        cb([("task-0", "t2")])
+        cb([("task-0", STOP)])
 
         assert asyncio.run(collect()) == ["t1", "t2"]
 
@@ -222,7 +254,7 @@ def test_engine_async_close_cancels_unfinished_task():
 
         engine = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=1)
         stream = engine.generate_async("hello")
-        callbacks_saved[0]("t1")
+        callbacks_saved[0]([("task-1", "t1")])
 
         async def consume_then_close():
             assert await anext(stream) == "t1"
@@ -236,20 +268,25 @@ def test_engine_async_close_cancels_unfinished_task():
 def test_engine_generate_non_streaming_batch():
     mock_model, mock_tokenizer = _make_engine_mocks(decode="r")
 
+    counter = itertools.count()
+    task_ids = []
+
+    def fake_add(prompt, **kw):
+        cb = kw["stream_callback"]
+        tid = f"task-{next(counter)}"
+        task_ids.append(tid)
+        cb([(tid, "r"), (tid, STOP)])
+        return tid
+
     with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
         instance = MockSched.return_value
-
-        def fake_add(prompt, **kw):
-            cb = kw["stream_callback"]
-            cb("r")
-            cb(STOP)
-
         instance.add_task.side_effect = fake_add
         instance.remove_task.return_value = []
 
         eng = InferenceEngine(mock_model, mock_tokenizer, max_batch_size=2)
         results = eng.generate(["hello", "world"])
         assert results == ["r", "r"]
+        assert task_ids == ["task-0", "task-1"]
 
 
 def test_engine_generate_zero_max_tokens_returns_empty():
@@ -297,7 +334,7 @@ def test_generate_captures_calling_backend_context():
 
         def fake_add(prompt, **kwargs):
             captured.append(kwargs["backend"])
-            kwargs["stream_callback"](STOP)
+            kwargs["stream_callback"]([("task", STOP)])
             return "task"
 
         instance.add_task.side_effect = fake_add
@@ -307,3 +344,65 @@ def test_generate_captures_calling_backend_context():
 
     assert len(captured) == 1
     assert isinstance(captured[0], TorchNativeBackend)
+
+
+def test_build_engine_from_live_objects_starts_scheduler():
+    model, _ = make_model("cpu", max_position_embeddings=64)
+    tokenizer = FakeTokenizer()
+    engine = build_engine(
+        model=model,
+        tokenizer=tokenizer,
+        device=None,
+        dtype=None,
+        max_batch_size=2,
+    )
+    try:
+        assert isinstance(engine, InferenceEngine)
+        assert engine.tokenizer is tokenizer
+        assert engine.scheduler._stop_event.is_set() is False
+    finally:
+        engine.shutdown()
+
+
+def test_build_engine_passes_engine_kwargs_through():
+    model, _ = make_model("cpu", max_position_embeddings=64)
+    backend = TorchNativeBackend()
+    with patch("astrai.inference.engine.InferenceScheduler") as MockSched:
+
+        def fake_add(*args, **k):
+            k["stream_callback"]([("task", STOP)])
+            return "task"
+
+        MockSched.return_value.add_task.side_effect = fake_add
+        engine = build_engine(
+            model=model,
+            tokenizer=FakeTokenizer(),
+            device=None,
+            dtype=None,
+            cache=object(),
+            enable_cuda_graph=False,
+            backend=backend,
+        )
+        engine.generate("hi")
+
+    kwargs = MockSched.call_args.kwargs
+    assert kwargs["cache"] is not None
+    assert kwargs["enable_cuda_graph"] is False
+    assert kwargs["backend"] is backend
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "message"),
+    [
+        (
+            {"param_path": "x", "model": object()},
+            ValueError,
+            "not both",
+        ),
+        ({}, ValueError, "requires param_path"),
+        ({"param_path": "/nonexistent-dir-xyz"}, FileNotFoundError, "not found"),
+    ],
+)
+def test_build_engine_rejects_invalid_arguments(kwargs, error, message):
+    with pytest.raises(error, match=message):
+        build_engine(**kwargs)

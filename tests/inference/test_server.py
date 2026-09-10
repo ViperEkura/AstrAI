@@ -5,8 +5,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from astrai.inference import get_app
-from astrai.inference.network.app import _create_engine
+from astrai.inference import build_engine, get_app
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.serialization import save_model
 from tests.helpers import CHAT_TEMPLATE, build_test_tokenizer, make_tiny_config
@@ -238,7 +237,7 @@ def test_chat_completions_real_engine(tmp_path, client):
     tokenizer = build_test_tokenizer(vocab_size=256, chat_template=CHAT_TEMPLATE)
     tokenizer.save_pretrained(str(tmp_path))
 
-    engine = _create_engine(
+    engine = build_engine(
         Path(tmp_path),
         device="cpu",
         dtype=torch.float32,

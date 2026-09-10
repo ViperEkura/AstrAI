@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-PARALLEL_MODES = {"auto", "none", "ddp", "fsdp"}
+DP_MODES = {"auto", "none", "ddp", "fsdp"}
 
 
 def _mapping(value, name: str) -> dict:
@@ -72,16 +72,45 @@ def load_runtime(config_path: str) -> dict[str, str]:
     else:
         raise ValueError("runtime.gpu.devices must be 'all' or a non-empty list")
 
-    parallel_mode = str(gpu.get("parallel_mode", "auto"))
-    if parallel_mode not in PARALLEL_MODES:
-        raise ValueError("runtime.gpu.parallel_mode must be auto, none, ddp, or fsdp")
+    dp_mode = str(gpu.get("dp_mode", "auto"))
+    if dp_mode not in DP_MODES:
+        raise ValueError("runtime.gpu.dp_mode must be auto, none, ddp, or fsdp")
     if gpu_count != "all":
         count = int(gpu_count)
-        if parallel_mode == "none" and count != 1:
-            raise ValueError("parallel_mode none requires exactly one GPU")
-        if parallel_mode in {"ddp", "fsdp"} and count < 2:
+        if dp_mode == "none" and count != 1:
+            raise ValueError("dp_mode none requires exactly one GPU")
+        if dp_mode in {"ddp", "fsdp"} and count < 2:
+            raise ValueError(f"dp_mode {dp_mode} requires at least two GPUs")
+
+    # The parallel section feeds the trainer's --dp_size/--cp_size/--tp_size;
+    # the process count is derived from the degrees, so the device list must
+    # decompose along cp_size * tp_size.  dp_size itself is derived per launch
+    # (gpu count / (cp_size * tp_size)) unless declared, in which case it must
+    # agree.
+    parallel = _mapping(config.get("parallel"), "parallel")
+
+    def _degree(name: str) -> int:
+        value = parallel.get(name, 1)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"parallel.{name} must be an integer >= 1")
+        return value
+
+    cp_size = _degree("cp_size")
+    tp_size = _degree("tp_size")
+    yaml_dp_size = _degree("dp_size")
+    if gpu_count != "all":
+        count = int(gpu_count)
+        world = cp_size * tp_size
+        if count % world != 0:
             raise ValueError(
-                f"parallel_mode {parallel_mode} requires at least two GPUs"
+                f"runtime.gpu.devices count ({count}) must be divisible by "
+                f"parallel.cp_size * tp_size ({world})"
+            )
+        if "dp_size" in parallel and count != yaml_dp_size * world:
+            raise ValueError(
+                f"parallel degrees dp_size x cp_size x tp_size = "
+                f"{yaml_dp_size * world} must match the "
+                f"runtime.gpu.devices count ({count})"
             )
 
     max_hours = container.get("max_duration_hours", 0)
@@ -102,7 +131,9 @@ def load_runtime(config_path: str) -> dict[str, str]:
             paths.get("checkpoints"), "checkpoints", path.parent
         ),
         "TRAIN_GPU_COUNT": gpu_count,
-        "TRAIN_PARALLEL_MODE": parallel_mode,
+        "TRAIN_DP_MODE": dp_mode,
+        "TRAIN_CP_SIZE": str(cp_size),
+        "TRAIN_TP_SIZE": str(tp_size),
         "CUDA_TAG": str(container.get("cuda_tag", "cu128")),
         "TRAIN_IPC_MODE": str(container.get("ipc", "host")),
         "TRAIN_STOP_GRACE_PERIOD": str(container.get("stop_grace_period", "10m")),

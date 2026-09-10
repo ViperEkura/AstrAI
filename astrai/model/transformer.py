@@ -106,6 +106,7 @@ class AutoRegressiveLM(AutoModel):
         kv_cache: Optional[KVCache] = None,
         position_ids: Optional[Tensor] = None,
         fwd: Optional[str] = None,
+        logits_positions: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         if fwd is None:
             if input_ids.ndim != 2:
@@ -142,7 +143,11 @@ class AutoRegressiveLM(AutoModel):
                 aux_losses.append(layer_output["aux_loss"])
                 router_stats_list.append(stats)
 
-        hidden_states = self.norm(x)
+        if logits_positions is not None:
+            # RMSNorm is per-row, so gathering before it matches gathering after.
+            hidden_states = self.norm(x[logits_positions])
+        else:
+            hidden_states = self.norm(x)
         logits = self.lm_head(hidden_states)
 
         output = {"logits": logits, "hidden_states": hidden_states}

@@ -17,7 +17,7 @@ from astrai.dataset import (
     StoreFactory,
 )
 from astrai.factory import BaseFactory
-from astrai.inference import InferenceEngine, get_app, run_server, sample
+from astrai.inference import InferenceEngine, build_engine, get_app, run_server, sample
 from astrai.inference.network import ProtocolHandler
 from astrai.inference.runtime.sample import SamplingPipeline
 from astrai.logging import setup_logging
@@ -67,6 +67,7 @@ __all__ = [
     "EncoderConfig",
     "ExecutorFactory",
     "InferenceEngine",
+    "build_engine",
     "LoRAConfig",
     "Pipeline",
     "PipelineConfig",

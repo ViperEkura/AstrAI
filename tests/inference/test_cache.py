@@ -34,13 +34,6 @@ def _make_task_cache(pool: PagePool) -> TaskCacheManager:
 # ---- page_hash ----
 
 
-def test_page_hash_full_page():
-    token_ids = list(range(256))
-    h = page_hash(token_ids, 0, 64)
-    assert isinstance(h, int)
-    assert h >= 0
-
-
 def test_page_hash_different_page_differs():
     token_ids = list(range(256))
     assert page_hash(token_ids, 0, 64) != page_hash(token_ids, 1, 64)
@@ -121,17 +114,11 @@ def test_prefix_cache_ignores_partial_last_page():
 
 def test_prefix_cache_on_evict_clears_mappings():
     prefix = RadixCache(64)
+    assert not prefix.has_page(0)
     prefix.record(0, list(range(64)), 0)
     assert prefix.has_page(0)
     prefix.evict(0)
     assert not prefix.has_page(0)
-
-
-def test_prefix_cache_has_page():
-    prefix = RadixCache(64)
-    assert not prefix.has_page(0)
-    prefix.record(0, list(range(64)), 0)
-    assert prefix.has_page(0)
 
 
 def test_prefix_cache_does_not_reuse_page_without_parent_prefix():

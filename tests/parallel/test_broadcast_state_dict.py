@@ -8,8 +8,9 @@ import torch
 
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.parallel import get_rank, spawn_parallel_fn
-from astrai.parallel.executor import broadcast_state_dict, create_ref_model
+from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.strategy import GRPOStrategy
+from astrai.trainer.train_context import create_ref_model
 from tests.helpers import make_rollout_config
 
 

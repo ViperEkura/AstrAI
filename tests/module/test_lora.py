@@ -332,4 +332,6 @@ def test_collect_lora_info():
     info = _collect_lora_info(model)
     assert "q_proj" in info
     assert "o_proj" in info
-    assert "q_proj" in info  # each layer has one
+    # every decoder layer contributes one of each attention projection
+    assert len(info["q_proj"]) == len(info["o_proj"]) == 2
+    assert all(name.endswith("attention.q_proj") for name in info["q_proj"])

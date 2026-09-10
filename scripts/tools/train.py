@@ -1,109 +1,430 @@
 import os
-import re
-from collections import OrderedDict
 from collections.abc import Callable
 from functools import partial
 
 import click
 import torch
-import yaml
 from click.core import ParameterSource
 from torch import optim
 
 from astrai.config import AutoRegressiveLMConfig, TrainConfig
+from astrai.config.cli import (
+    GroupedCommand,
+    OptSpec,
+    apply_specs,
+    merge_yaml_into_kwargs,
+)
 from astrai.config.train_config import (
     BACKENDS,
-    PARALLEL_MODES,
+    DP_MODES,
     START_METHODS,
     TRAIN_TYPES,
 )
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
-from astrai.model import AutoRegressiveLM
+from astrai.model import AutoRegressiveLM, ValueModel
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.optim import OptimizerFactory
 from astrai.trainer import SchedulerFactory, Trainer
 from astrai.trainer.rollout import BaseRewardModel
 
-
-class GroupedOption(click.Option):
-    """A ``click.Option`` that carries a ``group`` label for help output."""
-
-    def __init__(self, *args, group: str = "Options", **kwargs):
-        super().__init__(*args, **kwargs)
-        self.group = group
-
-
-class GroupedCommand(click.Command):
-    """A ``click.Command`` that renders options grouped by their ``group``."""
-
-    def format_options(self, ctx, formatter):
-        groups: OrderedDict[str, list] = OrderedDict()
-        for param in self.get_params(ctx):
-            record = param.get_help_record(ctx)
-            if record is None:
-                continue
-            group = getattr(param, "group", "Options")
-            groups.setdefault(group, []).append(record)
-        for group_name, records in groups.items():
-            with formatter.section(group_name):
-                formatter.write_dl(records)
-
-
-def opt(*param_decls, group: str, **kwargs):
-    """Shorthand for ``click.option`` that tags the option with a group."""
-    kwargs.setdefault("cls", GroupedOption)
-    kwargs["group"] = group
-    return click.option(*param_decls, **kwargs)
-
-
-_YAML_FLOAT_PATTERN = re.compile(
-    r"""^(?:[-+]?(?:[0-9][0-9_]*)\.[0-9_]*(?:[eE][-+]?[0-9]+)?
-    |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
-    |[-+]?\.(?:inf|Inf|INF)
-    |\.(?:nan|NaN|NAN))$""",
-    re.X,
-)
-
-
-def _enable_yaml12_floats() -> None:
-    """PyYAML implements YAML 1.1, where ``2e-5`` parses as a string; switch its
-    float resolver to the YAML 1.2 core schema so scientific notation works."""
-    yaml.SafeLoader.add_implicit_resolver(
-        "tag:yaml.org,2002:float", _YAML_FLOAT_PATTERN, list("-+0123456789.")
-    )
-
-
-def _merge_yaml_into_kwargs(
-    config_path: str,
-    passed_kwargs: dict,
-    explicit_keys: set[str] | None = None,
-) -> dict:
-    """Merge Click defaults, YAML values, then explicit CLI values."""
-    _enable_yaml12_floats()
-
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f) or {}
-
-    merged = dict(passed_kwargs)
-    for section in ("model", "data", "parallel", "training", "ckpt", "log"):
-        if section in cfg:
-            merged.update(cfg[section])
-
-    if explicit_keys is None:
-        explicit_keys = set(passed_kwargs)
-    for key in explicit_keys:
-        if key in passed_kwargs:
-            merged[key] = passed_kwargs[key]
-
-    return merged
-
+# Re-exported under its historical name for tests importing it from here.
+_merge_yaml_into_kwargs = merge_yaml_into_kwargs
 
 _TRAIN_TYPE = sorted(TRAIN_TYPES)
-_PARALLEL = sorted(PARALLEL_MODES)
+_DP = sorted(DP_MODES)
 _SCHEDULES = ["cosine", "sgdr", "wsd"]
 _OPTIMIZERS = OptimizerFactory.list_registered()
 _BACKENDS = sorted(BACKENDS)
 _START_METHODS = sorted(START_METHODS)
+
+# Option table: types/defaults marked AUTO are inferred from TrainConfig
+# fields; everything else (CLI-only options and default overrides) is
+# declared inline. Table order is the --help order.
+_SPECS = [
+    OptSpec(
+        "config_path",
+        "Paths & Setup",
+        type=click.Path(exists=True),
+        param_decls=("--config", "-c", "config_path"),
+        help="YAML config file. CLI flags override YAML values.",
+    ),
+    OptSpec("train_type", "Paths & Setup", choices=_TRAIN_TYPE, help="Training type."),
+    OptSpec(
+        "data_root_path",
+        "Paths & Setup",
+        type=click.Path(exists=True),
+        help="Root directory of the dataset.",
+    ),
+    OptSpec(
+        "param_path",
+        "Paths & Setup",
+        type=click.Path(exists=True),
+        help="Path to model parameters or resume checkpoint.",
+    ),
+    OptSpec(
+        "resume",
+        "Paths & Setup",
+        is_flag=True,
+        default=False,
+        help="Resume from checkpoint.",
+    ),
+    OptSpec("n_epoch", "Training", help="Number of epochs."),
+    OptSpec("batch_per_device", "Training", default=1, help="Batch size per GPU."),
+    OptSpec(
+        "grad_accum_steps",
+        "Training",
+        help="Gradient accumulation steps.",
+    ),
+    OptSpec("max_grad_norm", "Training", help="Max gradient norm for clipping."),
+    OptSpec(
+        "warmup_ratio",
+        "LR Schedule",
+        type=float,
+        default=0.05,
+        help="Fraction of total steps for LR warmup.",
+    ),
+    OptSpec(
+        "max_lr",
+        "Optimizer",
+        type=float,
+        default=3e-4,
+        help="Max learning rate.",
+    ),
+    OptSpec(
+        "optimizer",
+        "Optimizer",
+        choices=_OPTIMIZERS,
+        default="muon_adamw",
+        help="Built-in optimizer.",
+    ),
+    OptSpec(
+        "weight_decay",
+        "Optimizer",
+        type=float,
+        default=0.1,
+        help="Weight decay for eligible optimizer parameters.",
+    ),
+    OptSpec(
+        "nora_lr", "Optimizer", type=float, default=5e-3, help="Nora learning rate."
+    ),
+    OptSpec(
+        "nora_beta", "Optimizer", type=float, default=0.95, help="Nora EMA factor."
+    ),
+    OptSpec(
+        "nora_momentum",
+        "Optimizer",
+        type=float,
+        default=0.95,
+        help="Nora update momentum.",
+    ),
+    OptSpec(
+        "nora_weight_decay",
+        "Optimizer",
+        type=float,
+        default=0.0,
+        help="Nora weight decay.",
+    ),
+    OptSpec(
+        "muon_momentum",
+        "Optimizer",
+        type=float,
+        default=0.95,
+        help="Muon momentum factor.",
+    ),
+    OptSpec(
+        "muon_nesterov",
+        "Optimizer",
+        type=bool,
+        default=True,
+        help="Muon Nesterov.",
+    ),
+    OptSpec(
+        "muon_ns_steps",
+        "Optimizer",
+        type=int,
+        default=5,
+        help="Muon Newton-Schulz steps.",
+    ),
+    OptSpec(
+        "muon_adjust_lr",
+        "Optimizer",
+        choices=["original", "match_rms_adamw"],
+        default="match_rms_adamw",
+        help="Muon LR adjustment strategy.",
+    ),
+    OptSpec(
+        "mano_momentum",
+        "Optimizer",
+        type=float,
+        default=0.95,
+        help="Mano momentum factor.",
+    ),
+    OptSpec(
+        "mano_nesterov",
+        "Optimizer",
+        type=bool,
+        default=True,
+        help="Mano Nesterov momentum.",
+    ),
+    OptSpec("random_seed", "Data Loading", help="Random seed."),
+    OptSpec("num_workers", "Data Loading", default=4, help="DataLoader workers."),
+    OptSpec("pin_memory", "Data Loading", default=True, help="Pin memory."),
+    OptSpec(
+        "persistent_workers",
+        "Data Loading",
+        default=True,
+        help="Keep DataLoader workers alive between epochs.",
+    ),
+    OptSpec(
+        "window_size",
+        "Data Loading",
+        type=int,
+        default=None,
+        help="Max input sequence length.",
+    ),
+    OptSpec(
+        "stride",
+        "Data Loading",
+        type=int,
+        default=None,
+        help="Step size for sliding window.",
+    ),
+    OptSpec(
+        "label_smoothing",
+        "Data Loading",
+        type=float,
+        default=0.0,
+        help="Label smoothing.",
+    ),
+    OptSpec("dpo_beta", "Algorithm", type=float, default=0.1, help="DPO beta."),
+    OptSpec("group_size", "Algorithm", type=int, default=4, help="GRPO group size."),
+    OptSpec(
+        "grpo_clip_eps",
+        "Algorithm",
+        type=float,
+        default=0.2,
+        help="GRPO clip epsilon.",
+    ),
+    OptSpec(
+        "grpo_kl_coef",
+        "Algorithm",
+        type=float,
+        default=0.01,
+        help="GRPO KL penalty coefficient.",
+    ),
+    OptSpec(
+        "ppo_gamma",
+        "Algorithm",
+        type=float,
+        default=1.0,
+        help="PPO reward discount factor.",
+    ),
+    OptSpec(
+        "ppo_gae_lambda",
+        "Algorithm",
+        type=float,
+        default=0.95,
+        help="PPO GAE bias/variance trade-off.",
+    ),
+    OptSpec(
+        "ppo_vf_coef",
+        "Algorithm",
+        type=float,
+        default=0.5,
+        help="PPO value-loss coefficient.",
+    ),
+    OptSpec(
+        "moe_aux_loss_coef",
+        "Algorithm",
+        help="MoE load balancing auxiliary loss coefficient (0=disable).",
+    ),
+    OptSpec("rollout_interval", "Algorithm", help="Steps between rollouts."),
+    OptSpec(
+        "rollout_max_policy_lag",
+        "Algorithm",
+        help="Maximum accepted rollout/live policy-version gap.",
+    ),
+    OptSpec("rollout_temperature", "Algorithm", help="Rollout temperature."),
+    OptSpec("rollout_top_k", "Algorithm", help="Rollout top-k (0=disable)."),
+    OptSpec("rollout_top_p", "Algorithm", help="Rollout top-p."),
+    OptSpec("rollout_max_tokens", "Algorithm", help="Max tokens per rollout response."),
+    OptSpec(
+        "rollout_dynamic_sampling",
+        "Algorithm",
+        type=bool,
+        default=False,
+        help="Refill low-variance online GRPO prompt groups.",
+    ),
+    OptSpec(
+        "rollout_dynamic_variance_threshold",
+        "Algorithm",
+        type=float,
+        default=0.0,
+        help="Minimum population reward variance for group acceptance.",
+    ),
+    OptSpec(
+        "rollout_dynamic_max_refill_rounds",
+        "Algorithm",
+        type=int,
+        default=2,
+        help="Maximum low-variance refill rounds per prompt group.",
+    ),
+    OptSpec(
+        "rollout_dynamic_max_generated_tokens_per_group",
+        "Algorithm",
+        type=int,
+        default=32768,
+        help="Hard generated-token budget per prompt group.",
+    ),
+    OptSpec(
+        "rollout_dynamic_max_wall_time_per_group",
+        "Algorithm",
+        type=float,
+        default=300.0,
+        help="Hard wall-clock budget in seconds per prompt group.",
+    ),
+    OptSpec(
+        "rollout_dynamic_max_total_tokens_per_step",
+        "Algorithm",
+        type=int,
+        default=262144,
+        help="Hard generated-token budget per training step.",
+    ),
+    OptSpec(
+        "rollout_dynamic_max_pending_groups",
+        "Algorithm",
+        type=int,
+        default=128,
+        help="Maximum prompt groups admitted into one sampling step.",
+    ),
+    OptSpec(
+        "rollout_dynamic_seed",
+        "Algorithm",
+        type=int,
+        default=None,
+        help="Base refill seed (defaults to random_seed).",
+    ),
+    OptSpec("neftune_alpha", "Algorithm", help="NEFTune noise alpha."),
+    OptSpec("val_split", "Validation", help="Validation split ratio."),
+    OptSpec("val_step", "Validation", help="Steps between validation runs."),
+    OptSpec(
+        "metrics",
+        "Validation",
+        default=("loss", "lr", "grad_norm", "grad_snr"),
+        help="Metrics to log (repeatable).",
+    ),
+    OptSpec("ckpt_interval", "Checkpoint", help="Steps between checkpoints."),
+    OptSpec(
+        "ckpt_dir",
+        "Checkpoint",
+        type=click.Path(),
+        default="checkpoint",
+        help="Checkpoint directory.",
+    ),
+    OptSpec("start_epoch", "Checkpoint", help="Start epoch."),
+    OptSpec("start_samples", "Checkpoint", help="Start samples (per rank)."),
+    OptSpec(
+        "dp_size",
+        "Distributed",
+        help="Data-parallel replicas; total GPUs/processes = dp_size x cp_size.",
+    ),
+    OptSpec(
+        "cp_size",
+        "Distributed",
+        type=int,
+        default=None,
+        help="Context parallelism: shard sequences across contiguous ranks (seq pretraining).",
+    ),
+    OptSpec(
+        "tp_size",
+        "Distributed",
+        type=int,
+        default=None,
+        help="Tensor parallelism: shard Linear projections over features "
+        "(attention heads / ffn channels).",
+    ),
+    OptSpec(
+        "dp_mode",
+        "Distributed",
+        choices=_DP,
+        default="fsdp",
+        help="Data-parallel gradient-sync strategy (none/ddp/fsdp).",
+    ),
+    OptSpec("backend", "Distributed", choices=_BACKENDS, help="Distributed backend."),
+    OptSpec("master_addr", "Distributed", help="Master node address."),
+    OptSpec("master_port", "Distributed", help="Master node port."),
+    OptSpec("device_type", "Distributed", help="Device type."),
+    OptSpec(
+        "start_method",
+        "Distributed",
+        choices=_START_METHODS,
+        help="Multiprocessing start method.",
+    ),
+    OptSpec(
+        "gradient_checkpointing",
+        "Misc",
+        type=bool,
+        default=False,
+        help="Enable activation checkpointing.",
+    ),
+    OptSpec(
+        "compile_mode",
+        "Misc",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        param_decls=("--compile", "compile_mode"),
+        help="torch.compile mode. Omit to disable.",
+    ),
+    OptSpec(
+        "dry_run",
+        "Misc",
+        is_flag=True,
+        default=False,
+        param_decls=("--dry-run",),
+        help="Validate config and print plan, do not train.",
+    ),
+    OptSpec(
+        "schedule_type",
+        "LR Schedule",
+        choices=_SCHEDULES,
+        default="cosine",
+        help="LR scheduler.",
+    ),
+    OptSpec(
+        "min_rate",
+        "LR Schedule",
+        type=float,
+        default=None,
+        help="Minimum LR as fraction of base LR.",
+    ),
+    OptSpec(
+        "cycle_length",
+        "LR Schedule",
+        type=int,
+        default=None,
+        help="SGDR first cycle length.",
+    ),
+    OptSpec(
+        "t_mult",
+        "LR Schedule",
+        type=int,
+        default=2,
+        help="SGDR cycle length multiplier.",
+    ),
+    OptSpec(
+        "stable_steps",
+        "LR Schedule",
+        type=int,
+        default=None,
+        help="WSD stable plateau steps.",
+    ),
+    OptSpec(
+        "decay_steps",
+        "LR Schedule",
+        type=int,
+        default=None,
+        help="WSD decay steps.",
+    ),
+]
 
 
 @click.command(
@@ -112,480 +433,7 @@ _START_METHODS = sorted(START_METHODS)
     help="Start model training (pretrain / SFT / DPO / GRPO).",
     context_settings={"show_default": True},
 )
-@opt(
-    "--config",
-    "-c",
-    "config_path",
-    type=click.Path(exists=True),
-    group="Paths & Setup",
-    help="YAML config file. CLI flags override YAML values.",
-)
-@opt(
-    "--train_type",
-    type=click.Choice(_TRAIN_TYPE),
-    required=False,
-    group="Paths & Setup",
-    help="Training type.",
-)
-@opt(
-    "--data_root_path",
-    type=click.Path(exists=True),
-    group="Paths & Setup",
-    help="Root directory of the dataset.",
-)
-@opt(
-    "--param_path",
-    type=click.Path(exists=True),
-    group="Paths & Setup",
-    help="Path to model parameters or resume checkpoint.",
-)
-@opt(
-    "--resume",
-    is_flag=True,
-    default=False,
-    group="Paths & Setup",
-    help="Resume from checkpoint.",
-)
-@opt("--n_epoch", type=int, default=1, group="Training", help="Number of epochs.")
-@opt(
-    "--batch_per_device",
-    type=int,
-    default=1,
-    group="Training",
-    help="Batch size per GPU.",
-)
-@opt(
-    "--grad_accum_steps",
-    type=int,
-    default=1,
-    group="Training",
-    help="Gradient accumulation steps.",
-)
-@opt(
-    "--warmup_ratio",
-    type=float,
-    default=0.05,
-    group="LR Schedule",
-    help="Fraction of total steps for LR warmup.",
-)
-@opt(
-    "--max_lr",
-    type=float,
-    default=3e-4,
-    group="Optimizer",
-    help="Max learning rate.",
-)
-@opt(
-    "--optimizer",
-    type=click.Choice(_OPTIMIZERS),
-    default="muon_adamw",
-    group="Optimizer",
-    help="Built-in optimizer.",
-)
-@opt(
-    "--max_grad_norm",
-    type=float,
-    default=1.0,
-    group="Training",
-    help="Max gradient norm for clipping.",
-)
-@opt(
-    "--weight_decay",
-    type=float,
-    default=0.1,
-    group="Optimizer",
-    help="Weight decay for eligible optimizer parameters.",
-)
-@opt(
-    "--nora_lr", type=float, default=5e-3, group="Optimizer", help="Nora learning rate."
-)
-@opt(
-    "--nora_beta", type=float, default=0.95, group="Optimizer", help="Nora EMA factor."
-)
-@opt(
-    "--nora_momentum",
-    type=float,
-    default=0.95,
-    group="Optimizer",
-    help="Nora update momentum.",
-)
-@opt(
-    "--nora_weight_decay",
-    type=float,
-    default=0.0,
-    group="Optimizer",
-    help="Nora weight decay.",
-)
-@opt(
-    "--muon_momentum",
-    type=float,
-    default=0.95,
-    group="Optimizer",
-    help="Muon momentum factor.",
-)
-@opt(
-    "--muon_nesterov/--no-muon_nesterov",
-    default=True,
-    group="Optimizer",
-    help="Muon Nesterov.",
-)
-@opt(
-    "--muon_ns_steps",
-    type=int,
-    default=5,
-    group="Optimizer",
-    help="Muon Newton-Schulz steps.",
-)
-@opt(
-    "--muon_adjust_lr",
-    type=click.Choice(["original", "match_rms_adamw"]),
-    default="match_rms_adamw",
-    group="Optimizer",
-    help="Muon LR adjustment strategy.",
-)
-@opt(
-    "--mano_momentum",
-    type=float,
-    default=0.95,
-    group="Optimizer",
-    help="Mano momentum factor.",
-)
-@opt(
-    "--mano_nesterov/--no-mano_nesterov",
-    default=True,
-    group="Optimizer",
-    help="Mano Nesterov momentum.",
-)
-@opt(
-    "--random_seed",
-    type=int,
-    default=3407,
-    group="Data Loading",
-    help="Random seed.",
-)
-@opt(
-    "--num_workers",
-    type=int,
-    default=4,
-    group="Data Loading",
-    help="DataLoader workers.",
-)
-@opt(
-    "--pin_memory/--no-pin_memory",
-    default=True,
-    group="Data Loading",
-    help="Pin memory.",
-)
-@opt(
-    "--persistent_workers/--no-persistent_workers",
-    default=True,
-    group="Data Loading",
-    help="Keep DataLoader workers alive between epochs.",
-)
-@opt(
-    "--window_size",
-    type=int,
-    default=None,
-    group="Data Loading",
-    help="Max input sequence length.",
-)
-@opt(
-    "--stride",
-    type=int,
-    default=None,
-    group="Data Loading",
-    help="Step size for sliding window.",
-)
-@opt("--dpo_beta", type=float, default=0.1, group="Algorithm", help="DPO beta.")
-@opt("--group_size", type=int, default=4, group="Algorithm", help="GRPO group size.")
-@opt(
-    "--grpo_clip_eps",
-    type=float,
-    default=0.2,
-    group="Algorithm",
-    help="GRPO clip epsilon.",
-)
-@opt(
-    "--grpo_kl_coef",
-    type=float,
-    default=0.01,
-    group="Algorithm",
-    help="GRPO KL penalty coefficient.",
-)
-@opt(
-    "--label_smoothing",
-    type=float,
-    default=0.0,
-    group="Data Loading",
-    help="Label smoothing.",
-)
-@opt(
-    "--moe_aux_loss_coef",
-    type=float,
-    default=0.01,
-    group="Algorithm",
-    help="MoE load balancing auxiliary loss coefficient (0=disable).",
-)
-@opt(
-    "--rollout_interval",
-    type=int,
-    default=512,
-    group="Algorithm",
-    help="Steps between rollouts.",
-)
-@opt(
-    "--rollout_max_policy_lag",
-    type=int,
-    default=None,
-    group="Algorithm",
-    help="Maximum accepted rollout/live policy-version gap.",
-)
-@opt(
-    "--rollout_temperature",
-    type=float,
-    default=0.7,
-    group="Algorithm",
-    help="Rollout temperature.",
-)
-@opt(
-    "--rollout_top_k",
-    type=int,
-    default=0,
-    group="Algorithm",
-    help="Rollout top-k (0=disable).",
-)
-@opt(
-    "--rollout_top_p",
-    type=float,
-    default=0.9,
-    group="Algorithm",
-    help="Rollout top-p.",
-)
-@opt(
-    "--rollout_max_tokens",
-    type=int,
-    default=1024,
-    group="Algorithm",
-    help="Max tokens per rollout response.",
-)
-@opt(
-    "--rollout_dynamic_sampling/--no-rollout_dynamic_sampling",
-    default=False,
-    group="Algorithm",
-    help="Refill low-variance online GRPO prompt groups.",
-)
-@opt(
-    "--rollout_dynamic_variance_threshold",
-    type=float,
-    default=0.0,
-    group="Algorithm",
-    help="Minimum population reward variance for group acceptance.",
-)
-@opt(
-    "--rollout_dynamic_max_refill_rounds",
-    type=int,
-    default=2,
-    group="Algorithm",
-    help="Maximum low-variance refill rounds per prompt group.",
-)
-@opt(
-    "--rollout_dynamic_max_generated_tokens_per_group",
-    type=int,
-    default=32768,
-    group="Algorithm",
-    help="Hard generated-token budget per prompt group.",
-)
-@opt(
-    "--rollout_dynamic_max_wall_time_per_group",
-    type=float,
-    default=300.0,
-    group="Algorithm",
-    help="Hard wall-clock budget in seconds per prompt group.",
-)
-@opt(
-    "--rollout_dynamic_max_total_tokens_per_step",
-    type=int,
-    default=262144,
-    group="Algorithm",
-    help="Hard generated-token budget per training step.",
-)
-@opt(
-    "--rollout_dynamic_max_pending_groups",
-    type=int,
-    default=128,
-    group="Algorithm",
-    help="Maximum prompt groups admitted into one sampling step.",
-)
-@opt(
-    "--rollout_dynamic_seed",
-    type=int,
-    default=None,
-    group="Algorithm",
-    help="Base refill seed (defaults to random_seed).",
-)
-@opt(
-    "--gradient_checkpointing/--no-gradient_checkpointing",
-    default=False,
-    group="Misc",
-    help="Enable activation checkpointing.",
-)
-@opt(
-    "--compile",
-    "compile_mode",
-    type=click.Choice(["default", "reduce-overhead", "max-autotune"]),
-    default=None,
-    group="Misc",
-    help="torch.compile mode. Omit to disable.",
-)
-@opt(
-    "--ckpt_interval",
-    type=int,
-    default=5000,
-    group="Checkpoint",
-    help="Steps between checkpoints.",
-)
-@opt(
-    "--ckpt_dir",
-    type=click.Path(),
-    default="checkpoint",
-    group="Checkpoint",
-    help="Checkpoint directory.",
-)
-@opt(
-    "--val_split",
-    type=float,
-    default=None,
-    group="Validation",
-    help="Validation split ratio.",
-)
-@opt(
-    "--val_step",
-    type=int,
-    default=1000,
-    group="Validation",
-    help="Steps between validation runs.",
-)
-@opt(
-    "--metrics",
-    multiple=True,
-    default=("loss", "lr", "grad_norm", "grad_snr"),
-    group="Validation",
-    help="Metrics to log (repeatable).",
-)
-@opt("--start_epoch", type=int, default=0, group="Checkpoint", help="Start epoch.")
-@opt(
-    "--start_samples",
-    type=int,
-    default=0,
-    group="Checkpoint",
-    help="Start samples (per rank).",
-)
-@opt(
-    "--master_addr",
-    type=str,
-    default="localhost",
-    group="Distributed",
-    help="Master node address.",
-)
-@opt(
-    "--master_port",
-    type=str,
-    default="29500",
-    group="Distributed",
-    help="Master node port.",
-)
-@opt(
-    "--backend",
-    type=click.Choice(_BACKENDS),
-    default="nccl",
-    group="Distributed",
-    help="Distributed backend.",
-)
-@opt("--nprocs", type=int, default=1, group="Distributed", help="Number of GPUs.")
-@opt(
-    "--parallel_mode",
-    type=click.Choice(_PARALLEL),
-    default="fsdp",
-    group="Distributed",
-    help="Parallel strategy.",
-)
-@opt(
-    "--device_type",
-    type=str,
-    default="cuda",
-    group="Distributed",
-    help="Device type.",
-)
-@opt(
-    "--start_method",
-    type=click.Choice(_START_METHODS),
-    default="spawn",
-    group="Distributed",
-    help="Multiprocessing start method.",
-)
-@opt(
-    "--neftune_alpha",
-    type=float,
-    default=0.0,
-    group="Algorithm",
-    help="NEFTune noise alpha.",
-)
-@opt(
-    "--schedule_type",
-    type=click.Choice(_SCHEDULES),
-    default="cosine",
-    group="LR Schedule",
-    help="LR scheduler.",
-)
-@opt(
-    "--min_rate",
-    type=float,
-    default=None,
-    group="LR Schedule",
-    help="Minimum LR as fraction of base LR.",
-)
-@opt(
-    "--cycle_length",
-    type=int,
-    default=None,
-    group="LR Schedule",
-    help="SGDR first cycle length.",
-)
-@opt(
-    "--t_mult",
-    type=int,
-    default=2,
-    group="LR Schedule",
-    help="SGDR cycle length multiplier.",
-)
-@opt(
-    "--stable_steps",
-    type=int,
-    default=None,
-    group="LR Schedule",
-    help="WSD stable plateau steps.",
-)
-@opt(
-    "--decay_steps",
-    type=int,
-    default=None,
-    group="LR Schedule",
-    help="WSD decay steps.",
-)
-@opt(
-    "--tp_size",
-    type=int,
-    default=None,
-    group="Distributed",
-    help="Tensor parallelism (future).",
-)
-@opt(
-    "--dry-run",
-    is_flag=True,
-    default=False,
-    group="Misc",
-    help="Validate config and print plan, do not train.",
-)
+@apply_specs(_SPECS, TrainConfig)
 @click.pass_context
 def train_command(ctx, config_path, dry_run, metrics, **kwargs):
     """Start model training (pretrain / SFT / DPO / GRPO)."""
@@ -608,8 +456,9 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
 
     # Convert tuple back to list
     kwargs["metrics"] = list(kwargs["metrics"])
-    # Remove tp_size (not yet wired)
-    kwargs.pop("tp_size", None)
+    kwargs["tp_size"] = kwargs.pop("tp_size") or 1
+    kwargs["cp_size"] = kwargs.pop("cp_size") or 1
+    kwargs["dp_size"] = kwargs.pop("dp_size") or 1
 
     if dry_run:
         _print_dry_run(kwargs)
@@ -620,12 +469,18 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
 
 def _print_dry_run(kwargs: dict) -> None:
     """Print training plan summary."""
+    dp_size = kwargs.get("dp_size", 1) or 1
+    cp_size = kwargs.get("cp_size", 1) or 1
+    tp_size = kwargs.get("tp_size", 1) or 1
     rows = [
         ("Train type", kwargs.get("train_type")),
         ("Model path", kwargs.get("param_path")),
         ("Data path", kwargs.get("data_root_path")),
-        ("Parallel mode", kwargs.get("parallel_mode", "none")),
-        ("GPUs", str(kwargs.get("nprocs", 1))),
+        ("DP mode", kwargs.get("dp_mode", "none")),
+        ("DP replicas", str(dp_size)),
+        ("CP size", str(cp_size)),
+        ("TP size", str(tp_size)),
+        ("GPUs", str(dp_size * cp_size * tp_size)),
         ("Epochs", str(kwargs.get("n_epoch", 1))),
         ("Batch/device", str(kwargs.get("batch_per_device", 1))),
         ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
@@ -649,6 +504,10 @@ def create_model(config):
     return AutoRegressiveLM(config).to(dtype=torch.bfloat16)
 
 
+def create_value_model(config):
+    return ValueModel(config).to(dtype=torch.bfloat16)
+
+
 def create_optimizer(
     model, optimizer_name: str = "muon_adamw", **kwargs
 ) -> optim.Optimizer:
@@ -666,14 +525,14 @@ def compute_total_steps(
     dataset_len: int,
     n_epoch: int,
     batch_per_device: int,
-    nprocs: int,
+    dp_size: int,
     grad_accum_steps: int,
 ) -> int:
 
     def ceil_div(a: int, b: int) -> int:
         return (a + b - 1) // b
 
-    samples_per_replica = ceil_div(dataset_len, nprocs)
+    samples_per_replica = ceil_div(dataset_len, dp_size)
     batches_per_replica = ceil_div(samples_per_replica, batch_per_device)
     total_steps = (batches_per_replica // grad_accum_steps) * n_epoch
     return total_steps
@@ -703,8 +562,10 @@ def train(
     gradient_checkpointing: bool,
     window_size: int,
     stride: int,
-    nprocs: int,
-    parallel_mode: str,
+    dp_size: int,
+    cp_size: int,
+    tp_size: int,
+    dp_mode: str,
     device_type: str,
     backend: str,
     master_addr: str,
@@ -726,8 +587,24 @@ def train(
         )
     if not os.path.exists(param_path):
         raise FileNotFoundError(f"Model directory not found: {param_path}")
-    if nprocs > 1 and parallel_mode == "none":
-        raise ValueError("--nprocs > 1 requires --parallel_mode to be 'ddp' or 'fsdp'")
+    if dp_size > 1 and dp_mode == "none":
+        raise ValueError("--dp_size > 1 requires --dp_mode to be 'ddp' or 'fsdp'")
+
+    if cp_size > 1:
+        if tp_size > 1:
+            raise ValueError(
+                "--cp_size > 1 combined with --tp_size > 1 is not verified "
+                "yet: the ring-attention patch and head-sharded projections "
+                "interact on the SDPA inputs"
+            )
+        if train_type not in ("seq", "sft"):
+            raise ValueError(
+                "--cp_size > 1 supports seq (pretrain) and sft only; RL "
+                "strategies need cross-shard logprob handling and a "
+                "context-parallel rollout path"
+            )
+        if dp_mode not in ("ddp", "fsdp"):
+            raise ValueError("--cp_size > 1 requires --dp_mode ddp or fsdp")
 
     # Load config
     config_path = os.path.join(param_path, "config.json")
@@ -743,6 +620,9 @@ def train(
         "clip_eps": kwargs.pop("grpo_clip_eps"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
+        "gamma": kwargs.pop("ppo_gamma"),
+        "gae_lambda": kwargs.pop("ppo_gae_lambda"),
+        "vf_coef": kwargs.pop("ppo_vf_coef"),
     }
 
     rollout_interval = kwargs.pop("rollout_interval", 512)
@@ -772,9 +652,14 @@ def train(
     )
     rollout_dynamic_seed = kwargs.pop("rollout_dynamic_seed", None)
     reward_model_fn: Callable[[], BaseRewardModel] | None = None
+    critic_model_fn = None
+    if train_type == "online_ppo":
+        # The optimizer defaults to the policy's; critic_optimizer_fn can
+        # override it in the TrainConfig.
+        critic_model_fn = partial(create_value_model, config)
 
     executor_kwargs = {}
-    if parallel_mode == "ddp":
+    if dp_mode == "ddp":
         executor_kwargs.update(
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
@@ -845,8 +730,10 @@ def train(
             )
         }
 
+    # The scheduler counts optimizer steps over data-parallel replicas; cp
+    # peers split each batch's sequence rather than consuming extra samples.
     total_steps = compute_total_steps(
-        len(dataset), n_epoch, batch_per_device, nprocs, grad_accum_steps
+        len(dataset), n_epoch, batch_per_device, dp_size, grad_accum_steps
     )
     warmup_steps = int(warmup_ratio * total_steps)
     warmup_steps = min(warmup_steps, total_steps)
@@ -883,7 +770,7 @@ def train(
         collate_fn = dpo_collate_fn
     elif train_type == "grpo":
         collate_fn = grpo_collate_fn
-    elif train_type in ("online_grpo", "online_dpo"):
+    elif train_type in ("online_grpo", "online_dpo", "online_ppo"):
         collate_fn = None
 
     train_config = TrainConfig(
@@ -906,11 +793,13 @@ def train(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        nprocs=nprocs,
+        dp_size=dp_size,
+        cp_size=cp_size,
+        tp_size=tp_size,
+        dp_mode=dp_mode,
         backend=backend,
         master_addr=master_addr,
         master_port=master_port,
-        parallel_mode=parallel_mode,
         device_type=device_type,
         start_method=start_method,
         val_split=val_split,
@@ -943,6 +832,7 @@ def train(
         rollout_dynamic_max_pending_groups=rollout_dynamic_max_pending_groups,
         rollout_dynamic_seed=rollout_dynamic_seed,
         reward_model_fn=reward_model_fn,
+        critic_model_fn=critic_model_fn,
         moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),
     )
 

@@ -34,7 +34,7 @@ runtime:
     checkpoints: ./checkpoints
   gpu:
     devices: all
-    parallel_mode: auto  # one GPU: none; multiple GPUs: ddp
+    dp_mode: auto  # one GPU: none; multiple GPUs: ddp
   container:
     cuda_tag: cu128
     ipc: host
@@ -54,7 +54,7 @@ runtime:
   passes all GPUs once; `CUDA_VISIBLE_DEVICES` performs the only filtering.
 - The process count is derived from `devices`. With `all`, the entrypoint uses
   `torch.cuda.device_count()` after Docker starts.
-- `parallel_mode: auto` selects `none` for one GPU and `ddp` for multiple GPUs.
+- `dp_mode: auto` selects `none` for one GPU and `ddp` for multiple GPUs.
   Use `fsdp` explicitly when model sharding is required.
 - To select specific physical GPUs, replace `all` with a list such as
   `devices: [0, 1]`.
@@ -185,6 +185,10 @@ optimizer.pt
 scheduler.pt
 manifest.json
 ```
+
+`online_ppo` jobs additionally require `value_model.pt` and
+`value_optimizer.pt` (the critic state); the completeness check derives this
+from the training config's `train_type`.
 
 New checkpoints write `manifest.json` after every payload file, sync the complete
 staging directory, and then atomically rename that directory into place. Legacy

@@ -18,12 +18,10 @@ import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from astrai.inference.engine import InferenceEngine
+from astrai.inference.engine import InferenceEngine, build_engine
 from astrai.inference.network.anthropic import AnthropicResponseBuilder
 from astrai.inference.network.openai import OpenAIResponseBuilder
 from astrai.inference.network.protocol import ProtocolHandler
-from astrai.model import AutoModel
-from astrai.tokenize import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +90,7 @@ async def lifespan(app: FastAPI):
     config = app.state.server_config
     if not config.get("_test", False):
         try:
-            app.state.engine = _create_engine(**config)
+            app.state.engine = build_engine(**config)
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             raise
@@ -103,31 +101,6 @@ async def lifespan(app: FastAPI):
 
 
 router = APIRouter()
-
-
-def _create_engine(
-    param_path: Path,
-    device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
-    max_batch_size: int = 16,
-    max_seq_len: Optional[int] = None,
-) -> InferenceEngine:
-    if not param_path.exists():
-        raise FileNotFoundError(f"Parameter directory not found: {param_path}")
-
-    tokenizer = AutoTokenizer.from_pretrained(param_path)
-    model = AutoModel.from_pretrained(param_path)
-    model.to(device=device, dtype=dtype)
-    logger.info(f"Model loaded on {device} with dtype {dtype}")
-
-    engine = InferenceEngine(
-        model=model,
-        tokenizer=tokenizer,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seq_len,
-    )
-    logger.info(f"Inference engine initialized with max_batch_size={max_batch_size}")
-    return engine
 
 
 def get_app() -> FastAPI:

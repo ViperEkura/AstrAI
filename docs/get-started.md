@@ -182,8 +182,8 @@ python scripts/tools/train.py \
     --max_lr=1e-4 \
     --window_size=2048 \
     --ckpt_dir=./checkpoint \
-    --nprocs=1 \
-    --parallel_mode=none
+    --dp_size=1 \
+    --dp_mode=none
 ```
 
 ### Multi-GPU (DDP)
@@ -198,8 +198,8 @@ python scripts/tools/train.py \
     --train_type=seq \
     --data_root_path=/path/to/dataset \
     --param_path=./params \
-    --parallel_mode=ddp \
-    --nprocs=4 \
+    --dp_mode=ddp \
+    --dp_size=4 \
     --batch_per_device=4 \
     --grad_accum_steps=8 \
     --max_lr=1e-4 \

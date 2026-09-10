@@ -2,7 +2,9 @@
 
 import asyncio
 import gc
+import logging
 import threading
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Generator, List, Optional, Tuple, Union
 
 import torch
@@ -11,8 +13,11 @@ import torch.nn as nn
 from astrai.extension import ATTN_BACKEND, AttentionBackend, get_backend
 from astrai.inference.cache import PagePool
 from astrai.inference.scheduler import InferenceScheduler
-from astrai.inference.task import STOP
+from astrai.inference.task import STOP, BatchedStreamCallback
+from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class GenerateResult:
@@ -28,15 +33,27 @@ class GenerateResult:
         self._total = count
 
     def append(self, token: str, idx: int = 0):
+        self.append_batch([(idx, token)])
+
+    def append_batch(self, items: List[Tuple[int, Any]]) -> None:
+        """Append multiple ``(idx, token)`` events under one lock/notify.
+
+        Batched counterpart to :meth:`append` for per-step delivery: state
+        updates for every event happen under a single condition hold and
+        waiters are woken once per batch instead of once per token.
+        """
+        if not items:
+            return
         with self._cond:
-            self.tokens.append((idx, token))
-            if token is not STOP:
-                self.results[idx] += token
-            else:
-                if not self._done[idx]:
-                    self._done[idx] = True
-                    self._completed += 1
-                    self._cond.notify_all()
+            for idx, token in items:
+                self.tokens.append((idx, token))
+                if token is STOP:
+                    if not self._done[idx]:
+                        self._done[idx] = True
+                        self._completed += 1
+                        self._cond.notify_all()
+                else:
+                    self.results[idx] += token
             self._event.set()
 
     def pop_all(self) -> List[Tuple[int, str]]:
@@ -62,6 +79,47 @@ class GenerateResult:
     def get_results(self) -> List[str]:
         with self._cond:
             return self.results.copy()
+
+
+class _ResultSink(BatchedStreamCallback):
+    """Batched stream channel from the scheduler into one GenerateResult.
+
+    Registered as the ``stream_callback`` for every task of a single
+    ``generate`` call, so the scheduler's one dispatch per decode step
+    maps to one ``append_batch`` (one lock, one waiter wake). A task can
+    start decoding the moment ``add_task`` returns — before the engine
+    learns its id — so events for ids not yet bound are buffered and
+    replayed on ``bind``.
+    """
+
+    def __init__(self, result: GenerateResult):
+        self._result = result
+        self._lock = threading.Lock()
+        self._index_of: Dict[str, int] = {}
+        self._pending: List[Tuple[str, Any]] = []
+
+    def bind(self, task_id: str, idx: int) -> None:
+        with self._lock:
+            self._index_of[task_id] = idx
+            replay = [(idx, token) for tid, token in self._pending if tid == task_id]
+            if replay:
+                self._pending = [
+                    (tid, token) for tid, token in self._pending if tid != task_id
+                ]
+        if replay:
+            self._result.append_batch(replay)
+
+    def __call__(self, events: List[Tuple[str, Any]]) -> None:
+        with self._lock:
+            items: List[Tuple[int, Any]] = []
+            for tid, token in events:
+                idx = self._index_of.get(tid)
+                if idx is None:
+                    self._pending.append((tid, token))
+                else:
+                    items.append((idx, token))
+        if items:
+            self._result.append_batch(items)
 
 
 class InferenceEngine:
@@ -142,6 +200,7 @@ class InferenceEngine:
     ) -> AsyncGenerator[str, None]:
         request_backend = get_backend(use_default=False)
         result = GenerateResult()
+        sink = _ResultSink(result)
         task_id = self.scheduler.add_task(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -151,8 +210,9 @@ class InferenceEngine:
             frequency_penalty=frequency_penalty,
             rep_window=rep_window,
             backend=request_backend,
-            stream_callback=result.append,
+            stream_callback=sink,
         )
+        sink.bind(task_id, 0)
 
         async def _agen():
             finished = False
@@ -186,8 +246,10 @@ class InferenceEngine:
         n = len(prompts)
         request_backend = get_backend(use_default=False)
         result = GenerateResult(count=n)
-        task_ids = [
-            self.scheduler.add_task(
+        sink = _ResultSink(result)
+        task_ids = []
+        for i, p in enumerate(prompts):
+            task_id = self.scheduler.add_task(
                 prompt=p,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -196,10 +258,10 @@ class InferenceEngine:
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
                 backend=request_backend,
-                stream_callback=lambda token, idx=i: result.append(token, idx),
+                stream_callback=sink,
             )
-            for i, p in enumerate(prompts)
-        ]
+            sink.bind(task_id, i)
+            task_ids.append(task_id)
 
         if not stream:
             try:
@@ -251,3 +313,53 @@ class InferenceEngine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
+
+
+def build_engine(
+    param_path: Optional[Union[str, Path]] = None,
+    *,
+    model: Optional[nn.Module] = None,
+    tokenizer: Optional[AutoTokenizer] = None,
+    device: Optional[str] = "cuda",
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    max_batch_size: int = 16,
+    max_seq_len: Optional[int] = None,
+    **engine_kwargs: Any,
+) -> InferenceEngine:
+    """Composition root for inference assembly.
+
+    Loads model and tokenizer from *param_path*, or accepts preloaded
+    objects, places the model, and returns a started InferenceEngine.
+    Extra *engine_kwargs* (cache, enable_cuda_graph, backend) pass
+    through to InferenceEngine. Placement parts left as None are skipped.
+    """
+    if param_path is not None:
+        if model is not None or tokenizer is not None:
+            raise ValueError("pass either param_path or model+tokenizer, not both")
+        path = Path(param_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Parameter directory not found: {path}")
+        tokenizer = AutoTokenizer.from_pretrained(path)
+        model = AutoModel.from_pretrained(path)
+    elif model is None or tokenizer is None:
+        raise ValueError("build_engine requires param_path or both model and tokenizer")
+
+    placement: Dict[str, Any] = {}
+    if device is not None:
+        placement["device"] = device
+    if dtype is not None:
+        placement["dtype"] = dtype
+    if placement:
+        model.to(**placement)
+        logger.info(
+            f"Model placed on {placement.get('device')} "
+            f"with dtype {placement.get('dtype')}"
+        )
+
+    return InferenceEngine(
+        model=model,
+        tokenizer=tokenizer,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        **engine_kwargs,
+    )

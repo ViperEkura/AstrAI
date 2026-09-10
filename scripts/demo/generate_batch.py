@@ -1,9 +1,6 @@
 from pathlib import Path
 
-import torch
-
-from astrai.inference import InferenceEngine
-from astrai.model import AutoModel
+from astrai.inference import build_engine
 from astrai.tokenize import AutoTokenizer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -11,10 +8,7 @@ PARAMETER_ROOT = Path(PROJECT_ROOT, "params")
 
 
 def batch_generate():
-    # Load model using AutoModel
-    model = AutoModel.from_pretrained(PARAMETER_ROOT)
     tokenizer = AutoTokenizer.from_pretrained(PARAMETER_ROOT)
-    model.to(device="cuda", dtype=torch.bfloat16)
 
     inputs = [
         "你好",
@@ -33,10 +27,7 @@ def batch_generate():
         for q in inputs
     ]
 
-    engine = InferenceEngine(
-        model=model,
-        tokenizer=tokenizer,
-    )
+    engine = build_engine(PARAMETER_ROOT)
     responses = engine.generate(
         prompt=prompts,
         stream=False,

@@ -7,6 +7,7 @@ from astrai.parallel.executor import (
     FSDPExecutor,
     GradientState,
     NoneExecutor,
+    RolloutCapabilities,
     broadcast_state_dict,
 )
 from astrai.parallel.setup import (
@@ -33,5 +34,6 @@ __all__ = [
     "NoneExecutor",
     "DDPExecutor",
     "FSDPExecutor",
+    "RolloutCapabilities",
     "broadcast_state_dict",
 ]

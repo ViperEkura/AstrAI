@@ -1,0 +1,103 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "astrai-ddp-online-rollout-l20-sm89-v3",
+  "benchmark_type": "correctness-deadlock-and-regression",
+  "candidate": "multi-process DDP online rollout through DDPExecutor.model_for_inference",
+  "candidate_git_revision": "5408054bb9d4199b69d214cf67f22dbbd153fc7b",
+  "candidate_archive_sha256": "1751778633e223b800321aaa4f1f3914d356c8ad6dc80b447e841ec595a21393",
+  "baseline_revision": "ce2f9d13b32f729c561d0175fd46927a37d9b0a2",
+  "environment": {
+    "accelerator": "NVIDIA L20",
+    "gpu_indices": [0, 1, 3, 4, 5, 6],
+    "accelerator_count": 6,
+    "compute_capability": "8.9",
+    "memory_mib_per_gpu": 46068,
+    "driver": "570.86.10",
+    "cuda_runtime": "12.8",
+    "pytorch": "2.11.0+cu128",
+    "python": "3.12.2",
+    "process_group": "NCCL",
+    "world_size": 6
+  },
+  "build": {
+    "status": "not_run",
+    "reason": "The cu128 runtime image did not contain nvcc or a native build toolchain, so the source-mounted native extensions could not be rebuilt in this isolated worktree.",
+    "scope_used_for_regression": "Python and torch-native paths; tests/extension excluded from the clean L20 regression run"
+  },
+  "multi_rank_correctness_probe": {
+    "status": "pass",
+    "test": "tests/trainer/test_rollout_executor_boundary.py::test_l20_multi_rank_rollout_can_diverge_before_ddp_training",
+    "wrapper": "torch.nn.parallel.DistributedDataParallel",
+    "backend": "torch_native",
+    "cuda_graph": false,
+    "rollout_forwards": "deliberately divergent across ranks (2 through 7 generated tokens on ranks 0 through 5)",
+    "assertions": [
+      "rollout uses each rank's collective-free DDP.module inference view",
+      "the following wrapped DDP forward/backward/optimizer step completes",
+      "parameters change and remain bitwise-identical across both replicas",
+      "post-update deterministic generation agrees across ranks"
+    ]
+  },
+  "online_grpo_workload": {
+    "status": "pass",
+    "test": "tests/trainer/test_online_e2e.py::test_ddp_online_grpo_end_to_end",
+    "batch_per_device": 1,
+    "group_size": 2,
+    "max_new_tokens": 4,
+    "dataset_samples": 40,
+    "optimizer_steps_per_rank": 7,
+    "checkpoint_assertion": "epoch_0_step_7 exists"
+  },
+  "fresh_process_replays_seconds": [11.85, 11.98, 12.30, 12.18, 12.00],
+  "fresh_process_replay_statistics": {
+    "count": 5,
+    "mean_seconds": 12.062,
+    "median_seconds": 12.0,
+    "sample_standard_deviation_seconds": 0.1775387,
+    "coefficient_of_variation_percent": 1.4719,
+    "minimum_seconds": 11.85,
+    "maximum_seconds": 12.30,
+    "interpretation": "Stability evidence only; no throughput or latency improvement is claimed."
+  },
+  "test_results": {
+    "l20_two_gpu_focused": "20 passed in 24.42s",
+    "l20_six_rank_core_and_end_to_end": "2 passed in 13.69s; 18.99s total wall clock",
+    "l20_six_rank_non_extension_regression": "577 passed in 61.54s; 66.84s total wall clock",
+    "local_full": "646 passed, 176 skipped, 1 warning in 12.82s"
+  },
+  "negative_contracts": [
+    "multi-process online rollout without parallel_mode='ddp' is rejected during TrainConfig validation",
+    "online rollout with torch.compile is rejected before scheduler construction",
+    "distributed FSDP online rollout is rejected because its parameters are sharded"
+  ],
+  "integrated_async_rollout_soak": {
+    "status": "pass",
+    "recorded_at": "2026-09-03T10:57:00+08:00",
+    "integration_revision": "fe81f17772db7acb8d7575b3f617a454a83ca58d",
+    "scope": "PR #55 DDP rollout path combined with PR #59 rollout-version fencing",
+    "world_size": 3,
+    "steps": 100000,
+    "elapsed_seconds": 2486.142,
+    "steps_per_second": 40.222963933677164,
+    "digest_checkpoints": 10001,
+    "max_rank_step_ms": {
+      "median": 25.935,
+      "p95": 35.636,
+      "p99": 39.387,
+      "maximum": 325.863
+    },
+    "cuda_memory_mib": {
+      "allocated": 16.453,
+      "reserved": 22.0,
+      "allocated_drift": 0.0,
+      "reserved_drift": 0.0
+    },
+    "result": "All 100,000 serialized DDP train updates completed with identical parameter digests on every rank."
+  },
+  "limitations": [
+    "No throughput or latency improvement is claimed by this correctness change.",
+    "The test model and seven-step-per-rank GRPO workload are intentionally small and validate six-rank lifecycle correctness rather than production-model scaling.",
+    "Distributed FSDP rollout remains explicitly unsupported rather than materializing a replicated inference copy.",
+    "The isolated cu128 runtime image could not rebuild native extensions; the clean L20 regression result therefore excludes tests/extension."
+  ]
+}

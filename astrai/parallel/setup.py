@@ -12,9 +12,27 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from astrai.parallel.topology import parse_device_order
 from astrai.signal_handler import install_early_signal_handlers
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_local_device_index(
+    local_rank: int,
+    local_world_size: int,
+    device_type: str,
+) -> int:
+    """Map a logical local rank to an accelerator selected by the planner."""
+
+    if not 0 <= local_rank < local_world_size:
+        raise ValueError(
+            f"local rank {local_rank} is outside local world size {local_world_size}"
+        )
+    value = os.environ.get("ASTRAI_DEVICE_ORDER")
+    if value is None or device_type == "cpu":
+        return local_rank
+    return parse_device_order(value, local_world_size)[local_rank]
 
 
 def find_free_port() -> str:
@@ -54,15 +72,18 @@ def setup_parallel(
         yield dist.group.WORLD
         return
 
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+    device_index = resolve_local_device_index(local_rank, local_world_size, device_type)
+
     if world_size <= 1:
-        device_id = torch.device(device_type, local_rank)
+        device_id = torch.device(device_type, device_index)
         os.environ["LOCAL_RANK"] = str(local_rank)
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_DEVICE"] = str(device_id)
         yield None
         return
 
-    device_id = torch.device(device_type, local_rank)
+    device_id = torch.device(device_type, device_index)
 
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = master_port

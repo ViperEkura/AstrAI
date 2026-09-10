@@ -1,0 +1,114 @@
+{
+  "schema_version": "0.5",
+  "score_kind": "diagnostic-project-fit",
+  "score_is_official": false,
+  "draft_id": "astrai-topology-aware-dlo-dpsp-v1",
+  "draft_state": "D3-contract-proposed",
+  "formula_template_id": "project-fit-kernel-v0.5",
+  "diagnostic_project_fit_100": 86.73007069241775,
+  "component_values": {
+    "evolutionary_maintainability": 0.7420138271431783,
+    "project_contract_fit": 1.0,
+    "performance_reuse_utilization": 0.9306048591020996,
+    "operational_fit": 0.9173147546424018
+  },
+  "component_floors": {
+    "evolutionary_maintainability": 0.6,
+    "project_contract_fit": 0.6,
+    "performance_reuse_utilization": 0.4,
+    "operational_fit": 0.6
+  },
+  "subcomponent_inputs": {
+    "evolutionary_maintainability": {
+      "evolution": 0.5,
+      "locality": 0.8,
+      "tests": 1.0,
+      "failure": 1.0,
+      "contract": 1.0
+    },
+    "project_contract_fit": {
+      "integration": 1.0,
+      "interface": 1.0,
+      "lifecycle": 1.0,
+      "buildtest": 1.0,
+      "policy": 1.0
+    },
+    "performance_reuse_utilization": {
+      "attainment": 1.0,
+      "coverage": 0.75,
+      "retention": 1.0,
+      "family": 1.0,
+      "compile": 1.0
+    },
+    "operational_fit": {
+      "replay": 1.0,
+      "load": 0.75,
+      "resource": 1.0,
+      "coldsteady": 1.0
+    }
+  },
+  "input_rationale": {
+    "evolution": "First AstrAI integration; no upstream maintenance or release history exists yet.",
+    "locality": "The runtime change is isolated to parallel planning, setup, and DDP device selection, with separate tools, tests, and documentation.",
+    "tests": "The complete AstrAI suite passed: 631 passed and 103 environment-dependent tests skipped.",
+    "failure": "Malformed, partial, asymmetric, and unknown topology inputs fail closed; invalid device permutations are rejected.",
+    "contract": "Digest-bound planner, CLI, launch, and DDP mapping acceptance tests all passed.",
+    "integration": "The planner is exported through astrai.parallel and consumed by the existing setup and executor paths.",
+    "interface": "Environment variables and planner CLI output are documented and tested.",
+    "lifecycle": "Logical LOCAL_RANK is preserved while LOCAL_DEVICE selects the mapped accelerator.",
+    "buildtest": "The full test suite, Ruff formatting, and import-order checks passed.",
+    "policy": "The candidate adds no dependency and leaves natural rank order as the safe fallback.",
+    "attainment": "Measured selection chooses the best tested mapping for each request-concurrency shape.",
+    "coverage": "The required 8x RTX 5060 Ti cell was tested; optional SM90 and SM100 cells were not.",
+    "retention": "The planner retains natural order for DP4xSP2, avoiding the measured 9.67% topology-label regression.",
+    "family": "DP1/2/4/8 shapes and MiniMax-H3 online-FP8 end-to-end inference were covered.",
+    "compile": "The Python planner adds no timed compilation path.",
+    "replay": "Collectives use seven trials with worst-rank median and p99 reporting.",
+    "load": "Single-request MiniMax-H3 was exercised end to end; DP2/4/8 deployed multi-request service load was not.",
+    "resource": "Peak GPU memory, retained headroom, all-GPU utilization, and clean service shutdown were checked.",
+    "coldsteady": "Initialization, first valid request, warm request, and 10-step stability request were recorded."
+  },
+  "benchmark_trust": {
+    "formula_version": "benchmark-trust-v0.5",
+    "status": "scored",
+    "score_100": 93.06048591020996,
+    "components": {
+      "reproducibility": 1.0,
+      "evidence": 0.75,
+      "statistics": 1.0,
+      "environment": 1.0
+    },
+    "failure_codes": [
+      "RAW_CAPTURE_NOT_CHECKED_IN",
+      "DRAFT_UNSEALED"
+    ]
+  },
+  "official_project_fit": {
+    "status": "unresolved",
+    "score_100": null,
+    "failure_codes": [
+      "DRAFT_SEAL_MISSING",
+      "HIDDEN_PROBES_INCOMPLETE",
+      "EVIDENCE_MANIFEST_UNVERIFIED"
+    ]
+  },
+  "comparison_cell": {
+    "target_project_profile_sha256": "sha256:1a013d117f58397189ba0f07b8bf417abf4905a165c3098a1957d2fcb228cbf6",
+    "target_repository_or_baseline_sha256": "sha256:671ae3f0331ace4f60b4331e963a61987662a7e3234596d0f057834c307acb74",
+    "semantic_contract_sha256": "sha256:e47fd486ddd2fe59959b5a0e585cd3a38c4c816e9fec1912fb71fed752765e05",
+    "acceptance_contract_sha256": "sha256:7ce14b99f74ca9fdb04c06a6c5225792535d412272996e3f89b7e486ac6bf93a",
+    "probe_set_sha256": "sha256:a43bdafee50ab450264c33ad8c655fb10c7f150a26a38cd21bba71791009e58f",
+    "workload_portfolio_sha256": "sha256:fa215b71961e452f1642dfaf2f53062715a6350f12ea011b36b404abaa461130",
+    "performance_target_sha256": "sha256:698990c49a23964b0f03b3f77a92e81e5417c27885c70c185695ed2b33eb1f61",
+    "required_deployment_cell_set_sha256": "sha256:41bdf6bc1d59535dadd4f2c70bce7765fff1824637d44741da815ebf9fedd38a",
+    "project_season": "astrai-2026q3",
+    "cross_project_ranking_allowed": false
+  },
+  "execution": {
+    "infraswe_commit": "811bc775ed5b3a6ec853219245f3469f78818020",
+    "draft_resolution_sha256": "ce886cb16bd5f0f00faa62449b29014aff1b0bb14e92df818221535f82eba7a4",
+    "infraswe_draft_engine_tests": "53 passed",
+    "astrai_tests": "631 passed, 103 skipped",
+    "astrai_lint": "passed"
+  }
+}

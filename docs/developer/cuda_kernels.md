@@ -356,7 +356,8 @@ catch-all row, so a miss means the table is empty or stale, not a shape
 the planner should infer. Rows come
 from two sources, override first: `ASTR_GEMM_TABLE=/path/to/plan_table.txt`
 (one row per line, `m_min m_max n_min n_max perf_class crosswise cta
-stages raster [k [k_min k_max]]`, where the optional `k` is the row's ring K
+stages raster [k [k_min k_max [min_ctas_per_sm]]]`, where the optional `k` is
+the row's ring K
 — omitted keeps 64, and a kK=32 row only survives a dual-2-byte pair — and
 the optional trailing pair is the row's contract-depth band, same (min, max]
 rule as M and N, omitted keeps it open so older row files and sweeps keep
@@ -365,6 +366,18 @@ the wide CTA loses the short-K epilogue race below ~512 while the kK=32 twin
 wins short K hardest — so one (M, N) band would have to lose one of them;
 note the crossover is epilogue dependent, which is why the W8A8 wide rows
 carry the band that holds under both per-tensor and per-channel scales;
+the last optional field is the row's WAVE GATE: `min_ctas_per_sm` makes a row
+match only while its own tile's grid covers that many CTAs per SM, priced
+against `DeviceFacts` at lookup time. A bound like "past M 3072" is usually
+wave arithmetic wearing a literal M — a tile wins once its grid fills the
+slots its ring leaves resident, which is `sms * resident_ctas` on the part
+actually running — and a literal is calibrated to one SM count, so the gated
+form states the requirement once and every device supplies its own count (the
+M 3072 row means 2 CTAs/SM, i.e. M 2816 on a 128-SM part and M 3712 on a
+170-SM one). Bands that are not wave arithmetic — a measured latency
+crossover, or a table property like "a row above already answers this" — keep
+literal bounds and are re-measured on a new device, which is what porting to
+one means below;
 re-parsed only
 when the env path changes; the special
 value `-` turns AOT off entirely — neither override nor builtin rows —
@@ -509,6 +522,145 @@ gather/grouped GEMM (the JIT-per-SM-heuristic idea survives AOT as the
 per-dtype-class `kPlanEff` table, calibrated by the offline sweep). We keep
 two things humming lacks: strided-batch operands with broadcast, and fp32
 output.
+
+#### Plan table tuning log
+
+The AOT rows in `csrc/kernels/gemm/plan_table.h` are measurements, and this
+is where the measurements live: the header keeps each row's rule and the
+numbers its dispatch depends on, and points here for the sweeps behind
+them. Two things every entry shares — the timings are interleaved A/B in
+one process (absolute TFLOPS drift with clock/power, ratios do not), and a
+band is only widened where the direction held at **every** swept point
+inside it.
+
+**2026-09-10, power-of-2 grid sweep.** Full-coverage sweep over M, N, K in
+32..4096 powers of two, all seven dtype combos / four perf classes
+(`gen_plan_table.py --full-coverage`), emitted as 42 rows and merged down
+to 14 (abutting same-recipe rectangles joined; verified decision-identical
+over 80656 probe points x 4 classes x 2 crosswise counts, so the merge
+costs nothing at dispatch). The distillate these rows replaced keyed the
+recipe on a single N split at 1280, and the measured recipe depends on N
+far more strongly than that for large M: it sent M>2560, N>1280 to the
+narrow CTA where the big CTA is 1.40x faster (4096x4096x4096 w16a16
+101 -> 142 TFLOPS), and M>2560, N<=1280 to the big CTA where the small CTA
+is up to 3.6x faster (4096x64x4096 16.5 -> 57 — a 128-wide N tile wastes
+half its mma on a 64-column problem). The quantized classes had no rows at
+all and fell to the degraded bands. Measured on the 42-row form
+(`validate_plan_table.py`, 26 holdout shapes x 6 combos): grid 1.199x, LLM
+shape list 1.097x, combined 1.109x, worst per-shape regression 0.84x.
+These rows are a **floor, not an optimum**: every one is kK=64 with
+`cta<=2` while the manifest carries more. On the narrow-N bands the kK=32
+twin of the class they name measures ~1.85x (RTX 4090, 4096x256x4096
+w16a16 71 -> 131 TFLOPS), and the warp tiling is not addressable from a
+row at all (the dispatch key is class + stages + kK).
+
+**2026-09-10, v2 dense sweep + rectangle search.** The first eight W16A16
+rows are measured additions in front of that floor, each required to beat
+the row it shadows at every sweep grid point inside its rectangle (min gain
+>= 1.00x, geomean >= 1.26x), so a row can only be an improvement.
+Rows 1-2 (pc2 wide CTA on the large-N rectangles the class-2 catch-all sent
+to the 64x64 tile): 1.34-1.45x (w8a8 4096x11008x4096 304 -> 450 TFLOPS).
+Rows 3-7 (pc0 kK=32 on the narrow-N and mid-N bands): 1.31-1.78x geomean,
+up to 1.85x (w16a16 2048x512x4096 73.6 -> 136.3 TFLOPS) — the kK=32 ring
+is 32KB at s3, under the 48KB two-CTA watermark, which is where the win
+comes from; s2 and s3 measure within noise. Row 8 (pc1 big CTA on the
+large-M/small-N band the class-1 rows sent to the 64x64 tile): 1.27x.
+Validated interleaved against the pre-v2 table (12 holdout shapes x 7
+combos): w16a16 -36.9/-39.2/-45.9% on three narrow-N holdouts, no
+regression above the ~4% per-shape noise floor.
+
+**2026-09-11, ring-residency rows (RTX 4090).** Two effects, both
+properties of the 128x128 kK=32 s2 ring. *Residency*: the kK=64 s2 ring is
+96KB, so exactly one CTA is resident per SM and the epilogue — which
+scatters the fp32 accumulators through the reclaimed rings and copies the
+tile out — is fully exposed; the kK=32 twin's 48KB ring keeps two CTAs
+overlapping. *Warps*: that tile runs 16 warps of 32x32 (512 threads,
+REG:64 = exactly the two-CTA register budget), against the 8 warps of 64x32
+the 128x128 entries carried; doubling the warps per partition is worth
+7-14% on large shapes on its own. Interleaved A/B (median of 5 rounds,
+event-timed) over the six fused-linear families x M in {512,2048,4096}:
+2048x4096x4096 -12.7%, 4096x4096x4096 -14.7%, 512x4096x11008 -11.6%,
+4096x4096x11008 -10.7%, 2048x4096x11008 -10.2%, 2048x6144x1536 -8.0%,
+512x28672x8192 -8.0%, 512x11008x4096 -8.0%, 512x4096x4096 -6.4%,
+4096x1536x1536 -5.3%; every other probed point within +-1.5%. The wide
+bands open at M 512 rather than the 1024 the first cut used — a band min is
+exclusive, so 1024 left M=1024 (and 768) on the rows below, which the 64x64
+CTA served at 0.81-0.89x cuBLAS while their M=2048 neighbours sat at
+0.96-1.00x. Extending those rows one octave down measured -12.5 to -15.7%
+on the M in {768,1024} points of the six families, with every
+already-covered point back within +-0.2%.
+
+**2026-09-11, the narrow-N wave bound.** The bound that says when the
+128x128 kK=32 tile beats the 64x64 one was a hand-calibrated M literal
+twice, and wrong twice: "past M 3072" (read off M 3072 below the line and
+M 4096 above it, assuming the crossover sat at the 256-slot mark), then
+"past M 3712" (29 M-tiles, from the N=1536 sweep). Both are the same
+arithmetic frozen at one N — the grid is m_tiles * n_tiles, so the M that
+fills the machine moves with N, and no single literal holds it. Measured
+against the 64x64 kK=32 row underneath, on a 128-SM part (256 slots at this
+ring's resident 2), as CTAs / 256:
+
+| shape | grid | waves | winner | TFLOPS |
+|---|---|---|---|---|
+| 4096x1152 | 32x 9 = 288 | 1.13 | 64x64 | 132.2 vs 107.6 |
+| 3328x1536 | 26x12 = 312 | 1.22 | 64x64 | 132.7 vs 116.6 |
+| 3584x1536 | 28x12 = 336 | 1.31 | 64x64 | 132.1 vs 125.9 |
+| 5120x1152 | 40x 9 = 360 | 1.41 | 128x128 | 133.6 vs 131.0 |
+| 3840x1536 | 30x12 = 360 | 1.41 | 128x128 | 133.9 vs 131.1 |
+| 4096x1536 | 32x12 = 384 | 1.50 | 128x128 | 141.6 vs 133.8 |
+
+Every N<=1536 point on either side of 1.36 waves agrees, including the one
+where the two rules disagree by more than noise (4096x1152: the literal sent
+it to the big tile and lost 23%). The 64x64 rate is flat (~132) across the
+span, so the crossover is the big tile climbing out of its own
+wave-quantization hole: a stub wave of 56-92 CTAs costs more than the tile's
+reuse advantage is worth. Hence the row states 1360 permille and drops the M
+literal — N=1152 shapes now need 39 M-tiles instead of 29, the dependence
+the literal could not express.
+
+**Open: the same rule does not hold across N in (1536,3072].** Four mid-N
+points split two against two on it:
+3072x2048 (24x16 = 384 = 1.50 waves) -> big wins 141.6 vs 133.5 (+6%);
+2688x3072 (21x24 = 504 = 1.97) -> big wins 141.5 vs 137.8;
+**2560x2560 (20x20 = 400 = 1.56) -> big loses 113.3 vs 133.6 (-15%)**;
+2048x2816 (16x22 = 352 = 1.38) -> big loses 131.2 vs 133.5.
+The two rejections are the two *best*-filled grids of the four, so wave
+fill is not what decides this band, and nothing about 2560 or 2816 is
+special (both divide 128). Until something that does decide it is measured,
+that half of the band keeps the N=1536 literal plus a bare CTAs-per-SM
+gate, and the 3072x2048 improvement is left on the table. Widening on a 2-2
+split would have been a 15% regression on a shape no row was measured on.
+
+**2026-09-11, the two kK=32 band swaps in the small CTA.** N in (768,1536]
+resolved to the kK=64 small tile (or, past M 768, to the 128x128 kK=64 one),
+whose ring is 64KB/96KB — one resident CTA — while the kK=32 twin is 32KB
+and leaves the epilogue overlapped. Above M 1536 the band is left alone
+(4096x1536x1536 is served by the big-tile row and the big CTA is 5.3%
+ahead), and M<=128 too (the grid is too thin for residency to pay; the
+deeper ring amortizes better — 128x1536x4096 is 4% slower on the kK=32
+twin). The kK=64 defaults of the bands N in (1536,3072] and N<=768 pay for
+their extra ring exactly where the grid is already thin: 1024x3072x1536
+-27% (94.7 -> 129.8), 768x768x3072 -37%, 768x512x2048 -23%, 512x768x3072
+-20%, 1024x2048x1536 -5%; the M bounds keep those rows off the shapes where
+the deeper ring measured ahead (3072x2048x1536 +2% for kK=64, 256x768x3072
++4%).
+
+**The W8A8 wide CTA's win is a grid-fill property, not a shape one.** At
+128x256 per CTA the tile needs >= 1 wave to pay off (measured: <0.5 wave
+0.79x, >=1 wave 1.08x, >=4 waves 1.42x against the small CTA), so those
+bands start where M/128 * N/256 >= 128 — one wave on a 128-SM part, which
+is what the resident-1 72KB ring makes a wave. Every wide row also carries
+the K > 512 band: the crossover is epilogue dependent, so the band takes
+the value that holds under both per-tensor and per-row/per-channel scales
+and the row is a strict win rather than one a cheap-scale harness sees as a
+regression.
+
+**Open: the M=512 family.** Its grid is thin in a way no tile fixes —
+512x1536x1536 is 192 CTAs of 64x64 against 384 slots, and the 128x128 tile
+is worse (48 CTAs, 1.13 waves). Split-K would add more reduction traffic
+than the lost parallel slack costs (the fp32 partials are larger than the
+bf16 output), so the shapes stay on the 64x64 tile at 0.87-0.95x cuBLAS
+until a persistent or stream-K kernel makes the grid a free variable.
 
 ## Build System
 

@@ -223,13 +223,13 @@ struct GemmPlan {
 
 // One [gemm-plan] line naming the planner's decision (ASTR_GEMM_PLAN = 1):
 // the AOT row table or the last-resort degraded band that produced the plan.
-inline void log_plan_decision(const char* src, const GemmParams& p,
+inline void log_plan_decision(const char* src, const PlanQuery& q,
                               const GemmPlan& plan) {
     if (!gemm_plan_log()) return;
     std::fprintf(stderr,
                  "[gemm-plan] %s m%lld n%lld k%lld b=%d -> cta%d s%d "
                  "raster %d\n",
-                 src, (long long)p.m, (long long)p.n, (long long)p.k, p.batch,
+                 src, (long long)q.m, (long long)q.n, (long long)q.k, (int)q.batch,
                  (int)plan.cta, plan.stages, plan.raster);
 }
 
@@ -243,16 +243,15 @@ inline void log_plan_decision(const char* src, const GemmParams& p,
 // fraction of L2 (fatter B traffic than A reserves more), cap the group so
 // the A side fits, and floor it at enough M rows to keep every SM busy
 // within one group sweep.
-inline int plan_raster(const GemmParams& p, int bm, int bn, int ba, int bb,
-                       const DeviceFacts& dev) {
-    const int64_t m_tiles = (p.m + bm - 1) / bm;
-    const int64_t n_tiles = (p.n + bn - 1) / bn;
+inline int plan_raster(const PlanQuery& q, int bm, int bn) {
+    const int64_t m_tiles = (q.m + bm - 1) / bm;
+    const int64_t n_tiles = (q.n + bn - 1) / bn;
     if (m_tiles < n_tiles) return -8;
-    if (p.n * p.k * (int64_t)bb <= dev.l2_bytes * 7 / 10) return 1;
-    const double reserve = 0.12 + 0.28 * (double)bb / (double)ba;
-    const double budget = (1.0 - std::min(reserve, 0.5)) * (double)dev.l2_bytes;
-    const int64_t ub = (int64_t)(budget / ((double)bm * (double)p.k * ba));
-    const int64_t lb = (dev.sms + n_tiles - 1) / n_tiles;
+    if (q.n * q.k * (int64_t)q.bb <= q.dev.l2_bytes * 7 / 10) return 1;
+    const double reserve = 0.12 + 0.28 * (double)q.bb / (double)q.ba;
+    const double budget = (1.0 - std::min(reserve, 0.5)) * (double)q.dev.l2_bytes;
+    const int64_t ub = (int64_t)(budget / ((double)bm * (double)q.k * q.ba));
+    const int64_t lb = (q.dev.sms + n_tiles - 1) / n_tiles;
     int64_t g = std::min(ub, m_tiles);
     if (ub >= lb) g = std::min(std::max(g, lb), m_tiles);
     return (int)std::max(g, (int64_t)1);
@@ -260,6 +259,7 @@ inline int plan_raster(const GemmParams& p, int bm, int bn, int ba, int bb,
 
 // Dtype-class ids the plan-table rows key on.
 enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
+
 
 // Compile-time dtype-class derivation from the operand pair (the mma
 // promotion rule plus operand widths; mixed bf16xfp8 lands with the 2B x
@@ -305,9 +305,7 @@ static_assert(gemm_perf_class<__nv_bfloat16, int8_t>() ==
 // the smem opt-in ceiling is a stale tuning artifact — no plan from that
 // row, the caller tries the next source.
 inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
-                                             const GemmParams& p, int ba,
-                                             int bb, const DeviceFacts& dev,
-                                             int crosswise = 0) {
+                                             const PlanQuery& q) {
     int bm, bn;
     plan_row_geometry(row.cta, bm, bn);
     // A row can name a geometry or a depth that this operand pair has no tile
@@ -317,14 +315,14 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
     // degraded bands, serves the shape instead. The failure is silent (the
     // launcher just does not fire), so this gate is the only thing standing
     // between a stale row and an uninitialized output tile.
-    if (row.cta == TileClass::kWide128x256 && (ba != 1 || bb != 1))
+    if (row.cta == TileClass::kWide128x256 && (q.ba != 1 || q.bb != 1))
         return std::nullopt;
     if (!row_k_supported(row.kk)) return std::nullopt;
     // Only the dual-2-byte ladder carries the kK=32 twins (policy.cuh): a
     // 1-byte line holds half as many 16B chunks, so no kK=32 tile divides its
     // load path. A row naming one for such a pair matches no tile either, and
     // is rejected on the same terms as the width rule above.
-    if (row.kk == 32 && (ba != 2 || bb != 2)) return std::nullopt;
+    if (row.kk == 32 && (q.ba != 2 || q.bb != 2)) return std::nullopt;
     // Only the 64x64 kK=64 geometry carries the deep s4/s5 rings (policy.cuh),
     // and only it has the smem room for them: every other class or depth would
     // dispatch to nothing. The ring check below cannot catch this — a deep
@@ -339,32 +337,28 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
         return std::nullopt;
     // Crosswise staging runs the conservative ladder, which carries kK 64 and
     // no wide CTA; a row naming more than that would match no tile there.
-    if (crosswise != 0 && (row.kk != kTableRowK || row.cta == TileClass::kWide128x256))
+    if (q.crosswise != 0 &&
+        (row.kk != kTableRowK || row.cta == TileClass::kWide128x256))
         return std::nullopt;
-    if (ring_smem_bytes(bm, bn, row.kk, row.stages, ba, bb) > dev.smem_max)
+    if (ring_smem_bytes(bm, bn, row.kk, row.stages, q.ba, q.bb) >
+        q.dev.smem_max)
         return std::nullopt;
     return GemmPlan{row.cta, row.stages,
-                    row.raster != 0 ? row.raster
-                                    : plan_raster(p, bm, bn, ba, bb, dev),
+                    row.raster != 0 ? row.raster : plan_raster(q, bm, bn),
                     row.kk};
 }
 
-// crosswise_ops counts the operands taking the direct crosswise load
-// (A ColMajor / B RowMajor storage): 0 = dual-congruous NT, 1 = TT and
-// the NN swap, 2 = TN. ba / bb are the operand element sizes; perf is
-// the dtype class the table rows key on.
-inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
-                          GemmPerfClass perf, int crosswise_ops = 0) {
-    const DeviceFacts dev = device_facts();
+// The planner core: one query in, one plan out, no device or binding access.
+inline GemmPlan plan_gemm(const PlanQuery& q) {
     // Table-only dispatch, one source: the AOT rows (override file, then the
     // compiled-in ones). plan_from_row smem-gates the row, so a stale tuning
     // ring falls through instead of failing a launch. The original cost model
     // is deleted from the codebase — a miss falls to the degraded bands (open
     // on M, -1 keys; always match, so planning stays a total function);
     // ASTR_GEMM_TABLE=- skips the rows entirely.
-    if (auto row = table_row(p, (int)perf, crosswise_ops); row) {
-        if (auto plan = plan_from_row(*row, p, ba, bb, dev, crosswise_ops)) {
-            log_plan_decision("table", p, *plan);
+    if (auto row = table_row(q); row) {
+        if (auto plan = plan_from_row(*row, q)) {
+            log_plan_decision("table", q, *plan);
             return *plan;
         }
     }
@@ -372,9 +366,39 @@ inline GemmPlan plan_gemm(const GemmParams& p, int ba, int bb,
     // matches and planning stays a total function (degraded_row_for
     // covers the degenerate m=0); the smem gate cannot demote them — the
     // s2 64x64 ring is the floor every supported device fits.
-    GemmPlan plan = *plan_from_row(degraded_row_for(p.m), p, ba, bb, dev);
-    log_plan_decision("degraded (no table)", p, plan);
+    GemmPlan plan = *plan_from_row(degraded_row_for(q.m), q);
+    log_plan_decision("degraded (no table)", q, plan);
     return plan;
+}
+
+// The one place a GemmParams becomes planner input, and the one place the
+// dispatch key is derived: perf class, operand widths and the crosswise count
+// are all functions of the typed call, so they are computed rather than passed
+// in and a caller cannot hand the planner a key that contradicts its own types
+// and layouts. Lives with the binding that owns GemmParams, not next to
+// PlanQuery: the table module is rows-as-data and knows no kernel ABI POD.
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
+PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
+    PlanQuery q;
+    q.m = p.m;
+    q.n = p.n;
+    q.k = p.k;
+    q.batch = p.batch;
+    q.perf_class = (int)gemm_perf_class<ElemA, ElemB>();
+    q.crosswise = crosswise_of<LayoutA, LayoutB>();
+    q.ba = (int)sizeof(ElemA);
+    q.bb = (int)sizeof(ElemB);
+    q.dev = dev;
+    return q;
+}
+
+// The typed entry: problem and device in, plan out. Taking the layout tags as
+// types is what ties the plan to the launch that follows it — every derived
+// field comes from the same tags the launcher instantiates with.
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
+GemmPlan plan_of(const GemmParams& p) {
+    return plan_gemm(
+        plan_query<ElemA, ElemB, LayoutA, LayoutB>(p, device_facts()));
 }
 
 // Grid + launch for one concrete Policy — the only place a GEMM kernel
@@ -565,8 +589,9 @@ template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
 void launch_plan_impl(GemmParams p, const GemmPlan& plan,
                       cudaStream_t stream) {
     p.raster = plan.raster;
-    constexpr bool kBigFast = !std::is_same_v<LayoutA, ColMajor> &&
-                              !std::is_same_v<LayoutB, RowMajor>;
+    // Dual-congruous (crosswise 0), the only pair whose plan can reach the
+    // fast-loop ladder entries: both operands staged as-is.
+    constexpr bool kBigFast = crosswise_of<LayoutA, LayoutB>() == 0;
     // TMA staging first when the layout pair and dtypes allow it (the
     // planner's stage/tile decisions are shared): sm_90+ device, no
     // kill switch, and every descriptor encodable — else the cp.async
@@ -653,36 +678,37 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
         swapped = !trans_a && !trans_b;  // canonicalize rewrites NN
         canonicalize_gemm(p, trans_a, trans_b);
     }
-    // Crosswise operand count for the plan: transposed-A storage
-    // (ColMajor) and plain-B storage (RowMajor) both take the direct
-    // crosswise load.
-    const int crosswise = (trans_a ? 1 : 0) + (trans_b ? 0 : 1);
-    const GemmPlan plan = plan_gemm(p, (int)sizeof(ElemA), (int)sizeof(ElemB),
-                                    gemm_perf_class<ElemA, ElemB>(),
-                                    crosswise);
+    // Each branch plans from its OWN layout tags, so the plan and the launch
+    // below cannot disagree about the crosswise count, widths or perf class.
     if (trans_a && trans_b) {
         // The swap computes the transposed problem; its (rewritten TT)
         // branch instantiates the column-major-output epilogue through
         // LayoutOut. Mixed never swaps, so its output stays row-major.
         if constexpr (kSymmetric) {
             if (swapped)
-                launch_plan<ElemA, ElemB, ColMajor, ColMajor, ColMajor, OutT>(p, plan, stream);
+                launch_plan<ElemA, ElemB, ColMajor, ColMajor, ColMajor, OutT>(
+                    p, plan_of<ElemA, ElemB, ColMajor, ColMajor>(p), stream);
             else
-                launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
+                launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(
+                    p, plan_of<ElemA, ElemB, ColMajor, ColMajor>(p), stream);
         } else {
-            launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
+            launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(
+                p, plan_of<ElemA, ElemB, ColMajor, ColMajor>(p), stream);
         }
     } else if (trans_b) {
         // NT (the fused-linear shape).
-        launch_plan<ElemA, ElemB, RowMajor, ColMajor, RowMajor, OutT>(p, plan, stream);
+        launch_plan<ElemA, ElemB, RowMajor, ColMajor, RowMajor, OutT>(
+            p, plan_of<ElemA, ElemB, RowMajor, ColMajor>(p), stream);
     } else if (trans_a) {
-        launch_plan<ElemA, ElemB, ColMajor, RowMajor, RowMajor, OutT>(p, plan, stream);
+        launch_plan<ElemA, ElemB, ColMajor, RowMajor, RowMajor, OutT>(
+            p, plan_of<ElemA, ElemB, ColMajor, RowMajor>(p), stream);
     } else {
         // Dual row-major: mixed only — symmetric NN was rewritten above
         // into the transposed TT kernel (if constexpr keeps this
         // instantiation out of symmetric builds).
         if constexpr (!kSymmetric)
-            launch_plan<ElemA, ElemB, RowMajor, RowMajor, RowMajor, OutT>(p, plan, stream);
+            launch_plan<ElemA, ElemB, RowMajor, RowMajor, RowMajor, OutT>(
+                p, plan_of<ElemA, ElemB, RowMajor, RowMajor>(p), stream);
     }
 }
 

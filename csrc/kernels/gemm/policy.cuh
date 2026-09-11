@@ -84,23 +84,57 @@ constexpr int ring_smem_bytes(int bm, int bn, int k, int stages,
     return (stages + 1) * k * (bm * ba + bn * bb);
 }
 
+// Resident-CTA hint for a ring of `bytes` bytes — __launch_bounds__'s second
+// argument, and so the per-thread register budget every kernel of that
+// geometry is compiled to (regs_per_sm / (threads * hint)). One source:
+// GemmSmem states it to the compiler and the planner's residency model
+// (plan_table.h) prices the same rule, so a ring the planner counts as two
+// CTAs per SM is one the compiler also fitted.
+//
+// The 48KB watermark is a preference, not a device limit — well under every
+// supported part's per-block opt-in ceiling, it reads "a ring that fits in
+// half of Ada's smem is worth splitting the register file for". It is
+// therefore NOT the smem term of residency: that term is priced from
+// DeviceFacts::smem_per_sm, because a part with more smem per SM packs more
+// CTAs than a watermark fixed at one device's figure allows.
+constexpr int min_ctas_for_ring(int bytes) {
+    return bytes <= 48 * 1024 ? 2 : 1;
+}
+
+// Which storages take the DIRECT (crosswise) staging path. A stored [K][M]
+// (ColMajor) and B stored [K][N] (RowMajor) each keep the tile's rows along K,
+// so their load walks memory crosswise; the other two are congruous and stage
+// as-is. The operand role rides the function name because a tag alone does not
+// say which side it is: the canonical A is [M][K] and B is [K][N], so
+// ColMajor means crosswise for A and congruous for B. Everything else in this
+// directory spells the predicate from these two — crosswise_of() sums them,
+// GemmSmem reads them per operand, the ladder picks its kind from them.
+template <typename Layout>
+constexpr bool direct_a() {
+    return std::is_same_v<Layout, ColMajor>;
+}
+template <typename Layout>
+constexpr bool direct_b() {
+    return std::is_same_v<Layout, RowMajor>;
+}
+
 // Layout-aware shared-memory budget and occupancy hint. Every operand ring
 // holds kStages+1 buffers: the load for tile i+kStages targets slot
 // (i-1)%(kStages+1) — already consumed — so neither load path needs a
-// post-compute barrier (one __syncthreads per k-tile). The 48KB static
-// watermark picks the resident-CTA hint for __launch_bounds__.
+// post-compute barrier (one __syncthreads per k-tile). The register-budget
+// hint comes from min_ctas_for_ring below.
 template <typename Traits, typename LayoutA, typename LayoutB>
 struct GemmSmem {
     // Crosswise (direct-load) operands: A ColMajor storage, B RowMajor
     // storage (B's tag is relative to the canonical [K][N]).
-    static constexpr bool kDirectA = std::is_same_v<LayoutA, ColMajor>;
-    static constexpr bool kDirectB = std::is_same_v<LayoutB, RowMajor>;
+    static constexpr bool kDirectA = direct_a<LayoutA>();
+    static constexpr bool kDirectB = direct_b<LayoutB>();
     static constexpr int kRingDepth = Traits::kStages + 1;
     static constexpr int kBytes =
         ring_smem_bytes(Traits::kBlockM, Traits::kBlockN, Traits::kK,
                         Traits::kStages, Traits::kElemBytesA,
                         Traits::kElemBytesB);
-    static constexpr int kMinCtas = kBytes <= 48 * 1024 ? 2 : 1;
+    static constexpr int kMinCtas = min_ctas_for_ring(kBytes);
 };
 
 // Tile recipe (CUTLASS-style configuration type): one named bundle of CTA
@@ -170,6 +204,16 @@ using Tile_128x128x32_W64x32_S2_Fast =
     GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 2, true>;
 using Tile_128x128x32_W64x32_S3_Fast =
     GemmTileConfig<Shape<128, 128, 32>, Shape<64, 32>, 3, true>;
+// 16 warps per CTA on the 128x128x32 ring (32x32 warp tiles, 512 threads):
+// same CTA geometry, same 48KB ring, twice the warps. The 8-warp twin above
+// leaves the tensor pipe waiting at every fragment boundary; doubling the warps
+// per partition is worth 7-14% on every large fused-linear shape and costs
+// nothing on the small ones (13 shapes measured, only 512x1536x1536 gives up
+// 1.2%, and that shape is served by the 64x64 rows). The residency budget
+// still holds: 512 threads x 2 CTAs needs <= 64 registers, which the smaller
+// 32x32 warp tile's accumulator (32 fp32 cells) leaves room for.
+using Tile_128x128x32_W32x32_S2_Fast =
+    GemmTileConfig<Shape<128, 128, 32>, Shape<32, 32>, 2, true>;
 // 1-byte operands only: the ring is 147KB for a 2-byte pair (past the smem
 // opt-in ceiling) against 74KB for a 1-byte one.
 using Tile_128x256x64_W64x32_S2_Fast =
@@ -268,7 +312,7 @@ using TileManifest = tuple_cat_t<
     TileManifestCross,
     std::tuple<Tile_64x64x64_W16x16_S2_Fast, Tile_64x64x64_W16x16_S3_Fast,
                Tile_64x64x32_W16x32_S2_Fast, Tile_64x64x32_W16x32_S3_Fast,
-               Tile_128x64x32_W32x32_S2_Fast, Tile_128x128x32_W64x32_S2_Fast,
+               Tile_128x64x32_W32x32_S2_Fast, Tile_128x128x32_W32x32_S2_Fast,
                Tile_128x128x32_W64x32_S3_Fast>>;
 
 // The 1-byte ladder: the shared six plus the wide CTA, every one of them at
@@ -280,21 +324,45 @@ using TileManifest = tuple_cat_t<
 using TileManifestByte =
     tuple_cat_t<TileManifestCross, std::tuple<Tile_128x256x64_W64x32_S2_Fast>>;
 
-// The manifest a given operand pair and staging selects over. The widening
-// ladder is only legal where it was measured, so everything else keeps the
-// conservative six: crosswise staging (the staging budget differs), a mixed
-// width pair (one 1-byte operand halves the chunk count the same way),
-// 1-byte pairs (no kK=32 tile divides, above), and 2-byte pairs, which get
-// the full ladder.
+// How many operands take that direct path (0 = dual-congruous NT). The
+// planner's crosswise field and the launcher's ladder selection are this one
+// number, asked of the layout tags rather than re-derived from trans flags.
+template <typename LayoutA, typename LayoutB>
+constexpr int crosswise_of() {
+    return (direct_a<LayoutA>() ? 1 : 0) + (direct_b<LayoutB>() ? 1 : 0);
+}
+
+// Which of the three ladders a (staging path, operand widths) pair selects —
+// the one rule behind both the type-level alias and the planner's runtime
+// lookup, so the two cannot disagree about which tiles a plan may reach.
+// The widening ladders are only legal where they were measured, so everything
+// else keeps the conservative six: crosswise staging (different staging
+// budget), a mixed width pair (one 1-byte operand halves the chunk count the
+// same way), 1-byte pairs (no kK=32 tile divides, see TileManifestByte).
+enum class ManifestKind { kCrosswise, kTwoByte, kByte };
+
+constexpr ManifestKind manifest_kind(bool crosswise_staging, int ba, int bb) {
+    if (crosswise_staging) return ManifestKind::kCrosswise;
+    if (ba == 2 && bb == 2) return ManifestKind::kTwoByte;
+    if (ba == 1 && bb == 1) return ManifestKind::kByte;
+    return ManifestKind::kCrosswise;
+}
+
+template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
+constexpr ManifestKind manifest_kind_of() {
+    return manifest_kind(crosswise_of<LayoutA, LayoutB>() != 0,
+                         (int)sizeof(ElemA), (int)sizeof(ElemB));
+}
+
+// The manifest a given operand pair and staging selects over: the kind above,
+// mapped to its ladder (kCrosswise is the fallback, so it needs no arm).
 template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
 using manifest_for = std::conditional_t<
-    std::is_same_v<LayoutA, ColMajor> || std::is_same_v<LayoutB, RowMajor>,
-    TileManifestCross,
-    std::conditional_t<sizeof(ElemA) == 2 && sizeof(ElemB) == 2, TileManifest,
-                       std::conditional_t<sizeof(ElemA) == 1 &&
-                                              sizeof(ElemB) == 1,
-                                          TileManifestByte,
-                                          TileManifestCross>>>;
+    manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kTwoByte,
+    TileManifest,
+    std::conditional_t<
+        manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kByte,
+        TileManifestByte, TileManifestCross>>;
 
 template <typename ElemA_, typename ElemB_, typename LayoutA_, typename LayoutB_,
           typename Tile_, typename LayoutOut_ = RowMajor,

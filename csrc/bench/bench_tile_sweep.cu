@@ -322,9 +322,8 @@ std::vector<Row> sweep_shape(int m, int n, int k, bool use_scale, int warmup,
         p.out_batch_stride = m * n;
         // Raster is a property of the geometry, and production recomputes it
         // per tile; match that so the comparison is apples-to-apples.
-        p.raster = plan_raster(p, (int)Tile::CtaShape::kM,
-                               (int)Tile::CtaShape::kN, (int)sizeof(EA),
-                               (int)sizeof(EB), dev);
+        p.raster = plan_raster(plan_query<EA, EB, RowMajor, ColMajor>(p, dev),
+                               (int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN);
 
         const BenchResult r = bench_kernel(
             [&] { launch_policy<Policy>(p, 0); }, warmup, iters, flops);
@@ -389,8 +388,7 @@ int planned_candidate_index(const GemmPlan& plan) {
 
 template <typename EA, typename EB>
 void report_shape(const char* cfg, const std::vector<Row>& rows, int m, int n,
-                  int k, GemmPerfClass perf, int ba, int bb,
-                  const DeviceFacts& dev, const char* dtype_tag) {
+                  int k, const DeviceFacts& dev, const char* dtype_tag) {
     for (const Row& r : rows) {
         if (r.ok)
             std::printf("%s,%s,%s,%d,%.4f,%.2f,%.4f,%.4f,%d\n", dtype_tag, cfg,
@@ -405,7 +403,10 @@ void report_shape(const char* cfg, const std::vector<Row>& rows, int m, int n,
     p.m = m;
     p.n = n;
     p.k = k;
-    const GemmPlan plan = plan_gemm(p, ba, bb, perf, /*crosswise=*/0);
+    // The sweep only times the NT (fused-linear) route, which is the layout
+    // pair the candidates above are built with; the plan derives its own
+    // perf class, widths and crosswise count from those same tags.
+    const GemmPlan plan = plan_of<EA, EB, RowMajor, ColMajor>(p);
     const int pi = planned_candidate_index<EA, EB>(plan);
     const char* planned = pi >= 0 ? rows[(size_t)pi].tile.c_str() : "?";
 
@@ -510,15 +511,14 @@ int main(int argc, char** argv) {
             const auto rows =
                 sweep_shape<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>(
                     m, n, k, /*use_scale=*/false, warmup, iters);
-            report_shape<__nv_bfloat16, __nv_bfloat16>(
-                cfg, rows, m, n, k, GemmPerfClass::kW16A16, 2, 2, dev, "bf16");
+            report_shape<__nv_bfloat16, __nv_bfloat16>(cfg, rows, m, n, k, dev,
+                                                       "bf16");
         }
 #ifdef ASTRAI_SWEEP_INT8
         if (want_int8) {
             const auto rows = sweep_shape<int8_t, int8_t, __nv_bfloat16>(
                 m, n, k, /*use_scale=*/true, warmup, iters);
-            report_shape<int8_t, int8_t>(cfg, rows, m, n, k,
-                                         GemmPerfClass::kW8A8, 1, 1, dev, "int8");
+            report_shape<int8_t, int8_t>(cfg, rows, m, n, k, dev, "int8");
         }
 #endif
     }

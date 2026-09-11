@@ -1,18 +1,18 @@
 #pragma once
-// AOT dispatch table: measured best-recipe rows per (shape band, dtype
-// class, layout class) that plan_gemm consults. Rows are data — the launch
-// ladders resolve a row's CTA class through the manifest, so this header
-// holds no kernel pointers or registration. Sources, override first:
-//   - a runtime table file (ASTR_GEMM_TABLE=/path/to/rows.txt), so tile
-//     tuning never needs a rebuild;
-//   - the compiled-in GENERATED rows below (paste the row file the
-//     measurement script emits; the script never writes source).
-// An empty table makes every lookup miss and dispatch falls through to the
-// degraded band rows.
-// The sweep times the fused-linear (NT) layout, so pasted rows carry
-// crosswise 0: non-NT shapes (TT, TN, mixed dual-row-major) take the same
-// degraded fallback.
+// AOT dispatch table: measured best-recipe rows per (shape band, dtype class,
+// layout class) that plan_gemm consults. Rows are data — the launch ladders
+// resolve a row's CTA class through the manifest, so this header holds no
+// kernel pointers or registration. Sources, override first: a runtime table
+// file (ASTR_GEMM_TABLE=/path/to/rows.txt), so tile tuning never needs a
+// rebuild, then the compiled-in GENERATED rows below (paste what the
+// measurement script emits; the script never writes source). An empty table
+// makes every lookup miss, and dispatch falls through to the degraded rows.
+// The sweep times the fused-linear (NT) layout, so pasted rows carry crosswise
+// 0 and the other layout classes take that same degraded fallback. Row files
+// and their field order: parse_plan_table_file below; measurements, sweeps and
+// the open questions: docs/developer/cuda_kernels.md (Plan table tuning log).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,22 +21,25 @@
 #include <string>
 #include <vector>
 
+#include "common/device.cuh"
 #include "policy.cuh"
 
 namespace astrai {
 namespace gemm {
 
-// Ring K a row carries when its file omits the field, and the depth the
-// forced-recipe knob pins. The k-tile depth is a row field now that the
-// manifest holds kK twins (policy.cuh): the measured winner is kK=32 on most
-// shapes, but not on all, so it has to be per row.
+// Ring K a row carries when its file omits the field. Per row rather than
+// global because the manifest holds kK twins (policy.cuh) and the measured
+// winner is kK=32 on most shapes but not all.
 static constexpr int kTableRowK = 64;
 // Fields the parser reads: the current row, the 9-field one the sweep
-// scripts still emit (its absent k field keeps kTableRowK), and the 12-field
-// form that adds the contract-depth band.
+// scripts still emit (its absent k field keeps kTableRowK), the 12-field
+// form that adds the contract-depth band, and the 13-field form that adds
+// the wave gate.
 static constexpr int kRowFields = 10;
 static constexpr int kRowFieldsLegacyK = 9;
 static constexpr int kRowFieldsKband = 12;
+static constexpr int kRowFieldsWave = 13;
+static constexpr int kRowFieldsWavePermille = 14;
 
 // Upper bound of the perf_class field. The GemmPerfClass ids live in gemm.cuh,
 // which includes this header, so the enum cannot be named here: this mirrors
@@ -57,25 +60,28 @@ inline constexpr bool row_k_supported(int kk) { return kk == 32 || kk == 64; }
 inline constexpr bool row_stages_supported(int stages) {
     return stages == 2 || stages == 3 || stages == 4 || stages == 5;
 }
-// One tuned row. Bands are (min, max] on M and N — min exclusive,
-// max inclusive, 0 = unbounded (humming's dispatch-table convention);
-// a row matches when m > m_min && (m_max == 0 || m <= m_max) and the
-// same for n. perf_class is the GemmPerfClass id (0 W16A16 / 1 W8A16 /
-// 2 W8A8 / 3 F8A8; -1 = any): the same band can price a different
-// recipe per dtype class. crosswise is the crosswise-operand count of
-// the problem (0 = dual-congruous NT, 1 = TT, the NN swap and the mixed
-// dual-row-major NN case, 2 = TN — the
-// (trans_a ? 1 : 0) + (trans_b ? 0 : 1) of gemm_dispatch; -1 = any).
-// raster: 0 = plan_raster with this row's CTA geometry at launch time.
-// kk: the row's ring K; a row file that omits the trailing field keeps
-// kTableRowK.
-// k_min / k_max are the row's contract-depth band, same (min, max] rule as
-// m and n, 0 = open. A row that omits both keeps an open band, so every
-// existing row file and table keeps its meaning. The band exists because the
-// recipe can flip with K: the wide CTA needs K past ~256 to beat the small
-// one (a 128x256 tile's ring is only filled by the prologue for short K),
-// while the kK=32 twin wins short K hardest. Without the band the two
-// demands collide in one (M, N) cell and the row has to lose one of them.
+// One tuned row. Every band is (min, max] — min EXCLUSIVE, max inclusive,
+// 0 = unbounded (humming's dispatch-table convention) — and the same rule
+// applies to the K band. perf_class is the GemmPerfClass id (-1 = any);
+// crosswise the crosswise-operand count (-1 = any, see crosswise_of);
+// raster 0 means plan_raster with this row's CTA geometry at launch time.
+// kk is the row's ring K, defaulting to kTableRowK when a file omits it.
+// The K band exists because the recipe flips with K — the wide CTA needs K
+// past ~256 (its ring is only filled by the prologue for short K) while the
+// kK=32 twin wins short K hardest — so without it the two demands would
+// collide in one (M, N) cell and the row would have to lose one of them.
+//
+// min_ctas_per_sm / min_wave_permille are the row's WAVE GATES: the row
+// matches only while its own CTA tile's grid — ceil(m/bm) * ceil(n/bn) *
+// batch — covers that much of the machine, the bare form being
+// grid >= n * sms and the wave form grid * 1000 >= n * sms * resident, with
+// resident priced per device from the row's own ring. 0 = no gate (every row
+// that predates the field, so the format stays backward compatible). The wave
+// form is the one to prefer: it is dimensionless, so it survives both a
+// different SM count and a different smem per SM, where a literal M bound is
+// calibrated to one device. Rows whose bound is NOT wave arithmetic — a
+// measured latency crossover, or a table property like "a row above already
+// answers this band" — keep literals and want a re-measure on a new device.
 struct TableRow {
     TileClass cta;
     int64_t m_min;
@@ -89,6 +95,8 @@ struct TableRow {
     int kk = kTableRowK;
     int64_t k_min = 0;
     int64_t k_max = 0;
+    int min_ctas_per_sm = 0;
+    int min_wave_permille = 0;
 };
 
 // CTA geometry of one class — the shapes dispatch_tile resolves from the
@@ -100,27 +108,101 @@ inline constexpr void plan_row_geometry(TileClass cta, int& bm, int& bn) {
     bn = kTileClassCta[(int)cta][1];
 }
 
-// First matching row wins (generated tables are emitted non-overlapping;
-// the override file can shadow the builtin rows when it precedes them).
-// k <= 0 asks for the open-K reading, which is how the degraded rows and the
-// callers that have no contract depth still resolve.
+// Everything one plan decision is priced against, assembled once per launch
+// and passed as one value: the problem's shape, the class it keys the table
+// on, the operand widths the ring and the load path depend on, and the
+// device. A struct because these facts used to travel as eight positional
+// arguments, each planner entry in its own order, with GemmParams and loose
+// scalars carrying the same numbers — a call site read
+// `plan_row_for(rows, count, m, n, perf, crosswise, k, ba, bb, dev, batch)`
+// and nothing at the call site said which argument was which. The device is
+// the queried DeviceFacts rather than a planner-private view: a bare SM count
+// cannot carry a wave bound (a wave is sms * resident, and resident is the
+// minimum of three per-SM resource limits), and a second device type with
+// most of the same fields only invited the two to drift.
+struct PlanQuery {
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int64_t batch = 1;
+    int perf_class = -1;  // GemmPerfClass id; -1 matches any
+    int crosswise = 0;    // direct-load operand count, see gemm_dispatch
+    int ba = 2;           // operand element bytes
+    int bb = 2;
+    DeviceFacts dev{};
+};
+
+// CTAs of one plan's tile that fit on an SM, or 0 when the plan cannot be
+// priced (no device facts) or its ring cannot be launched at all (the same
+// ceiling plan_from_row rejects past). Two limits, minimum wins: the device's
+// smem per SM over the plan's ring, and the launch-bounds hint —
+// __launch_bounds__(threads, hint) is what makes the compiler fit `hint` CTAs
+// into the register file, so the hint is a FLOOR on the real count and not the
+// count itself (the exact figure needs
+// cudaOccupancyMaxActiveBlocksPerMultiprocessor, a driver query a pure planner
+// cannot make; the test asserts the floor instead). A thread term is left out
+// on purpose: no manifested tile's thread ceiling is under its register floor
+// (see DeviceFacts).
+// The direction of that floor matters: resident_model <= resident_true puts
+// the wave threshold at or BELOW the physical one, so a device that packs more
+// CTAs of this ring than the hint would fire the gate early. It is exact for
+// the 512-thread tiles, where the register file is what binds (64 regs x 512
+// threads x 2 = 65536 of 64K, on every supported part) — which is why the
+// only gated ring today is the 128x128 kK=32 one.
+inline int plan_resident_ctas(TileClass cta, int stages, int kk,
+                              const PlanQuery& q) {
+    const DeviceFacts& dev = q.dev;
+    if (dev.smem_per_sm <= 0 || dev.regs_per_sm <= 0) return 0;
+    int bm = 0, bn = 0;
+    plan_row_geometry(cta, bm, bn);
+    const int ring = ring_smem_bytes(bm, bn, kk, stages, q.ba, q.bb);
+    if (ring > dev.smem_max) return 0;
+    return std::min(dev.smem_per_sm / ring, min_ctas_for_ring(ring));
+}
+
+// First matching row wins (generated tables are emitted non-overlapping; the
+// override file can shadow the builtin rows when it precedes them). q.k <= 0
+// asks for the open-K reading, which is how the degraded rows and callers with
+// no contract depth still resolve. q.dev.sms <= 0 means "no device facts": a
+// gated row is then skipped rather than guessed at, and the lookup still ends
+// at the degraded rows, so planning stays total.
 inline const TableRow* plan_row_for(const TableRow* rows, int count,
-                                    int64_t m, int64_t n, int perf_class,
-                                    int crosswise, int64_t k = 0) {
+                                    const PlanQuery& q) {
     for (int i = 0; i < count; ++i) {
         const TableRow& r = rows[i];
-        if (m <= r.m_min) continue;
-        if (r.m_max != 0 && m > r.m_max) continue;
-        if (n <= r.n_min) continue;
-        if (r.n_max != 0 && n > r.n_max) continue;
-        if (r.perf_class != -1 && r.perf_class != perf_class) continue;
-        if (r.crosswise != -1 && r.crosswise != crosswise) continue;
+        if (q.m <= r.m_min) continue;
+        if (r.m_max != 0 && q.m > r.m_max) continue;
+        if (q.n <= r.n_min) continue;
+        if (r.n_max != 0 && q.n > r.n_max) continue;
+        if (r.perf_class != -1 && r.perf_class != q.perf_class) continue;
+        if (r.crosswise != -1 && r.crosswise != q.crosswise) continue;
         // An open row (both bounds 0) matches any K, including the k <= 0
         // callers; a bounded row only matches a real depth.
         if (r.k_min != 0 || r.k_max != 0) {
-            if (k <= 0) continue;
-            if (k <= r.k_min) continue;
-            if (r.k_max != 0 && k > r.k_max) continue;
+            if (q.k <= 0) continue;
+            if (q.k <= r.k_min) continue;
+            if (r.k_max != 0 && q.k > r.k_max) continue;
+        }
+        // Wave gates: the row's own geometry prices the grid, so a row cannot
+        // state a fill it could not itself satisfy. min_ctas_per_sm is the
+        // bare CTAs-per-SM form; min_wave_permille the wave form, whose
+        // resident term is priced from the row's ring on this device.
+        if (r.min_ctas_per_sm > 0 || r.min_wave_permille > 0) {
+            if (q.dev.sms <= 0) continue;
+            int bm, bn;
+            plan_row_geometry(r.cta, bm, bn);
+            const int64_t grid = ((q.m + bm - 1) / bm) * ((q.n + bn - 1) / bn) *
+                                 q.batch;
+            if (r.min_ctas_per_sm > 0 &&
+                grid < (int64_t)r.min_ctas_per_sm * q.dev.sms)
+                continue;
+            if (r.min_wave_permille > 0) {
+                const int resident = plan_resident_ctas(r.cta, r.stages, r.kk, q);
+                if (resident <= 0) continue;
+                if (grid * 1000 <
+                    (int64_t)r.min_wave_permille * q.dev.sms * resident)
+                    continue;
+            }
         }
         return &r;
     }
@@ -128,18 +210,18 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count,
 }
 
 // Row file format: one row per line, whitespace-separated
-//   m_min m_max n_min n_max perf_class crosswise cta stages raster [k]
-// ('#' starts a comment; 'perf_class' 0..3 / -1 any; 'crosswise'
-// 0..2 / -1 any; 'cta' is the TileClass ordinal (0..kTileClassCount-1, i.e.
-// the policy.cuh enum order);
-// 'stages' 2..5 (only the 64x64 kK=64 geometry carries s4/s5, and only it has
-// the smem room for them: plan_from_row rejects a deeper ring anywhere else.
-// The deep rings are a dead end in practice — s2..s5 land within 1-2% at that
-// tile, so no compiled-in row names one); the trailing 'k' is optional and
-// defaults to kTableRowK,
-// which is what the sweep scripts leave off). Invalid lines are warn-and-skip:
-// tuning files are hand-edited between sweeps, and a malformed row must never
-// block a launch the fallback would serve.
+//   m_min m_max n_min n_max perf_class crosswise cta stages raster
+//   [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
+// '#' starts a comment; perf_class 0..3 or -1; crosswise 0..2 or -1; cta is the
+// TileClass ordinal (the policy.cuh enum order); stages 2..5, of which only the
+// 64x64 kK=64 geometry carries s4/s5 (plan_from_row rejects a deeper ring
+// anywhere else, and no compiled-in row names one — s2..s5 land within 1-2% at
+// that tile). The trailing 'k' defaults to kTableRowK, which is what the sweep
+// scripts leave off.
+// The trailing forms are additive — a row that omits them behaves exactly as
+// it did before they existed, which is what keeps hand-edited tuning files and
+// older sweeps valid. Invalid lines are warn-and-skip: a malformed row must
+// never block a launch the fallback would serve.
 
 // lo <= v <= hi, for the fields whose legal values are a contiguous interval.
 inline constexpr bool in_range(int v, int lo, int hi) {
@@ -158,7 +240,8 @@ inline constexpr bool row_band_ok(int64_t min, int64_t max) {
 // a hand-edited file is wrong.
 inline const char* plan_row_error(const TableRow& row, int fields) {
     if (fields != kRowFields && fields != kRowFieldsLegacyK &&
-        fields != kRowFieldsKband)
+        fields != kRowFieldsKband && fields != kRowFieldsWave &&
+        fields != kRowFieldsWavePermille)
         return "field count";
     if (row.m_min < 0 || row.n_min < 0) return "band min < 0";
     if (!row_k_supported(row.kk)) return "k (want 32 or 64)";
@@ -166,6 +249,8 @@ inline const char* plan_row_error(const TableRow& row, int fields) {
     if (!row_band_ok(row.n_min, row.n_max)) return "n band (max < min)";
     if (!row_band_ok(row.k_min, row.k_max)) return "k band (max < min)";
     if (row.k_min < 0 || row.k_max < 0) return "k band min < 0";
+    if (row.min_ctas_per_sm < 0) return "min_ctas_per_sm < 0";
+    if (row.min_wave_permille < 0) return "min_wave_permille < 0";
     if (!in_range(row.perf_class, -1, kMaxPerfClass)) return "perf_class";
     if (!in_range(row.crosswise, -1, 2)) return "crosswise (-1..2)";
     if (!row_stages_supported(row.stages)) return "stages (want 2..5)";
@@ -195,10 +280,14 @@ inline bool parse_plan_table_file(const std::string& path,
         // and k-less field counts need no repair pass.
         int kk = kTableRowK;
         long long k_min = 0, k_max = 0;
+        int min_ctas_per_sm = 0;
+        int min_wave_permille = 0;
         const int got =
-            std::sscanf(line, " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld",
+            std::sscanf(line,
+                        " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld %d %d",
                         &m_min, &m_max, &n_min, &n_max, &perf_class, &crosswise,
-                        &cta, &stages, &raster, &kk, &k_min, &k_max);
+                        &cta, &stages, &raster, &kk, &k_min, &k_max,
+                        &min_ctas_per_sm, &min_wave_permille);
         if (got == EOF) continue;  // blank or comment-only line
         // cta is read as the TileClass ordinal, so it is the one field checked
         // before there is a row to validate; plan_row_error takes the rest.
@@ -208,7 +297,8 @@ inline bool parse_plan_table_file(const std::string& path,
         }
         const TableRow row{
             static_cast<TileClass>(cta), m_min, m_max, n_min, n_max,
-            perf_class, crosswise, stages, raster, kk, k_min, k_max
+            perf_class, crosswise, stages, raster, kk, k_min, k_max,
+            min_ctas_per_sm, min_wave_permille
         };
         if (const char* bad = plan_row_error(row, got); bad != nullptr) {
             warn_bad_row(path, lineno, bad);
@@ -237,60 +327,60 @@ inline const std::vector<TableRow>& plan_table_override_rows() {
 }
 
 // BEGIN GENERATED
-// Measured power-of-2 grid table (2026-09-10): a band-search partition of a
-// sweep over M, N, K in 32..4096 powers of two, all seven dtype combos / four
-// perf classes (gen_plan_table.py --full-coverage; the band-search pass that
-// cut the M bands has since been dropped from the script), emitted as
-// 42 rows and merged down to these 14 (abutting same-recipe rectangles
-// joined, the catch-alls the open last N band already shadows dropped;
-// verified decision-identical over 80656 probe points x 4 classes x 2
-// crosswise counts, so the merge costs nothing at dispatch).
-// The distillate these rows replace keyed the recipe on one N split at 1280;
-// the measured recipe depends on N far more strongly than that for large M.
-// It sent M>2560, N>1280 to the narrow CTA where the big CTA is 1.40x faster
-// (4096x4096x4096 w16a16 101 -> 142 TFLOPS), and M>2560, N<=1280 to the big
-// CTA where the small CTA is up to 3.6x faster (4096x64x4096 16.5 -> 57) — a
-// 128-wide N tile wastes half its mma on a 64-column problem; the quantized
-// classes had no rows at all and fell to the degraded bands. Measured on the
-// 42-row form (validate_plan_table.py, interleaved A/B, 26 holdout shapes x 6
-// combos): grid 1.199x, LLM shape list 1.097x, combined 1.109x; worst
-// per-shape regression 0.84x.
-// A floor, not an optimum: every row here is kK=64 with cta<=2, while the
-// manifest carries more. On the narrow-N bands the kK=32 twin of the class
-// these rows already name measures ~1.85x (RTX 4090, 4096x256x4096 w16a16
-// 71 -> 131 TFLOPS), and the warp tiling is not addressable from a row at all
-// (the dispatch key is class + stages + kK, see above). Rows naming either
-// come from a row file, not from here.
+// Measured rows, distilled (2026-09-10, power-of-2 grid sweep over M, N, K in
+// 32..4096): 42 rows merged to 14. A row here is a FLOOR, not an optimum —
+// every one is kK=64 with cta <= 2 while the manifest carries more (the kK=32
+// twin of the same band measures ~1.85x on narrow N, and the warp tiling is
+// not addressable from a row at all: the dispatch key is class + stages + kK).
+// One table per dtype class, so a row tuned for one operand pair cannot fire
+// on another; the sweeps, the merge proof and the per-shape numbers are in
+// docs/developer/cuda_kernels.md (Plan table tuning log).
 //
-// v2 (2026-09-10, dense sweep + rectangle search): the first eight rows are
-// measured additions in front of that floor, each one required to beat the
-// row it shadows at EVERY sweep grid point inside its rectangle (min gain
-// >= 1.00x, geomean >= 1.26x) — so a row here can only be an improvement.
-//   1-2  pc2 wide CTA on the large-N rectangles the class-2 catch-all sent to
-//        the 64x64 tile: 1.34-1.45x (w8a8 4096x11008x4096 304 -> 450 TFLOPS).
-//   3-7  pc0 kK=32 on the narrow-N and mid-N bands: 1.31-1.78x geomean, up to
-//        1.85x (w16a16 2048x512x4096 73.6 -> 136.3 TFLOPS). The kK=32 ring is
-//        32KB at s3, under the 48KB two-CTA watermark, which is where the win
-//        comes from; s2 and s3 measure within noise of each other.
-//   8    pc1 big CTA on the large-M/small-N band the class-1 rows sent to the
-//        64x64 tile: 1.27x.
-// Validated interleaved against the pre-v2 table (validate_plan_table.py, 12
-// holdout shapes x 7 combos): w16a16 -36.9/-39.2/-45.9% on three narrow-N
-// holdouts, no regression above the ~4% per-shape noise floor (the one >=2%
-// delta, f8a8_e4m3 on 2048x14336x4096, is the same tile in both tables).
-// One builtin table per dtype class (GemmPerfClass): the class is the table,
-// so a row tuned for one operand pair cannot fire on another. The single mixed
-// table matched rows on a perf_class field instead, which made a row's reach a
-// property of class ids alone — and int8 shared an id with fp8 until
-// gemm_perf_class stopped bucketing it there, so every W8A8 row was dead while
-// int8 dispatched on the F8A8 rows. Rows keep the field for the override-file
-// path (one file still serves every class); inside a class table a row may
-// only repeat its class's id or say -1, asserted below, so a typo cannot
-// silently drop a row out of the table it sits in.
-//
-// First match wins, so order matters within a table: measured additions sit in
-// front of the rows they shadow.
+// First match wins, so order matters: measured additions sit in front of the
+// rows they shadow.
 static constexpr TableRow kBuiltinPlanW16A16[] = {
+    // Ring-residency rows (2026-09-11, RTX 4090), all on the 128x128 kK=32 s2
+    // ring: its 48KB ring keeps TWO CTAs resident where the kK=64 twin's 96KB
+    // keeps one, so the epilogue (which scatters through the reclaimed rings)
+    // overlaps instead of being exposed, and its 16 warps of 32x32 double the
+    // warps per partition at the same 64-register budget. Worth 7-14% on the
+    // large shapes; sweeps and per-shape numbers in the doc's tuning log.
+    // The M<=512 band keeps kK=64 s2 instead: there the K loop is too short
+    // for the 64x64 CTA's 3 resident CTAs to lose.
+    {TileClass::kBig128, 512, 0, 4096, 0, 0, 0, 2, 0, 32},
+    // The wave bound of the narrow-N band (N <= 1536), replacing an M literal
+    // that was hand-calibrated twice and wrong twice — the M that fills the
+    // machine moves with N (grid = m_tiles * n_tiles), so no literal holds it.
+    // Measured against the 64x64 kK=32 row below on a 128-SM part (256 slots
+    // at this ring's resident 2): 288 CTAs = 1.13 waves and 312 = 1.22 and
+    // 336 = 1.31 all went to the 64x64 tile (up to 23% ahead), 360 = 1.41 and
+    // 384 = 1.50 to this one. So 1360 permille, and resident is priced from
+    // the ring per device (plan_resident_ctas), so a part that packs four CTAs
+    // of this ring moves the crossover with it. Table and controls: doc.
+    //
+    // N in (1536,3072] stays on the literal row below: the wave rule splits
+    // 2-2 across the four mid-N points measured — and the two it gets WRONG
+    // are the two best-filled grids (2560x2560 at 1.56 waves is 15% for the
+    // 64x64 tile), so fill is not what decides that band. Left open rather
+    // than guessed at; the doc records the four points.
+    {TileClass::kBig128, 0, 0, 1024, 1536, 0, 0, 2, 0, 32, 0, 0, 0, 1360},
+    // The mid-N half of that band keeps its calibrated literal (29 M-tiles,
+    // see above) and its bare CTAs-per-SM gate.
+    {TileClass::kBig128, 3712, 0, 1536, 3072, 0, 0, 2, 0, 32, 0, 0, 2},
+    {TileClass::kBig128, 512, 0, 3072, 4096, 0, 0, 2, 0, 32},
+    {TileClass::kBig128, 0, 512, 3072, 0, 0, 0, 2, 0, 32, 2048, 0},
+    // The same residency effect as a k-tile depth: N in (768,1536] resolved to
+    // the kK=64 small tile below (64KB ring, one resident CTA) where the kK=32
+    // twin is 32KB. M > 1536 keeps the big-tile row (5.3% ahead there) and
+    // M <= 128 keeps kK=64 (the grid is too thin for residency to pay and the
+    // deeper ring amortizes better).
+    {TileClass::kSmall64, 128, 1536, 768, 1536, 0, 0, 3, 0, 32},
+    // Same swap for N in (1536,3072] and N <= 768, which resolved to the kK=64
+    // floors below (64KB ring vs the twin's 32KB): worth 5-37% where the grid
+    // is thin. The M bounds keep the rows off the shapes where kK=64 measured
+    // ahead instead (3072x2048x1536 +2%, 256x768x3072 +4%).
+    {TileClass::kSmall64, 384, 1024, 1536, 3072, 0, 0, 3, 0, 32},
+    {TileClass::kSmall64, 384, 0, 0, 768, 0, 0, 3, 0, 32},
     // 2026-09-11 power-of-2 grid sweep (M,N,K in 32..4096, GPU A/B over all
     // 512 points against the rows below): the kK=32 twin wins the whole
     // M,N >= 1024 region — -4.32% summed over the grid, 48 points better by
@@ -327,19 +417,13 @@ static constexpr TableRow kBuiltinPlanW8A16[] = {
 };
 
 static constexpr TableRow kBuiltinPlanW8A8[] = {
-    // The wide CTA's win is a grid-fill property, not just a shape one: at
-    // 128x256 per CTA the tile needs >= 1 wave of 128 SMs to pay off
-    // (measured: <0.5 wave 0.79x, >=1 wave 1.08x, >=4 waves 1.42x against the
-    // small CTA), so these bands start where M/128 * N/256 >= 128.
-    //
-    // Every wide row carries the K > 512 band. The crossover is epilogue
-    // dependent — with per-tensor scales the wide tile is 1.24-1.27x *slower*
-    // at K <= 256 and crosses over near 1K, while with the per-row/per-channel
-    // scales W8A8 actually uses it is already even at K=32 (the scale loads
-    // dominate the short-K epilogue either way) — so the band takes the
-    // crossover that holds under both, which makes these rows a strict win
-    // rather than a win that a benchmark harness with cheaper scales sees as a
-    // regression.
+    // The wide CTA (128x256, resident 1) needs >= 1 wave to pay off — measured
+    // <0.5 wave 0.79x, >=1 wave 1.08x, >=4 waves 1.42x against the small CTA —
+    // so these bands start where M/128 * N/256 >= 128, i.e. one wave here.
+    // Every wide row also carries the K > 512 band: that crossover is epilogue
+    // dependent, so it takes the value that holds under both per-tensor and
+    // per-row/per-channel scales (a strict win rather than one a cheap-scale
+    // harness reads as a regression).
     {TileClass::kWide128x256, 2048, 4096, 3072, 11008, 2, 0, 2, 0, 64, 512, 0},
     {TileClass::kWide128x256, 512, 4096, 8192, 11008, 2, 0, 2, 0, 64, 512, 0},
     // Mid-N at large M is the grid-sweep gap those bands leave: measured
@@ -404,27 +488,26 @@ inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) 
 // column), then the class's own builtin table. ASTR_GEMM_TABLE="-"
 // is the explicit "AOT off" escape hatch: neither override nor builtin
 // rows, so dispatch falls through to the degraded band rows (dev/bench).
-inline const TableRow* plan_table_lookup(const GemmParams& p, int perf_class,
-                                         int crosswise) {
+// dev/batch are the running device and the problem's batch, the inputs a
+// row's wave gates need; dev.sms <= 0 (no device facts) skips gated rows
+// instead of inventing a count. ba/bb are the operand widths.
+inline const TableRow* plan_table_lookup(const PlanQuery& q) {
     const char* env = std::getenv("ASTR_GEMM_TABLE");
     if (env != nullptr && std::strcmp(env, "-") == 0) return nullptr;
     const std::vector<TableRow>& rows = plan_table_override_rows();
-    if (const TableRow* row = plan_row_for(rows.data(), (int)rows.size(), p.m,
-                                           p.n, perf_class, crosswise, p.k);
+    if (const TableRow* row =
+            plan_row_for(rows.data(), (int)rows.size(), q);
         row != nullptr)
         return row;
     int count = 0;
-    const TableRow* builtin = builtin_plan_table(perf_class, count);
+    const TableRow* builtin = builtin_plan_table(q.perf_class, count);
     if (builtin == nullptr) return nullptr;
-    return plan_row_for(builtin, count, p.m, p.n, perf_class, crosswise, p.k);
+    return plan_row_for(builtin, count, q);
 }
 
 // The planner's row source: override file first, then the compiled-in rows.
-inline std::optional<TableRow> table_row(const GemmParams& p, int perf,
-                                         int crosswise) {
-    if (const TableRow* row = plan_table_lookup(p, perf, crosswise);
-        row != nullptr)
-        return *row;
+inline std::optional<TableRow> table_row(const PlanQuery& q) {
+    if (const TableRow* row = plan_table_lookup(q); row != nullptr) return *row;
     return std::nullopt;
 }
 
@@ -439,8 +522,13 @@ static constexpr TableRow kDegradedPlanRows[] = {
 };
 
 inline const TableRow& degraded_row_for(int64_t m) {
-    if (const TableRow* row =
-            plan_row_for(kDegradedPlanRows, 3, m, /*n=*/1, -1, -1);
+    // Only the M band decides here: the degraded rows are open on N and K with
+    // -1 keys and carry no gate, so the rest of the query is left at its
+    // defaults (k = 0 asks the open-K reading, and an empty device skips
+    // nothing because nothing is gated).
+    PlanQuery q;
+    q.m = m;
+    if (const TableRow* row = plan_row_for(kDegradedPlanRows, 3, q);
         row != nullptr)
         return *row;
     return kDegradedPlanRows[0];  // the degenerate m=0 matches no band

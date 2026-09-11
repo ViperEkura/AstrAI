@@ -240,6 +240,9 @@ struct GemmCollectiveEpilogue {
                     // Streaming write-through: the output is read-once (no
                     // future reuse), so bypass the L2 write-back stage and
                     // preserve L2 for the reused weight/activation tiles.
+                    // Measured neutral-to-negative on the 4090's shapes
+                    // (a process-alternated A/B flipped sign between runs),
+                    // so the fused-linear default stays the plain store.
                     __stwt(reinterpret_cast<uint4*>(dst), v);
                 } else if constexpr (kStreamOut) {
                     // Evict-first streaming store knob: neutral on L20

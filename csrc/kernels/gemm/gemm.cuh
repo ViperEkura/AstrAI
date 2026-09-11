@@ -264,21 +264,38 @@ enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
 // Compile-time dtype-class derivation from the operand pair (the mma
 // promotion rule plus operand widths; mixed bf16xfp8 lands with the 2B x
 // 1B class — same bytes and same promoted bf16 k16 mma as W8A16).
+//
+// The int8 pair is tested first: it promotes to an int8 mma, not to bf16, so
+// the "not bf16 -> fp8 pair" arm below would otherwise swallow it and every
+// W8A8 row would be unreachable (int8 dispatched on the F8A8 rows, and the
+// plan log showed an int8 problem resolving to a class-3 row).
 template <typename ElemA, typename ElemB>
 constexpr GemmPerfClass gemm_perf_class() {
     using MmaT = typename gemm_mma_traits<ElemA, ElemB>::MmaT;
-    if constexpr (!std::is_same_v<MmaT, __nv_bfloat16>) {
+    if constexpr (std::is_same_v<ElemA, int8_t> &&
+                  std::is_same_v<ElemB, int8_t>) {
+        return GemmPerfClass::kW8A8;
+    } else if constexpr (!std::is_same_v<MmaT, __nv_bfloat16>) {
         return GemmPerfClass::kF8A8;  // native fp8 symmetric pair
     } else if constexpr (std::is_same_v<ElemA, __nv_bfloat16> &&
                          std::is_same_v<ElemB, __nv_bfloat16>) {
         return GemmPerfClass::kW16A16;
-    } else if constexpr (std::is_same_v<ElemA, int8_t> &&
-                         std::is_same_v<ElemB, int8_t>) {
-        return GemmPerfClass::kW8A8;
     } else {
         return GemmPerfClass::kW8A16;
     }
 }
+
+static_assert(gemm_perf_class<int8_t, int8_t>() == GemmPerfClass::kW8A8,
+              "int8 x int8 is its own class (see the ordering note above)");
+static_assert(gemm_perf_class<__nv_fp8_e4m3, __nv_fp8_e4m3>() ==
+                  GemmPerfClass::kF8A8,
+              "fp8 x fp8 keys the F8A8 table");
+static_assert(gemm_perf_class<__nv_bfloat16, __nv_bfloat16>() ==
+                  GemmPerfClass::kW16A16,
+              "bf16 x bf16 keys the W16A16 table");
+static_assert(gemm_perf_class<__nv_bfloat16, int8_t>() ==
+                  GemmPerfClass::kW8A16,
+              "a quantized weight against bf16 activations keys W8A16");
 
 
 

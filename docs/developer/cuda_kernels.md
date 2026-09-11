@@ -59,7 +59,7 @@ layered directory:
 | `gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `gemm/epilogue.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `gemm/gemm.cuh` | umbrella: `gemm_kernel<Policy>` orchestrator + device-parameterized host planning (`plan_gemm` / `plan_raster` over `DeviceFacts`; 64×64 / 128×64 / 128×128 CTA) + manifest-driven tile dispatch (`dispatch_tile` over `TileManifest`, one ladder per staging discipline) + entry `gemm_dispatch<ElemA, ElemB, OutT>` = `canonicalize_gemm` → `plan_gemm` → `launch_plan` |
-| `gemm/plan_table.h` | AOT dispatch rows: (M, N) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `ASTR_GEMM_TABLE` override or the compiled-in rows) — `plan_gemm` is table-only (planning section below); a row's CTA geometry is read from `policy.cuh`'s `kTileClassCta`, not re-spelled here |
+| `gemm/plan_table.h` | AOT dispatch rows: (M, N, K) band × dtype class → measured recipe winner (`TableRow`; band-parse + lookup, `ASTR_GEMM_TABLE` override or the per-class compiled-in tables `kBuiltinPlanW16A16`/`W8A16`/`W8A8`/`F8A8`) — `plan_gemm` is table-only (planning section below); a row's CTA geometry is read from `policy.cuh`'s `kTileClassCta`, not re-spelled here |
 | `quantize/quantize.cu` | binding only: entry checks (`checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
@@ -327,10 +327,20 @@ small picks with s2: benchmark_w8 over the llama shapes totals
 with no case regressing >3%.
 
 **AOT dispatch table** (`plan_table.h`): the table is the production
-planner — `plan_gemm` consults a measured row table: (M, N) bands
+planner — `plan_gemm` consults a measured row table: (M, N, K) bands
 (min exclusive, max inclusive, 0 = open), keyed per dtype class /
 crosswise count, each row naming a recipe (CTA class + ring depth;
-raster 0 = `plan_raster` with the row's geometry). `plan_from_row` is the
+raster 0 = `plan_raster` with the row's geometry). The compiled-in rows are
+one table per dtype class (`kBuiltinPlanW16A16` / `W8A16` / `W8A8` /
+`F8A8`, selected by `builtin_plan_table`): the class *is* the table, so a
+row tuned for one operand pair cannot fire on another, and a static_assert
+rejects a row keyed for a different class. (The earlier single mixed table
+matched rows on a `perf_class` field, which made a row's reach a property
+of class ids alone — and int8 shared an id with fp8 until
+`gemm_perf_class` stopped bucketing it there, so every W8A8 row was
+unreachable while int8 dispatched on the F8A8 rows. `gemm_perf_class` now
+tests the int8 pair before the "not bf16 → fp8 pair" arm, with
+static_asserts pinning all four pairings.) `plan_from_row` is the
 single interpreter: geometry from the CTA class, ring depth from the row,
 raster 0 = `plan_raster` at the row's geometry, and one smem gate (a row
 whose ring exceeds the smem opt-in ceiling is a stale tuning artifact — it
@@ -345,8 +355,16 @@ catch-all row, so a miss means the table is empty or stale, not a shape
 the planner should infer. Rows come
 from two sources, override first: `ASTR_GEMM_TABLE=/path/to/plan_table.txt`
 (one row per line, `m_min m_max n_min n_max perf_class crosswise cta
-stages raster [k]`, where the optional `k` is the row's ring K — omitted
-keeps 64, and a kK=32 row only survives a dual-2-byte pair; re-parsed only
+stages raster [k [k_min k_max]]`, where the optional `k` is the row's ring K
+— omitted keeps 64, and a kK=32 row only survives a dual-2-byte pair — and
+the optional trailing pair is the row's contract-depth band, same (min, max]
+rule as M and N, omitted keeps it open so older row files and sweeps keep
+their meaning; the band exists because the winning recipe can flip with K —
+the wide CTA loses the short-K epilogue race below ~512 while the kK=32 twin
+wins short K hardest — so one (M, N) band would have to lose one of them;
+note the crossover is epilogue dependent, which is why the W8A8 wide rows
+carry the band that holds under both per-tensor and per-channel scales;
+re-parsed only
 when the env path changes; the special
 value `-` turns AOT off entirely — neither override nor builtin rows —
 so the degraded bands run for dev and
@@ -773,6 +791,7 @@ Test files:
 - `attn_test.cu` — decode + prefill kernels (correctness tables + benchmarks)
 - `attn_paged_test.cu` — paged decode/prefill kernels
 - `quant_gemm_test.cu` — quantized GEMM correctness: every dtype pair (fp8/int8/bf16 × layouts/K tiles/ragged shapes/scales/fp32 out) + a per-combo TFLOPS bench (sm_89+)
+- `plan_table_test.cu` — planner checks: dtype-class keying, per-class table selection (a row cannot leak across classes), the K band's edge cases, and row-file parsing for the 9/10/12-field forms
 
 ## Benchmarks
 
@@ -829,7 +848,7 @@ csrc/
 │   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
 │   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
 │   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy + TileManifest (+ kTileClassCta)
-│   │   ├── plan_table.h              #     AOT dispatch rows (TableRow): override/builtin/degraded row sources
+│   │   ├── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded row sources
 │   │   ├── load.cuh                  #     operand loaders (typed staged tiles over declared layouts, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
 │   │   ├── scheduler.cuh             #     grouped/plain raster mapping
 │   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
@@ -841,6 +860,7 @@ csrc/
     ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
     ├── attn_test.cu                  # Decode + prefill kernels
     ├── attn_paged_test.cu            # Paged decode/prefill kernels
+    ├── plan_table_test.cu            # Planner: class keying, per-class tables, K band, row-file forms
     └── quant_gemm_test.cu           # GEMM correctness: fp8/bf16/int8 pairs across layouts/K tiles/ragged shapes + dtype-combo TFLOPS bench
 ```
 

@@ -208,6 +208,41 @@ version or beyond `rollout_max_policy_lag` are rejected before training. The
 final version check and rollout-cache publication share that policy lock, so a
 concurrent update cannot land between validation and cache insertion.
 
+Online GRPO can additionally enable a versioned dynamic-sampling buffer with
+`rollout_dynamic_sampling`. Each prompt group moves through
+`pending -> generating -> scoring` and is either accepted, refilled,
+invalidated, or dropped. Only low-variance groups are regenerated. Accepted
+rows are reassembled in the original prompt order, so refill completion order
+cannot reorder the training batch.
+
+Every attempt records a stable prompt ID, attempt ID, generation seed,
+behaviour-policy version, reward vector and variance, refill round, token count,
+timestamps, and terminal reason. Acceptance is provisional until the entire
+batch commits: if the policy version changes while any group is being
+refilled, all accepted rows from the old version are invalidated and the full
+batch restarts on the new version. Samples from different behaviour-policy
+versions are never combined into one training batch.
+
+Refill is bounded by per-group round, token, and wall-time budgets plus
+per-step generated-token and pending-group limits. Exhausting any budget raises
+`DynamicSamplingBudgetError` instead of returning a partial batch. When
+`torch.distributed` is initialized, policy versions, group acceptance, and
+budget failure are reduced across ranks before the next generation round,
+which keeps every rank on the same training step. Per-refresh counters are
+reported under `dynamic_sampling/*`, including accepted and zero-variance
+groups, refill rounds/tokens, invalidations, budget exhaustion, effective
+groups per million generated tokens, and rollout waste ratio.
+
+On an NVIDIA L20 with eight prompts, group size four, and a controlled workload
+where half of first attempts have zero variance, dynamic refill accepted twice
+as many useful groups and improved effective groups per million generated
+tokens by 33.37%. The cost was 49.95% more generated tokens, 55.80% higher
+median rollout latency, and a 33.23% waste ratio. A 100-step, three-rank NCCL
+soak with rank-skewed rewards and policy-version jitter produced zero mixed
+version batches, incomplete batches, or generation-schedule mismatches. Full
+parameters and raw measurements are in
+`benchmarks/results/versioned_dynamic_sampling_l20_sm89.json`.
+
 Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
 model factory.

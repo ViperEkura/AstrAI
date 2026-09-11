@@ -1,0 +1,84 @@
+{
+  "schema_version": "1.0",
+  "candidate_source_commit": "392d53d3dca99e78c8d5d5b461d6f108a802e28a",
+  "base_commit": "f87ac4592d25cd98096d3a628e2747f668bc4d96",
+  "recorded_at": "2026-09-03T11:48:00+08:00",
+  "hardware": {
+    "gpu": "NVIDIA L20",
+    "compute_capability": "sm89",
+    "torch": "2.11.0+cu128",
+    "cuda": "12.8"
+  },
+  "single_gpu": {
+    "gpu_index": 0,
+    "seed": 3407,
+    "prompts": 8,
+    "group_size": 4,
+    "max_tokens": 16,
+    "warmup": 5,
+    "trials": 50,
+    "workload": "half of first-attempt prompt groups have zero reward variance; refills become non-degenerate",
+    "baseline": {
+      "median_latency_ms": 248.517238,
+      "p95_latency_ms": 256.624277,
+      "generated_tokens": 24657,
+      "accepted_groups": 200,
+      "effective_groups_per_million_tokens": 8111.28685565965,
+      "mean_rollout_waste_ratio": 0.0
+    },
+    "dynamic": {
+      "median_latency_ms": 387.1997145,
+      "p95_latency_ms": 396.259705,
+      "generated_tokens": 36974,
+      "accepted_groups": 400,
+      "effective_groups_per_million_tokens": 10818.412938821875,
+      "mean_rollout_waste_ratio": 0.33227127734037476
+    },
+    "dynamic_vs_baseline": {
+      "effective_groups_per_million_tokens_delta_percent": 33.374803916265485,
+      "median_latency_delta_percent": 55.803966604521825,
+      "generated_tokens_delta_percent": 49.95336010057996
+    },
+    "policy_version_jitter": {
+      "final_policy_version": 1,
+      "behavior_policy_versions": [1],
+      "mixed_version_groups": false,
+      "version_invalidated_groups": 8
+    }
+  },
+  "three_gpu_rank_consistency": {
+    "gpu_indices": [0, 1, 2],
+    "backend": "nccl",
+    "world_size": 3,
+    "steps": 100,
+    "warmup": 10,
+    "jitter_interval": 10,
+    "prompts": 2,
+    "group_size": 2,
+    "max_tokens": 4,
+    "workload": "rank-skewed reward variance forces collective refill decisions; policy version advances every tenth measured step",
+    "max_rank_latency_median_ms": 35.1143005,
+    "max_rank_latency_p95_ms": 52.265118,
+    "mixed_version_batches": 0,
+    "incomplete_batches": 0,
+    "generation_schedule_mismatches": 0,
+    "version_invalidated_groups": 60,
+    "rank_local_failure_propagation": {
+      "generation": true,
+      "scoring": true
+    },
+    "rank0_memory": {
+      "allocated_drift_bytes": 4096,
+      "reserved_drift_bytes": 0,
+      "max_allocated_bytes": 8876544,
+      "max_reserved_bytes": 23068672
+    }
+  },
+  "validation": {
+    "local_test_suite": "650 passed, 171 skipped",
+    "l20_targeted_tests": "42 passed",
+    "format": "ruff format --check: pass",
+    "import_order": "ruff check --select I: pass"
+  },
+  "scope_limit": "This benchmark measures rollout-buffer correctness and refill efficiency with a tiny real CUDA policy plus deterministic synthetic rewards; it does not claim downstream reward convergence."
+}

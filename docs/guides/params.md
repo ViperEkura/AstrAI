@@ -145,6 +145,12 @@ with `--optimizer=muon_adamw`.
 | `--ppo_gamma` | PPO reward discount factor | 1.0 | `online_ppo` |
 | `--ppo_gae_lambda` | PPO GAE bias/variance trade-off | 0.95 | `online_ppo` |
 | `--ppo_vf_coef` | PPO value-loss coefficient | 0.5 | `online_ppo` |
+| `--grpo_clip_eps_low` | Optional lower clip epsilon; defaults to `grpo_clip_eps` | None | `grpo`, `online_grpo` |
+| `--grpo_clip_eps_high` | Optional upper clip epsilon for DAPO Clip-Higher | None | `grpo`, `online_grpo` |
+| `--grpo_loss_aggregation` | Loss weighting: DAPO-style `token` or equal-weight `sequence` | token | `grpo`, `online_grpo` |
+| `--grpo_overlong_max_len` | Optional maximum response length for DAPO soft overlong shaping | None | `grpo`, `online_grpo` |
+| `--grpo_overlong_buffer_len` | Linear penalty window before `grpo_overlong_max_len` | 0 | `grpo`, `online_grpo` |
+| `--grpo_overlong_penalty_scale` | Scale for the soft overlong reward penalty | 1.0 | `grpo`, `online_grpo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
 
 ### Online Rollout

@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import astrai.trainer.strategy as strategy_module
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.trainer.strategy import GRPOStrategy
 from tests.helpers import FakeExecutor, make_frozen, make_model
@@ -107,6 +108,147 @@ def test_grpo_rejects_invalid_behavior_logprobs(grpo_strategy, invalid):
         match = "only finite values"
     with pytest.raises(ValueError, match=match):
         strategy.compute_loss(batch)
+
+
+def test_grpo_symmetric_clip_is_backward_compatible(grpo_strategy):
+    strategy, _device = grpo_strategy
+    assert strategy.clip_eps == pytest.approx(0.2)
+    assert strategy.clip_eps_low == pytest.approx(0.2)
+    assert strategy.clip_eps_high == pytest.approx(0.2)
+    assert strategy.loss_aggregation == "token"
+
+
+def test_grpo_dapo_clip_higher_changes_positive_advantage_bound(
+    grpo_strategy, monkeypatch
+):
+    strategy, device = grpo_strategy
+    batch = {
+        "prompts": torch.tensor([[5]], device=device),
+        "responses": torch.tensor([[[6], [7]]], device=device),
+        "masks": torch.ones(1, 2, 1, device=device),
+        "rewards": torch.tensor([[1.0, -1.0]], device=device),
+    }
+    policy_logprobs = torch.log(
+        torch.tensor([[1.25], [0.75]], device=device, dtype=torch.float32)
+    )
+    zeros = torch.zeros_like(policy_logprobs)
+
+    def policy_loss(clip_eps_high):
+        strategy.clip_eps_high = clip_eps_high
+        outputs = iter(
+            [
+                policy_logprobs,
+                zeros,
+                policy_logprobs,
+            ]
+        )
+
+        def fake_get_logprobs(*_args, **_kwargs):
+            return {
+                "logprobs": next(outputs),
+                "aux_loss": None,
+                "router_stats": None,
+            }
+
+        monkeypatch.setattr(strategy_module, "get_logprobs", fake_get_logprobs)
+        return strategy.compute_loss_output(batch)["metrics"]["policy_loss"]
+
+    assert policy_loss(0.2) == pytest.approx(-0.2, abs=1e-6)
+    assert policy_loss(0.28) == pytest.approx(-0.225, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"clip_eps_low": 1.0}, "clip_eps_low"),
+        ({"clip_eps_high": float("nan")}, "clip_eps_high"),
+        (
+            {"clip_eps_low": 0.3, "clip_eps_high": 0.2},
+            "greater than or equal",
+        ),
+    ],
+)
+def test_grpo_rejects_invalid_asymmetric_clip(grpo_strategy, kwargs, match):
+    strategy, device = grpo_strategy
+    with pytest.raises(ValueError, match=match):
+        GRPOStrategy(
+            model=strategy.model,
+            device=device,
+            old_model=strategy.old_model,
+            ref_model=strategy.ref_model,
+            clip_eps=0.2,
+            executor=FakeExecutor(),
+            **kwargs,
+        )
+
+
+def test_grpo_token_and_sequence_aggregation_weight_lengths_differently(
+    grpo_strategy,
+):
+    strategy, device = grpo_strategy
+    losses = torch.tensor([[[1.0, 1.0, 0.0, 0.0], [3.0, 3.0, 3.0, 3.0]]], device=device)
+    masks = torch.tensor([[[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]]], device=device)
+
+    strategy.loss_aggregation = "token"
+    token_loss = strategy._reduce_token_loss(losses, masks)
+    strategy.loss_aggregation = "sequence"
+    sequence_loss = strategy._reduce_token_loss(losses, masks)
+
+    assert token_loss.item() == pytest.approx(14.0 / 6.0)
+    assert sequence_loss.item() == pytest.approx(2.0)
+
+
+def test_grpo_dapo_soft_overlong_reward_shaping(grpo_strategy):
+    strategy, device = grpo_strategy
+    strategy.overlong_max_len = 8
+    strategy.overlong_buffer_len = 2
+    strategy.overlong_penalty_scale = 0.5
+    rewards = torch.zeros(1, 4, device=device)
+    masks = torch.zeros(1, 4, 8, device=device)
+    for index, length in enumerate((5, 6, 7, 8)):
+        masks[0, index, :length] = 1
+
+    shaped, penalty = strategy._shape_overlong_rewards(rewards, masks)
+
+    assert penalty is not None
+    torch.testing.assert_close(
+        penalty, torch.tensor([[0.0, 0.0, -0.5, -1.0]], device=device)
+    )
+    torch.testing.assert_close(
+        shaped, torch.tensor([[0.0, 0.0, -0.25, -0.5]], device=device)
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"loss_aggregation": "batch"}, "loss_aggregation"),
+        ({"overlong_buffer_len": 4}, "requires overlong_max_len"),
+        (
+            {"overlong_max_len": 8, "overlong_buffer_len": 9},
+            "no greater than overlong_max_len",
+        ),
+        (
+            {
+                "overlong_max_len": 8,
+                "overlong_buffer_len": 2,
+                "overlong_penalty_scale": -0.1,
+            },
+            "overlong_penalty_scale",
+        ),
+    ],
+)
+def test_grpo_rejects_invalid_dapo_objective_options(grpo_strategy, kwargs, match):
+    strategy, device = grpo_strategy
+    with pytest.raises((TypeError, ValueError), match=match):
+        GRPOStrategy(
+            model=strategy.model,
+            device=device,
+            old_model=strategy.old_model,
+            ref_model=strategy.ref_model,
+            executor=FakeExecutor(),
+            **kwargs,
+        )
 
 
 @pytest.mark.parametrize("model_name", ["ref_model", "old_model"])

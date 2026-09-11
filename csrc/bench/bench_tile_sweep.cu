@@ -52,7 +52,6 @@ that computes the wrong thing is not a win.
 #include <vector>
 
 #include "common/device.cuh"
-#include "common/launch.cuh"
 #include "gemm/gemm.cuh"
 
 using namespace astrai;

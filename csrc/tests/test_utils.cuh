@@ -120,18 +120,6 @@ inline void set_default_strides(P& p) {
     p.mask_l_stride = 0;
 }
 
-// Set default Q strides for a paged decode params struct.
-template<typename P>
-inline void set_default_paged_strides(P& p) {
-    p.q_b_stride  = p.q_head * p.q_len * p.head_dim;
-    p.q_h_stride  = p.q_len * p.head_dim;
-    p.q_l_stride  = p.head_dim;
-    p.q_d_stride  = 1;
-    p.mask_b_stride = p.kv_len;
-    p.mask_h_stride = 0;
-    p.mask_l_stride = 0;
-}
-
 // Generic CPU reference for multi-query / grouped-query attention.
 // Tensor shapes (all float*):
 //   Q : [B, Hq, q_len, D]

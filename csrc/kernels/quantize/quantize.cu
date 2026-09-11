@@ -6,7 +6,6 @@
 
 #include <cstdint>
 
-#include "common/device.cuh"
 #include "checks.h"
 #include "quantize.cuh"
 

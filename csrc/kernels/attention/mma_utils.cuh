@@ -52,22 +52,9 @@ struct KernelTraits {
 using bf16 = __nv_bfloat16;
 // bf16 mma.sync lives in the shared astrai::mma_sync template (common/mma.cuh).
 
-// read two adjacent bf16 from smem as one packed .b32 (elem0 low, elem1 high)
-__device__ __forceinline__ unsigned ld2(const bf16* p) {
-    return *reinterpret_cast<const unsigned*>(p);
-}
-
 // pack two floats into one bf16x2 as .b32
 __device__ __forceinline__ unsigned pk2(float a, float b) {
     __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-    return *reinterpret_cast<unsigned*>(&v);
-}
-
-// pack two (non-contiguous) bf16 into one .b32
-__device__ __forceinline__ unsigned pkb(bf16 a, bf16 b) {
-    __nv_bfloat162 v;
-    v.x = a;
-    v.y = b;
     return *reinterpret_cast<unsigned*>(&v);
 }
 

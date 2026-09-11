@@ -162,8 +162,8 @@ staging writes and final fragment reads (caught by racecheck + a W8A8
 stress case: zeroed 32-row output bands on multi-wave grids). The ring
 discipline itself (prologue commit, steady wait, tail commit) runs through
 the `PipelineSync` stage-pipeline type of `common/pipeline.cuh` — the
-sm_80/89 backing of the shared producer/consumer surface that
-`PipelineMbarrier` (sm_90+, TMA) implements on the other generation.
+sm_80/89 backing of the cp.async rings, with the raw mbarrier PTX sites
+(init / arrive_expect_tx / wait_parity) shared with the TMA path below.
 
 **TMA staging (sm_90+, dual-congruous operands).** The congruous rings
 can also be fed by TMA (`common/tma.cuh`): the staging swizzles already
@@ -171,8 +171,9 @@ ARE the TMA hardware modes (`<3,3>` = SWIZZLE_128B for 2-byte elements,
 `<2,3>` = SWIZZLE_64B for 1-byte), so fragment addressing, ring slots
 and the epilogue reclaim are untouched — only the load/wait discipline
 changes. The templating follows the staging types: `TmaSwizzleOf<Staged>`
-derives the swizzle enum and the box's inner extent (the mode's span)
-from the declared `ComposedLayout`, and `tma_spec<Elem, Staged, BoxRows>`
+derives the swizzle width and the box's inner extent (the mode's span)
+from the declared `ComposedLayout` (the encoder decodes the `CUtensorMap`
+swizzle enum from that width), and `tma_spec<Elem, Staged, BoxRows>`
 fills only the runtime geometry — the map cannot drift from what the
 fragments read. Each operand's rank is a template bit on
 `GemmTmaContext` / `gemm_kernel_tma` (strided batch = 3D emitter,
@@ -492,8 +493,8 @@ per-operand epilogue scale placement, the CUTLASS-style
 `Shape`/`GemmTileConfig` vocabulary, the device-parameterized launch
 planning (the `DeviceFacts` wave-count model plus the L2-budget raster
 rule from humming's tune heuristics), and — since the TMA staging — the
-sm90+ load/PDMA vocabulary (TMA descriptors + the `PipelineMbarrier`-style
-full/empty handshake humming's sm120 heuristics enable for WnA16). Not
+sm90+ load/PDMA vocabulary (TMA descriptors + the mbarrier full/empty
+handshake humming's sm120 heuristics enable for WnA16). Not
 adopted, in rough priority order
 for future work: grouped-along-K / 2-D block scales (GPTQ/AWQ import —
 needs mainloop scale application, the epilogue cannot fold them),
@@ -817,9 +818,9 @@ csrc/
 ├── CMakeLists.txt                    # CMake build: kernel registry (KERNEL_NAMES / KERNEL_SRCS), torch/pybind11 linking
 ├── kernels/
 │   ├── common/                       # cross-family pure-CUDA helpers (no torch)
-│   │   ├── device.cuh                #   DeviceFacts geometry query (sms / smem opt-in / L2) + ArchSm80..100 generation tags with feature gates (fp8 mma / TMA / mbarrier / wgmma) and the runtime arch_dispatch ladder; fp8 capability helpers live in quantize/common.h, the torch-bound gate in quantize/checks.h
-│   │   ├── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2/x4<T> + typed fragment cells (AFrag/BFrag/CFrag, by-reference fma/ldmatrix overloads)
-│   │   ├── pipeline.cuh              #   async data-movement vocabulary, one header: raw cp.async 16B emitters (fixed + runtime-src-size zfill) and mbarrier PTX, plus PipelineSync (sm_80/89 wait_group+syncthreads) / PipelineMbarrier (sm_90+) stage pipelines
+│   │   ├── device.cuh                #   DeviceFacts geometry query (sms / smem opt-in / L2); fp8 capability helpers live in quantize/common.h, the torch-bound gate in quantize/checks.h
+│   │   ├── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2<T> and the per-lane ldmatrix cores + typed fragment cells (AFrag/BFrag/CFrag, by-reference fma/ldmatrix overloads)
+│   │   ├── pipeline.cuh              #   async data-movement vocabulary, one header: raw cp.async 16B emitters (fixed + runtime-src-size zfill) and the mbarrier PTX sites, plus the PipelineSync (sm_80/89 wait_group+syncthreads) stage pipeline
 │   │   ├── swizzle.cuh               #   staging-layout vocabulary: Swizzle/Shape/Stride/Layout + composition(Swizzle, Layout) in 16B-chunk units; per-tile SmemLayout types declared by the gemm collectives
 │   │   ├── tensor.cuh                #   tensor vocabulary, cute's Tensor<Engine, Layout>: PtrEngine/ArrayEngine, RingLayout/CellLayout, one Tensor type spelled directly (make_ring constructs the stage ring, stage_of slices a slot)
 │   │   └── reduce.cuh                #   warp_reduce_max, atomic_max_float

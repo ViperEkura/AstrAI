@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "common/device.cuh"
 #include "gemm/gemm.cuh"
 
 using namespace astrai;

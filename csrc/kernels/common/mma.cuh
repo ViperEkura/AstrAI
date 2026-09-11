@@ -308,15 +308,11 @@ struct MxMmaOp<__nv_fp8_e5m2> {
 // --- convenience views over the trait layers --------------------------------
 
 // Compile-time facts of an input type's MMA, flattened for the layers that
-// want plain ints (the attention kernels' KD/KT2 math, the gemm policy's
-// register budgets). Derives entirely from the two traits above.
+// want plain ints (the attention kernels' KD/KT2 math). Derives entirely
+// from the two traits above.
 template <typename InT>
 struct mma_shape {
-    using Op = MmaOp<InT, InT, typename MmaShapeFor<InT>::type>;
     static constexpr int k = MmaShapeFor<InT>::type::kK;
-    static constexpr int a_regs = Op::kARegs;
-    static constexpr int b_regs = Op::kBRegs;
-    static constexpr int min_arch = MmaShapeFor<InT>::kMinArch;
 };
 
 // d[4] = a[4] x b[2] + c[4], row-major A, col-major B — the fp32-accumulating
@@ -412,17 +408,11 @@ DEVICE_FORCEINLINE void ldmatrix_x4_lane(ArrayEngine<unsigned, 4>& f,
     ldmatrix_x4_lane<Trans>(f.storage, addr);
 }
 
-// Common-pointer wrappers over the per-lane cores (see the x2/x4 matrix
-// layout notes above).
+// Common-pointer wrapper over the per-lane core (see the matrix layout notes
+// above).
 template <typename T, bool Trans = false>
 DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
     ldmatrix_x2_lane<Trans>(r, __cvta_generic_to_shared(p));
-}
-
-// Four matrices at p, p+128, p+256, p+384 bytes (16-byte row stride).
-template <typename T, bool Trans = false>
-DEVICE_FORCEINLINE void ldmatrix_x4(unsigned r[4], const T* p) {
-    ldmatrix_x4_lane<Trans>(r, __cvta_generic_to_shared(p));
 }
 
 
@@ -432,7 +422,8 @@ DEVICE_FORCEINLINE void ldmatrix_x4(unsigned r[4], const T* p) {
 // different execution model: the MMA is issued by ONE thread, reads A/B
 // from shared-memory descriptors, accumulates into TENSOR MEMORY (TMEM)
 // instead of registers, and completion is observed through an mbarrier
-// via tcgen05.commit (the discipline PipelineMbarrier carries).
+// via tcgen05.commit (the discipline pipeline.cuh's raw mbarrier sites
+// carry).
 //
 // The PTX sites need an arch-specific sm_100+ target; declarations stay
 // visible on every pass (ASTRAI_TCGEN05_ENABLED guards only the asm

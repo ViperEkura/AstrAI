@@ -12,10 +12,8 @@
 #include <cstdint>
 #include <torch/extension.h>
 
-#include "common/device.cuh"
 #include "gemm.cuh"
 #include "quantize/checks.h"
-#include "quantize/common.h"
 
 using namespace astrai;
 using namespace astrai::quant;

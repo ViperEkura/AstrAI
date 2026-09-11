@@ -131,11 +131,12 @@ struct TmaMapSpec {
 
 // Staging-layout -> map facts: the swizzled staging tiles ARE hardware TMA
 // modes (Swizzle<Bits, 3> members — kTmaMode marks them), so one trait over
-// the declared ComposedLayout carries everything compile-time-derivable:
-// the swizzle enum, and the box's inner extent — which SWIZZLE_* pins to
-// the mode's span (16B << Bits). The staging layout is the single source:
-// deriving the swizzle from sizeof(Elem) again (as the hand-built specs
-// once did) can drift from what the fragments actually read.
+// the declared ComposedLayout carries the swizzle width and the box's inner
+// extent — which SWIZZLE_* pins to the mode's span (16B << Bits). The
+// staging layout is the single source: the map's swizzle enum is decoded
+// from its kBits at encode time, not re-derived from sizeof(Elem) as the
+// hand-built specs once did, which could drift from what the fragments
+// actually read.
 template <typename StagedT>
 struct TmaSwizzleOf;  // undefined: only swizzled congruous staging feeds TMA
 
@@ -144,10 +145,6 @@ struct TmaSwizzleOf<ComposedLayout<SwzT, LayT>> {
     static_assert(SwzT::kTmaMode,
                   "TMA staging needs a hardware swizzle mode (Swizzle<1-3, 3>)");
     static constexpr int kBits = SwzT::kBits;
-    static constexpr CUtensorMapSwizzle kSwizzle =
-        kBits == 3 ? CU_TENSOR_MAP_SWIZZLE_128B
-                   : kBits == 2 ? CU_TENSOR_MAP_SWIZZLE_64B
-                                : CU_TENSOR_MAP_SWIZZLE_NONE;
     static constexpr uint32_t kBox0Bytes = 16u << kBits;  // the swizzle span
 };
 

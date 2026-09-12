@@ -9,9 +9,7 @@
 // makes every lookup miss, and dispatch falls through to the degraded rows.
 // The sweep times the fused-linear (NT) layout, so pasted rows carry crosswise
 // 0 and the other layout classes take that same degraded fallback. Row files
-// and their field order: parse_plan_table_file below; measurements, sweeps and
-// the open questions: the dated tuning-log entries in
-// docs/developer/cuda_kernels.md.
+// and their field order: parse_plan_table_file below.
 
 #include <algorithm>
 #include <cstdint>
@@ -334,8 +332,7 @@ inline const std::vector<TableRow>& plan_table_override_rows() {
 // twin of the same band measures ~1.85x on narrow N, and the warp tiling is
 // not addressable from a row at all: the dispatch key is class + stages + kK).
 // One table per dtype class, so a row tuned for one operand pair cannot fire
-// on another; the sweeps, the merge proof and the per-shape numbers are in
-// the tuning log (docs/developer/cuda_kernels.md).
+// on another.
 //
 // First match wins, so order matters: measured additions sit in front of the
 // rows they shadow.
@@ -345,8 +342,7 @@ static constexpr TableRow kBuiltinPlanW16A16[] = {
     // keeps one, so the epilogue (which scatters through the reclaimed rings)
     // overlaps instead of being exposed, and its 16 warps of 32x32 double the
     // warps per partition at the same 64-register budget. Worth 7-14% on the
-    // large shapes; sweeps and per-shape numbers in the tuning log
-    // (docs/developer/cuda_kernels.md).
+    // large shapes.
     // The M<=512 band keeps kK=64 s2 instead: there the K loop is too short
     // for the 64x64 CTA's 3 resident CTAs to lose.
     {TileClass::kBig128, 512, 0, 4096, 0, 0, 0, 2, 0, 32},
@@ -374,8 +370,8 @@ static constexpr TableRow kBuiltinPlanW16A16[] = {
     // ceil(M/128) x n_tiles — 32 CTAs at M <= 128 — and streaming B from a
     // thin grid costs more than the big tile's reuse pays. The 384/512 flip
     // and the kk split are measured literals, not wave arithmetic (at M 512
-    // the big tile wins on a half wave); the crossover table lives in the
-    // tuning log, per the TableRow comment on literal vs wave bounds.
+    // the big tile wins on a half wave), per the TableRow comment on literal
+    // vs wave bounds.
     {TileClass::kSmall64, 0, 128, 3072, 0, 0, 0, 3, 0, 64, 4096, 0},
     {TileClass::kSmall64, 0, 128, 3072, 0, 0, 0, 3, 0, 32, 2048, 0},
     {TileClass::kSmall64, 0, 384, 3072, 0, 0, 0, 3, 0, 32, 2048, 0},

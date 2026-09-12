@@ -662,6 +662,80 @@ than the lost parallel slack costs (the fp32 partials are larger than the
 bf16 output), so the shapes stay on the 64x64 tile at 0.87-0.95x cuBLAS
 until a persistent or stream-K kernel makes the grid a free variable.
 
+**2026-09-12, the small-M half of the wide band (N > 3072, K > 2048).**
+The band carried one row — big CTA, kK=32 — across its whole M in (0,512]
+span, and below M ~384 that was the wrong tile by a wide margin: at M <= 128
+its grid is ceil(M/128) x n_tiles, 32 CTAs at N=4096, and a thin grid
+streaming B outweighs everything the 128x128 tile is good at. Graph-timed
+(host enqueue is 8.4us and the kernel is 30-130us here, so event-timed
+Python measures the host) A/B of the shipped row against the 64x64 tile:
+M=1 131.6 -> 43.3us, M=64 121.9 -> 33.9 (3.6x), M=128 106.4 -> 36.0,
+M=256 107.2 -> 61.8, M=384 108.5 -> 95.8, M=512 109.9 -> 122.3 (big tile
+kept). Same ordering on the 28672x8192 family at M=16..256 (1.9x down to
+1.04x). The split replaced the single row with three 64x64 rows (s3:
+kK=64 above K 4096, kK=32 below) and restored the big tile on (384,512].
+Two lessons recorded. The crossover is a **shape** property, not a wave
+one — at M 512 the big tile's grid is 128 CTAs, half a wave, and it still
+wins, so the wave-permille rule deliberately does not reach this band; the
+M bounds are measured. And the kK=64/32 split inside it is calibrated on
+one family per side (kk=64 wins the K=8192 small-M points, kk=32 the
+K=4096 ones), so the K > 4096 boundary wants a re-measure if another
+large-K family shows up. Post-fix, M <= 64 sits at 0.30-0.46x cuBLAS on
+the K=1536 families — that residue is **split-K territory, not tile
+choice** (cuBLAS splits K there; at M <= 16 the fp32 partial workspace is
+< 1MB and the 8x-output traffic argument above does not bind), while
+M=64..512 landed at or above parity on the large-N families.
+
+**2026-09-12, what does NOT move the decode band (M=1..128, N>3072).**
+Two negative probes before building split-K, both CUDA-graph timed,
+interleaved in one process on the post-split table. *Fill*: a 3-D `a`
+broadcasts `b` (0 stride), so batch=B puts B copies of the same CTA on the
+machine — batch 2 (128 CTAs, one per SM) timed within 8% of batch 1
+(64 CTAs) on 4096x4096 and *slower* from there (batch 4 = 63us, batch 8 =
+125us vs 48.5us), on every family including the L2-resident ones. Extra
+CTAs are free up to one per SM but buy no B throughput: the per-CTA
+k-chain is what makes the time. *Ring depth*: s4/s5 and kK=64 variants of
+the small-M wide rows (via `ASTR_GEMM_TABLE`) timed flat on all 24
+probed shapes — deeper rings add no DRAM in-flight the compiler wasn't
+already tracking. Together: the decode deficit vs cuBLAS (46.7 vs 16.9us
+at 1x4096x4096) is per-CTA k-chain latency, so the lever is cutting
+k-iters per CTA — split-K's actual mechanism — not grid fill or tile
+depth. Expectation this sets: split=4 should land ~2.3x (128 iters x
+365ns/iter / 4, plus a reduce pass), well short of cuBLAS's gemv-class
+kernel; that residue is a skinny-kernel question, not a scheduling one.
+
+**2026-09-12 (later), the k-chain story was wrong: it is the B-read
+pattern, and the memory system has two regimes.** A standalone
+cp.async-ring microbench at the exact 64x64 staging geometry
+(`kstream_bench.cu`, workspace root) swept kK x stages x threads x
+CTAs/SM x issue order x per-row run length, plus a linear control with
+the identical ring/barrier/wait structure. Three findings. (1) The RTX
+4090's DRAM peak is 1008 GB/s — every cold-config (512MB set) hits
+0.88-0.96 of it with the shipped wait-first discipline, flat across the
+whole sweep; there is nothing to win on DRAM-bound shapes and no
+pipeline bug. (2) The decode shapes are NOT DRAM-bound: 4096x4096 bf16
+weights are 32MB against 72MB of L2, and cuBLAS's 16.9us (1.9TB/s) is an
+L2-resident number. From a warm 64MB set, the tile's interleaved B walk
+— 64 rows advancing 128B per round, row pitch K*2 — delivers only
+~0.6TB/s, while the linear control reaches 1.7TB/s at 64 CTAs and
+3.4TB/s at 128: the multi-stream interleave itself caps L2->SM at a
+fifth of what one stream per CTA gets. The shipped kernel's 0.69TB/s at
+1x4096x4096 is exactly this cap; issue order (wait-first vs issue-first,
+ring one slot deeper) moves it +5%, stage depth and thread count nothing.
+(3) Lengthening each row's per-round run (two/four back-to-back kK
+windows, 256B/512B) makes it WORSE, monotonically (0.63 -> 0.31 -> 0.08
+TB/s from L2, 0.94 -> 0.48 from DRAM) — so no load_stage reshaping inside
+the tile pattern recovers it, and with it die: the issue-reorder fix
+(+5%), kK=128-deeper-runs (run length is anti-correlated), and split-K /
+stream-K (more CTAs on the same interleave — consistent with the flat
+batch-fill probe). What survives: for M <= 8, a gemv-class kernel whose
+warps walk whole B rows linearly (the 3.4TB/s pattern) with A staged
+once per CTA; M in 9..64 is the open gap where tensor cores still matter
+but no measured in-tile fix exists. (The per-CTA 11GB/s constant that
+motivated the k-chain theory is real but it is the L2-regime interleave
+cap, not a latency chain: at DRAM the same code does 7.4GB/s/CTA with
+128 CTAs = 0.95TB/s aggregate.)
+
 ## Build System
 
 ### Auto-detection

@@ -154,6 +154,13 @@ int main() {
         // Bands the additions must not shadow: kK=64 floor, and the two edges
         // of the wide bands (N stays on the row below, M and K too).
         {64, 64, 64, 0, TileClass::kSmall64, 3, 64, "w16a16 tiny stays kK=64"},
+        // Small-M wide band: 64x64 tile below the measured 384/512 flip, kk=32
+        // on the K=4096 side (the kk twins tie at M 64; kk=32 is 44% ahead at
+        // M 128) and kk=64 above K 4096.
+        {64, 4096, 4096, 0, TileClass::kSmall64, 3, 32, "w16a16 small-M wide band, K=4096"},
+        {64, 28672, 8192, 0, TileClass::kSmall64, 3, 64, "w16a16 small-M wide band, large K"},
+        {192, 4096, 4096, 0, TileClass::kSmall64, 3, 32, "w16a16 small-M wide band kK=32"},
+        {256, 28672, 8192, 0, TileClass::kSmall64, 3, 32, "w16a16 mid-M wide band, large K"},
         {512, 4096, 4096, 0, TileClass::kBig128, 2, 32, "w16a16 small-M wide band kK=32"},
         {512, 100000, 4096, 0, TileClass::kBig128, 2, 32, "w16a16 small-M wide band kK=32"},
         {512, 6144, 1536, 0, TileClass::kSmall64, 3, 32, "w16a16 small-M short-K keeps its row"},

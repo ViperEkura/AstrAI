@@ -10,7 +10,7 @@
 // The sweep times the fused-linear (NT) layout, so pasted rows carry crosswise
 // 0 and the other layout classes take that same degraded fallback. Row files
 // and their field order: parse_plan_table_file below; measurements, sweeps and
-// the open questions: docs/developer/cuda_kernels.md (Plan table tuning log).
+// the open questions: AGENTS.md (Plan table tuning log).
 
 #include <algorithm>
 #include <cstdint>
@@ -334,7 +334,7 @@ inline const std::vector<TableRow>& plan_table_override_rows() {
 // not addressable from a row at all: the dispatch key is class + stages + kK).
 // One table per dtype class, so a row tuned for one operand pair cannot fire
 // on another; the sweeps, the merge proof and the per-shape numbers are in
-// docs/developer/cuda_kernels.md (Plan table tuning log).
+// AGENTS.md (Plan table tuning log).
 //
 // First match wins, so order matters: measured additions sit in front of the
 // rows they shadow.
@@ -344,7 +344,7 @@ static constexpr TableRow kBuiltinPlanW16A16[] = {
     // keeps one, so the epilogue (which scatters through the reclaimed rings)
     // overlaps instead of being exposed, and its 16 warps of 32x32 double the
     // warps per partition at the same 64-register budget. Worth 7-14% on the
-    // large shapes; sweeps and per-shape numbers in the doc's tuning log.
+    // large shapes; sweeps and per-shape numbers in AGENTS.md's tuning log.
     // The M<=512 band keeps kK=64 s2 instead: there the K loop is too short
     // for the 64x64 CTA's 3 resident CTAs to lose.
     {TileClass::kBig128, 512, 0, 4096, 0, 0, 0, 2, 0, 32},
@@ -368,7 +368,16 @@ static constexpr TableRow kBuiltinPlanW16A16[] = {
     // see above) and its bare CTAs-per-SM gate.
     {TileClass::kBig128, 3712, 0, 1536, 3072, 0, 0, 2, 0, 32, 0, 0, 2},
     {TileClass::kBig128, 512, 0, 3072, 4096, 0, 0, 2, 0, 32},
-    {TileClass::kBig128, 0, 512, 3072, 0, 0, 0, 2, 0, 32, 2048, 0},
+    // Small M drops the wide band to the 64x64 tile: a 128x128 grid is
+    // ceil(M/128) x n_tiles — 32 CTAs at M <= 128 — and streaming B from a
+    // thin grid costs more than the big tile's reuse pays. The 384/512 flip
+    // and the kk split are measured literals, not wave arithmetic (at M 512
+    // the big tile wins on a half wave); the crossover table lives in the
+    // tuning log, per the TableRow comment on literal vs wave bounds.
+    {TileClass::kSmall64, 0, 128, 3072, 0, 0, 0, 3, 0, 64, 4096, 0},
+    {TileClass::kSmall64, 0, 128, 3072, 0, 0, 0, 3, 0, 32, 2048, 0},
+    {TileClass::kSmall64, 0, 384, 3072, 0, 0, 0, 3, 0, 32, 2048, 0},
+    {TileClass::kBig128, 384, 512, 3072, 0, 0, 0, 2, 0, 32, 2048, 0},
     // The same residency effect as a k-tile depth: N in (768,1536] resolved to
     // the kK=64 small tile below (64KB ring, one resident CTA) where the kK=32
     // twin is 32KB. M > 1536 keeps the big-tile row (5.3% ahead there) and

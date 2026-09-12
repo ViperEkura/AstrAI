@@ -51,9 +51,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     auto* out = reinterpret_cast<OutT*>(p.out_ptr) +
                 (int64_t)blockIdx.z * p.out_batch_stride;
 
-    static_assert(Mainloop::kBlockM * Mainloop::kBlockN * sizeof(OutT) <=
-                  Mainloop::RingA::Layout::kTotalBytes +
-                  Mainloop::RingB::Layout::kTotalBytes,
+    static_assert(Mainloop::kOutputReclaimsRings,
                   "output tile must fit the reclaimed operand smem");
     const int2 blk = GemmTileScheduler::tile(blockIdx, gridDim, p.raster);
     Mainloop mainloop(gemm_smem, a, b, p.m, p.n, p.k, p.a_ld, p.b_ld,
@@ -97,9 +95,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     auto* out = reinterpret_cast<OutT*>(p.out_ptr) +
                 (int64_t)blockIdx.z * p.out_batch_stride;
 
-    static_assert(Mainloop::kBlockM * Mainloop::kBlockN * sizeof(OutT) <=
-                  Mainloop::RingA::Layout::kTotalBytes +
-                  Mainloop::RingB::Layout::kTotalBytes,
+    static_assert(Mainloop::kOutputReclaimsRings,
                   "output tile must fit the reclaimed operand smem");
 
     GemmTmaContext<kRank3A, kRank3B> tma;
@@ -323,16 +319,14 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
     // load path. A row naming one for such a pair matches no tile either, and
     // is rejected on the same terms as the width rule above.
     if (row.kk == 32 && (q.ba != 2 || q.bb != 2)) return std::nullopt;
-    // Only the 64x64 kK=64 geometry carries the deep s4/s5 rings (policy.cuh),
-    // and only it has the smem room for them: every other class or depth would
-    // dispatch to nothing. The ring check below cannot catch this — a deep
-    // kK=32 ring is only 40-80KB, well inside the ceiling — so the rule has to
-    // be explicit here. Likewise the wide CTA is a lone s2 entry on the 1-byte
-    // ladder, deeper than the ring check expects: 128x256 s3 is 96KB, which
-    // fits, and still names no tile.
-    if (row.stages > 3 &&
-        (row.cta != TileClass::kSmall64 || row.kk != kTableRowK))
-        return std::nullopt;
+    // Ring depths past 3 name no tile on any ladder (the s4/s5 deep-ring
+    // twins were a measured wash and were removed), so a stale sweep row
+    // naming one is rejected on the same terms — the next source, or the
+    // degraded bands, serves the shape. The ring check below cannot catch
+    // a deep kK=32 ring (40-80KB, well inside the ceiling). Likewise the
+    // wide CTA is a lone s2 entry on the 1-byte ladder: 128x256 s3 is
+    // 96KB, which fits, and still names no tile.
+    if (row.stages > 3) return std::nullopt;
     if (row.cta == TileClass::kWide128x256 && row.stages != 2)
         return std::nullopt;
     // Crosswise staging runs the conservative ladder, which carries kK 64 and
@@ -680,35 +674,36 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
     }
     // Each branch plans from its OWN layout tags, so the plan and the launch
     // below cannot disagree about the crosswise count, widths or perf class.
+    // The tags ride empty tag instances; decltype recovers the types.
+    const auto launch = [&](auto la, auto lb, auto lout) {
+        launch_plan<ElemA, ElemB, decltype(la), decltype(lb), decltype(lout),
+                    OutT>(p, plan_of<ElemA, ElemB, decltype(la), decltype(lb)>(p),
+                          stream);
+    };
     if (trans_a && trans_b) {
         // The swap computes the transposed problem; its (rewritten TT)
         // branch instantiates the column-major-output epilogue through
-        // LayoutOut. Mixed never swaps, so its output stays row-major.
+        // LayoutOut. Mixed never swaps, so its output stays row-major (and
+        // if constexpr keeps the swapped instantiation out of mixed builds).
         if constexpr (kSymmetric) {
             if (swapped)
-                launch_plan<ElemA, ElemB, ColMajor, ColMajor, ColMajor, OutT>(
-                    p, plan_of<ElemA, ElemB, ColMajor, ColMajor>(p), stream);
+                launch(ColMajor{}, ColMajor{}, ColMajor{});
             else
-                launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(
-                    p, plan_of<ElemA, ElemB, ColMajor, ColMajor>(p), stream);
+                launch(ColMajor{}, ColMajor{}, RowMajor{});
         } else {
-            launch_plan<ElemA, ElemB, ColMajor, ColMajor, RowMajor, OutT>(
-                p, plan_of<ElemA, ElemB, ColMajor, ColMajor>(p), stream);
+            launch(ColMajor{}, ColMajor{}, RowMajor{});
         }
     } else if (trans_b) {
-        // NT (the fused-linear shape).
-        launch_plan<ElemA, ElemB, RowMajor, ColMajor, RowMajor, OutT>(
-            p, plan_of<ElemA, ElemB, RowMajor, ColMajor>(p), stream);
+        // NT (the fused-linear shape), the production nn.Linear route.
+        launch(RowMajor{}, ColMajor{}, RowMajor{});
     } else if (trans_a) {
-        launch_plan<ElemA, ElemB, ColMajor, RowMajor, RowMajor, OutT>(
-            p, plan_of<ElemA, ElemB, ColMajor, RowMajor>(p), stream);
+        launch(ColMajor{}, RowMajor{}, RowMajor{});
     } else {
         // Dual row-major: mixed only — symmetric NN was rewritten above
         // into the transposed TT kernel (if constexpr keeps this
         // instantiation out of symmetric builds).
         if constexpr (!kSymmetric)
-            launch_plan<ElemA, ElemB, RowMajor, RowMajor, RowMajor, OutT>(
-                p, plan_of<ElemA, ElemB, RowMajor, RowMajor>(p), stream);
+            launch(RowMajor{}, RowMajor{}, RowMajor{});
     }
 }
 

@@ -146,6 +146,14 @@ struct GemmCollectiveMainloop {
     using TileA = Tensor<PtrEngine<ElemA>, StagedLayoutA>;
     using TileB = Tensor<PtrEngine<ElemB>, StagedLayoutB>;
 
+    // The epilogue scatters the output tile into the reclaimed operand
+    // rings, so the tile must fit them — the single predicate both
+    // orchestrators static_assert (the launchers' reclaim_fits prices the
+    // same rule per tile).
+    static constexpr bool kOutputReclaimsRings =
+        kBlockM * kBlockN * sizeof(typename Policy::OutT) <=
+        RingA::Layout::kTotalBytes + RingB::Layout::kTotalBytes;
+
     // The warp's accumulator: typed C cells on a (mt, nt) grid — indexing
     // by semantic coordinates all the way to the mma (no pointer decay at
     // the fma seam; the epilogue reads the same cells).
@@ -527,31 +535,56 @@ struct GemmCollectiveMainloop {
     // element math scaled by sizeof(ElemT). The swizzle chunk term comes
     // from the declared staging layouts — the same instances the staged
     // tiles apply, so the mirror can never drift.
+    //
+    // Both operands' canonical and trans offsets are the same formulas
+    // parameterized by the operand's staging layout, element type and
+    // extent term; the per-operand wrappers below only pick their lane
+    // bits and base row (A's fragment row carries the +8-row and +1-chunk
+    // halves, B uses the +8-row bit as its chunk half — see the notes on
+    // each wrapper).
+    template <typename SmemLayoutT, typename ElemT>
+    static __device__ __forceinline__ unsigned
+    canonical_lane_off(int64_t row, int chunk_half, int lane) {
+        constexpr int kChunkShift = log2_const<16 / sizeof(ElemT)>::value;
+        const unsigned lswz = static_cast<unsigned>(
+            ((lane & 7) >> SmemLayoutT::kRowShift) & SmemLayoutT::kMask);
+        return static_cast<unsigned>((row * kK +
+                                      ((chunk_half ^ lswz) << kChunkShift)) *
+                                     sizeof(ElemT));
+    }
+
+    // Trans-tile addressing (crosswise 16-bit operands): the LDSM row is a
+    // k line, the 16B chunk a window of the non-contract dim, chunks
+    // swizzled by the k-row bits (the trans layout instance).
+    // ldmatrix.trans lane
+    // contract: lanes 0-7 feed k rows 0-7, lanes 8-15 k rows 8-15 (the
+    // second k half of the fragment), lanes 16-31 (x4) step one column
+    // chunk (the +8 half of the m16/n8 tile); x2 ignores lanes 16-31.
+    // kMtXor/kNtXor: one m/n-tile step in chunks (16B each) — an XOR on
+    // the chunk field, not an add; kTransSeg*: one mma k-segment = kMmaK
+    // k rows.
+    template <typename SmemLayoutT, typename ElemT>
+    static __device__ __forceinline__ unsigned
+    trans_lane_off(int krow, int col, int block_extent) {
+        const unsigned lswz = static_cast<unsigned>(
+            (krow >> SmemLayoutT::kRowShift) & SmemLayoutT::kMask);
+        return static_cast<unsigned>(((int64_t)krow * block_extent +
+                                      (((col >> 3) ^ lswz) << 3) + (col & 7)) *
+                                     sizeof(ElemT));
+    }
+
     static constexpr int kChunkElems = 16 / sizeof(ElemA);
     static constexpr int kChunkShift = log2_const<kChunkElems>::value;
     __device__ __forceinline__ unsigned a_lane_off(int lane) const {
-        const int r7 = lane & 7;          // row within the 8-row matrix
-        const int rh8 = (lane >> 3) & 1;  // +8 rows (A: lanes 8-15, 24-31)
-        const int rh16 = lane >> 4;       // +1 chunk (A: lanes 16-31)
-        const unsigned lswz = static_cast<unsigned>(
-            (r7 >> SmemLayoutA::kRowShift) & SmemLayoutA::kMask);
         // Stage-relative, loop-invariant per-lane base; A's fragment row
         // carries the +8-row (rh8) and +1-chunk (rh16) halves.
-        return static_cast<unsigned>(((a_row0 + rh8 * 8 + r7) * kK +
-                                      ((rh16 ^ lswz) << kChunkShift)) *
-                                     sizeof(ElemA));
+        return canonical_lane_off<SmemLayoutA, ElemA>(
+            a_row0 + ((lane >> 3) & 1) * 8 + (lane & 7), lane >> 4, lane);
     }
     __device__ __forceinline__ unsigned b_lane_off(int lane) const {
         // ldmatrix (non-dequant) B addressing: byte offsets in ElemB units.
-        constexpr int kChunkB = 16 / sizeof(ElemB);
-        constexpr int kChunkShiftB = log2_const<kChunkB>::value;
-        const int r7 = lane & 7;
-        const int rh8 = (lane >> 3) & 1;  // +8 rows (B uses rh8 as its chunk half)
-        const unsigned lswz = static_cast<unsigned>(
-            (r7 >> SmemLayoutB::kRowShift) & SmemLayoutB::kMask);
-        return static_cast<unsigned>(((b_row0 + r7) * kK +
-                                      ((rh8 ^ lswz) << kChunkShiftB)) *
-                                     sizeof(ElemB));
+        return canonical_lane_off<SmemLayoutB, ElemB>(
+            b_row0 + (lane & 7), (lane >> 3) & 1, lane);
     }
     // x4-paired B loads: one ldmatrix.x4 feeds the two adjacent nt
     // fragments. Lane contract: lanes 0-7 address rows n0..n7 chunk c,
@@ -577,16 +610,6 @@ struct GemmCollectiveMainloop {
         return b_lane_off(lane) + (lane >> 4) * kPairStep / 2;
     }
 
-    // Trans-tile addressing (crosswise 16-bit operands): the LDSM row is a
-    // k line, the 16B chunk a window of the non-contract dim, chunks
-    // swizzled by the k-row bits (the trans layout instance).
-    // ldmatrix.trans lane
-    // contract: lanes 0-7 feed k rows 0-7, lanes 8-15 k rows 8-15 (the
-    // second k half of the fragment), lanes 16-31 (x4) step one column
-    // chunk (the +8 half of the m16/n8 tile); x2 ignores lanes 16-31.
-    // kMtXor/kNtXor: one m/n-tile step in chunks (16B each) — an XOR on
-    // the chunk field, not an add; kTransSeg*: one mma k-segment = kMmaK
-    // k rows.
     static constexpr unsigned kMtXor = 32u;  // m16 = 2 chunks
     static constexpr unsigned kNtXor = 16u;  // n8 = 1 chunk
     static constexpr unsigned kTransSegA = (unsigned)Traits::kMmaK * kBlockM * sizeof(ElemA);
@@ -595,22 +618,14 @@ struct GemmCollectiveMainloop {
         // x4 matrix order must match the mma's A-register order (m+8 rides
         // reg1, k+8 reg2): lanes 8-15 step the m+8 chunk, lanes 16-31 the
         // k+8 row half.
-        const int krow = (lane & 7) + ((lane >> 4) << 3);
-        const int col = a_row0 + (((lane >> 3) & 1) << 3);
-        return (unsigned)(((int64_t)krow * kBlockM +
-                           (((col >> 3) ^ ((krow >> SmemLayoutATrans::kRowShift) &
-                                           SmemLayoutATrans::kMask)) << 3) +
-                           (col & 7)) *
-                          sizeof(ElemA));
+        return trans_lane_off<SmemLayoutATrans, ElemA>(
+            (lane & 7) + ((lane >> 4) << 3),
+            a_row0 + (((lane >> 3) & 1) << 3), kBlockM);
     }
     __device__ __forceinline__ unsigned b_trans_lane_off(int lane) const {
-        const int krow = (lane & 7) + (((lane >> 3) & 1) << 3);
-        const int col = b_row0 + 0;  // nt windows step by kNtXor at call sites
-        return (unsigned)(((int64_t)krow * kBlockN +
-                           (((col >> 3) ^ ((krow >> SmemLayoutBTrans::kRowShift) &
-                                           SmemLayoutBTrans::kMask)) << 3) +
-                           (col & 7)) *
-                          sizeof(ElemB));
+        // nt windows step by kNtXor at call sites (col stays at b_row0).
+        return trans_lane_off<SmemLayoutBTrans, ElemB>(
+            (lane & 7) + (((lane >> 3) & 1) << 3), b_row0, kBlockN);
     }
 
     // One k_seg's B-fragment loads, shared by the initial fill and the

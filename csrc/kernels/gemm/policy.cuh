@@ -175,16 +175,11 @@ using Tile_64x64x64_W16x32_S2_Fast =
     GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 2, true>;
 using Tile_64x64x64_W16x32_S3_Fast =
     GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 3, true>;
-// Deep-ring twins. The 64x64 ring is the only class where s4/s5 survive the
-// per-block smem opt-in ceiling on a 2-byte pair (80KB / 96KB against 99KB;
-// 128x64 tops out at s3 and 128x128 at s2), so the deep ring is testable
-// here and nowhere else. The compiled-in rows all carry s2/s3 and the sweep
-// measured the deep rings a wash (s2..s5 within 1-2% at this tile), so only
-// the row-file route reaches one.
-using Tile_64x64x64_W16x32_S4_Fast =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 4, true>;
-using Tile_64x64x64_W16x32_S5_Fast =
-    GemmTileConfig<Shape<64, 64, 64>, Shape<16, 32>, 5, true>;
+// Deep-ring s4/s5 twins of this geometry were removed: the sweep measured
+// them a wash against s2..s3 (within 1-2% at this tile) and no compiled-in
+// row reaches past s3. The planner rejects stages > 3 outright, so a stale
+// row file naming one falls to the next source instead of silently
+// launching nothing (plan_from_row in gemm.cuh).
 // 16 warps per CTA on the small geometry (16x16 warp tiles, 512 threads):
 // more parallel slack over the same 64x64x64 ring, for the underfed shapes.
 using Tile_64x64x64_W16x16_S2_Fast =
@@ -277,10 +272,7 @@ static_assert(cta_matches_class<Tile_64x64x64_W16x32_S2_Fast>() &&
 template <typename... Ts>
 using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
 
-// The shared ladder: the geometries every staging path instantiates, plus the
-// 64x64 deep-ring twins (see the alias above — they are here rather than in
-// one ladder so that every manifest carries them and a row naming s4/s5
-// always finds a tile, whatever the staging path).
+// The shared ladder: the geometries every staging path instantiates.
 // load_operand_tile stages a crosswise operand as kK lines of (M or N)*elem/16
 // chunks and needs that product to divide its thread count with a
 // power-of-two quotient, which the kK=32 twins and the 16-warp small CTA both
@@ -289,8 +281,7 @@ using tuple_cat_t = decltype(std::tuple_cat(std::declval<Ts>()...));
 using TileManifestCross = std::tuple<
     Tile_128x128x64_W64x32_S2_Fast, Tile_128x128x64_W64x32_S3_Fast,
     Tile_128x64x64_W32x32_S2_Fast, Tile_128x64x64_W32x32_S3_Fast,
-    Tile_64x64x64_W16x32_S2_Fast, Tile_64x64x64_W16x32_S3_Fast,
-    Tile_64x64x64_W16x32_S4_Fast, Tile_64x64x64_W16x32_S5_Fast>;
+    Tile_64x64x64_W16x32_S2_Fast, Tile_64x64x64_W16x32_S3_Fast>;
 
 // The dispatch manifests (CUTLASS builder-table style): every recipe the
 // launch ladders select over, keyed by the plan's CTA class, ring depth and

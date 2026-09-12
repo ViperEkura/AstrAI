@@ -134,61 +134,43 @@ struct MmaOp<__nv_bfloat16, __nv_bfloat16, Shape<16, 8, 16>> {
 // CALLED: member bodies of full specializations are checked in every
 // including TU, and a bare assert would trip uncalled on the sm_80 passes
 // (attention includes this header for the bf16 cell and ldmatrix).
-template <>
-struct MmaOp<__nv_fp8_e4m3, __nv_fp8_e4m3, Shape<16, 8, 32>> {
-    using AccT = float;
-    static constexpr int kARegs = 4;
-    static constexpr int kBRegs = 2;
-    static constexpr int kCRegs = 4;
-    using AFrag = ArrayEngine<unsigned, kARegs>;
-    using BFrag = ArrayEngine<unsigned, kBRegs>;
-    using CFrag = ArrayEngine<AccT, kCRegs>;
-    template <int Arch = ASTRAI_DEVICE_ARCH>
-    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
-                                const CFrag& c) {
-        fma<Arch>(d.storage, a.storage, b.storage, c.storage);
-    }
-    template <int Arch = ASTRAI_DEVICE_ARCH>
-    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
-                                       const unsigned b[2], const float c[4]) {
-        static_assert(Arch == 0 || Arch >= 890,
-                      "fp8 mma.sync requires sm_89+");
-        asm volatile(
-            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
-            : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
-              "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-    }
-};
+// One cell per fp8 format: identical register contract, operand lists and
+// instruction shape — only the format token differs, so each cell is
+// stamped from one macro. (The asm template must be a string literal,
+// which is why this is a file-local macro rather than a template over an
+// opcode trait.)
+#define ASTRAI_MMA_OP_FP8(FP8T, FMT)                                        \
+    template <>                                                             \
+    struct MmaOp<FP8T, FP8T, Shape<16, 8, 32>> {                            \
+        using AccT = float;                                                 \
+        static constexpr int kARegs = 4;                                    \
+        static constexpr int kBRegs = 2;                                    \
+        static constexpr int kCRegs = 4;                                    \
+        using AFrag = ArrayEngine<unsigned, kARegs>;                        \
+        using BFrag = ArrayEngine<unsigned, kBRegs>;                        \
+        using CFrag = ArrayEngine<AccT, kCRegs>;                            \
+        template <int Arch = ASTRAI_DEVICE_ARCH>                            \
+        DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a,               \
+                                    const BFrag& b, const CFrag& c) {       \
+            fma<Arch>(d.storage, a.storage, b.storage, c.storage);          \
+        }                                                                   \
+        template <int Arch = ASTRAI_DEVICE_ARCH>                            \
+        DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],        \
+                                    const unsigned b[2], const float c[4]) {\
+            static_assert(Arch == 0 || Arch >= 890,                         \
+                          "fp8 mma.sync requires sm_89+");                  \
+            asm volatile(                                                   \
+                "mma.sync.aligned.m16n8k32.row.col.f32." FMT "." FMT        \
+                ".f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "              \
+                "{%10,%11,%12,%13};"                                        \
+                : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])            \
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]),    \
+                  "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));   \
+        }                                                                   \
+    };
 
-template <>
-struct MmaOp<__nv_fp8_e5m2, __nv_fp8_e5m2, Shape<16, 8, 32>> {
-    using AccT = float;
-    static constexpr int kARegs = 4;
-    static constexpr int kBRegs = 2;
-    static constexpr int kCRegs = 4;
-    using AFrag = ArrayEngine<unsigned, kARegs>;
-    using BFrag = ArrayEngine<unsigned, kBRegs>;
-    using CFrag = ArrayEngine<AccT, kCRegs>;
-    template <int Arch = ASTRAI_DEVICE_ARCH>
-    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
-                                const CFrag& c) {
-        fma<Arch>(d.storage, a.storage, b.storage, c.storage);
-    }
-    template <int Arch = ASTRAI_DEVICE_ARCH>
-    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
-                                       const unsigned b[2], const float c[4]) {
-        static_assert(Arch == 0 || Arch >= 890,
-                      "fp8 mma.sync requires sm_89+");
-        asm volatile(
-            "mma.sync.aligned.m16n8k32.row.col.f32.e5m2.e5m2.f32 "
-            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
-            : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
-              "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-    }
-};
+ASTRAI_MMA_OP_FP8(__nv_fp8_e4m3, "e4m3")
+ASTRAI_MMA_OP_FP8(__nv_fp8_e5m2, "e5m2")
 
 template <>
 struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> {
@@ -227,83 +209,49 @@ struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> {
 template <typename InT>
 struct MxMmaOp;
 
-template <>
-struct MxMmaOp<__nv_fp8_e4m3> {
-    using AccT = float;
-    static constexpr int kARegs = 4;
-    static constexpr int kBRegs = 2;
-    static constexpr int kCRegs = 4;
-    static constexpr int kMinArch = 1200;  // block_scale mxf8f6f4, sm_120 family
-    using AFrag = ArrayEngine<unsigned, kARegs>;
-    using BFrag = ArrayEngine<unsigned, kBRegs>;
-    using CFrag = ArrayEngine<AccT, kCRegs>;
-    template <int Family = ASTRAI_ARCH_FAMILY>
-    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
-                                const CFrag& c) {
-        fma<Family>(d.storage, a.storage, b.storage, c.storage);
-    }
-    template <int Family = ASTRAI_ARCH_FAMILY>
-    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
-                                       const unsigned b[2], const float c[4]) {
-        if constexpr (Family >= 1200) {
-            constexpr uint32_t sf_one = 0x7f7f7f7fu;  // ue8m0 1.0 x4
-            const uint16_t sel = 0;
-            asm volatile(
-                "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
-                "m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, "
-                "{%14}, {%15,%16}, {%17}, {%18,%19};"
-                : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]),
-                  "r"(b[1]),
-                  "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
-                  "r"(sf_one), "h"(sel), "h"(sel), "r"(sf_one), "h"(sel),
-                  "h"(sel));
-        } else {
-            MmaOp<__nv_fp8_e4m3, __nv_fp8_e4m3, Shape<16, 8, 32>>::fma(
-                d, a, b, c);
-        }
-    }
-};
+// Same stamping as the plain fp8 cells: the two formats differ only in the
+// format token and the plain cell they fall back to off the sm_120 family.
+#define ASTRAI_MX_MMA_OP(FP8T, FMT)                                         \
+    template <>                                                             \
+    struct MxMmaOp<FP8T> {                                                  \
+        using AccT = float;                                                 \
+        static constexpr int kARegs = 4;                                    \
+        static constexpr int kBRegs = 2;                                    \
+        static constexpr int kCRegs = 4;                                    \
+        static constexpr int kMinArch = 1200; /* block_scale mxf8f6f4 */    \
+        using AFrag = ArrayEngine<unsigned, kARegs>;                        \
+        using BFrag = ArrayEngine<unsigned, kBRegs>;                        \
+        using CFrag = ArrayEngine<AccT, kCRegs>;                            \
+        template <int Family = ASTRAI_ARCH_FAMILY>                          \
+        DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a,               \
+                                    const BFrag& b, const CFrag& c) {       \
+            fma<Family>(d.storage, a.storage, b.storage, c.storage);        \
+        }                                                                   \
+        template <int Family = ASTRAI_ARCH_FAMILY>                          \
+        DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],        \
+                                    const unsigned b[2], const float c[4]) {\
+            if constexpr (Family >= 1200) {                                 \
+                constexpr uint32_t sf_one = 0x7f7f7f7fu; /* ue8m0 1.0 x4 */ \
+                const uint16_t sel = 0;                                     \
+                asm volatile(                                               \
+                    "mma.sync.aligned.kind::mxf8f6f4.block_scale."          \
+                    "scale_vec::1X.m16n8k32.row.col.f32." FMT "." FMT       \
+                    ".f32.ue8m0 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "    \
+                    "{%10,%11,%12,%13}, {%14}, {%15,%16}, {%17}, "          \
+                    "{%18,%19};"                                            \
+                    : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])        \
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),           \
+                      "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]),           \
+                      "f"(c[2]), "f"(c[3]), "r"(sf_one), "h"(sel),          \
+                      "h"(sel), "r"(sf_one), "h"(sel), "h"(sel));           \
+            } else {                                                        \
+                MmaOp<FP8T, FP8T, Shape<16, 8, 32>>::fma(d, a, b, c);       \
+            }                                                               \
+        }                                                                   \
+    };
 
-template <>
-struct MxMmaOp<__nv_fp8_e5m2> {
-    using AccT = float;
-    static constexpr int kARegs = 4;
-    static constexpr int kBRegs = 2;
-    static constexpr int kCRegs = 4;
-    static constexpr int kMinArch = 1200;
-    using AFrag = ArrayEngine<unsigned, kARegs>;
-    using BFrag = ArrayEngine<unsigned, kBRegs>;
-    using CFrag = ArrayEngine<AccT, kCRegs>;
-    template <int Family = ASTRAI_ARCH_FAMILY>
-    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
-                                const CFrag& c) {
-        fma<Family>(d.storage, a.storage, b.storage, c.storage);
-    }
-    template <int Family = ASTRAI_ARCH_FAMILY>
-    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
-                                       const unsigned b[2], const float c[4]) {
-        if constexpr (Family >= 1200) {
-            constexpr uint32_t sf_one = 0x7f7f7f7fu;
-            const uint16_t sel = 0;
-            asm volatile(
-                "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
-                "m16n8k32.row.col.f32.e5m2.e5m2.f32.ue8m0 "
-                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, "
-                "{%14}, {%15,%16}, {%17}, {%18,%19};"
-                : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
-                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]),
-                  "r"(b[1]),
-                  "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]),
-                  "r"(sf_one), "h"(sel), "h"(sel), "r"(sf_one), "h"(sel),
-                  "h"(sel));
-        } else {
-            MmaOp<__nv_fp8_e5m2, __nv_fp8_e5m2, Shape<16, 8, 32>>::fma(
-                d, a, b, c);
-        }
-    }
-};
+ASTRAI_MX_MMA_OP(__nv_fp8_e4m3, "e4m3")
+ASTRAI_MX_MMA_OP(__nv_fp8_e5m2, "e5m2")
 
 // --- convenience views over the trait layers --------------------------------
 
@@ -611,4 +559,6 @@ __device__ __forceinline__ void tcgen05_st_16x128b_x2(uint32_t address,
 
 }  // namespace astrai
 
+#undef ASTRAI_MMA_OP_FP8
+#undef ASTRAI_MX_MMA_OP
 #undef DEVICE_FORCEINLINE

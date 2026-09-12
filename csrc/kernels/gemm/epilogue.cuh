@@ -134,24 +134,15 @@ struct GemmCollectiveEpilogue {
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = local_col0 + nt * 8;
                 const int64_t gcol = bias_col0 + col;
-                const float b0 = bias && gcol < n 
-                    ? __bfloat162float(bias[gcol]) 
-                    : 0.0f;
-                const float b1 = bias && gcol + 1 < n 
-                    ? __bfloat162float(bias[gcol + 1])
-                    : 0.0f;
-                const float c0 = b_scale && gcol < n ? b_scale[gcol] : 1.0f;
-                const float c1 = b_scale && gcol + 1 < n ? b_scale[gcol + 1] : 1.0f;
+                const float b0 = bias_at(gcol, n), b1 = bias_at(gcol + 1, n);
+                const float c0 = col_factor(gcol, n), c1 = col_factor(gcol + 1, n);
 #pragma unroll
                 for (int mt = 0; mt < kMt; ++mt) {
                     const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
+                    const int64_t grow = bias_row0 + r0;
                     // Per-row activation scale: D-row == kernel row here.
-                    const float rfac = a_scale && bias_row0 + r0 < m
-                            ? __ldcg(a_scale + bias_row0 + r0)
-                            : 1.0f;
-                    const float rfac8 = a_scale && bias_row0 + r0 + 8 < m
-                        ? __ldcg(a_scale + bias_row0 + r0 + 8)
-                        : 1.0f;
+                    const float rfac = row_factor(grow, m);
+                    const float rfac8 = row_factor(grow + 8, m);
                     const auto& cell = *acc(mt, nt);
                     // Two bf16x2 stores per accumulator tile: rows g and
                     // g+8 of the m16n8 output, columns tig*2/tig*2+1 inside
@@ -172,38 +163,25 @@ struct GemmCollectiveEpilogue {
             // D[col0_global + col][row0_global + r0], staged at T[col][r0].
             // The acc pair spans two staged rows, so these are scalar
             // stores (the swap path is the rare NN layout). OOB elements
-            // store dead lanes of the tile, never copied out.
+            // store dead lanes of the tile, never copied out. The factors
+            // keep their D roles (bias/b_scale on D-cols, a_scale on
+            // D-rows) — only the kernel axis playing each role swaps, so
+            // the same helpers serve.
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = local_col0 + nt * 8;
+                const float r0f = row_factor(bias_col0 + col, n);
+                const float r1f = row_factor(bias_col0 + col + 1, n);
 #pragma unroll
                 for (int mt = 0; mt < kMt; ++mt) {
                     const int r0 = warp_m * Traits::kWarpM + group + mt * 16;
-                    const int64_t grow = bias_row0 + r0;
-                    const int64_t grow8 = grow + 8;
-                    const float b =
-                        bias && grow < m ? __bfloat162float(bias[grow]) : 0.0f;
-                    const float b8 =
-                        bias && grow8 < m ? __bfloat162float(bias[grow8]) : 0.0f;
-                    // Swapped orientation mirrors bias: D-cols come from
-                    // kernel rows (the +8 acc half carries its own), D-rows
-                    // from kernel cols.
-                    const float c = b_scale && grow < m
-                        ? b_scale[grow]
-                        : 1.0f;
-                    const float c8 = b_scale && grow8 < m
-                        ? b_scale[grow8]
-                        : 1.0f;
-                    const float r0f = a_scale && bias_col0 + col < n
-                        ? __ldcg(a_scale + bias_col0 + col)
-                        : 1.0f;
-                    const float r1f = a_scale && bias_col0 + col + 1 < n
-                        ? __ldcg(a_scale + bias_col0 + col + 1)
-                        : 1.0f;
+                    const int64_t grow = bias_row0 + r0, grow8 = grow + 8;
+                    const float b = bias_at(grow, m), b8 = bias_at(grow8, m);
+                    const float c = col_factor(grow, m), c8 = col_factor(grow8, m);
                     const auto& cell = *acc(mt, nt);
                     *out_elem(col, r0) = OE::cvt((float)cell[0] * output_scale * r0f * c + b);
                     *out_elem(col + 1, r0) = OE::cvt((float)cell[1] * output_scale * r1f * c + b);
-                    *out_elem(col, r0 + 8) =  OE::cvt((float)cell[2] * output_scale * r0f * c8 + b8);
+                    *out_elem(col, r0 + 8) = OE::cvt((float)cell[2] * output_scale * r0f * c8 + b8);
                     *out_elem(col + 1, r0 + 8) = OE::cvt((float)cell[3] * output_scale * r1f * c8 + b8);
                 }
             }
@@ -269,6 +247,20 @@ struct GemmCollectiveEpilogue {
 
   private:
     static constexpr int kCtaThreads = Traits::kCtaThreads;
+
+    // Orientation-shared factor reads for the scatter: bias indexes D-cols,
+    // b_scale D-cols and a_scale D-rows in BOTH orientations. The load
+    // flavors stay as they always were — b_scale/bias keep the L1-friendly
+    // plain loads (broadcast cols), a_scale the streaming __ldcg (per-row).
+    __device__ __forceinline__ float bias_at(int64_t i, int64_t ext) const {
+        return bias && i < ext ? __bfloat162float(bias[i]) : 0.0f;
+    }
+    __device__ __forceinline__ float col_factor(int64_t i, int64_t ext) const {
+        return b_scale && i < ext ? b_scale[i] : 1.0f;
+    }
+    __device__ __forceinline__ float row_factor(int64_t i, int64_t ext) const {
+        return a_scale && i < ext ? __ldcg(a_scale + i) : 1.0f;
+    }
 };
 
 }  // namespace gemm

@@ -10,7 +10,8 @@
 // The sweep times the fused-linear (NT) layout, so pasted rows carry crosswise
 // 0 and the other layout classes take that same degraded fallback. Row files
 // and their field order: parse_plan_table_file below; measurements, sweeps and
-// the open questions: AGENTS.md (Plan table tuning log).
+// the open questions: the dated tuning-log entries in
+// docs/developer/cuda_kernels.md.
 
 #include <algorithm>
 #include <cstdint>
@@ -51,12 +52,12 @@ static constexpr int kMaxPerfClass = 3;
 // it and the degraded bands serve the shape.
 inline constexpr bool row_k_supported(int kk) { return kk == 32 || kk == 64; }
 
-// The ring depths the manifests carry as tiles — the stages twin of
-// row_k_supported, enumerated rather than written as a range so that a gap in
-// the set cannot be admitted as "still inside 2..5". Only the 64x64 class has
-// s4/s5 (policy.cuh): whether a given operand pair has room for the ring is
-// not this header's business, it is plan_from_row's smem gate, which checks
-// against the real device ceiling.
+// The ring depths a row file may NAME (the stages twin of row_k_supported,
+// enumerated rather than written as a range so that a gap in the set cannot
+// be admitted as "still inside 2..5"): s4/s5 stay parseable so old sweep
+// files keep meaning what they meant, but no ladder instantiates a tile
+// past s3 (the s4/s5 twins were a measured wash and were removed) —
+// plan_from_row rejects those rows, and the degraded bands serve the shape.
 inline constexpr bool row_stages_supported(int stages) {
     return stages == 2 || stages == 3 || stages == 4 || stages == 5;
 }
@@ -213,10 +214,10 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count,
 //   m_min m_max n_min n_max perf_class crosswise cta stages raster
 //   [k [k_min k_max [min_ctas_per_sm [min_wave_permille]]]]
 // '#' starts a comment; perf_class 0..3 or -1; crosswise 0..2 or -1; cta is the
-// TileClass ordinal (the policy.cuh enum order); stages 2..5, of which only the
-// 64x64 kK=64 geometry carries s4/s5 (plan_from_row rejects a deeper ring
-// anywhere else, and no compiled-in row names one — s2..s5 land within 1-2% at
-// that tile). The trailing 'k' defaults to kTableRowK, which is what the sweep
+// TileClass ordinal (the policy.cuh enum order); stages 2..5 parse, but no
+// ladder instantiates a tile past s3 — plan_from_row rejects a deeper ring
+// outright, so a stale sweep row naming s4/s5 falls to the next source. The
+// trailing 'k' defaults to kTableRowK, which is what the sweep
 // scripts leave off.
 // The trailing forms are additive — a row that omits them behaves exactly as
 // it did before they existed, which is what keeps hand-edited tuning files and
@@ -334,7 +335,7 @@ inline const std::vector<TableRow>& plan_table_override_rows() {
 // not addressable from a row at all: the dispatch key is class + stages + kK).
 // One table per dtype class, so a row tuned for one operand pair cannot fire
 // on another; the sweeps, the merge proof and the per-shape numbers are in
-// AGENTS.md (Plan table tuning log).
+// the tuning log (docs/developer/cuda_kernels.md).
 //
 // First match wins, so order matters: measured additions sit in front of the
 // rows they shadow.
@@ -344,7 +345,8 @@ static constexpr TableRow kBuiltinPlanW16A16[] = {
     // keeps one, so the epilogue (which scatters through the reclaimed rings)
     // overlaps instead of being exposed, and its 16 warps of 32x32 double the
     // warps per partition at the same 64-register budget. Worth 7-14% on the
-    // large shapes; sweeps and per-shape numbers in AGENTS.md's tuning log.
+    // large shapes; sweeps and per-shape numbers in the tuning log
+    // (docs/developer/cuda_kernels.md).
     // The M<=512 band keeps kK=64 s2 instead: there the K loop is too short
     // for the 64x64 CTA's 3 resident CTAs to lose.
     {TileClass::kBig128, 512, 0, 4096, 0, 0, 0, 2, 0, 32},

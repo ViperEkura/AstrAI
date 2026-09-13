@@ -153,7 +153,118 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
     }
 }
 
+// The probe twin of the switch above: same pairs, host-only functions that
+// run the planner without a launch (the autotuner's coverage check).
+using GemmProbeFn = PlanProbe (*)(int64_t, int64_t, int64_t, int64_t, bool,
+                                  bool, const DeviceFacts&);
+
+GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
+    switch (pack_dtypes(a, b)) {
+        case pack_dtypes(torch::kBFloat16, torch::kBFloat16):
+            return &plan_probe_for<__nv_bfloat16, __nv_bfloat16>;
+        case pack_dtypes(torch::kBFloat16, torch::kChar):
+            return &plan_probe_for<__nv_bfloat16, int8_t>;
+        case pack_dtypes(torch::kChar, torch::kChar):
+            return &plan_probe_for<int8_t, int8_t>;
+        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e4m3fn):
+            return &plan_probe_for<__nv_bfloat16, __nv_fp8_e4m3>;
+        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e5m2):
+            return &plan_probe_for<__nv_bfloat16, __nv_fp8_e5m2>;
+        case pack_dtypes(torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn):
+            return &plan_probe_for<__nv_fp8_e4m3, __nv_fp8_e4m3>;
+        case pack_dtypes(torch::kFloat8_e5m2, torch::kFloat8_e5m2):
+            return &plan_probe_for<__nv_fp8_e5m2, __nv_fp8_e5m2>;
+        default:
+            TORCH_CHECK(false,
+                        "unsupported operand dtype pair ", toString(a), " x ", toString(b),
+                        ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "
+                        "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or "
+                        "matching fp8 x fp8");
+    }
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Planner introspection + runtime row injection: the Python autotuner's C++
+// face. The planner is GPU-free (plan_table_test.cu pins that), so the probe
+// launches nothing. Injected rows rank BELOW the ASTR_GEMM_TABLE file at
+// lookup (plan_table.h), keeping the sweep scripts' env channel authoritative.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+py::dict probe_dict(const PlanProbe& p) {
+    const char* source = "?";
+    switch (p.tier) {
+        case RowTier::kOverride: source = "override"; break;
+        case RowTier::kInjected: source = "injected"; break;
+        case RowTier::kBuiltin: source = "builtin"; break;
+        case RowTier::kDegraded: source = "degraded"; break;
+    }
+    py::dict d;
+    d["source"] = source;
+    d["cta"] = (int)p.plan.cta;
+    d["stages"] = p.plan.stages;
+    d["raster"] = p.plan.raster;
+    d["kk"] = p.plan.kk;
+    d["perf_class"] = p.perf_class;
+    d["crosswise"] = p.crosswise;
+    return d;
+}
+
+}  // namespace
+
+py::dict plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
+                    at::ScalarType dt_b, bool trans_a, bool trans_b,
+                    int64_t batch) {
+    return probe_dict(find_gemm_probe(dt_a, dt_b)(
+        m, n, k, batch, trans_a, trans_b, astrai::device_facts()));
+}
+
+// Replace the runtime-injected rows wholesale. `source` is a row-file path
+// when one opens, else inline row text (same syntax as the file); the
+// return value is the row count installed, so a mistyped path that parses
+// as zero rows is visible to the caller rather than silent.
+int set_plan_table_override(const std::string& source) {
+    std::vector<TableRow> rows;
+    if (parse_plan_table_file(source, rows)) {
+        const int installed = (int)rows.size();
+        set_plan_table_injected_rows(std::move(rows));
+        return installed;
+    }
+    parse_plan_table_text(source, "injected rows", rows);
+    const int installed = (int)rows.size();
+    set_plan_table_injected_rows(std::move(rows));
+    return installed;
+}
+
+// The recipe vocabulary per (crosswise, operand widths) — every
+// (CTA class, stages, kK) the launch ladders instantiate for that staging
+// pair, deduped on the dispatch key. (2,1) covers the mixed W8A16 / W-F8A16
+// classes, whose congruent staging runs the conservative ladder too
+// (manifest_kind's fallback); (1,2) matches no supported pair.
+std::vector<std::vector<int>> tile_vocabulary() {
+    const std::pair<int, int> widths[] = {{2, 2}, {2, 1}, {1, 1}};
+    std::vector<std::vector<int>> out;
+    for (int crosswise = 0; crosswise <= 1; ++crosswise)
+        for (const auto& [ba, bb] : widths)
+            for (const GemmRecipe& r : gemm_recipes_for(crosswise != 0, ba, bb))
+                out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk});
+    return out;
+}
+
+py::dict device_facts_info() {
+    const DeviceFacts dev = astrai::device_facts();
+    py::dict d;
+    d["sms"] = dev.sms;
+    d["smem_max"] = dev.smem_max;
+    d["smem_per_sm"] = dev.smem_per_sm;
+    d["regs_per_sm"] = dev.regs_per_sm;
+    d["l2_bytes"] = dev.l2_bytes;
+    d["cc"] = dev.cc;
+    return d;
+}
 
 // The single quantized-GEMM entry (one kernel for every cell, the only
 // export). The dtype pair picks the mma mode:
@@ -272,4 +383,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
           py::arg("trans_a") = false, py::arg("trans_b") = true,
           py::arg("bias") = py::none());
+    m.def("plan_probe", &astrai::gemm::plan_probe, py::arg("m"), py::arg("n"),
+          py::arg("k"), py::arg("dt_a"), py::arg("dt_b"),
+          py::arg("trans_a") = false, py::arg("trans_b") = true,
+          py::arg("batch") = 1);
+    m.def("set_plan_table_override", &astrai::gemm::set_plan_table_override,
+          py::arg("source"));
+    m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary);
+    m.def("device_facts_info", &astrai::gemm::device_facts_info);
 }

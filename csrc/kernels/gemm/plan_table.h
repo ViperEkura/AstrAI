@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -263,6 +264,48 @@ inline void warn_bad_row(const std::string& path, int lineno, const char* why) {
                  path.c_str(), lineno, why);
 }
 
+// One line of a row file (the label names the source in warnings: a path or
+// an in-memory text marker). The line buffer is mutated in place — the '#'
+// comment cut — and parses into `rows` or is warn-skipped, exactly as the
+// file loop always did; both the file and the runtime-injection readers go
+// through here so the two cannot drift.
+inline void parse_plan_table_line(char* line, const char* label, int lineno,
+                                  std::vector<TableRow>& rows) {
+    if (char* hash = std::strchr(line, '#'); hash != nullptr) *hash = '\0';
+    long long m_min, m_max, n_min, n_max;
+    int perf_class, crosswise, cta, stages, raster;
+    // sscanf leaves a variable alone when its conversion fails, so a row
+    // that omits the trailing fields keeps the defaults here: the legacy
+    // and k-less field counts need no repair pass.
+    int kk = kTableRowK;
+    long long k_min = 0, k_max = 0;
+    int min_ctas_per_sm = 0;
+    int min_wave_permille = 0;
+    const int got =
+        std::sscanf(line,
+                    " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld %d %d",
+                    &m_min, &m_max, &n_min, &n_max, &perf_class, &crosswise,
+                    &cta, &stages, &raster, &kk, &k_min, &k_max,
+                    &min_ctas_per_sm, &min_wave_permille);
+    if (got == EOF) return;  // blank or comment-only line
+    // cta is read as the TileClass ordinal, so it is the one field checked
+    // before there is a row to validate; plan_row_error takes the rest.
+    if (!in_range(cta, 0, kTileClassCount - 1)) {
+        warn_bad_row(label, lineno, "cta index");
+        return;
+    }
+    const TableRow row{
+        static_cast<TileClass>(cta), m_min, m_max, n_min, n_max,
+        perf_class, crosswise, stages, raster, kk, k_min, k_max,
+        min_ctas_per_sm, min_wave_permille
+    };
+    if (const char* bad = plan_row_error(row, got); bad != nullptr) {
+        warn_bad_row(label, lineno, bad);
+        return;
+    }
+    rows.push_back(row);
+}
+
 inline bool parse_plan_table_file(const std::string& path,
                                   std::vector<TableRow>& rows) {
     FILE* f = std::fopen(path.c_str(), "r");
@@ -271,42 +314,80 @@ inline bool parse_plan_table_file(const std::string& path,
     int lineno = 0;
     while (std::fgets(line, sizeof line, f) != nullptr) {
         ++lineno;
-        if (char* hash = std::strchr(line, '#'); hash != nullptr) *hash = '\0';
-        long long m_min, m_max, n_min, n_max;
-        int perf_class, crosswise, cta, stages, raster;
-        // sscanf leaves a variable alone when its conversion fails, so a row
-        // that omits the trailing fields keeps the defaults here: the legacy
-        // and k-less field counts need no repair pass.
-        int kk = kTableRowK;
-        long long k_min = 0, k_max = 0;
-        int min_ctas_per_sm = 0;
-        int min_wave_permille = 0;
-        const int got =
-            std::sscanf(line,
-                        " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld %d %d",
-                        &m_min, &m_max, &n_min, &n_max, &perf_class, &crosswise,
-                        &cta, &stages, &raster, &kk, &k_min, &k_max,
-                        &min_ctas_per_sm, &min_wave_permille);
-        if (got == EOF) continue;  // blank or comment-only line
-        // cta is read as the TileClass ordinal, so it is the one field checked
-        // before there is a row to validate; plan_row_error takes the rest.
-        if (!in_range(cta, 0, kTileClassCount - 1)) {
-            warn_bad_row(path, lineno, "cta index");
-            continue;
-        }
-        const TableRow row{
-            static_cast<TileClass>(cta), m_min, m_max, n_min, n_max,
-            perf_class, crosswise, stages, raster, kk, k_min, k_max,
-            min_ctas_per_sm, min_wave_permille
-        };
-        if (const char* bad = plan_row_error(row, got); bad != nullptr) {
-            warn_bad_row(path, lineno, bad);
-            continue;
-        }
-        rows.push_back(row);
+        parse_plan_table_line(line, path.c_str(), lineno, rows);
     }
     std::fclose(f);
     return true;
+}
+
+// The same parser over an in-memory row text (newline-separated), so the
+// runtime-injection binding and the file path accept identical row syntax.
+// Returns the number of rows that survived.
+inline int parse_plan_table_text(const std::string& text, const char* label,
+                                 std::vector<TableRow>& rows) {
+    const int before = (int)rows.size();
+    std::string line;
+    int lineno = 0;
+    for (std::size_t pos = 0; pos <= text.size(); ++pos) {
+        const char c = pos < text.size() ? text[pos] : '\n';
+        if (c != '\n' && c != '\r') {
+            line.push_back(c);
+            continue;
+        }
+        ++lineno;
+        line.push_back('\0');
+        parse_plan_table_line(&line[0], label, lineno, rows);
+        line.clear();
+        // The trailing newline of the final chunk loops once more with an
+        // empty string; an empty line parses to nothing, so the extra pass
+        // is harmless.
+    }
+    return (int)rows.size() - before;
+}
+
+// Which source served a lookup — the probe binding reports it so the Python
+// autotuner can top up only the shapes nothing else covers (the env file is
+// the experimenter's, the builtin table is the AOT baseline; neither is the
+// autotuner's to shadow, which is also why injected rows rank below the env
+// file at lookup).
+enum class RowTier { kOverride = 0, kInjected, kBuiltin, kDegraded };
+
+// Runtime-injected rows (the set_plan_table_override binding): the Python
+// autotuner's persistent-cache path installs measured winners here, in the
+// same row syntax as the file override. The container is replaced, never
+// mutated in place, and lookups copy the row out under the mutex — a
+// concurrent install therefore cannot dangle a pointer a launched plan
+// still holds (the same race the env re-parse tolerates by convention is
+// not tolerable here: installs happen during serving warmups).
+inline std::mutex& plan_table_injected_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::vector<TableRow>& plan_table_injected_storage() {
+    static std::vector<TableRow> rows;
+    return rows;
+}
+
+// Replace the injected rows wholesale. Takes parsed rows (the binding layer
+// parses text/file first so the return value can name what survived).
+inline void set_plan_table_injected_rows(std::vector<TableRow> rows) {
+    std::lock_guard<std::mutex> g(plan_table_injected_mutex());
+    plan_table_injected_storage() = std::move(rows);
+}
+
+inline void clear_plan_table_injected_rows() {
+    set_plan_table_injected_rows({});
+}
+
+// First-match over the injected rows, copied out under the lock.
+inline std::optional<TableRow> plan_table_injected_lookup(const PlanQuery& q) {
+    std::lock_guard<std::mutex> g(plan_table_injected_mutex());
+    const std::vector<TableRow>& rows = plan_table_injected_storage();
+    if (const TableRow* row =
+            plan_row_for(rows.data(), (int)rows.size(), q);
+        row != nullptr)
+        return *row;
+    return std::nullopt;
 }
 
 // Cache of the override file, re-parsed only when the env path changes
@@ -492,30 +573,56 @@ inline constexpr const TableRow* builtin_plan_table(int perf_class, int& count) 
 }
 
 // Override file first (one file for every class, keyed by its perf_class
-// column), then the class's own builtin table. ASTR_GEMM_TABLE="-"
-// is the explicit "AOT off" escape hatch: neither override nor builtin
-// rows, so dispatch falls through to the degraded band rows (dev/bench).
-// dev/batch are the running device and the problem's batch, the inputs a
-// row's wave gates need; dev.sms <= 0 (no device facts) skips gated rows
-// instead of inventing a count. ba/bb are the operand widths.
-inline const TableRow* plan_table_lookup(const PlanQuery& q) {
+// column), then the runtime-injected rows, then the class's own builtin
+// table — the ranking that keeps every owner in its lane: the env file is
+// the experimenter's A/B channel and outranks everything, the injected rows
+// are the autotuner's measured winners (they shadow the AOT baseline only
+// where they match), and the builtin table is the baseline the other two
+// top up. ASTR_GEMM_TABLE="-" is the explicit "AOT off" escape hatch:
+// neither override nor injected nor builtin rows, so dispatch falls through
+// to the degraded band rows (dev/bench). Row copies come back by value so
+// an injected-row install racing a lookup cannot dangle (see
+// plan_table_injected_lookup). dev/batch are the running device and the
+// problem's batch, the inputs a row's wave gates need; dev.sms <= 0 (no
+// device facts) skips gated rows instead of inventing a count. ba/bb are
+// the operand widths.
+inline std::optional<TableRow> plan_table_lookup(const PlanQuery& q,
+                                                 RowTier* tier = nullptr) {
     const char* env = std::getenv("ASTR_GEMM_TABLE");
-    if (env != nullptr && std::strcmp(env, "-") == 0) return nullptr;
+    if (env != nullptr && std::strcmp(env, "-") == 0) {
+        if (tier != nullptr) *tier = RowTier::kDegraded;
+        return std::nullopt;
+    }
     const std::vector<TableRow>& rows = plan_table_override_rows();
-    if (const TableRow* row =
-            plan_row_for(rows.data(), (int)rows.size(), q);
-        row != nullptr)
+    if (const TableRow* row = plan_row_for(rows.data(), (int)rows.size(), q);
+        row != nullptr) {
+        if (tier != nullptr) *tier = RowTier::kOverride;
+        return *row;
+    }
+    if (std::optional<TableRow> row = plan_table_injected_lookup(q)) {
+        if (tier != nullptr) *tier = RowTier::kInjected;
         return row;
+    }
     int count = 0;
     const TableRow* builtin = builtin_plan_table(q.perf_class, count);
-    if (builtin == nullptr) return nullptr;
-    return plan_row_for(builtin, count, q);
+    if (builtin == nullptr) {
+        if (tier != nullptr) *tier = RowTier::kDegraded;
+        return std::nullopt;
+    }
+    if (const TableRow* row = plan_row_for(builtin, count, q);
+        row != nullptr) {
+        if (tier != nullptr) *tier = RowTier::kBuiltin;
+        return *row;
+    }
+    if (tier != nullptr) *tier = RowTier::kDegraded;
+    return std::nullopt;
 }
 
-// The planner's row source: override file first, then the compiled-in rows.
-inline std::optional<TableRow> table_row(const PlanQuery& q) {
-    if (const TableRow* row = plan_table_lookup(q); row != nullptr) return *row;
-    return std::nullopt;
+// The planner's row source: override file first, then the injected rows,
+// then the compiled-in rows.
+inline std::optional<TableRow> table_row(const PlanQuery& q,
+                                         RowTier* tier = nullptr) {
+    return plan_table_lookup(q, tier);
 }
 
 // Last-resort rows for a table miss with the model retired: the M band's
@@ -532,9 +639,14 @@ inline const TableRow& degraded_row_for(int64_t m) {
     // Only the M band decides here: the degraded rows are open on N and K with
     // -1 keys and carry no gate, so the rest of the query is left at its
     // defaults (k = 0 asks the open-K reading, and an empty device skips
-    // nothing because nothing is gated).
+    // nothing because nothing is gated). n is the exception: the row
+    // matcher's band test is "strictly past the min", and an n of 0 sits
+    // ON the open bound instead of past it — every degraded row would
+    // skip and the m-only query would fall to the small-CTA fallback for
+    // every m. A 1 stands for "some real n", the least the bands need.
     PlanQuery q;
     q.m = m;
+    q.n = 1;
     if (const TableRow* row = plan_row_for(kDegradedPlanRows, 3, q);
         row != nullptr)
         return *row;

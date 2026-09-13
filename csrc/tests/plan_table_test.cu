@@ -6,6 +6,7 @@
 // expectation fails.
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
@@ -370,6 +371,217 @@ int main() {
         // A ring past the per-block opt-in ceiling has no plan at all.
         CHECK(plan_resident_ctas(TileClass::kWide128x256, 2, 64, own) == 0,
               "residency: a ring over smem_max prices as unpriceable");
+    }
+
+    // 5. Row text parses identically to a row file (the runtime-injection
+    //    binding accepts inline text; same parser, so same rows).
+    {
+        const char* rows_txt =
+            "# parity probe\n"
+            "1024 0 1024 0 2 0 3 2 0 64 512 0\n"
+            "0 0 0 0 0 0 0 3 0 32\n"
+            "0 0 0 0 99 0 0 3 0\n"
+            "0 0 0 0 0 0 0 3 0 64 0 0 0 1360\n";
+        std::vector<TableRow> from_text;
+        const int kept = parse_plan_table_text(rows_txt, "parity-text", from_text);
+        CHECK(kept == 3, "row text: %d rows survived (want 3)", kept);
+        if (kept == 3) {
+            CHECK(from_text[0].k_min == 512 && from_text[0].kk == 64,
+                  "row text: K band parsed (k_min=%lld)", (long long)from_text[0].k_min);
+            CHECK(from_text[1].kk == 32, "row text: 10-field form keeps kK=32");
+            CHECK(from_text[2].min_wave_permille == 1360,
+                  "row text: wave permille parsed (%d)",
+                  from_text[2].min_wave_permille);
+        }
+    }
+
+    // 6. Runtime-injected rows and the tier ranking: env file > injected >
+    //    builtin, "-" kills all three, and a clear returns the shape to the
+    //    degraded bands. All through the same lookup plan_gemm uses.
+    {
+        // A crosswise query (TT staging): every builtin row carries crosswise
+        // 0, so this shape has no builtin row to hit — the tier probe.
+        PlanQuery q = shape_query(1024, 1024, 4096, 0);
+        q.crosswise = 1;
+        RowTier tier = RowTier::kDegraded;
+        std::optional<TableRow> row = table_row(q, &tier);
+        CHECK(!row.has_value() && tier == RowTier::kDegraded,
+              "injected: crosswise shape starts degraded (tier %d)", (int)tier);
+
+        std::vector<TableRow> injected;
+        parse_plan_table_text("0 0 0 0 0 1 1 2 0 64", "inject", injected);
+        CHECK((int)injected.size() == 1, "injected: row text installed 1 row");
+        set_plan_table_injected_rows(injected);
+        tier = RowTier::kDegraded;
+        row = table_row(q, &tier);
+        CHECK(row.has_value() && tier == RowTier::kInjected &&
+                  row->cta == TileClass::kNarrow128x64,
+              "injected: row serves the shape (tier %d)", (int)tier);
+
+        // The env file outranks the injected rows.
+        const char* envpath = "/tmp/plan_classes_envfile.txt";
+        if (FILE* f = std::fopen(envpath, "w")) {
+            std::fprintf(f, "0 0 0 0 0 1 0 3 0 64\n");  // small64 s3 k64
+            std::fclose(f);
+        }
+        setenv("ASTR_GEMM_TABLE", envpath, 1);
+        tier = RowTier::kInjected;
+        row = table_row(q, &tier);
+        CHECK(row.has_value() && tier == RowTier::kOverride &&
+                  row->cta == TileClass::kSmall64,
+              "injected: env file outranks the injected rows (tier %d)", (int)tier);
+
+        // While the env owns the source, every call re-reads it (sweeps
+        // toggle the env per launch): same query, served by the env row.
+        const PlanDecision d_env = plan_gemm_sourced(q);
+        CHECK(d_env.tier == RowTier::kOverride &&
+                  d_env.plan.cta == TileClass::kSmall64,
+              "sourced: env-served plan comes from the env file (tier %d)",
+              (int)d_env.tier);
+
+        setenv("ASTR_GEMM_TABLE", "-", 1);
+        tier = RowTier::kBuiltin;
+        row = table_row(q, &tier);
+        CHECK(!row.has_value() && tier == RowTier::kDegraded,
+              "injected: '-' disables env, injected and builtin alike");
+
+        unsetenv("ASTR_GEMM_TABLE");
+        tier = RowTier::kDegraded;
+        row = table_row(q, &tier);
+        CHECK(row.has_value() && tier == RowTier::kInjected,
+              "injected: unset env restores the injected rows (tier %d)", (int)tier);
+
+        // An injected-row swap serves the next decision from the new rows
+        // (no decision state outlives the call that made it).
+        const PlanDecision d1 = plan_gemm_sourced(q);
+        CHECK(d1.plan.cta == TileClass::kNarrow128x64, "sourced: first decision narrow");
+        injected.clear();  // parse_plan_table_text appends; the swap replaces
+        parse_plan_table_text("0 0 0 0 0 1 0 3 0 64", "swap", injected);
+        set_plan_table_injected_rows(injected);
+        const PlanDecision d2 = plan_gemm_sourced(q);
+        CHECK(d2.plan.cta == TileClass::kSmall64,
+              "sourced: row swap serves the next decision from the new rows");
+        const PlanDecision d3 = plan_gemm_sourced(q);
+        CHECK(d3.plan.cta == d2.plan.cta && d3.tier == d2.tier,
+              "sourced: repeat query is stable");
+
+        clear_plan_table_injected_rows();
+        tier = RowTier::kInjected;
+        row = table_row(q, &tier);
+        CHECK(!row.has_value() && tier == RowTier::kDegraded,
+              "injected: clear returns the shape to the degraded bands");
+    }
+
+    // 7. The planner probe: same decision the dispatch branch would make,
+    //    tag selection mirrored branch-for-branch (NT crosswise 0 hits the
+    //    builtin rows; TT is crosswise 1 and degraded; the symmetric NN
+    //    rewrite swaps M and N exactly like gemm_dispatch).
+    {
+        const DeviceFacts dev = test_dev();
+        const PlanProbe nt = plan_probe_for<__nv_bfloat16, __nv_bfloat16>(
+            1024, 1024, 4096, 1, false, true, dev);
+        CHECK(nt.perf_class == 0 && nt.crosswise == 0 &&
+                  nt.tier == RowTier::kBuiltin && nt.plan.cta == TileClass::kSmall64 &&
+                  nt.plan.stages == 3 && nt.plan.kk == 32,
+              "probe: NT bf16xbf16 -> builtin small64 s3 k32 (tier %d cw %d)",
+              (int)nt.tier, nt.crosswise);
+
+        const PlanProbe tt = plan_probe_for<__nv_bfloat16, __nv_bfloat16>(
+            1024, 1024, 4096, 1, true, true, dev);
+        CHECK(tt.crosswise == 1 && tt.tier == RowTier::kDegraded &&
+                  tt.plan.cta == TileClass::kNarrow128x64,
+              "probe: TT has no builtin row -> degraded narrow (tier %d cw %d "
+              "cta %d s%d k%d)",
+              (int)tt.tier, tt.crosswise, (int)tt.plan.cta, tt.plan.stages,
+              tt.plan.kk);
+
+        // The n=0 regression: the m-only degraded query used to sit ON the
+        // open n bound and skip every band, so every m took the small-CTA
+        // fallback row and the narrow/big degraded bands were dead.
+        CHECK(degraded_row_for(100).cta == TileClass::kSmall64 &&
+                  degraded_row_for(1024).cta == TileClass::kNarrow128x64 &&
+                  degraded_row_for(100000).cta == TileClass::kBig128,
+              "probe: degraded bands pick by m (the n=0 skip regression)");
+
+        const PlanProbe mixed = plan_probe_for<__nv_bfloat16, int8_t>(
+            4096, 1024, 4096, 1, false, true, dev);
+        CHECK(mixed.perf_class == 1 && mixed.crosswise == 0 &&
+                  mixed.tier == RowTier::kBuiltin && mixed.plan.cta == TileClass::kBig128,
+              "probe: NT bf16xint8 -> W8A16 builtin big128 (tier %d)", (int)mixed.tier);
+
+        const PlanProbe nn = plan_probe_for<__nv_bfloat16, __nv_bfloat16>(
+            2048, 512, 1024, 1, false, false, dev);
+        const PlanProbe swapped_tt = plan_probe_for<__nv_bfloat16, __nv_bfloat16>(
+            512, 2048, 1024, 1, true, true, dev);
+        CHECK(nn.plan.cta == swapped_tt.plan.cta &&
+                  nn.plan.stages == swapped_tt.plan.stages &&
+                  nn.plan.kk == swapped_tt.plan.kk && nn.crosswise == swapped_tt.crosswise,
+              "probe: symmetric NN rewrites to the transposed TT problem");
+    }
+
+    // 8. The recipe vocabulary: the (class, stages, kK) keys each ladder
+    //    instantiates, deduped — the Python autotuner's candidate space.
+    {
+        const std::vector<GemmRecipe> two_byte = gemm_recipes_for(false, 2, 2);
+        // Cross six (all kK 64) + the kK=32 twins the two-byte ladder adds
+        // (small64, big128 at s2/s3, narrow s2), with the 16-warp twins
+        // deduped onto their 32-warp keys.
+        CHECK((int)two_byte.size() == 11, "vocab: two-byte ladder -> %d recipes (want 11)",
+              (int)two_byte.size());
+        auto has = [](const std::vector<GemmRecipe>& v, int cta, int s, int kk) {
+            for (const GemmRecipe& r : v)
+                if (r.cta == cta && r.stages == s && r.kk == kk) return true;
+            return false;
+        };
+        CHECK(has(two_byte, (int)TileClass::kSmall64, 2, 32) &&
+                  has(two_byte, (int)TileClass::kBig128, 3, 32),
+              "vocab: two-byte ladder carries the kK=32 twins");
+        CHECK(!has(two_byte, (int)TileClass::kWide128x256, 2, 64),
+              "vocab: two-byte ladder has no wide CTA");
+
+        const std::vector<GemmRecipe> byte = gemm_recipes_for(false, 1, 1);
+        CHECK(has(byte, (int)TileClass::kWide128x256, 2, 64) &&
+                  (int)byte.size() == 7,
+              "vocab: byte ladder adds the wide CTA (%d recipes)", (int)byte.size());
+        CHECK(!has(byte, (int)TileClass::kSmall64, 2, 32),
+              "vocab: byte ladder has no kK=32 tile");
+
+        const std::vector<GemmRecipe> cross = gemm_recipes_for(true, 2, 2);
+        CHECK((int)cross.size() == 6, "vocab: crosswise ladder is the shared six (%d)",
+              (int)cross.size());
+        for (const GemmRecipe& r : cross)
+            CHECK(r.kk == 64, "vocab: crosswise ladder is all kK=64 (got %d)", r.kk);
+
+        // The mixed pair (2,1) runs the conservative ladder even congruent
+        // (manifest_kind's fallback), so W8A16 candidates match the cross six.
+        const std::vector<GemmRecipe> mixed = gemm_recipes_for(false, 2, 1);
+        CHECK((int)mixed.size() == 6, "vocab: mixed widths fall back to the shared six (%d)",
+              (int)mixed.size());
+    }
+
+    // 9. Planner cost (informational, one process): the row scan + wave
+    //    pricing every launch runs. A 2026-09-13 exact-shape memo measured
+    //    45 ns here against this ~110 ns plain path and was retired — the
+    //    ~64 ns is invisible under the pybind marshalling around a launch.
+    {
+        const int kProbesSet = 256;
+        const int kReps = 2000;
+        PlanQuery qs[kProbesSet];
+        for (int i = 0; i < kProbesSet; ++i) {
+            qs[i] = shape_query(64 + 8 * i, 1024 + 16 * i, 768 + 32 * i,
+                                i % 2 /* classes 0/1 */);
+            qs[i].batch = 1;
+            plan_gemm_sourced(qs[i]);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        volatile long long sink = 0;
+        for (int r = 0; r < kReps; ++r)
+            for (int i = 0; i < kProbesSet; ++i)
+                sink += plan_gemm_sourced(qs[i]).plan.stages;
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count() /
+                          (double)(kReps * kProbesSet);
+        std::printf("planner bench: %.0f ns/query\n", ns);
     }
 
     std::printf(failures == 0 ? "\nall checks passed\n" : "\n%d FAILURES\n", failures);

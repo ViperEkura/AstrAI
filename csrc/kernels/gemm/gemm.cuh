@@ -229,6 +229,22 @@ inline void log_plan_decision(const char* src, const PlanQuery& q,
                  (int)plan.cta, plan.stages, plan.raster);
 }
 
+// A plan plus the row tier that produced it. The tier is the probe
+// binding's answer to "who serves this shape" — the sweep scripts and the
+// human log keep the coarser two-word vocabulary below, because their
+// regexes (gen_plan_table's _TAG_RE) predate the tiers and every row source
+// alike means "planned, not degraded" to them.
+struct PlanDecision {
+    GemmPlan plan;
+    RowTier tier;
+};
+
+inline const char* row_tier_log_name(RowTier tier) {
+    // One word per class for the log: "table" for every row source (the
+    // _TAG_RE contract above), "degraded" for the fallback bands.
+    return tier == RowTier::kDegraded ? "degraded" : "table";
+}
+
 // Raster order. Direction follows the tile aspect (walk the dimension with
 // more tiles fastest, CUTLASS's rule): the N-side mirrored group keeps the
 // measured width 8. The M-side group width is humming's L2-budget rule
@@ -342,27 +358,44 @@ inline std::optional<GemmPlan> plan_from_row(const TableRow& row,
                     row.kk};
 }
 
-// The planner core: one query in, one plan out, no device or binding access.
-inline GemmPlan plan_gemm(const PlanQuery& q) {
-    // Table-only dispatch, one source: the AOT rows (override file, then the
-    // compiled-in ones). plan_from_row smem-gates the row, so a stale tuning
-    // ring falls through instead of failing a launch. The original cost model
-    // is deleted from the codebase — a miss falls to the degraded bands (open
-    // on M, -1 keys; always match, so planning stays a total function);
-    // ASTR_GEMM_TABLE=- skips the rows entirely.
-    if (auto row = table_row(q); row) {
-        if (auto plan = plan_from_row(*row, q)) {
-            log_plan_decision("table", q, *plan);
-            return *plan;
+// The planner core: one query in, one decision out, no device or binding
+// access. Table-only dispatch, sources in rank: the AOT rows (override
+// file, then injected, then the compiled-in ones). plan_from_row smem-gates
+// the row, so a stale tuning ring falls through instead of failing a
+// launch. The original cost model is deleted from the codebase — a miss
+// falls to the degraded bands (open on M, -1 keys; always match, so
+// planning stays a total function); ASTR_GEMM_TABLE=- skips the rows
+// entirely.
+//
+// A 2026-09-13 measurement retired an exact-shape memo here (humming's
+// runtime half): the plain row scan prices at ~110 ns/query on this part
+// and the memoized hit at ~45 ns — the ~64 ns saved is invisible under
+// the pybind marshalling around every launch, so the memo's mutex and
+// epoch invalidation bought nothing (the standalone test has the bench).
+inline PlanDecision plan_gemm_sourced(const PlanQuery& q) {
+    RowTier tier = RowTier::kDegraded;
+    if (std::optional<TableRow> row = table_row(q, &tier); row) {
+        if (std::optional<GemmPlan> plan = plan_from_row(*row, q)) {
+            const PlanDecision d{*plan, tier};
+            log_plan_decision(row_tier_log_name(tier), q, *plan);
+            return d;
         }
+        // A matched row that names no tile for this pair (stale sweep
+        // artifact) is a miss like any other: the tier falls back with it.
+        tier = RowTier::kDegraded;
     }
     // The degraded bands are open on N with -1 keys, so a row always
     // matches and planning stays a total function (degraded_row_for
     // covers the degenerate m=0); the smem gate cannot demote them — the
     // s2 64x64 ring is the floor every supported device fits.
-    GemmPlan plan = *plan_from_row(degraded_row_for(q.m), q);
-    log_plan_decision("degraded (no table)", q, plan);
-    return plan;
+    const GemmPlan plan = *plan_from_row(degraded_row_for(q.m), q);
+    const PlanDecision d{plan, RowTier::kDegraded};
+    log_plan_decision(row_tier_log_name(d.tier), q, plan);
+    return d;
+}
+
+inline GemmPlan plan_gemm(const PlanQuery& q) {
+    return plan_gemm_sourced(q).plan;
 }
 
 // The one place a GemmParams becomes planner input, and the one place the
@@ -393,6 +426,57 @@ template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
 GemmPlan plan_of(const GemmParams& p) {
     return plan_gemm(
         plan_query<ElemA, ElemB, LayoutA, LayoutB>(p, device_facts()));
+}
+
+// ---------------------------------------------------------------------------
+// Recipe vocabulary: the (CTA class, stages, kK) set each ladder
+// instantiates, enumerated for the Python autotuner's candidate space. The
+// runtime half of manifest_for's rule (manifest_kind over crosswise +
+// widths), so the tuner's candidates are the compiled truth rather than a
+// Python-side re-parse of policy.cuh that could drift.
+// ---------------------------------------------------------------------------
+
+struct GemmRecipe {
+    int cta;
+    int stages;
+    int kk;
+};
+
+// Deduped on the dispatch key: two tiles sharing (class, stages, kK) — the
+// 16-warp small CTA behind its 32-warp twin — are one candidate, because a
+// plan names only the key and dispatch_tile takes the first manifest match.
+template <typename Tile>
+inline void append_recipe(std::vector<GemmRecipe>& out) {
+    const GemmRecipe r{(int)tile_class<Tile>(), Tile::kStages,
+                        Tile::CtaShape::kK};
+    for (const GemmRecipe& have : out)
+        if (have.cta == r.cta && have.stages == r.stages && have.kk == r.kk)
+            return;
+    out.push_back(r);
+}
+
+template <typename Manifest>
+inline void collect_recipes(std::vector<GemmRecipe>& out) {
+    std::apply([&out](auto... tiles) {
+        (append_recipe<decltype(tiles)>(out), ...);
+    }, Manifest{});
+}
+
+inline std::vector<GemmRecipe> gemm_recipes_for(bool crosswise_staging,
+                                                int ba, int bb) {
+    std::vector<GemmRecipe> out;
+    switch (manifest_kind(crosswise_staging, ba, bb)) {
+        case ManifestKind::kTwoByte:
+            collect_recipes<TileManifest>(out);
+            break;
+        case ManifestKind::kByte:
+            collect_recipes<TileManifestByte>(out);
+            break;
+        default:  // kCrosswise is the fallback kind, manifest_for included
+            collect_recipes<TileManifestCross>(out);
+            break;
+    }
+    return out;
 }
 
 // Grid + launch for one concrete Policy — the only place a GEMM kernel
@@ -705,6 +789,42 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a,
         if constexpr (!kSymmetric)
             launch(RowMajor{}, RowMajor{}, RowMajor{});
     }
+}
+
+// Host-only planner probe (the Python autotuner's coverage check): the
+// decision gemm_dispatch would make for this problem, without a launch —
+// the planner is GPU-free by design (plan_table_test.cu pins that). The
+// tag selection mirrors gemm_dispatch branch-for-branch, symmetric-NN
+// rewrite included, so a probe cannot disagree with the branch the real
+// call takes; LayoutOut never reaches the planner, so it is absent here.
+struct PlanProbe {
+    GemmPlan plan;
+    RowTier tier;
+    int perf_class;
+    int crosswise;
+};
+
+template <typename ElemA, typename ElemB>
+PlanProbe plan_probe_for(int64_t m, int64_t n, int64_t k, int64_t batch,
+                         bool trans_a, bool trans_b, const DeviceFacts& dev) {
+    GemmParams p{};  // the planner reads m/n/k/batch only
+    p.m = static_cast<int>(m);
+    p.n = static_cast<int>(n);
+    p.k = static_cast<int>(k);
+    p.batch = static_cast<int>(batch);
+    if constexpr (std::is_same_v<ElemA, ElemB>) {
+        canonicalize_gemm(p, trans_a, trans_b);  // symmetric NN -> transposed TT
+    }
+    auto probe = [&](auto la, auto lb) {
+        const PlanQuery q =
+            plan_query<ElemA, ElemB, decltype(la), decltype(lb)>(p, dev);
+        const PlanDecision d = plan_gemm_sourced(q);
+        return PlanProbe{d.plan, d.tier, q.perf_class, q.crosswise};
+    };
+    if (trans_a && trans_b) return probe(ColMajor{}, ColMajor{});
+    if (trans_b) return probe(RowMajor{}, ColMajor{});
+    if (trans_a) return probe(ColMajor{}, RowMajor{});
+    return probe(RowMajor{}, RowMajor{});
 }
 
 }  // namespace gemm

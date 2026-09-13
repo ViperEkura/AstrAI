@@ -591,7 +591,9 @@ astrai/extension/
 ├── ops/
 │   ├── attention.py        # Stateless attention kernel wrappers
 │   ├── rotary.py           # Stateless rotary kernel wrapper
-│   └── fp8.py              # Stateless FP8 primitives (custom_op)
+│   ├── fp8.py              # Stateless FP8 primitives (custom_op)
+│   └── gemm.py             # Stateless quantized-GEMM wrapper + autotune hook
+├── gemm_autotune.py        # Runtime plan-row autotuner (see below)
 ├── fp8.py                  # FP8 strategy layer (fp8_autocast, recipes)
 └── backend/
     ├── attention.py        # Backend selection, KV cache I/O, and fallback
@@ -639,6 +641,38 @@ output = attn_prefill(q, k, v, mask=mask, is_causal=True)
 
 If the kernel is unavailable, this call fails. Callers that need fallback and
 capability dispatch must use the public `attention(...)` entry point instead.
+
+### GEMM Plan Autotuning
+
+The `gemm` module exposes the planner the launch path uses (it is host-only
+and GPU-free — `plan_table_test.cu` pins that):
+
+- `plan_probe(m, n, k, dt_a, dt_b, trans_a, trans_b, batch)` — the decision
+  `gemm_dispatch` would make, with the row tier that made it:
+  `"override"` (the `ASTR_GEMM_TABLE` file), `"injected"` (rows installed
+  through `set_plan_table_override`, ranked below the env file and above the
+  compiled-in table), `"builtin"`, or `"degraded"`.
+- `tile_vocabulary()` — the `(crosswise, ba, bb, cta, stages, kk)` set the
+  manifest ladders instantiate, deduped on the dispatch key; the candidate
+  space for anything choosing recipes from Python.
+- `set_plan_table_override(source)` — install rows from a file path or
+  inline row text (returns the count that survived parsing).
+- `device_facts_info()` — the `DeviceFacts` geometry as a dict.
+
+`astrai.extension.gemm_autotune` builds the tuning loop on those: a shape no
+measured row serves (the builtin and env tables count; the heuristic
+crosswise floor does not) tunes once — candidates from `tile_vocabulary`
+filtered to the staging pair and smem ceiling, forced one row at a time,
+interleaved CUDA-event medians over the caller's own tensors — and the
+winner persists under `~/.astrai/cache/gemm_plans/<device-sig>.rows`, so a
+new process (or a different part, via the geometry key) re-derives nothing
+measured. Enable with `ASTR_GEMM_AUTOTUNE=1` or
+`astrai.extension.gemm_autotune.enable()`; the hook costs one flag check
+when disabled and idles while `ASTR_GEMM_TABLE` is set. The offline
+whole-table recalibration stays a separate command:
+`csrc/bench/tune_baseline.py` sweeps (`gen_plan_table.py --full-coverage`),
+gates on the holdout validator (a ≥2% per-shape regression rejects), and
+installs under the same device signature.
 
 ### Backend Layer
 
@@ -805,7 +839,7 @@ Test files:
 - `attn_test.cu` — decode + prefill kernels (correctness tables + benchmarks)
 - `attn_paged_test.cu` — paged decode/prefill kernels
 - `quant_gemm_test.cu` — quantized GEMM correctness: every dtype pair (fp8/int8/bf16 × layouts/K tiles/ragged shapes/scales/fp32 out) + a per-combo TFLOPS bench (sm_89+)
-- `plan_table_test.cu` — planner checks: dtype-class keying, per-class table selection (a row cannot leak across classes), the K band's edge cases, and row-file parsing for the 9/10/12-field forms
+- `plan_table_test.cu` — planner checks: dtype-class keying, per-class table selection (a row cannot leak across classes), the K band's edge cases, row-file parsing for the 9/10/12-field forms, the injected-row tier ranking (env file > injected > builtin, `-` kills all), the host-only probe against the dispatch branches, the recipe vocabulary per staging pair, and an informational planner-cost line (~110 ns/query on sm_89)
 
 ## Benchmarks
 

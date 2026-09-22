@@ -85,11 +85,7 @@ identity, but those integrations belong in follow-up changes.
 
 The repository includes a deterministic serialization-only benchmark:
 
-```bash
-python scripts/benchmark_route_trace_codec.py \
-  --tokens 8192 --layers 40 --top-k 22 --num-experts 512 \
-  --level ids --device cpu --warmups 5 --repeats 50
-```
+Validation scripts are maintained locally.
 
 The JSON output separates logical tensor bytes, wire bytes, and an int64-ID
 baseline, and reports serialize/deserialize latency. Construction happens
@@ -210,13 +206,7 @@ routes, replay experts, or use route metrics to change sample admission.
 Measure immutable binding and cache-validation cost separately from model
 capture with:
 
-```bash
-python scripts/benchmark_rollout_route_binding.py \
-  --batch-size 2 --group-size 2 --prompt-tokens 512 \
-  --response-tokens 1024 --layers 40 --top-k 22 --num-experts 512 \
-  --level ids --device cpu --warmups 5 \
-  --bind-repeats 5 --validate-repeats 50
-```
+Validation scripts are maintained locally.
 
 The reported bind time includes per-trace serialization and immutable-header
 verification. Validation hashes only the comparatively small rollout token,

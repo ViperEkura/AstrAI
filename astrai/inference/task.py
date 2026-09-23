@@ -101,6 +101,10 @@ class Task:
         self.rep_window = rep_window
         self.backend = backend
 
+        # Scoring only: how many trailing tokens of ``prompt_ids`` form the
+        # continuation to score.  Zero for generation tasks.
+        self.cont_len: int = 0
+
         self.status = TaskStatus.PENDING
         self.output_ids: List[int] = []
         self.output_logprobs: List[float] = []

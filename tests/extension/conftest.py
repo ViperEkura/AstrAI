@@ -27,3 +27,28 @@ def cuda_model():
     model = AutoRegressiveLM(config).to(device="cuda", dtype=torch.bfloat16)
     model.eval()
     return model, config
+
+
+@pytest.fixture(autouse=True)
+def _reset_dispatch_state():
+    """Isolate the process-level dispatch/planner state per test.
+
+    set_op selections, cached record lists and the gemm planner
+    configuration are process state; without this a test that touches
+    them leaks into the next one.
+    """
+    yield
+    import astrai.extension.dispatch as dispatch
+
+    dispatch._selection = None
+    dispatch.invalidate()
+    from astrai.extension import ops
+    from astrai.extension.loader import is_available
+
+    if is_available("gemm"):
+        ops.gemm.set_table("")
+        ops.gemm.set_planner("")  # back to the shipped default
+        # staging too: the planner prices per staging variant (gemm.cuh
+        # cost_of branches on q.tma), so a test leaving tma disabled would
+        # silently move every later probe to the cp.async cost form
+        ops.gemm.set_staging(tma=True, mx=True)

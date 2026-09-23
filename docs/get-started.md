@@ -41,7 +41,8 @@ pip install -e .
 > them, or `CSRC_KERNELS=true` to force them (required when building in an
 > isolated environment with `--no-build-isolation`). Once built, `CudaBackend`
 > is the default attention backend on GPU (cuda > flash > torch priority).
-> Override via `ASTR_BACKEND` env var or `attn_backend()` context manager.
+> Override via `set_op("attention", ...)` / the `attn_backend()` context
+> manager (the `ASTR_BACKEND` env var is a deprecated seed).
 > Fused rotary embedding kernel is auto-dispatched when available. Skip for
 > CPU-only usage.
 

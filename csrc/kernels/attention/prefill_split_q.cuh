@@ -84,15 +84,11 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
 
         // Load K/V into shared memory (addressing via KV policy; paged
         // guards empty slots with zero-fill).
-        for (int i = lid; i < tlen * HEAD_DIM; i += tt) {
-            int s = i / HEAD_DIM;
-            int d_dim = i % HEAD_DIM;
-            int kc = kv0 + s;
-            int token = KV::resolve_token(p, kctx, kc, true);
-            KVAddr a = KV::kv_addr_from_token(p, kctx, token, d_dim);
-            sK[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
-            sV[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
-        }
+        fill_kv_smem(sK, sV, tlen * HEAD_DIM, HEAD_DIM, kv0, lid, tt,
+                     [&](int kc, int d) {
+                         int token = KV::resolve_token(p, kctx, kc, true);
+                         return KV::kv_addr_from_token(p, kctx, token, d);
+                     });
         __syncthreads();
 
         int lim = tlen;

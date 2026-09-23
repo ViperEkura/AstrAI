@@ -53,7 +53,7 @@ AstrAI 是一个覆盖模型构建、训练、评测与部署的端到端 Transf
 | 领域 | 能力 |
 |---|---|
 | **模型** | 自回归语言模型与嵌入模型，支持 GQA、MLA、MoE、RoPE，以及可扩展的 Attention/FFN 组件 |
-| **训练** | 预训练（`seq`）、监督微调（`sft`）、DPO 和 GRPO，支持梯度累积、检查点、DDP 与 FSDP |
+| **训练** | 预训练（`seq`）、监督微调（`sft`）、DPO 和在线 RL（GRPO/PPO，rollout 后端可进程内或跨卡），支持梯度累积、检查点、DDP 与 FSDP |
 | **数据** | 声明式 JSON 预处理、可配置掩码与样本打包、二进制/JSONL 存储和流式数据集 |
 | **推理** | 连续批处理、分页 KV Cache、Radix 前缀缓存、流式生成，以及 Torch/CUDA/FlashAttention 后端 |
 | **服务** | 基于 FastAPI 的 OpenAI 与 Anthropic 聊天补全协议，支持 SSE 流式输出和工具调用 |
@@ -242,7 +242,7 @@ SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference
 | [架构文档](./developer/architecture.md) | 系统架构、类图与设计模式 |
 | [数据流程](./developer/dataflow.md) | 数据管道、存储后端与数据集架构 |
 | [内部实现](./developer/internals.md) | 训练原理：损失公式、回调生命周期、KV Cache |
-| [CUDA 内核](./developer/cuda_kernels.md) | 自定义 CUDA 注意力内核与基准测试 |
+| [CUDA kernel](./developer/kernels/README.md) | CUDA kernel 文档：GEMM / 注意力 / RoPE 的数学契约、设计笔记与构建 |
 | [Docker 服务部署](./developer/docker-serving.md) | YAML 驱动的容器化服务（`serve.yaml`、`serve.sh`） |
 | [Docker 训练部署](./developer/docker-training.md) | YAML 驱动的容器化训练（`train.yaml`、`train.sh`） |
 

@@ -6,9 +6,10 @@ family* needs, an ordered list of ``ImplRecord`` rows (name, impl object,
 capability ``Spec``, machine-level ``available``), and a fallback record.
 The core defines no axes itself — each ``Spec`` predicates over the axes
 dict produced by the family's own extractor.  Resolution: explicit/context
-selection (strict — raises when incapable) > ``ASTR_OPS`` env entry (soft —
-falls through) > first capable row > family fallback.  The rows are the
-family's decision table, printable via ``explain``.
+selection (strict — raises when incapable) > process selection (soft —
+falls through; ``set_op``, seeded once from the deprecated ``ASTR_OPS`` /
+``ASTR_BACKEND`` variables) > first capable row > family fallback.  The
+rows are the family's decision table, printable via ``explain``.
 
 Records flagged ``faithful=False`` change numerics (e.g. fp8) and are only
 reachable through an explicit selection, never the implicit chain.
@@ -157,12 +158,19 @@ class OpFamily:
 _FAMILIES: Dict[str, OpFamily] = {}
 _ENV_ALIASES: Dict[str, str] = {}
 
+# Priority-sorted record lists, cached per family until invalidated: the
+# providers return constant record sets (availability is a per-call check
+# on each record, not part of the sort), so resolving an op must not
+# rebuild and re-sort the list every call. register_family and loader-side
+# kernel imports invalidate.
+_family_records: Dict[str, List[ImplRecord]] = {}
+
 _current_overrides: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
     "astrai_op_overrides", default={}
 )
 
-_env_lock = threading.Lock()
-_env_cache: Dict[tuple, Optional[Dict[str, str]]] = {}
+_selection_lock = threading.Lock()
+_selection: Optional[Dict[str, str]] = None  # None = not seeded yet
 _warned: set = set()
 
 
@@ -172,12 +180,31 @@ def register_family(
     provider: Callable[[], List[ImplRecord]],
     fallback: Callable[[], ImplRecord],
 ) -> None:
-    """Register (or replace) a family; ``provider`` is re-evaluated per
-    resolution so availability changes (tests, late imports) are honored.
+    """Register (or replace) a family. Availability changes are honored
+    without re-registration: each record's ``available`` runs per resolve,
+    and loader-side kernel imports call :func:`invalidate`.
     ``axes`` mirrors the op call signature and snapshots that family's
     decision axes; unregistered handles are probed through the same args.
     """
     _FAMILIES[name] = OpFamily(name, axes, provider, fallback)
+    invalidate(name)
+
+
+def invalidate(family: Optional[str] = None) -> None:
+    """Drop the cached record lists — call when a provider's record set or
+    a kernel module's availability changed (family=None drops all)."""
+    if family is None:
+        _family_records.clear()
+    else:
+        _family_records.pop(family, None)
+
+
+def _records(fam: OpFamily) -> List[ImplRecord]:
+    records = _family_records.get(fam.name)
+    if records is None:
+        records = sorted(fam.provider(), key=lambda r: r.priority)
+        _family_records[fam.name] = records
+    return records
 
 
 def register_env_alias(family: str, varname: str) -> None:
@@ -228,7 +255,7 @@ def op_backend(**handles: Any):
             fam = _FAMILIES.get(family)
             if fam is None:
                 raise ValueError(f"unknown operator family {family!r}")
-            if _record_for_handle(fam, handle) is None:
+            if _record_for_handle(fam, handle, _records(fam)) is None:
                 raise ValueError(f"Unknown {family} implementation: {handle!r}")
     tokens = [set_override(f, h) for f, h in handles.items()]
     try:
@@ -238,55 +265,65 @@ def op_backend(**handles: Any):
             reset_override(token)
 
 
-def env_overrides() -> Dict[str, str]:
-    """Merged ASTR_OPS + legacy-alias selections (family or "profile").
+def parse_selections(raw: str) -> Dict[str, str]:
+    """Parse an ASTR_OPS-style ``family=impl`` comma list (the seed format).
 
-    Cached per distinct env content; unknown families / malformed entries
-    warn once and are dropped (soft override, never fatal).
+    Malformed entries warn once and are dropped.
     """
-    with _env_lock:
-        merged: Dict[str, str] = {}
-        raw = os.environ.get("ASTR_OPS", "").strip()
-        if raw:
-            key = ("ASTR_OPS", raw)
-            if key not in _env_cache:
-                parsed: Dict[str, str] = {}
-                for item in raw.split(","):
-                    key_part, sep, value = item.strip().partition("=")
-                    key_part, value = key_part.strip(), value.strip()
-                    if not sep or not key_part or not value:
-                        _warn_once(f"ASTR_OPS: ignoring malformed entry {item!r}")
-                        continue
-                    parsed[key_part] = value
-                _env_cache[key] = parsed or None
-            merged.update(_env_cache[key] or {})
-        for fam, varname in _ENV_ALIASES.items():
-            raw = os.environ.get(varname, "").strip()
+    parsed: Dict[str, str] = {}
+    for item in raw.split(","):
+        key_part, sep, value = item.strip().partition("=")
+        key_part, value = key_part.strip(), value.strip()
+        if not sep or not key_part or not value:
+            _warn_once(f"ASTR_OPS: ignoring malformed entry {item!r}")
+            continue
+        parsed[key_part] = value
+    return parsed
+
+
+def _seed_selection() -> Dict[str, str]:
+    """The process selection tier, seeded once from the deprecated
+    ASTR_OPS / legacy-alias variables and owned at runtime by set_op()."""
+    global _selection
+    with _selection_lock:
+        if _selection is None:
+            merged: Dict[str, str] = {}
+            raw = os.environ.get("ASTR_OPS", "").strip()
             if raw:
-                key = (varname, raw)
-                if key not in _env_cache:
-                    _env_cache[key] = {fam: raw.lower()}
-                merged.setdefault(fam, _env_cache[key][fam])
-        for fam in [f for f in merged if f not in _FAMILIES and f != "profile"]:
-            _warn_once(f"ASTR_OPS: unknown operator family {fam!r}; dropping it")
-            merged.pop(fam)
-        return merged
+                merged.update(parse_selections(raw))
+            for fam, varname in _ENV_ALIASES.items():
+                raw = os.environ.get(varname, "").strip()
+                if raw:
+                    merged.setdefault(fam, raw.lower())
+            for fam in [f for f in merged if f not in _FAMILIES and f != "profile"]:
+                _warn_once(f"ASTR_OPS: unknown operator family {fam!r}; dropping it")
+                merged.pop(fam)
+            _selection = merged
+        return _selection
+
+
+def set_op(family: str, impl: Optional[str] = None) -> None:
+    """Set (or, with ``impl=None``, clear) the process-level implementation
+    for a family — the runtime replacement for the ``ASTR_OPS`` /
+    ``ASTR_BACKEND`` variables. Like those variables the selection is soft:
+    an incapable pick falls through to the chain."""
+    overrides = dict(_seed_selection())
+    if impl is None:
+        overrides.pop(family, None)
+    else:
+        overrides[family] = impl
+    global _selection
+    with _selection_lock:
+        _selection = overrides
+
+
+def env_overrides() -> Dict[str, str]:
+    """The active process-level selections (family or ``profile``)."""
+    return _seed_selection()
 
 
 def env_selection(family: str) -> Optional[str]:
     return env_overrides().get(family)
-
-
-def env_mode(varname: str) -> str:
-    """Read a family's ``0``/``1``/``auto`` mode variable (default ``auto``).
-
-    Invalid values warn once per distinct value and fall back to ``auto``.
-    """
-    mode = os.environ.get(varname, "auto").strip().lower()
-    if mode in ("0", "1", "auto"):
-        return mode
-    _warn_once(f"{varname}={mode!r} is invalid; expected 0, 1, or auto; using auto")
-    return "auto"
 
 
 @dataclass(frozen=True)
@@ -299,8 +336,9 @@ class ExplicitSelectionError(RuntimeError):
     """An explicitly selected implementation cannot handle the call."""
 
 
-def _record_for_handle(fam: OpFamily, handle: Any) -> Optional[ImplRecord]:
-    records = sorted(fam.provider(), key=lambda r: r.priority)
+def _record_for_handle(
+    fam: OpFamily, handle: Any, records: List[ImplRecord]
+) -> Optional[ImplRecord]:
     if isinstance(handle, str):
         return next((r for r in records if r.name == handle), None)
     return next((r for r in records if r.obj is handle), None)
@@ -331,6 +369,7 @@ def resolve(
     """
     fam = _family(family)
     ax = fam.axes(*args, **kwargs)
+    records = _records(fam)
 
     handle: Optional[Any] = None
     origin = "chain"
@@ -344,7 +383,7 @@ def resolve(
             handle, origin = env_name, "env"
 
     if handle is not None:
-        record = _record_for_handle(fam, handle)
+        record = _record_for_handle(fam, handle, records)
         if record is None and not isinstance(handle, str):
             record = _adhoc_record(family, handle, args, kwargs)
         if record is None:
@@ -363,7 +402,7 @@ def resolve(
     if handle is None and env_overrides().get("profile") == "reference":
         return Resolution(fam.fallback(), "profile")
 
-    for record in sorted(fam.provider(), key=lambda r: r.priority):
+    for record in records:
         if record.available() and record.faithful and record.spec.matches(ax):
             return Resolution(record, "chain")
     return Resolution(fam.fallback(), "fallback")
@@ -387,7 +426,7 @@ def explain(
     """Human-readable decision trace for one family call."""
     fam = _family(family)
     ax = fam.axes(*args, **kwargs)
-    records = sorted(fam.provider(), key=lambda r: r.priority)
+    records = _records(fam)
     lines = [f"[{family}] {_describe_axes(ax)}"]
     for record in records:
         if not record.available():
@@ -422,9 +461,11 @@ __all__ = [
     "Spec",
     "Axis",
     "axis",
-    "env_mode",
     "env_overrides",
     "env_selection",
+    "invalidate",
+    "parse_selections",
+    "set_op",
     "explain",
     "explain_plan",
     "get_override",

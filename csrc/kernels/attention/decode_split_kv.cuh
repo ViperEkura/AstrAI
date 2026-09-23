@@ -72,17 +72,13 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
 
             // Load K and V into shared memory (addressing via KV policy;
             // paged guards empty slots with zero-fill).
-            int total = this_chunk * p.head_dim;
-            for (int i = threadIdx.y * 32 + lane; i < total;
-                 i += blockDim.x * blockDim.y) {
-                int s = i / p.head_dim;
-                int d_dim = i % p.head_dim;
-                int kc = chunk_start + s;
-                KVAddr a = KV::template decode_addr<1>(
-                    p, kctx, batch, kv_head, kc, d_dim, true, true);
-                k_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
-                v_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
-            }
+            fill_kv_smem(k_smem, v_smem, this_chunk * p.head_dim, p.head_dim,
+                         chunk_start, threadIdx.y * 32 + lane,
+                         blockDim.x * blockDim.y,
+                         [&](int kc, int d) {
+                             return KV::template decode_addr<1>(
+                                 p, kctx, batch, kv_head, kc, d, true, true);
+                         });
             __syncthreads();
 
             for (int s = 0; s < this_chunk; s++) {

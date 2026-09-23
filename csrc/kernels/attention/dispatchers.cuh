@@ -6,7 +6,10 @@
 // (ContigKV / PagedKV from layout_policies.cuh), so each launcher struct
 // below is templated on KV and the paged dispatch is just the same launcher
 // instantiated with PagedKV.  Only the grid/split math differs, and that is
-// covered by KV::host_q_len / KV::host_kv_len.
+// covered by KV::host_q_len / KV::host_kv_len. For the same reason the
+// dispatch_* entries funnel through one impl per family
+// (dispatch_prefill_impl / dispatch_decode_impl), so the MMA/scalar selection
+// lives in one place instead of once per entry.
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -58,8 +61,39 @@ inline int compute_num_splits(int base_blocks, int tiles_total,
     } while (0)
 
 // ======================================================================
-// Prefill launchers (KV selects ContigKV or PagedKV addressing)
+// Kernel family: ONE place picks the MMA or the scalar implementation.
+//
+// Both families expose the same launcher interface — a static
+// launch<HEAD_DIM, IsCausal, HasMask> — so the dispatchers below name only
+// these aliases. Declared here and defined in the sections below;
+// ASTRAI_NO_MMA (the manual escape hatch the build never sets) swaps both
+// families at once, instead of the choice being repeated at each dispatch
+// site.
 // ======================================================================
+
+#ifndef ASTRAI_NO_MMA
+template <typename QSchedule, typename KV>
+struct PrefillLauncherMMA;
+template <typename KV>
+struct DecodeLauncherMMA;
+#endif
+
+template <typename QSchedule, typename KV>
+struct PrefillLauncherScalar;
+template <typename KV>
+struct DecodeLauncherScalar;
+
+#ifndef ASTRAI_NO_MMA
+template <typename QSchedule, typename KV>
+using PrefillLauncher = PrefillLauncherMMA<QSchedule, KV>;
+template <typename KV>
+using DecodeLauncher = DecodeLauncherMMA<KV>;
+#else
+template <typename QSchedule, typename KV>
+using PrefillLauncher = PrefillLauncherScalar<QSchedule, KV>;
+template <typename KV>
+using DecodeLauncher = DecodeLauncherScalar<KV>;
+#endif
 
 #ifndef ASTRAI_NO_MMA
 template <int BC_>
@@ -124,40 +158,29 @@ struct PrefillLauncherScalar {
     }
 };
 
-template <int HEAD_DIM>
-static inline void dispatch_prefill(AttentionParams<bf16>& p, cudaStream_t stream) {
+// The contiguous and paged entries differ only in the policy pair (Q schedule
+// + KV source), so one implementation carries the MMA/scalar selection and the
+// causal/mask ladder for both.
+template <typename QSchedule, typename KV, int HEAD_DIM>
+static inline void dispatch_prefill_impl(AttentionParams<bf16>& p,
+                                         cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
     bool has_mask = (p.use_mask && p.mask);
 
-#ifndef ASTRAI_NO_MMA
-    using Launcher = PrefillLauncherMMA<DenseQSchedule, ContigKV>;
+    using Launcher = PrefillLauncher<QSchedule, KV>;
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
                          Launcher::template launch,
                          HEAD_DIM, p, stream);
-#else
-    using Launcher = PrefillLauncherScalar<DenseQSchedule, ContigKV>;
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         Launcher::template launch,
-                         HEAD_DIM, p, stream);
-#endif
+}
+
+template <int HEAD_DIM>
+static inline void dispatch_prefill(AttentionParams<bf16>& p, cudaStream_t stream) {
+    dispatch_prefill_impl<DenseQSchedule, ContigKV, HEAD_DIM>(p, stream);
 }
 
 template <int HEAD_DIM>
 static inline void dispatch_paged_prefill(AttentionParams<bf16>& p, cudaStream_t stream) {
-    bool is_causal = (p.causal_offset >= 0);
-    bool has_mask = (p.use_mask && p.mask);
-
-#ifndef ASTRAI_NO_MMA
-    using Launcher = PrefillLauncherMMA<PackedQSchedule, PagedKV>;
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         Launcher::template launch,
-                         HEAD_DIM, p, stream);
-#else
-    using Launcher = PrefillLauncherScalar<PackedQSchedule, PagedKV>;
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         Launcher::template launch,
-                         HEAD_DIM, p, stream);
-#endif
+    dispatch_prefill_impl<PackedQSchedule, PagedKV, HEAD_DIM>(p, stream);
 }
 
 // ======================================================================
@@ -212,42 +235,31 @@ struct DecodeLauncherScalar {
     }
 };
 
-template <int HEAD_DIM>
-static inline void dispatch_decode(AttentionParams<bf16>& p, cudaStream_t stream) {
+// Same funnel as prefill: the entry's only difference is the KV policy, which
+// also parameterizes the combine pass reducing the split partials.
+template <typename KV, int HEAD_DIM>
+static inline void dispatch_decode_impl(AttentionParams<bf16>& p,
+                                        cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
     bool has_mask = (p.use_mask && p.mask);
 
-#ifndef ASTRAI_NO_MMA
+    using Launcher = DecodeLauncher<KV>;
     DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         DecodeLauncherMMA<ContigKV>::template launch,
+                         Launcher::template launch,
                          HEAD_DIM, p, stream);
-#else
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         DecodeLauncherScalar<ContigKV>::template launch,
-                         HEAD_DIM, p, stream);
-#endif
 
-    attn_decode_combine_kernel<ContigKV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
+    attn_decode_combine_kernel<KV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
     ASTRAI_LAUNCH_CHECK();
 }
 
 template <int HEAD_DIM>
+static inline void dispatch_decode(AttentionParams<bf16>& p, cudaStream_t stream) {
+    dispatch_decode_impl<ContigKV, HEAD_DIM>(p, stream);
+}
+
+template <int HEAD_DIM>
 static inline void dispatch_paged_decode(AttentionParams<bf16>& p, cudaStream_t stream) {
-    bool is_causal = (p.causal_offset >= 0);
-    bool has_mask = (p.use_mask && p.mask);
-
-#ifndef ASTRAI_NO_MMA
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         DecodeLauncherMMA<PagedKV>::template launch,
-                         HEAD_DIM, p, stream);
-#else
-    DISPATCH_CAUSAL_MASK(is_causal, has_mask,
-                         DecodeLauncherScalar<PagedKV>::template launch,
-                         HEAD_DIM, p, stream);
-#endif
-
-    attn_decode_combine_kernel<PagedKV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
-    ASTRAI_LAUNCH_CHECK();
+    dispatch_decode_impl<PagedKV, HEAD_DIM>(p, stream);
 }
 
 }  // namespace attention

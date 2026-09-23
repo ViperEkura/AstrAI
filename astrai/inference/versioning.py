@@ -96,13 +96,15 @@ class PolicyVersionGuard:
 
     @_locked
     def apply_weight_update(
-        self, policy_version: Optional[int], update: Callable[[], T]
+        self, policy_version: Optional[int], update: Callable[[int], T]
     ) -> T:
         """Mutate shared weights and publish their version without generation.
 
         ``policy_version=None`` derives ``live + 1`` under the same lock, for
         callers that only need "advance by one" (e.g. ``optimizer.step()``)
-        without a read-compute-write race on the current version.
+        without a read-compute-write race on the current version.  The
+        derived target version is handed to ``update`` so weight
+        publishers can fan it out while still inside the lock.
         """
         if not callable(update):
             raise TypeError("update must be callable")
@@ -112,7 +114,7 @@ class PolicyVersionGuard:
             self._validate(policy_version, require_advance=True)
         self._ensure_ready()
 
-        result = update()
+        result = update(policy_version)
         self._commit(policy_version)
         return result
 

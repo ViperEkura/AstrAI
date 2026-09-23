@@ -85,7 +85,8 @@ AttentionBackend (ABC)
 
 Default priority is cuda > flash > torch. Automatic selection may choose a
 compatible fallback for a particular call. Set
-`ASTR_BACKEND=cuda|torch_native|flash` to override the default process-wide;
+`set_op("attention", "cuda"|"torch_native"|"flash")` to override the default
+process-wide (the `ASTR_BACKEND` env var is a deprecated startup seed);
 an explicit `attn_backend(...)` context still takes precedence over the env
 override.
 

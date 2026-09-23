@@ -8,12 +8,10 @@ import random
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 import tqdm
 from datasets import load_dataset
 
-from astrai.model import AutoModel
-from astrai.tokenize import AutoTokenizer
+from astrai.bench import load_score_model, loglikelihood_batched
 
 MMLU_HF_DATASET = "cais/mmlu"
 MMLU_SUBJECTS = [
@@ -186,46 +184,21 @@ def choice_logprobs_batched(
     device: str,
     max_model_len: int,
 ) -> list[dict[str, float]]:
-    """Compute log-probs for multiple questions x 4 choices in batches.
+    """Compute log-probs for multiple questions x 4 answer letters.
 
     Returns a list of dicts: [{A: score, B: score, C: score, D: score}, ...]
     """
     letters = ("A", "B", "C", "D")
     choice_ids_list = [tokenizer.encode(c, add_special_tokens=False) for c in letters]
-
-    all_inputs: list[tuple[int, int, list[int], int, list[int]]] = []
-    for qi, context_ids in enumerate(context_ids_list):
-        for ci, choice_ids in enumerate(choice_ids_list):
-            input_ids = context_ids + choice_ids
-            if len(input_ids) > max_model_len:
-                overflow = len(input_ids) - max_model_len
-                input_ids = input_ids[overflow:]
-                ctx_len = len(input_ids) - len(choice_ids)
-            else:
-                ctx_len = len(context_ids)
-            all_inputs.append((qi, ci, input_ids, ctx_len, choice_ids))
-
-    n = len(all_inputs)
-    max_input_len = max(len(x[2]) for x in all_inputs)
-    padded = torch.zeros(n, max_input_len, dtype=torch.long, device=device)
-    mask = torch.zeros(n, max_input_len, dtype=torch.bool, device=device)
-    for i, (_, _, ids, _, _) in enumerate(all_inputs):
-        padded[i, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-        mask[i, : len(ids)] = True
-
-    with torch.inference_mode():
-        logits = model(padded, input_mask=mask)["logits"]
-
-    results = [{} for _ in range(len(context_ids_list))]
-    for i, (qi, ci, _, ctx_len, choice_ids) in enumerate(all_inputs):
-        score = 0.0
-        for j, tid in enumerate(choice_ids):
-            pos = ctx_len - 1 + j
-            if pos >= logits.size(1):
-                break
-            score += F.log_softmax(logits[i, pos].float(), dim=-1)[tid].item()
-        results[qi][letters[ci]] = score
-    return results
+    requests = []
+    for ctx_ids in context_ids_list:
+        for cid in choice_ids_list:
+            requests.append((ctx_ids, cid))
+    scores = loglikelihood_batched(model, tokenizer, requests, device, max_model_len)
+    return [
+        {letters[ci]: scores[qi * 4 + ci] for ci in range(4)}
+        for qi in range(len(context_ids_list))
+    ]
 
 
 def _permute_choices(item: dict, rng: random.Random) -> tuple[dict, str]:
@@ -340,12 +313,8 @@ def main():
     if args.download or not os.path.exists(args.data_dir):
         download_mmlu(args.data_dir)
 
-    model = AutoModel.from_pretrained(args.param_path)
-    tokenizer = AutoTokenizer.from_pretrained(args.param_path)
     device = args.device
-    dtype = getattr(torch, args.dtype)
-    model.to(device=device, dtype=dtype)
-    model.eval()
+    model, tokenizer = load_score_model(args.param_path, device, args.dtype)
 
     subjects = args.subjects or MMLU_SUBJECTS
     results = {}

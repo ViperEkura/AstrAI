@@ -18,13 +18,59 @@ if(NOT DEFINED PYTHON_INCLUDE_DIR)
     set(PYTHON_INCLUDE_DIR "/usr/include/python${PYTHON_VERSION_MAJOR}.${PYTHON_VERSION_MINOR}")
 endif()
 
-if(NOT DEFINED ASTRAI_CUDA_ARCH)
-    if(DEFINED ENV{ASTRAI_CUDA_ARCH})
-        set(ASTRAI_CUDA_ARCH "$ENV{ASTRAI_CUDA_ARCH}")
-    else()
-        set(ASTRAI_CUDA_ARCH 80)
-    endif()
+# ASTRAI_CUDA_ARCH is the only arch knob and has no default: it comes from
+# the cache/command line (setup.py passes it), else the environment. Unset
+# builds NO kernel targets — a GPU-less configure installs the pure-Python
+# package and the loader skips the absent .so files.
+if(NOT DEFINED ASTRAI_CUDA_ARCH AND DEFINED ENV{ASTRAI_CUDA_ARCH})
+    set(ASTRAI_CUDA_ARCH "$ENV{ASTRAI_CUDA_ARCH}")
 endif()
+
+# Accepts a single token or a semicolon list ("80;89;120a"): every listed
+# token lands in the fatbin as its own image, so one .so serves a mixed
+# fleet — the driver picks the slice per device (for one CC the arch-
+# specific image wins over the plain one).
+#
+# Arch-level conventions, one per layer (keep them in lockstep):
+#   build (this file / setup.py env): CC tens        "120a" = CC 12.0, arch-specific
+#   device compile (mma.cuh): __CUDA_ARCH__ hundreds  1200  (kMinArch compares
+#     against ASTRAI_DEVICE_ARCH, the raw __CUDA_ARCH__)
+#   runtime (device_facts().cc): CC tens again        120   (gemm.cuh's
+#     route gates — cc >= 90 TMA, cc == 120 the sm_120a mx cell)
+# The mx route keys on the device's cc == 120, the cell's activation on the
+# compile pass — so a consumer-Blackwell build lists the arch-specific token
+# ("120a"). Listing plain "120" compiles the same tree but the fp8
+# block_scale cell falls back to the half-rate plain instruction; the gemm
+# warning below flags exactly that. Every numeric gate (the FP8 cutoff, the
+# max, each module's 89+ filter) reads the suffix-stripped token.
+set(ASTRAI_CUDA_ARCH_LIST "")
+if(ASTRAI_CUDA_ARCH)
+    separate_arguments(ASTRAI_CUDA_ARCH_LIST NATIVE_COMMAND "${ASTRAI_CUDA_ARCH}")
+    list(TRANSFORM ASTRAI_CUDA_ARCH_LIST STRIP)
+    list(REMOVE_DUPLICATES ASTRAI_CUDA_ARCH_LIST)
+    # Natural sort keeps the newest arch last: CMake embeds real SASS for
+    # every listed arch plus the newest one's PTX (the JIT fallback).
+    list(SORT ASTRAI_CUDA_ARCH_LIST COMPARE NATURAL)
+endif()
+
+# <token> -> its CC-tens number ("120a" -> 120). The one spelling of the
+# suffix rule: no comparison below ever sees a token.
+function(astrai_arch_number token out)
+    if(NOT token MATCHES "^([0-9]+)a?$")
+        message(FATAL_ERROR
+            "ASTRAI_CUDA_ARCH token '${token}' is not <CC digits>[a] "
+            "(e.g. 89, 120a)")
+    endif()
+    set(${out} "${CMAKE_MATCH_1}" PARENT_SCOPE)
+endfunction()
+
+set(ASTRAI_CUDA_ARCH_MAX 0)
+foreach(_token IN LISTS ASTRAI_CUDA_ARCH_LIST)
+    astrai_arch_number("${_token}" _num)
+    if(_num GREATER ASTRAI_CUDA_ARCH_MAX)
+        set(ASTRAI_CUDA_ARCH_MAX "${_num}")
+    endif()
+endforeach()
 
 set(TORCH_LIB_DIR "${TORCH_HOME}/lib")
 set(CUDA_LIB_DIR "/usr/local/cuda/lib64")
@@ -35,6 +81,10 @@ set(NVCC_FLAGS -O3
     --use_fast_math
     "--ptxas-options=-O3,-v"
     --extra-device-vectorization
+    # Fatbin entries (SASS and PTX) stored compressed; the driver decompresses
+    # at module load, the code that runs is unchanged. Per-TU measured
+    # 4.2x: one gemm TU 8.03 MB -> 1.89 MB.
+    -Xfatbin --compress-all
     --threads=16)
 
 set(TORCH_LIBS
@@ -46,50 +96,88 @@ set(TORCH_LIBS
     "${TORCH_LIB_DIR}/libc10.so"
     CUDA::cudart)
 
-set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH}")
+# One authoritative arch knob: force the cache entry too, so a stale
+# toolkit-default value (e.g. 75, seeded by project() before the env is
+# parsed) never lingers in CMakeCache.txt next to the effective list.
+set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
+    CACHE STRING "CUDA architectures (derived from ASTRAI_CUDA_ARCH)" FORCE)
 
-# Kernel registry — parallel lists of module names (.so / pybind names,
-# globally unique across families) and their per-family source paths under
-# kernels/. `loader.py` auto-discovers the .so files in astrai/extension/lib/,
-# so this CMake registry is the single place to register a new kernel.
+# Kernel registry — one module per entry: name (.so / pybind name, globally
+# unique across families), then its source paths under kernels/ (whitespace-
+# separated, so a long list may wrap across lines with indentation: a module
+# may span several TUs; gemm is split into per-dtype-pair instantiation units
+# (one explicit gemm_dispatch instantiation each), so the heavy template work
+# parallelizes). The '|' separator keeps the entry a single list element —
+# CMake lists cannot nest semicolons. `loader.py` auto-discovers the .so files
+# in astrai/extension/lib/, so this CMake registry is the single place to
+# register a new kernel.
 #
-# FP8 MMA instructions require sm_89+. Keep the target out of the build on
-# older architectures instead of instantiating templates that cannot compile.
-# The remaining kernels are still useful on sm_80+ (including sm_86).
-set(KERNEL_NAMES
-    attn_decode
-    attn_prefill
-    attn_paged_decode
-    attn_paged_prefill
-    rotary_emb
-)
-set(KERNEL_SRCS
-    attention/decode.cu
-    attention/prefill.cu
-    attention/paged_decode.cu
-    attention/paged_prefill.cu
-    rotary_emb.cu
+# FP8 MMA instructions require sm_89+. Keep the target out of the build
+# unless at least one listed arch is 89+ instead of instantiating templates
+# that cannot compile. The remaining kernels are still useful on sm_80+
+# (including sm_86).
+set(KERNEL_MODULES
+    "attn_decode|attention/decode.cu"
+    "attn_prefill|attention/prefill.cu"
+    "attn_paged_decode|attention/paged_decode.cu"
+    "attn_paged_prefill|attention/paged_prefill.cu"
+    "rotary_emb|rotary_emb.cu"
 )
 
-if(ASTRAI_CUDA_ARCH GREATER_EQUAL 89)
-    list(APPEND KERNEL_NAMES quantize)
-    list(APPEND KERNEL_SRCS quantize/quantize.cu)
-    list(APPEND KERNEL_NAMES gemm)
-    list(APPEND KERNEL_SRCS gemm/gemm.cu)
+if(ASTRAI_CUDA_ARCH_LIST)
+    if(ASTRAI_CUDA_ARCH_MAX GREATER_EQUAL 89)
+        list(APPEND KERNEL_MODULES
+            "quantize|quantize/quantize.cu"
+            "gemm|gemm/gemm.cu
+                  gemm/bindings.cu
+                  gemm/fp8_linear.cu
+                  gemm/gemm_bf16_bf16.cu
+                  gemm/gemm_bf16_int8.cu
+                  gemm/gemm_int8_int8.cu
+                  gemm/gemm_fp8_e4m3_fp8_e4m3.cu
+                  gemm/gemm_fp8_e5m2_fp8_e5m2.cu")
+    else()
+        message(WARNING
+            "FP8 operator disabled: max ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "
+            "requires compute capability 89 or newer")
+    endif()
 else()
-    message(WARNING
-        "FP8 operator disabled: ASTRAI_CUDA_ARCH=${ASTRAI_CUDA_ARCH} "
-        "requires compute capability 89 or newer")
+    # No arch: the registry stays empty and the loop below builds nothing.
+    # The loader discovers kernels by globbing the lib dir, so an install
+    # without .so files runs the pure-Python/torch paths.
+    set(KERNEL_MODULES "")
+    message(STATUS "ASTRAI_CUDA_ARCH is unset: no CUDA kernel targets are built")
 endif()
 
-list(LENGTH KERNEL_NAMES _kernel_count)
-math(EXPR _kernel_last "${_kernel_count} - 1")
-foreach(i RANGE ${_kernel_last})
-    list(GET KERNEL_NAMES ${i} name)
-    list(GET KERNEL_SRCS ${i} src)
-    add_library(${name} MODULE "${CMAKE_CURRENT_SOURCE_DIR}/kernels/${src}")
+foreach(entry IN LISTS KERNEL_MODULES)
+    string(REPLACE "|" ";" _parts "${entry}")
+    list(GET _parts 0 name)
+    list(REMOVE_AT _parts 0)
+    # Whitespace, not just spaces: the source list may wrap across lines.
+    separate_arguments(_srcs NATIVE_COMMAND "${_parts}")
+    list(TRANSFORM _srcs PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/kernels/")
+    add_library(${name} MODULE ${_srcs})
 
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
+
+    # Per-family arch lists: the fp8 mma cells static_assert below sm_89
+    # (MmaOp's kMinArch = 890), so the fp8 modules compile only the 89+
+    # subset of the requested arches — a compute_80 device pass would trip
+    # the assert at template instantiation. Every other family carries the
+    # full list (its oldest cell is sm_80). The 120a image below keys on
+    # the shared list, so it rides along whenever 120 is requested.
+    set(_target_arches "${ASTRAI_CUDA_ARCH_LIST}")
+    if(name STREQUAL "gemm" OR name STREQUAL "quantize")
+        set(_target_arches "")
+        foreach(a IN LISTS ASTRAI_CUDA_ARCH_LIST)
+            astrai_arch_number("${a}" _a_num)
+            if(_a_num GREATER_EQUAL 89)
+                list(APPEND _target_arches "${a}")
+            endif()
+        endforeach()
+    endif()
+    set_target_properties(${name} PROPERTIES
+        CUDA_ARCHITECTURES "${_target_arches}")
 
     target_include_directories(${name} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/kernels"
@@ -108,4 +196,18 @@ foreach(i RANGE ${_kernel_last})
         PREFIX ""
         SUFFIX ".${PY_SOABI}.so"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../astrai/extension/lib")
+
+    # The arch-specific pass is what activates the fp8 block_scale cell
+    # (MxMmaOp's family key), so listing the plain token on a consumer-
+    # Blackwell fleet silently loses the full-rate cell: warn at configure
+    # time instead (the route keys on the device's cc == 120, this gate on
+    # the compile token). CMake's own 'a' grammar (>= 3.24) emits the image
+    # when the list names it — no extra -gencode.
+    if(name STREQUAL "gemm" AND "120" IN_LIST _target_arches AND
+       NOT "120a" IN_LIST _target_arches)
+        message(WARNING
+            "gemm: ASTRAI_CUDA_ARCH lists 120 without 120a — the fp8 "
+            "block_scale cell is inactive and symmetric fp8 runs at half "
+            "rate on sm_120")
+    endif()
 endforeach()

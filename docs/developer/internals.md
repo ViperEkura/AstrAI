@@ -86,7 +86,12 @@ $$ L_{\text{GRPO}} = -\mathbb{E}_t\left[\min\left(\rho_t A,\; \text{clip}\left(\
 
 Where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the per-token importance sampling ratio. Online rollout records $\log \pi_{\text{old}}$ when each token is sampled and reuses those values directly during training; offline batches may fall back to a synchronized `old_model`. Advantages are derived from scalar per-response rewards, group-normalized, and broadcast across all response tokens. Only response tokens contribute to the loss.
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`.
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. Optional
+`clip_eps_low`/`clip_eps_high` values enable DAPO-style asymmetric clipping;
+unset values inherit `clip_eps` for backward-compatible symmetric clipping.
+The `loss_aggregation` switch selects token-level DAPO weighting or equal
+sequence weighting. Optional `overlong_max_len`/`overlong_buffer_len` settings
+add the DAPO linear soft-overlong penalty before group advantage normalization.
 
 ### MoE Load Balancing
 
@@ -187,8 +192,10 @@ Three-layer separation (SGLang-inspired):
 
 The extension package separates mechanism from policy:
 
-- `astrai/extension/ops/` contains stateless wrappers that invoke one exact compiled kernel and fail when it is unavailable.
-- `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O.
+- `astrai/extension/loader.py` discovers and lazily loads the compiled kernel modules (`.so` name = module name = pybind name).
+- `astrai/extension/ops/` contains stateless adapters — one file per compiled kernel module — that call their kernel directly and fail when it is unavailable.
+- `astrai/extension/backend/` owns capability checks, implementation selection, fallback, and KV cache I/O (`dispatch.py` is the family-agnostic selection core it registers into).
+- `astrai/extension/quantize.py` holds every quantization scheme (int8 strategies, fp8 recipes and autocast); its `aten::linear` override installs lazily on the first fp8 activation, so plain imports stay dispatcher-neutral.
 - Model and inference code use the stable `astrai.extension` API instead of selecting ops directly.
 
 Attention computation is decoupled from the model via `AttentionBackend` ABC (`astrai/extension/backend/attention.py`):

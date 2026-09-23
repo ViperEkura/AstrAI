@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
+from astrai.bench import causal_sequence_logits
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
@@ -36,44 +37,41 @@ def _load_items(filepath: str) -> List[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def _encode_batch(
+def _encode_rows(
     tokenizer: AutoTokenizer, texts: List[str], max_length: int
-) -> Tuple[List[List[int]], List[List[int]]]:
-    """Encode *texts* and return (token_ids, attention_masks).
+) -> List[List[int]]:
+    """Tokenize *texts*, truncating each to *max_length* tokens.
 
-    Each sequence is left-aligned and padded to the batch max length.
+    Rows stay ragged: padding and the attention mask belong to the shared
+    scorer (``astrai.bench.causal_sequence_logits``), which is the only
+    place that is allowed to build one.
     """
-    encoded = [tokenizer.encode(t)[:max_length] for t in texts]
-    if not encoded:
-        return [], []
-    max_len = max(len(seq) for seq in encoded)
-    padded_ids = []
-    masks = []
-    for seq in encoded:
-        pad_len = max_len - len(seq)
-        padded_ids.append(seq + [tokenizer.pad_id] * pad_len)
-        masks.append([1] * len(seq) + [0] * pad_len)
-    return padded_ids, masks
+    return [tokenizer.encode(t)[:max_length] for t in texts]
 
 
 def _compute_batch(
     model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    rows: List[List[int]],
+    device: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass and return (log_probs, valid_mask) of shape [B, S-1].
 
     log_probs[i, j] = log P(token j+1 | tokens 0..j)
     """
-    output = model(input_ids, input_mask=attention_mask)
-    logits = output["logits"][:, :-1, :]  # [B, S-1, V]
-    targets = input_ids[:, 1:]  # [B, S-1]
-    valid = attention_mask[:, 1:].float()  # [B, S-1]
+    logits, valid = causal_sequence_logits(model, rows, device)
+    batch, seq_len = valid.shape
 
-    log_probs = F.log_softmax(logits.float(), dim=-1)  # [B, S-1, V]
-    token_log_probs = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)  # [B, S-1]
+    targets = torch.zeros(batch, seq_len - 1, dtype=torch.long, device=device)
+    for i, row in enumerate(rows):
+        if len(row) > 1:
+            targets[i, : len(row) - 1] = torch.tensor(
+                row[1:], dtype=torch.long, device=device
+            )
 
-    return token_log_probs, valid
+    log_probs = F.log_softmax(logits[:, :-1].float(), dim=-1)  # [B, S-1, V]
+    token_log_probs = log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1).cpu()
+
+    return token_log_probs, valid[:, 1:].float().cpu()
 
 
 def _token_type(token_id: int, stop_ids: frozenset, decode_fn) -> str:
@@ -251,12 +249,9 @@ def process_file(
         leave=False,
     ):
         batch_texts = texts[i : i + batch_size]
-        padded_ids, masks = _encode_batch(tokenizer, batch_texts, max_length)
+        padded_ids = _encode_rows(tokenizer, batch_texts, max_length)
 
-        input_ids = torch.tensor(padded_ids, device=device, dtype=torch.long)
-        attention_mask = torch.tensor(masks, device=device, dtype=torch.bool)
-
-        token_log_probs, valid = _compute_batch(model, input_ids, attention_mask)
+        token_log_probs, valid = _compute_batch(model, padded_ids, device)
 
         for b in range(len(batch_texts)):
             seq_len = int(valid[b].sum().item())

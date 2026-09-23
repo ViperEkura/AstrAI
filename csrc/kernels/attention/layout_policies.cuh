@@ -24,7 +24,6 @@
 
 #define HOST_FORCEINLINE static __host__ __forceinline__
 #define DEVICE_FORCEINLINE static __device__ __forceinline__
-#define HOST_DEV_FORCEINLINE static __host__ __device__ __forceinline__
 
 namespace astrai {
 namespace attention {
@@ -287,6 +286,23 @@ struct PagedKV {
         return kv_addr_from_token(p, c, token, d);
     }
 };
+
+// Scalar K/V tile fill shared by the non-MMA kernels: copies one chunk into
+// linear (unswizzled) shared memory, zero-filling invalid slots.  AddrFn
+// maps (kc, d) -> KVAddr; tid/stride carry the caller's thread mapping.
+template <typename AddrFn>
+DEVICE_FORCEINLINE void fill_kv_smem(
+    bf16* k_smem, bf16* v_smem, int elems, int head_dim,
+    int kv_base, int tid, int stride, const AddrFn& addr)
+{
+    for (int i = tid; i < elems; i += stride) {
+        int s = i / head_dim;
+        int d = i % head_dim;
+        KVAddr a = addr(kv_base + s, d);
+        k_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.k) : (bf16)0.f;
+        v_smem[i] = a.valid ? *reinterpret_cast<const bf16*>(a.v) : (bf16)0.f;
+    }
+}
 
 }  // namespace attention
 }  // namespace astrai

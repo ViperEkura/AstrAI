@@ -188,6 +188,93 @@ class InferenceEngine:
             rep_window,
         )
 
+    def score(
+        self,
+        prompt: Union[str, List[int], List[Union[str, List[int]]]],
+        continuation: Union[str, List[int], List[Union[str, List[int]]]],
+        per_token: bool = False,
+    ) -> Union[float, None, List[Any]]:
+        """Teacher-forced log-probability of ``continuation`` given ``prompt``.
+
+        The engine's entry point for log-likelihood metrics.  Nothing is
+        sampled: the sequence is prefilled as ``prompt + continuation`` and
+        only the continuation's own tokens are scored, projected at exactly
+        the positions that predict them.  Callers therefore never build an
+        attention mask -- a 2-D one used to switch causality off here.
+
+        Strings are tokenized the way the eval scripts tokenize a scored pair:
+        the prompt keeps its special tokens, the continuation does not.  Pass
+        token ids to control the boundary exactly (tokenizing a pair jointly
+        can differ from tokenizing the two sides).
+
+        Args:
+            prompt: one context, or a list of contexts.
+            continuation: the matching continuation(s).
+            per_token: return per-token log-probabilities instead of the sum.
+
+        Returns:
+            A ``float`` for a single pair, or a list for a batch.  ``None``
+            marks a pair that cannot be scored (empty side, or the sequence
+            reaching the engine's ``max_seq_len``).
+
+        Note:
+            Synchronous and not re-entrant: like :meth:`InferenceScheduler.
+            generate` it drives the executor on the calling thread, so do not
+            overlap it with generation on the same engine.
+        """
+
+        # A list of ints is one prompt given as token ids; a list of strings or
+        # of id-lists is a batch.
+        def _is_batch(side) -> bool:
+            return isinstance(side, list) and (
+                not side or isinstance(side[0], (str, list))
+            )
+
+        is_batch = _is_batch(prompt)
+        if is_batch != _is_batch(continuation):
+            raise ValueError(
+                "prompt and continuation must both be single or both batches"
+            )
+        if is_batch and len(prompt) != len(continuation):
+            raise ValueError("prompt and continuation batches must have equal length")
+        if not is_batch:
+            prompt, continuation = [prompt], [continuation]
+
+        def _encode(side: str, **kwargs) -> List[int]:
+            out = self.tokenizer.encode(side, **kwargs)
+            # Tokenizers in this repo return a flat list for a bare string;
+            # accept the batched shape too rather than depending on that.
+            if out and isinstance(out[0], list):
+                out = out[0]
+            return list(out)
+
+        def _ids(side) -> List[int]:
+            return _encode(side) if isinstance(side, str) else list(side)
+
+        def _cont_ids(side) -> List[int]:
+            return (
+                _encode(side, add_special_tokens=False)
+                if isinstance(side, str)
+                else list(side)
+            )
+
+        prompts = [_ids(p) for p in prompt]
+        conts = [_cont_ids(c) for c in continuation]
+
+        # The executor holds max_batch_size worth of fixed-shape buffers, so
+        # split a long batch here rather than failing deep in the executor.
+        chunk = max(1, self.scheduler._task_mgr.max_batch_size)
+        results: List[Any] = []
+        for start in range(0, len(prompts), chunk):
+            results.extend(
+                self.scheduler.score_ids(
+                    prompts[start : start + chunk],
+                    conts[start : start + chunk],
+                    per_token=per_token,
+                )
+            )
+        return results if is_batch else results[0]
+
     def generate_async(
         self,
         prompt: str,

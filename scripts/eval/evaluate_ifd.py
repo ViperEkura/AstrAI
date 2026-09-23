@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
+from astrai.bench import causal_sequence_logits
 from astrai.model import AutoModel
 from astrai.preprocessing.packing import plan_bfd
 from astrai.tokenize import AutoTokenizer
@@ -131,18 +132,13 @@ def _score_batch(
             doc_ids.extend([di] * item_len)
             doc_offsets.append((start, end, orig_idx, ctx_len))
 
-        full_ids = torch.tensor([seq_ids], device=device, dtype=torch.long)
-        pos_ids = torch.tensor([global_pos], device=device, dtype=torch.long)
-        seq_len = len(seq_ids)
-        causal = torch.tril(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
-        )
-        doc_t = torch.tensor([doc_ids], device=device)
-        doc_mask = doc_t.unsqueeze(-1) == doc_t.unsqueeze(-2)
-        attn_mask = (causal & doc_mask[0]).unsqueeze(0).unsqueeze(0)
-        logits_full = model(full_ids, position_ids=pos_ids, input_mask=attn_mask)[
-            "logits"
-        ][0]
+        logits_full = causal_sequence_logits(
+            model,
+            [seq_ids],
+            device,
+            position_ids=[global_pos],
+            group_ids=[doc_ids],
+        )[0][0]
 
         for start, end, orig_idx, ctx_len in doc_offsets:
             rl = end - start - ctx_len
@@ -177,21 +173,17 @@ def _score_batch(
 
     valid_items.sort(key=lambda x: -x[1])
     prefix_len = len(sentinel_ids)
-    max_rl = prefix_len + max(rl for _, rl, _, _, _ in valid_items)
-    bsz = len(valid_items)
 
-    u_batch = torch.zeros(bsz, max_rl, dtype=torch.long, device=device)
-    for ri, (_, rl, _, _, r_ids) in enumerate(valid_items):
-        u_batch[ri, :prefix_len] = torch.tensor(sentinel_ids, dtype=torch.long)
-        u_batch[ri, prefix_len : prefix_len + rl] = torch.tensor(
-            r_ids, dtype=torch.long
-        )
-
-    logits_resp = model(u_batch)["logits"]
+    u_rows = [list(sentinel_ids) + list(r_ids) for _, _, _, _, r_ids in valid_items]
+    u_targets = [
+        torch.tensor(list(sentinel_ids) + list(r_ids), dtype=torch.long, device=device)
+        for _, _, _, _, r_ids in valid_items
+    ]
+    logits_resp, _ = causal_sequence_logits(model, u_rows, device)
 
     for ri, (orig_idx, rl, ctx_len, cond_losses, _) in enumerate(valid_items):
         unp_logits = logits_resp[ri, prefix_len - 1 : prefix_len - 1 + rl]
-        unp_targets = u_batch[ri, prefix_len : prefix_len + rl]
+        unp_targets = u_targets[ri][prefix_len : prefix_len + rl]
         uncond_losses = F.cross_entropy(unp_logits, unp_targets, reduction="none").cpu()
 
         L_cond = cond_losses.mean().item()
@@ -469,7 +461,8 @@ def main():
         help="Maximum number of samples per file (random subsample). Default: all.",
     )
     parser.add_argument(
-        "--append_eos/--no-append_eos",
+        "--append_eos",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Append EOS token at the end of response in both passes (default: enabled).",
     )

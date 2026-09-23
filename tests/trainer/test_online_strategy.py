@@ -68,10 +68,10 @@ class _RecordingRunner:
         return policy_version
 
     def apply_weight_update(self, policy_version, update):
-        result = update()
         if policy_version is None:
             # Mirror the scheduler: None derives live+1 under the lock.
             policy_version = self.policy_version + 1
+        result = update(policy_version)
         self.update_weights(policy_version)
         return result
 
@@ -354,6 +354,58 @@ def test_optimizer_step_publishes_version_with_weight_update(device):
     assert not torch.equal(parameter, before)
     assert runner.weight_updates == [1]
     assert runner.step_calls == 1
+
+
+class _RecordingPublisher:
+    """WeightPublisher double: records (version, source model) per publish."""
+
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    def publish(self, policy_version, source):
+        self.calls.append((policy_version, source))
+        if self.error is not None:
+            raise self.error
+
+
+def test_optimizer_step_publishes_to_weight_publishers(device):
+    strat = _make_grpo(device)
+    runner = _RecordingRunner(_make_rollout_result(device=device))
+    strat.set_rollout_runner(runner)
+    publisher = _RecordingPublisher()
+    strat.set_weight_publishers([publisher])
+    parameter = next(strat.model.parameters())
+    parameter.grad = torch.ones_like(parameter)
+    optimizer = torch.optim.SGD(strat.model.parameters(), lr=0.1)
+    before = parameter.detach().clone()
+
+    strat.optimizer_step(optimizer)
+
+    # Publish runs after the optimizer step (fresh weights visible) and
+    # receives the derived target version plus the strategy's model.
+    assert not torch.equal(parameter, before)
+    assert publisher.calls == [(1, strat.model)]
+    assert runner.weight_updates == [1]
+
+
+def test_weight_publisher_failure_prevents_version_commit(device):
+    strat = _make_grpo(device)
+    runner = _RecordingRunner(_make_rollout_result(device=device))
+    strat.set_rollout_runner(runner)
+    publisher = _RecordingPublisher(error=RuntimeError("publish failed"))
+    strat.set_weight_publishers([publisher])
+    parameter = next(strat.model.parameters())
+    parameter.grad = torch.ones_like(parameter)
+    optimizer = torch.optim.SGD(strat.model.parameters(), lr=0.1)
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        strat.optimizer_step(optimizer)
+
+    # The update callable raised inside the lock, so no version was
+    # published and the replay-cadence counter never advanced.
+    assert runner.weight_updates == []
+    assert runner.step_calls == 0
 
 
 def test_loss_is_differentiable_dpo(device):

@@ -12,7 +12,8 @@ from astrai.config import TrainConfig
 from astrai.model.transformer import AutoRegressiveLM
 from astrai.model.value import ValueModel
 from astrai.serialization import Checkpoint
-from astrai.trainer.rollout import BaseRewardModel
+from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
+from astrai.trainer.rollout import BaseRewardModel, RolloutEvaluator
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.train_callback import CheckpointCallback
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
@@ -189,6 +190,93 @@ def test_builder_resumes_critic_from_checkpoint(device, temp_dir, monkeypatch):
         saved_critic.state_dict()["value_head.weight"],
     )
     assert context.strategy.policy_version == 3
+
+
+def test_builder_wires_val_evaluator_with_inherited_params(
+    device, temp_dir, monkeypatch
+):
+    """The rollout wiring builds a val evaluator whose SamplingParams
+    inherit every unset field from the training rollout."""
+    monkeypatch.setenv("LOCAL_DEVICE", device)
+    build_test_tokenizer(vocab_size=200).save_pretrained(temp_dir)
+
+    cfg = _ppo_config(
+        device,
+        model_fn=lambda: AutoRegressiveLM(make_rollout_config()),
+        ckpt_dir=os.path.join(temp_dir, "ckpt"),
+        rollout_val_temperature=0.0,
+        rollout_val_group_size=1,
+    )
+    context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
+
+    assert isinstance(context.val_evaluator, RolloutEvaluator)
+    assert context.val_evaluator.params.temperature == 0.0
+    assert context.val_evaluator.params.group_size == 1
+    assert context.val_evaluator.params.max_tokens == cfg.rollout_max_tokens
+    assert context.val_evaluator.params.top_p == cfg.rollout_top_p
+
+    # Training-side defaults are untouched by the val overrides.
+    runner = context.strategy._rollout_runner
+    assert runner.generator.params.group_size == 2  # from strategy_kwargs
+    assert runner.generator.params.temperature == cfg.rollout_temperature
+    # The evaluator shares the training generator (same scheduler) until
+    # a dedicated val backend is configured.
+    assert context.val_evaluator.generator is runner.generator
+
+
+def test_builder_wires_val_replica_and_publisher(device, temp_dir, monkeypatch):
+    """rollout_val_device builds a dedicated replica backend for the val
+    evaluator and registers a P2PCopyPublisher on the strategy."""
+    monkeypatch.setenv("LOCAL_DEVICE", device)
+    build_test_tokenizer(vocab_size=200).save_pretrained(temp_dir)
+
+    cfg = _ppo_config(
+        device,
+        model_fn=lambda: AutoRegressiveLM(make_rollout_config()),
+        ckpt_dir=os.path.join(temp_dir, "ckpt"),
+        rollout_val_device=device,
+    )
+    context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
+
+    train_generator = context.strategy._rollout_runner.generator
+    assert isinstance(train_generator.backend, ColocatedBackend)
+    assert isinstance(context.val_evaluator.generator.backend, ReplicaBackend)
+    assert context.val_evaluator.generator is not train_generator
+
+    publishers = context.strategy._weight_publishers
+    assert len(publishers) == 1
+    assert isinstance(publishers[0], P2PCopyPublisher)
+    # The val replica started at the trainer's live policy version.
+    assert (
+        context.val_evaluator.generator.backend.policy_version
+        == train_generator.backend.policy_version
+    )
+
+
+def test_builder_right_sizes_rollout_pool(device, temp_dir, monkeypatch):
+    """rollout_pool_seq_len clamps the scheduler's KV budget below the
+    model's context window (min semantics; None keeps the default)."""
+    monkeypatch.setenv("LOCAL_DEVICE", device)
+    build_test_tokenizer(vocab_size=200).save_pretrained(temp_dir)
+
+    cfg = _ppo_config(
+        device,
+        model_fn=lambda: AutoRegressiveLM(make_rollout_config()),
+        ckpt_dir=os.path.join(temp_dir, "ckpt"),
+        rollout_pool_seq_len=32,
+    )
+    context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
+    scheduler = context.strategy._rollout_runner.generator.backend.scheduler
+    assert scheduler.max_seq_len == 32
+
+    cfg = _ppo_config(
+        device,
+        model_fn=lambda: AutoRegressiveLM(make_rollout_config()),
+        ckpt_dir=os.path.join(temp_dir, "ckpt2"),
+    )
+    context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
+    scheduler = context.strategy._rollout_runner.generator.backend.scheduler
+    assert scheduler.max_seq_len == make_rollout_config().max_position_embeddings
 
 
 def test_save_extra_persists_critic_state(device):

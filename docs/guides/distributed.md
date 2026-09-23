@@ -94,6 +94,7 @@ Context parallelism (`--cp_size`) shards the **sequence** dimension across a gro
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
+#   set_op("attention", "torch_native") before the run (or ASTR_BACKEND=torch)
 ASTR_BACKEND=torch python scripts/tools/train.py \
     --train_type=seq \
     --param_path ./params \
@@ -109,7 +110,7 @@ ASTR_BACKEND=torch python scripts/tools/train.py \
 How it works:
 
 - The world decomposes as `dp × cp × tp` (`astrai/parallel/topology.py`); cp requires `tp_size == 1` for now. Ranks in one cp group consume the **same** batches — the data sampler shards over dp groups only — and each rank holds a contiguous slice of every sequence.
-- All per-token computation (norms, projections, MLP, RoPE) runs locally on plain tensors. Only attention crosses ranks: the training forward routes through torch SDPA, which `torch.distributed.tensor.experimental.context_parallel` replaces with ring attention inside the loss computation (`astrai/parallel/cp.py`). The custom CUDA attention kernels and FlashAttention do not participate and CP fails loudly if they are active — set `ASTR_BACKEND=torch`.
+- All per-token computation (norms, projections, MLP, RoPE) runs locally on plain tensors. Only attention crosses ranks: the training forward routes through torch SDPA, which `torch.distributed.tensor.experimental.context_parallel` replaces with ring attention inside the loss computation (`astrai/parallel/cp.py`). The custom CUDA attention kernels and FlashAttention do not participate and CP fails loudly if they are active — `set_op("attention", "torch_native")`.
 - Strategies stay CP-oblivious: seq/sft implement the token-mean two-phase protocol (`forward_tokens` + `reduce_loss` in `BaseStrategy`), and `CPStrategy` decorates them — it shards the batch buffers between the phases and rescales the local reduction to the global mean (`CPState.mean_loss`: the true mean for logging, the cp-scaled loss for backward so DDP/FSDP's averaged gradient reduce reproduces the single-device gradient).
 - Weights, optimizer state, and checkpoints are untouched — CP shards activations only.
 

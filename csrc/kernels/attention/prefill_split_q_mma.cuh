@@ -95,22 +95,11 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
 
     // ---- Load tile lambda: predicated cp.async (addressing via KV policy) ----
     auto load_tile = [&](int ti, int buf) {
-        int kv0 = ti * Traits::BC;
-        bf16* dK = sK + buf * Traits::BC * Traits::LD;
-        bf16* dV = sV + buf * Traits::BC * Traits::LD;
-        #pragma unroll
-        for (int i = threadIdx.x * Traits::VEC; i < Traits::TOTAL;
-             i += Traits::NUM_THREADS * Traits::VEC) {
-            int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
-            int kc = kv0 + r;
-            bool valid = kc < seq_len;
-            int token = KV::resolve_token(p, kctx, kc, valid);
-            KVAddr a = KV::kv_addr_from_token(p, kctx, token, d);
-            int off = r * Traits::LD + swiz_col(d, r, Traits::SWIZ_MASK);
-            astrai::cp_async_16(&dK[off], a.k, a.valid);
-            astrai::cp_async_16(&dV[off], a.v, a.valid);
-        }
-        astrai::cp_async_commit_group();
+        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len,
+            [&](int kc, int d, bool valid) {
+                int token = KV::resolve_token(p, kctx, kc, valid);
+                return KV::kv_addr_from_token(p, kctx, token, d);
+            });
     };
 
     // ---- Prologue: issue first tile load ----
@@ -132,13 +121,7 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
         if (!IsCausal || kv0 <= max_kv) {
 
             float Sacc[Traits::NC8][4];
-            mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
-
-            // Post-multiply scale in float (no bf16 precision loss)
-            #pragma unroll
-            for (int n8 = 0; n8 < Traits::NC8; n8++)
-                Sacc[n8][0] *= p.scale, Sacc[n8][1] *= p.scale,
-                Sacc[n8][2] *= p.scale, Sacc[n8][3] *= p.scale;
+            mma_compute_scores<Traits>(Qa, bK, p.scale, lane, Sacc);
 
             int maxc0 = IsCausal ? min(seq_len, causal_off + qr0 + 1)
                                  : seq_len;

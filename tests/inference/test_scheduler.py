@@ -544,7 +544,7 @@ def test_scheduler_applies_weight_mutation_and_version_atomically(device):
     scheduler, _tok, model = _make_real_scheduler(device)
     before = next(model.parameters()).detach().clone()
 
-    def mutate():
+    def mutate(policy_version):
         with torch.no_grad():
             next(model.parameters()).add_(1)
         return "updated"
@@ -556,7 +556,7 @@ def test_scheduler_applies_weight_mutation_and_version_atomically(device):
         with pytest.raises(ValueError, match="must advance"):
             scheduler.apply_weight_update(1, mutate)
 
-        def failed_mutation():
+        def failed_mutation(policy_version):
             raise RuntimeError("optimizer failed")
 
         with pytest.raises(RuntimeError, match="optimizer failed"):
@@ -564,9 +564,17 @@ def test_scheduler_applies_weight_mutation_and_version_atomically(device):
         assert scheduler.policy_version == 1
 
         # None derives live+1 under the lock: no read-compute-write race
-        # on the current version for advance-by-one callers.
-        assert scheduler.apply_weight_update(None, mutate) == "updated"
+        # on the current version for advance-by-one callers. The derived
+        # target version is handed to the update callable.
+        seen_versions = []
+
+        def record(policy_version):
+            seen_versions.append(policy_version)
+            return "updated"
+
+        assert scheduler.apply_weight_update(None, record) == "updated"
         assert scheduler.policy_version == 2
+        assert seen_versions == [2]
     finally:
         scheduler.stop()
 
@@ -585,8 +593,8 @@ def test_scheduler_atomic_advance_survives_interleaved_publish(device):
         scheduler.update_weights(1)
         assert stale_read == 1  # now equals live -> explicit form would raise
         with pytest.raises(ValueError, match="must advance"):
-            scheduler.apply_weight_update(stale_read, lambda: "ok")
-        assert scheduler.apply_weight_update(None, lambda: "ok") == "ok"
+            scheduler.apply_weight_update(stale_read, lambda _version: "ok")
+        assert scheduler.apply_weight_update(None, lambda _version: "ok") == "ok"
         assert scheduler.policy_version == 2
     finally:
         scheduler.stop()

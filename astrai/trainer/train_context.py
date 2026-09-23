@@ -1,11 +1,12 @@
 import logging
 import threading
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Self
+from typing import Any, Optional, Self
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.utils.data import DataLoader, random_split
 
 from astrai.config.model_config import ConfigFactory
@@ -32,8 +33,19 @@ from astrai.serialization import (
     looks_like_hf_state_dict,
 )
 from astrai.tokenize import AutoTokenizer
+from astrai.trainer.backend import (
+    ColocatedBackend,
+    P2PCopyPublisher,
+    ReplicaBackend,
+)
 from astrai.trainer.metric_util import GradSNRTracker
-from astrai.trainer.rollout import RolloutGenerator, RolloutRunner
+from astrai.trainer.optional_extras import restore_checkpoint_extras
+from astrai.trainer.rollout import (
+    RolloutEvaluator,
+    RolloutGenerator,
+    RolloutRunner,
+    SamplingParams,
+)
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 
 logger = logging.getLogger(__name__)
@@ -53,17 +65,20 @@ class TrainContext:
     epoch: int = field(default=0)
     consumed_samples: int = field(default=0)
     loss: float = field(default=0.0)
-    metrics: Dict[str, float] = field(default_factory=dict)
-    grad_norm: Optional[float] = field(default=None)
+    metrics: dict[str, float] = field(default_factory=dict)
+    grad_norm: float | None = field(default=None)
     grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
-    val_dataloader: Optional[DataLoader] = field(default=None)
-    val_loss: Optional[float] = field(default=None)
+    val_dataloader: DataLoader | None = field(default=None)
+    val_loss: float | None = field(default=None)
+    #: Online-strategy validation: reward-statistics evaluator under its
+    #: own sampling params. ``None`` keeps the legacy validate_online path.
+    val_evaluator: Optional["RolloutEvaluator"] = field(default=None)
 
     world_size: int = field(default=1)
     rank: int = field(default=0)
-    topology: Optional[ParallelTopology] = field(default=None)
-    kwargs: Dict[str, Any] = field(default_factory=dict)
-    param_path: Optional[str] = field(default=None)
+    topology: ParallelTopology | None = field(default=None)
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    param_path: str | None = field(default=None)
 
     _stop_event: threading.Event = field(default_factory=threading.Event)
 
@@ -101,19 +116,19 @@ class TrainContext:
 @dataclass
 class _PreloadedState:
     model_config: dict = field(default_factory=dict)
-    state_dict: Optional[dict] = None
+    state_dict: dict | None = None
     epoch: int = 0
     consumed_samples: int = 0
-    checkpoint: Optional[Checkpoint] = None
+    checkpoint: Checkpoint | None = None
 
 
 def create_ref_model(
     model_fn: Callable[[], nn.Module],
-    executor: Optional[BaseExecutor] = None,
-    model: Optional[nn.Module] = None,
-    state_dict: Optional[Dict[str, torch.Tensor]] = None,
-    device: Optional[str] = None,
-) -> Optional[nn.Module]:
+    executor: BaseExecutor | None = None,
+    model: nn.Module | None = None,
+    state_dict: dict[str, torch.Tensor] | None = None,
+    device: str | None = None,
+) -> nn.Module | None:
     """Create a frozen reference model from executor or state dict.
 
     Training-domain helper for the DPO/GRPO reference and old policies: it
@@ -151,11 +166,11 @@ class TrainContextBuilder:
         config: TrainConfig,
     ):
         self.config = config
-        self._param_path: Optional[str] = None
+        self._param_path: str | None = None
         self._resume: bool = False
-        self._topology: Optional[ParallelTopology] = None
+        self._topology: ParallelTopology | None = None
 
-    def with_param_path(self, param_path: Optional[str], resume: bool = False) -> Self:
+    def with_param_path(self, param_path: str | None, resume: bool = False) -> Self:
         self._param_path = param_path
         self._resume = resume
         return self
@@ -387,6 +402,7 @@ class TrainContextBuilder:
                     getattr(context, name).load_state_dict(
                         context.checkpoint.extra[name]
                     )
+            restore_checkpoint_extras(context.checkpoint.extra)
 
     def _create_strategy(self, context: TrainContext, executor: BaseExecutor) -> dict:
         cfg = self.config
@@ -541,31 +557,125 @@ class TrainContextBuilder:
             )
         tokenizer = AutoTokenizer.from_pretrained(self._param_path)
         group_size = strategy_kwargs.get("group_size", 1)
-        scheduler = InferenceScheduler(
-            model=context.model,
-            tokenizer=tokenizer,
-            max_batch_size=group_size * max(1, cfg.batch_per_device),
-            max_seq_len=getattr(context.model.config, "max_position_embeddings", None),
-            policy_version=(
-                context.checkpoint.meta.get("policy_version", context.optimizer_step)
-                if context.checkpoint is not None
-                else context.optimizer_step
-            ),
+        policy_version = (
+            context.checkpoint.meta.get("policy_version", context.optimizer_step)
+            if context.checkpoint is not None
+            else context.optimizer_step
         )
+        max_seq_len = getattr(context.model.config, "max_position_embeddings", None)
+        if cfg.rollout_pool_seq_len is not None:
+            # Right-size the KV pool: the default is the model's full
+            # context window, but a rollout never needs more than prompt +
+            # rollout_max_tokens — the difference is GBs of idle pool
+            # (see TrainConfig.rollout_pool_seq_len for the formula).
+            max_seq_len = (
+                min(max_seq_len, cfg.rollout_pool_seq_len)
+                if max_seq_len is not None
+                else cfg.rollout_pool_seq_len
+            )
+        train_device = next(context.model.parameters()).device
+
+        def _resolve_device(name: str, value: str | None) -> str | None:
+            if value is None:
+                return None
+            if value.startswith("cuda"):
+                count = torch.cuda.device_count()
+                if count == 0:
+                    raise ValueError(
+                        f"{name}={value!r} but no CUDA device is available"
+                    )
+                if ":" in value and int(value.split(":", 1)[1]) >= count:
+                    raise ValueError(
+                        f"{name}={value!r} exceeds available CUDA devices ({count})"
+                    )
+            return value
+
+        rollout_device = _resolve_device("rollout_device", cfg.rollout_device)
+        val_device = _resolve_device("rollout_val_device", cfg.rollout_val_device)
+
+        def _colocated(max_batch_size: int) -> ColocatedBackend:
+            return ColocatedBackend(
+                InferenceScheduler(
+                    model=context.model,
+                    tokenizer=tokenizer,
+                    max_batch_size=max_batch_size,
+                    max_seq_len=max_seq_len,
+                    policy_version=policy_version,
+                )
+            )
+
+        def _replica(device: str, max_batch_size: int) -> ReplicaBackend:
+            model = create_ref_model(
+                model_fn=cfg.model_fn,
+                executor=context.executor,
+                model=context.model,
+                device=device,
+            )
+            if model is None:
+                raise RuntimeError(f"cannot build rollout replica on {device!r}")
+            # Match the training dtype so the replica's sampling space
+            # agrees with the training-side logprob recomputation.
+            model.to(dtype=next(context.model.parameters()).dtype)
+            return ReplicaBackend(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                max_batch_size=max_batch_size,
+                max_seq_len=max_seq_len,
+                policy_version=policy_version,
+            )
+
+        batch_capacity = group_size * max(1, cfg.batch_per_device)
+        publishers: list = []
+        if rollout_device is None:
+            train_backend = _colocated(batch_capacity)
+        else:
+            train_backend = _replica(rollout_device, batch_capacity)
+            publishers.append(P2PCopyPublisher(train_backend))
+
         generator = RolloutGenerator(
-            scheduler=scheduler,
+            backend=train_backend,
             tokenizer=tokenizer,
-            max_tokens=cfg.rollout_max_tokens,
-            group_size=group_size,
-            temperature=cfg.rollout_temperature,
-            top_k=cfg.rollout_top_k,
-            top_p=cfg.rollout_top_p,
+            params=SamplingParams(
+                max_tokens=cfg.rollout_max_tokens,
+                group_size=group_size,
+                temperature=cfg.rollout_temperature,
+                top_k=cfg.rollout_top_k,
+                top_p=cfg.rollout_top_p,
+            ),
+            output_device=train_device,
         )
+        reward_model = cfg.reward_model_fn()
         context.strategy.set_rollout_runner(
             RolloutRunner(
                 generator=generator,
-                reward_model=cfg.reward_model_fn(),
+                reward_model=reward_model,
                 rollout_interval=cfg.rollout_interval,
                 max_policy_lag=cfg.rollout_max_policy_lag,
             )
         )
+        # Validation rolls out under its own sampling params (e.g. greedy
+        # decode, val-specific group size), inheriting every unset field
+        # from the training rollout; with rollout_val_device set it runs
+        # on a dedicated replica instead of the training backend.
+        val_params = replace(generator.params, **cfg.rollout_val_overrides())
+        if val_device is None:
+            val_generator = generator
+        else:
+            val_backend = _replica(
+                val_device, val_params.group_size * max(1, cfg.batch_per_device)
+            )
+            publishers.append(P2PCopyPublisher(val_backend))
+            val_generator = RolloutGenerator(
+                backend=val_backend,
+                tokenizer=tokenizer,
+                params=val_params,
+                output_device=train_device,
+            )
+        context.val_evaluator = RolloutEvaluator(
+            generator=val_generator,
+            reward_model=reward_model,
+            params=val_params,
+        )
+        if publishers:
+            context.strategy.set_weight_publishers(publishers)

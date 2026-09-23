@@ -2,7 +2,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 from torch import Tensor
@@ -377,6 +377,92 @@ class Executor:
 
         step_out, _ = self._sample_logits(logits, tasks, return_logprobs)
         return tasks, step_out
+
+    def execute_score(
+        self,
+        tasks: List[Task],
+        per_token: bool = False,
+    ) -> List[Any]:
+        """Teacher-forced log-probabilities for a batch of prompts.
+
+        Each task's ``prompt_ids`` is the *whole* scored sequence
+        (context + continuation); ``task.cont_len`` says how many trailing
+        tokens of it are the continuation to score.  The model is projected
+        only at the positions that predict those tokens (``logits_positions``),
+        so nothing is sampled and the softmax runs over ``sum(cont_len)`` rows
+        rather than over the whole batch.
+
+        Returns per task either the summed log-probability of its continuation
+        or, with ``per_token=True``, the list of per-token log-probabilities.
+        """
+        if not tasks:
+            return []
+        batch_sz = len(tasks)
+        if batch_sz > self._workspace.max_batch_size:
+            raise ValueError(
+                f"Batch size {batch_sz} exceeds max_batch_size "
+                f"{self._workspace.max_batch_size}"
+            )
+
+        prompt_lens = [len(t.prompt_ids) for t in tasks]
+        cont_lens = [t.cont_len for t in tasks]
+        if any(c <= 0 for c in cont_lens):
+            raise ValueError("every scored task needs a non-empty continuation")
+        if any(c >= p for c, p in zip(cont_lens, prompt_lens)):
+            raise ValueError("continuation must be shorter than the scored sequence")
+
+        offsets = torch.tensor(prompt_lens, dtype=torch.long).cumsum(0) - torch.tensor(
+            prompt_lens, dtype=torch.long
+        )
+        # Position p predicts the token at p+1, so a continuation occupying
+        # logical positions [P-C, P) is read from logits at [P-C-1, P-1).
+        positions: List[int] = []
+        flat_targets: List[int] = []
+        for offset, prompt_len, cont_len, task in zip(
+            offsets.tolist(), prompt_lens, cont_lens, tasks
+        ):
+            start = offset + prompt_len - cont_len - 1
+            positions.extend(range(start, start + cont_len))
+            flat_targets.extend(task.prompt_ids[-cont_len:])
+
+        logits_positions = torch.tensor(positions, dtype=torch.long, device=self.device)
+        input_ids = torch.tensor(
+            [token for t in tasks for token in t.prompt_ids],
+            dtype=torch.long,
+            device=self.device,
+        )
+        position_ids = torch.cat(
+            [
+                torch.arange(prompt_len, dtype=torch.long, device=self.device)
+                for prompt_len in prompt_lens
+            ]
+        )
+        task_ids = [t.task_id for t in tasks]
+
+        with torch.inference_mode():
+            outputs = self.model(
+                input_ids,
+                position_ids=position_ids,
+                kv_cache=self.task_cache.bind(task_ids, self._workspace, start_pos=0),
+                fwd="prefill",
+                logits_positions=logits_positions,
+            )
+            logits = outputs["logits"]
+
+        tgt = torch.tensor(flat_targets, dtype=torch.long, device=self.device)
+        logprobs = (
+            torch.nn.functional.log_softmax(logits.float(), dim=-1)
+            .gather(1, tgt.unsqueeze(-1))
+            .squeeze(-1)
+        )
+
+        out: List[Any] = []
+        cursor = 0
+        for cont_len in cont_lens:
+            chunk = logprobs[cursor : cursor + cont_len].tolist()
+            cursor += cont_len
+            out.append(chunk if per_token else sum(chunk))
+        return out
 
     def execute_decode(
         self, tasks: List[Task], return_logprobs: bool = False

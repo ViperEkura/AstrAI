@@ -158,13 +158,14 @@ class InferenceScheduler:
         return self._policy_guard.update_weights(policy_version)
 
     def apply_weight_update(
-        self, policy_version: Optional[int], update: Callable[[], T]
+        self, policy_version: Optional[int], update: Callable[[int], T]
     ) -> T:
         """Mutate shared weights and publish their version without generation.
 
         ``policy_version=None`` derives ``live + 1`` under the same lock, for
         callers that only need "advance by one" (e.g. ``optimizer.step()``)
-        without a read-compute-write race on the current version.
+        without a read-compute-write race on the current version.  The
+        derived target version is handed to ``update``.
         """
         return self._policy_guard.apply_weight_update(policy_version, update)
 
@@ -456,3 +457,72 @@ class InferenceScheduler:
         if return_logprobs:
             return [(result.token_ids, result.logprobs) for result in details]
         return [result.token_ids for result in details]
+
+    def score_ids(
+        self,
+        prompt_ids_list: List[List[int]],
+        continuation_ids_list: List[List[int]],
+        per_token: bool = False,
+    ) -> List[Any]:
+        """Teacher-forced log-probabilities, one entry per request.
+
+        Unlike :meth:`generate` nothing is sampled: each request is fed
+        ``prompt + continuation`` and only the continuation's own tokens are
+        scored, so the caller gets P(continuation | prompt) under the model.
+        This is the single entry point for log-likelihood metrics (MMLU,
+        HellaSwag, perplexity, IFD), which used to each drive the model with
+        their own attention mask.
+
+        Args:
+            prompt_ids_list: ``B`` contexts.
+            continuation_ids_list: ``B`` continuations, each non-empty and
+                shorter than the concatenated sequence.
+            per_token: return per-token log-probabilities instead of the sum.
+
+        Returns:
+            ``List[float]`` of summed log-probabilities, or ``List[List[float]]``
+            when ``per_token`` is ``True``.  A request that cannot be scored
+            (empty, or the whole sequence at the sequence cap) yields ``None``.
+        """
+        if len(prompt_ids_list) != len(continuation_ids_list):
+            raise ValueError("prompt and continuation lists must have equal length")
+
+        request_backend = get_backend(use_default=False)
+        seq_cap = self.max_seq_len
+        tasks: List[Optional[Task]] = []
+        for prompt_ids, cont_ids in zip(prompt_ids_list, continuation_ids_list):
+            if not prompt_ids or not cont_ids:
+                tasks.append(None)
+                continue
+            scored_ids = list(prompt_ids) + list(cont_ids)
+            if len(scored_ids) > seq_cap:
+                tasks.append(None)
+                continue
+            task = Task(
+                task_id=f"score_{uuid.uuid4().hex[:8]}",
+                prompt_ids=scored_ids,
+                max_tokens=0,
+                backend=request_backend,
+            )
+            task.cont_len = len(cont_ids)
+            if not self._task_cache.task_alloc(task.task_id, task.prompt_ids):
+                tasks.append(None)
+                continue
+            task.input_tokens = len(task.prompt_ids)
+            tasks.append(task)
+
+        live = [t for t in tasks if t is not None]
+        results: Dict[str, Any] = {}
+        try:
+            if live:
+                with self._backend_context():
+                    scored = self._executor.execute_score(live, per_token=per_token)
+                for task, value in zip(live, scored):
+                    results[task.task_id] = value
+        finally:
+            for task in live:
+                self._task_cache.task_free(task.task_id)
+
+        return [
+            results.get(task.task_id) if task is not None else None for task in tasks
+        ]

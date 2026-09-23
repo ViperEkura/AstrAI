@@ -147,6 +147,162 @@ inline void print_paged_row(const char* cfg, float max_err, bool pass) {
            cfg, max_err, pass ? "PASS" : "FAIL");
 }
 
+// float mirror of a bf16 buffer, for the CPU references.
+static float* to_floats(const bf16* src, size_t n) {
+    float* dst = (float*)malloc(n * sizeof(float));
+    for (size_t i = 0; i < n; i++) dst[i] = bf2f(src[i]);
+    return dst;
+}
+
+// ======================================================================
+// Shared paged test rig: owns the flat KV pool, request table, index
+// buffers and (optionally) the split partials / mask, in host mirrors +
+// device buffers; fills and uploads them, and frees everything on
+// destruction.  Q is [total_q, Hq, D] — decode passes one row per request
+// (total_q == B), ragged prefill the packed per-request rows.
+// ======================================================================
+struct PagedRig {
+    int B, Hq, Hkv, D;
+    int total_q = 0, max_sl = 0, max_ctx = 0, pool_size = 0, num_reqs = 0;
+    std::vector<int> q_lens, kv_lens;
+    size_t q_elems = 0, kv_elems = 0, mask_elems = 0;
+
+    bf16 *h_q = nullptr, *h_k = nullptr, *h_v = nullptr;
+    bool *h_mask = nullptr;
+    std::vector<int> h_rtt, h_rpi, h_kvi, h_qoi;
+
+    bf16 *d_q, *d_o, *d_k, *d_v;
+    int *d_rtt, *d_rpi, *d_kvi, *d_qoi = nullptr;
+    bool *d_mask = nullptr;
+    float *d_op = nullptr, *d_ml = nullptr;
+
+    // Zero-value overrides pick the test defaults: ctx = max_sl + 16,
+    // pool = B * ctx, reqs = B + 4.  ragged allocates qo_indptr;
+    // split_partials the decode o_part/ml_part buffers.
+    PagedRig(int B_, int Hq_, int Hkv_, int D_, std::vector<int> ql,
+             std::vector<int> kl, bool ragged, bool split_partials,
+             int ctx_capacity = 0, int pool_override = 0, int reqs = 0)
+        : B(B_), Hq(Hq_), Hkv(Hkv_), D(D_),
+          q_lens(std::move(ql)), kv_lens(std::move(kl)) {
+        for (int b = 0; b < B; b++) {
+            total_q += q_lens[b];
+            max_sl = max(max_sl, kv_lens[b]);
+        }
+        max_ctx = ctx_capacity ? ctx_capacity : max_sl + 16;
+        pool_size = pool_override ? pool_override : B * max_ctx;
+        num_reqs = reqs ? reqs : B + 4;
+
+        q_elems = (size_t)total_q * Hq * D;
+        kv_elems = (size_t)pool_size * Hkv * D;
+        h_q = (bf16*)malloc(q_elems * sizeof(bf16));
+        h_k = (bf16*)malloc(kv_elems * sizeof(bf16));
+        h_v = (bf16*)malloc(kv_elems * sizeof(bf16));
+        CUDA_CHECK(cudaMalloc(&d_q, q_elems * sizeof(bf16)));
+        CUDA_CHECK(cudaMalloc(&d_o, q_elems * sizeof(bf16)));
+        CUDA_CHECK(cudaMalloc(&d_k, kv_elems * sizeof(bf16)));
+        CUDA_CHECK(cudaMalloc(&d_v, kv_elems * sizeof(bf16)));
+        CUDA_CHECK(cudaMalloc(&d_rtt, (size_t)num_reqs * max_ctx * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_rpi, (size_t)B * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_kvi, (size_t)(B + 1) * sizeof(int)));
+        if (ragged)
+            CUDA_CHECK(cudaMalloc(&d_qoi, (B + 1) * sizeof(int)));
+        if (split_partials) {
+            CUDA_CHECK(cudaMalloc(&d_op, (size_t)B * Hq * MAX_SPLITS * D * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_ml, (size_t)B * Hq * MAX_SPLITS * 2 * sizeof(float)));
+        }
+    }
+
+    ~PagedRig() {
+        free(h_q); free(h_k); free(h_v); free(h_mask);
+        cudaFree(d_q); cudaFree(d_o); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi);
+        if (d_qoi) cudaFree(d_qoi);
+        if (d_mask) cudaFree(d_mask);
+        if (d_op) cudaFree(d_op);
+        if (d_ml) cudaFree(d_ml);
+    }
+
+    PagedRig(const PagedRig&) = delete;
+    PagedRig& operator=(const PagedRig&) = delete;
+
+    // Random q/k/v fill + upload (kernel and CPU ref share the data).
+    void fill_data() {
+        auto rnd = [] { return (rand() / (float)RAND_MAX) * 2.0f - 1.0f; };
+        for (size_t i = 0; i < q_elems; i++) h_q[i] = f2bf(rnd());
+        for (size_t i = 0; i < kv_elems; i++) {
+            h_k[i] = f2bf(rnd());
+            h_v[i] = f2bf(rnd());
+        }
+        cudaMemcpy(d_q, h_q, q_elems * sizeof(bf16), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_k, h_k, kv_elems * sizeof(bf16), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_v, h_v, kv_elems * sizeof(bf16), cudaMemcpyHostToDevice);
+    }
+
+    // Scattered request table (unique slots wrapping the pool), identity
+    // pool indices, kv prefix sums (+ qo prefix sums when ragged).
+    void fill_indices() {
+        h_rtt.resize((size_t)num_reqs * max_ctx);
+        int next_slot = 0;
+        for (int r = 0; r < num_reqs; r++)
+            for (int p = 0; p < max_ctx; p++)
+                h_rtt[r * max_ctx + p] = next_slot++ % pool_size;
+        h_rpi.resize(B);
+        for (int b = 0; b < B; b++) h_rpi[b] = b;
+        h_kvi.assign(B + 1, 0);
+        for (int b = 0; b < B; b++) h_kvi[b + 1] = h_kvi[b] + kv_lens[b];
+        cudaMemcpy(d_rtt, h_rtt.data(), h_rtt.size() * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_rpi, h_rpi.data(), h_rpi.size() * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_kvi, h_kvi.data(), h_kvi.size() * sizeof(int), cudaMemcpyHostToDevice);
+        if (d_qoi) {
+            h_qoi.assign(B + 1, 0);
+            for (int b = 0; b < B; b++) h_qoi[b + 1] = h_qoi[b] + q_lens[b];
+            cudaMemcpy(d_qoi, h_qoi.data(), h_qoi.size() * sizeof(int), cudaMemcpyHostToDevice);
+        }
+    }
+
+    // Mask storage [rows × cols]; the test fills h_mask then uploads.
+    void alloc_mask(int rows, int cols) {
+        mask_elems = (size_t)rows * cols;
+        h_mask = (bool*)malloc(mask_elems);
+        CUDA_CHECK(cudaMalloc(&d_mask, mask_elems));
+    }
+    void upload_mask() {
+        cudaMemcpy(d_mask, h_mask, mask_elems, cudaMemcpyHostToDevice);
+    }
+
+    // Common launch parameters; callers tweak causal/mask/q-tile fields.
+    AttentionParams<bf16> base_params() {
+        AttentionParams<bf16> p = {};
+        p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
+        p.head_dim = D; p.q_len = total_q;
+        p.q_l_stride = Hq * D; p.q_h_stride = D; p.q_d_stride = 1;
+        p.max_context_len = max_ctx;
+        p.scale = 1.0f / sqrtf((float)D);
+        p.q_ptr = d_q; p.k_ptr = d_k; p.v_ptr = d_v;
+        p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
+        p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
+        p.o_ptr = d_o; p.o_part = d_op; p.ml_part = d_ml;
+        return p;
+    }
+
+    // Download O, compare against the CPU ref, print one table row.
+    int check(const char* cfg, const float* ref) {
+        bf16* h_o = (bf16*)malloc(q_elems * sizeof(bf16));
+        cudaMemcpy(h_o, d_o, q_elems * sizeof(bf16), cudaMemcpyDeviceToHost);
+        const float atol = 0.01f, rtol = 0.01f;
+        bool pass = true;
+        float max_err = 0.0f;
+        for (size_t i = 0; i < q_elems; i++) {
+            float e = fabsf(bf2f(h_o[i]) - ref[i]);
+            if (e > max_err) max_err = e;
+            if (e > atol + rtol * fabsf(ref[i])) { pass = false; break; }
+        }
+        print_paged_row(cfg, max_err, pass);
+        free(h_o);
+        return pass ? 0 : 1;
+    }
+};
+
 // ======================================================================
 // DECODE TEST
 // ======================================================================
@@ -154,129 +310,36 @@ template <int HEAD_DIM>
 static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
                             int causal, int seed, int context_capacity = 0,
                             int fixed_seq_len = 0) {
-    // Variable seq_lens per request
     srand(seed);
     std::vector<int> seq_lens(B);
     for (int b = 0; b < B; b++)
         seq_lens[b] = fixed_seq_len ? fixed_seq_len : 8 + rand() % (max_seq - 8);
-    int max_sl = *std::max_element(seq_lens.begin(), seq_lens.end());
-    int max_ctx = context_capacity ? context_capacity : max_sl + 16;
 
-    int pool_size = B * max_ctx;
-    int num_reqs = B + 4;
+    PagedRig rig(B, Hq, Hkv, HEAD_DIM, std::vector<int>(B, 1), seq_lens,
+                 /*ragged=*/false, /*split_partials=*/true, context_capacity);
+    rig.fill_data();
+    rig.fill_indices();
 
     char cfg[80];
     snprintf(cfg, sizeof(cfg), "DECODE B=%d Hq=%d Hkv=%d D=%d max_sl=%d causal=%d",
-             B, Hq, Hkv, HEAD_DIM, max_sl, causal);
+             B, Hq, Hkv, HEAD_DIM, rig.max_sl, causal);
 
-    size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
-    size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
-    size_t sz_rpi = (size_t)B * sizeof(int);
-    size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
-    size_t sz_op = (size_t)B * Hq * MAX_SPLITS * HEAD_DIM * sizeof(float);
-    size_t sz_ml = (size_t)B * Hq * MAX_SPLITS * 2 * sizeof(float);
+    float* qf = to_floats(rig.h_q, rig.q_elems);
+    float* kf = to_floats(rig.h_k, rig.kv_elems);
+    float* vf = to_floats(rig.h_v, rig.kv_elems);
+    float* ref = (float*)calloc(rig.q_elems, sizeof(float));
+    cpu_paged_decode_ref(qf, kf, vf, rig.h_rtt.data(), rig.h_rpi.data(),
+                         rig.h_kvi.data(), nullptr, 0,
+                         B, Hq, Hkv, HEAD_DIM, rig.max_ctx, ref);
 
-    bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int *d_rtt, *d_rpi;
-    int *d_kvi;
-    float *d_op, *d_ml;
-    cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
-    cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
-    cudaMalloc(&d_rtt, sz_rtt); cudaMalloc(&d_rpi, sz_rpi);
-    cudaMalloc(&d_kvi, sz_kvi);
-    cudaMalloc(&d_op, sz_op); cudaMalloc(&d_ml, sz_ml);
-
-    auto rnd = [&]() { return (rand() / (float)RAND_MAX) * 2.0f - 1.0f; };
-
-    bf16* h_q = (bf16*)malloc(sz_q);
-    for (size_t i = 0; i < sz_q / sizeof(bf16); i++) h_q[i] = f2bf(rnd());
-    cudaMemcpy(d_q, h_q, sz_q, cudaMemcpyHostToDevice);
-
-    bf16* h_k_pool = (bf16*)malloc(sz_kv);
-    bf16* h_v_pool = (bf16*)malloc(sz_kv);
-    for (size_t i = 0; i < sz_kv / sizeof(bf16); i++) {
-        h_k_pool[i] = f2bf(rnd());
-        h_v_pool[i] = f2bf(rnd());
-    }
-    cudaMemcpy(d_k_pool, h_k_pool, sz_kv, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
-
-    // req_to_token: assign unique slots per request (scattered, not contiguous)
-    int* h_rtt = (int*)malloc(sz_rtt);
-    int next_slot = 0;
-    for (int r = 0; r < num_reqs; r++)
-        for (int p = 0; p < max_ctx; p++) {
-            h_rtt[r * max_ctx + p] = next_slot % pool_size;
-            next_slot++;
-        }
-    cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-
-    // req_pool_indices: pick B random request rows
-    int* h_rpi = (int*)malloc(sz_rpi);
-    for (int b = 0; b < B; b++) h_rpi[b] = b;
-    cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
-
-    // kv_indptr: prefix sum of seq_lens
-    int* h_kvi = (int*)malloc(sz_kvi);
-    h_kvi[0] = 0;
-    for (int b = 0; b < B; b++) h_kvi[b + 1] = h_kvi[b] + seq_lens[b];
-    cudaMemcpy(d_kvi, h_kvi, sz_kvi, cudaMemcpyHostToDevice);
-
-    // CPU reference
-    float* h_q_f = (float*)malloc(B * Hq * HEAD_DIM * sizeof(float));
-    float* h_k_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    float* h_v_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < B * Hq * HEAD_DIM; i++) h_q_f[i] = bf2f(h_q[i]);
-    for (int i = 0; i < pool_size * Hkv * HEAD_DIM; i++) {
-        h_k_f[i] = bf2f(h_k_pool[i]);
-        h_v_f[i] = bf2f(h_v_pool[i]);
-    }
-    float* h_o_ref = (float*)calloc(B * Hq * HEAD_DIM, sizeof(float));
-    cpu_paged_decode_ref(h_q_f, h_k_f, h_v_f, h_rtt, h_rpi, h_kvi,
-                            nullptr, 0,
-                            B, Hq, Hkv, HEAD_DIM, max_ctx, h_o_ref);
-
-    // Kernel launch
-    AttentionParams<bf16> p = {};
-    p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM;
-    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx;
-    p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
-    p.mask = nullptr; p.mask_b_stride = 0;
-    p.mask_h_stride = 0; p.mask_l_stride = 0;
-    p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
-    p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
-    p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
-    p.o_ptr = d_o; p.o_part = d_op; p.ml_part = d_ml;
-
+    AttentionParams<bf16> p = rig.base_params();
+    p.causal_offset = causal ? 0 : -1;
     dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
     cudaDeviceSynchronize();
 
-    bf16* h_o_bf = (bf16*)malloc(sz_q);
-    cudaMemcpy(h_o_bf, d_o, sz_q, cudaMemcpyDeviceToHost);
-    float* h_o_got = (float*)malloc(B * Hq * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < B * Hq * HEAD_DIM; i++) h_o_got[i] = bf2f(h_o_bf[i]);
-
-    const float atol = 0.01f, rtol = 0.01f;
-    bool pass = true;
-    float max_err = 0.0f;
-    for (int i = 0; i < B * Hq * HEAD_DIM; i++) {
-        float e = fabsf(h_o_got[i] - h_o_ref[i]);
-        if (e > max_err) max_err = e;
-        if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
-    }
-
-    print_paged_row(cfg, max_err, pass);
-
-    free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
-    free(h_kvi); free(h_q_f); free(h_k_f); free(h_v_f);
-    free(h_o_ref); free(h_o_bf); free(h_o_got);
-    cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
-    cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_op); cudaFree(d_ml);
-    return pass ? 0 : 1;
+    int fail = rig.check(cfg, ref);
+    free(qf); free(kf); free(vf); free(ref);
+    return fail;
 }
 
 // ======================================================================
@@ -289,130 +352,40 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
     std::vector<int> seq_lens(B);
     for (int b = 0; b < B; b++)
         seq_lens[b] = 8 + rand() % (max_seq - 8);
-    int max_sl = *std::max_element(seq_lens.begin(), seq_lens.end());
-    int max_ctx = max_sl + 16;
-    int pool_size = B * max_ctx;
-    int num_reqs = B + 4;
+
+    PagedRig rig(B, Hq, Hkv, HEAD_DIM, std::vector<int>(B, 1), seq_lens,
+                 /*ragged=*/false, /*split_partials=*/true);
+    rig.fill_data();
+    rig.fill_indices();
+    rig.alloc_mask(B, rig.max_sl);
+    // Keep the even positions of each request's kv range, drop the rest —
+    // exercises the HasMask path with per-request seq_len.
+    for (int b = 0; b < B; b++)
+        for (int k = 0; k < rig.max_sl; k++)
+            rig.h_mask[b * rig.max_sl + k] = (k < seq_lens[b]) && (k % 2 == 0);
+    rig.upload_mask();
 
     char cfg[80];
     snprintf(cfg, sizeof(cfg), "DECODE-MASK B=%d Hq=%d Hkv=%d D=%d max_sl=%d",
-             B, Hq, Hkv, HEAD_DIM, max_sl);
+             B, Hq, Hkv, HEAD_DIM, rig.max_sl);
 
-    size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
-    size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
-    size_t sz_rpi = (size_t)B * sizeof(int);
-    size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
-    size_t sz_mask = (size_t)B * max_sl * sizeof(bool);
-    size_t sz_op = (size_t)B * Hq * MAX_SPLITS * HEAD_DIM * sizeof(float);
-    size_t sz_ml = (size_t)B * Hq * MAX_SPLITS * 2 * sizeof(float);
+    float* qf = to_floats(rig.h_q, rig.q_elems);
+    float* kf = to_floats(rig.h_k, rig.kv_elems);
+    float* vf = to_floats(rig.h_v, rig.kv_elems);
+    float* ref = (float*)calloc(rig.q_elems, sizeof(float));
+    cpu_paged_decode_ref(qf, kf, vf, rig.h_rtt.data(), rig.h_rpi.data(),
+                         rig.h_kvi.data(), rig.h_mask, rig.max_sl,
+                         B, Hq, Hkv, HEAD_DIM, rig.max_ctx, ref);
 
-    bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int *d_rtt, *d_rpi;
-    int *d_kvi;
-    bool *d_mask;
-    float *d_op, *d_ml;
-    cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
-    cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
-    cudaMalloc(&d_rtt, sz_rtt); cudaMalloc(&d_rpi, sz_rpi);
-    cudaMalloc(&d_kvi, sz_kvi);
-    cudaMalloc(&d_mask, sz_mask);
-    cudaMalloc(&d_op, sz_op); cudaMalloc(&d_ml, sz_ml);
-
-    auto rnd = [&]() { return (rand() / (float)RAND_MAX) * 2.0f - 1.0f; };
-
-    bf16* h_q = (bf16*)malloc(sz_q);
-    for (size_t i = 0; i < sz_q / sizeof(bf16); i++) h_q[i] = f2bf(rnd());
-    cudaMemcpy(d_q, h_q, sz_q, cudaMemcpyHostToDevice);
-
-    bf16* h_k_pool = (bf16*)malloc(sz_kv);
-    bf16* h_v_pool = (bf16*)malloc(sz_kv);
-    for (size_t i = 0; i < sz_kv / sizeof(bf16); i++) {
-        h_k_pool[i] = f2bf(rnd());
-        h_v_pool[i] = f2bf(rnd());
-    }
-    cudaMemcpy(d_k_pool, h_k_pool, sz_kv, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
-
-    int* h_rtt = (int*)malloc(sz_rtt);
-    int next_slot = 0;
-    for (int r = 0; r < num_reqs; r++)
-        for (int p = 0; p < max_ctx; p++) {
-            h_rtt[r * max_ctx + p] = next_slot % pool_size;
-            next_slot++;
-        }
-    cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-
-    int* h_rpi = (int*)malloc(sz_rpi);
-    for (int b = 0; b < B; b++) h_rpi[b] = b;
-    cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
-
-    int* h_kvi = (int*)malloc(sz_kvi);
-    h_kvi[0] = 0;
-    for (int b = 0; b < B; b++) h_kvi[b + 1] = h_kvi[b] + seq_lens[b];
-    cudaMemcpy(d_kvi, h_kvi, sz_kvi, cudaMemcpyHostToDevice);
-
-    // Mask: keep first half of each request's kv range, drop the rest —
-    // exercises the HasMask path with per-request seq_len.
-    bool* h_mask = (bool*)malloc(sz_mask);
-    for (int b = 0; b < B; b++)
-        for (int k = 0; k < max_sl; k++)
-            h_mask[b * max_sl + k] = (k < seq_lens[b]) && (k % 2 == 0);
-    cudaMemcpy(d_mask, h_mask, sz_mask, cudaMemcpyHostToDevice);
-
-    float* h_q_f = (float*)malloc(B * Hq * HEAD_DIM * sizeof(float));
-    float* h_k_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    float* h_v_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < B * Hq * HEAD_DIM; i++) h_q_f[i] = bf2f(h_q[i]);
-    for (int i = 0; i < pool_size * Hkv * HEAD_DIM; i++) {
-        h_k_f[i] = bf2f(h_k_pool[i]);
-        h_v_f[i] = bf2f(h_v_pool[i]);
-    }
-    float* h_o_ref = (float*)calloc(B * Hq * HEAD_DIM, sizeof(float));
-    cpu_paged_decode_ref(h_q_f, h_k_f, h_v_f, h_rtt, h_rpi, h_kvi,
-                            h_mask, max_sl,
-                            B, Hq, Hkv, HEAD_DIM, max_ctx, h_o_ref);
-
-    AttentionParams<bf16> p = {};
-    p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM;
-    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx;
+    AttentionParams<bf16> p = rig.base_params();
     p.causal_offset = -1; p.use_mask = 1;
-    p.mask = d_mask; p.mask_b_stride = max_sl;
-    p.mask_h_stride = 0; p.mask_l_stride = 0;
-    p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
-    p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
-    p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
-    p.o_ptr = d_o; p.o_part = d_op; p.ml_part = d_ml;
-
+    p.mask = rig.d_mask; p.mask_b_stride = rig.max_sl;
     dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
     cudaDeviceSynchronize();
 
-    bf16* h_o_bf = (bf16*)malloc(sz_q);
-    cudaMemcpy(h_o_bf, d_o, sz_q, cudaMemcpyDeviceToHost);
-    float* h_o_got = (float*)malloc(B * Hq * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < B * Hq * HEAD_DIM; i++) h_o_got[i] = bf2f(h_o_bf[i]);
-
-    const float atol = 0.01f, rtol = 0.01f;
-    bool pass = true;
-    float max_err = 0.0f;
-    for (int i = 0; i < B * Hq * HEAD_DIM; i++) {
-        float e = fabsf(h_o_got[i] - h_o_ref[i]);
-        if (e > max_err) max_err = e;
-        if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
-    }
-
-    print_paged_row(cfg, max_err, pass);
-
-    free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
-    free(h_kvi); free(h_mask); free(h_q_f); free(h_k_f); free(h_v_f);
-    free(h_o_ref); free(h_o_bf); free(h_o_got);
-    cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
-    cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_mask);
-    cudaFree(d_op); cudaFree(d_ml);
-    return pass ? 0 : 1;
+    int fail = rig.check(cfg, ref);
+    free(qf); free(kf); free(vf); free(ref);
+    return fail;
 }
 
 // ======================================================================
@@ -423,135 +396,39 @@ static int run_prefill_test(int B, int Hq, int Hkv,
                              std::vector<int>& q_lens,
                              std::vector<int>& kv_lens,
                              int causal, int seed) {
-    int total_q = 0;
-    int max_sl = 0;
-    for (int b = 0; b < B; b++) {
-        total_q += q_lens[b];
-        max_sl = max(max_sl, kv_lens[b]);
-    }
-    int max_ctx = max_sl + 16;
-    int pool_size = B * max_ctx;
-    int num_reqs = B + 4;
+    PagedRig rig(B, Hq, Hkv, HEAD_DIM, q_lens, kv_lens,
+                 /*ragged=*/true, /*split_partials=*/false);
+    srand(seed);
+    rig.fill_data();
+    rig.fill_indices();
 
     char cfg[80];
     snprintf(cfg, sizeof(cfg), "PREFILL B=%d Hq=%d Hkv=%d D=%d max_sl=%d causal=%d",
-             B, Hq, Hkv, HEAD_DIM, max_sl, causal);
+             B, Hq, Hkv, HEAD_DIM, rig.max_sl, causal);
 
-    size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
-    size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
-    size_t sz_rpi = (size_t)B * sizeof(int);
-    size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
-    size_t sz_qoi = (size_t)(B + 1) * sizeof(int);
-
-    bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int *d_rtt, *d_rpi;
-    int *d_kvi, *d_qoi;
-    cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
-    cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
-    cudaMalloc(&d_rtt, sz_rtt); cudaMalloc(&d_rpi, sz_rpi);
-    cudaMalloc(&d_kvi, sz_kvi); cudaMalloc(&d_qoi, sz_qoi);
-
-    srand(seed);
-    auto rnd = [&]() { return (rand() / (float)RAND_MAX) * 2.0f - 1.0f; };
-
-    bf16* h_q = (bf16*)malloc(sz_q);
-    for (size_t i = 0; i < sz_q / sizeof(bf16); i++) h_q[i] = f2bf(rnd());
-    cudaMemcpy(d_q, h_q, sz_q, cudaMemcpyHostToDevice);
-
-    bf16* h_k_pool = (bf16*)malloc(sz_kv);
-    bf16* h_v_pool = (bf16*)malloc(sz_kv);
-    for (size_t i = 0; i < sz_kv / sizeof(bf16); i++) {
-        h_k_pool[i] = f2bf(rnd());
-        h_v_pool[i] = f2bf(rnd());
-    }
-    cudaMemcpy(d_k_pool, h_k_pool, sz_kv, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
-
-    int* h_rtt = (int*)malloc(sz_rtt);
-    int next_slot = 0;
-    for (int r = 0; r < num_reqs; r++)
-        for (int p = 0; p < max_ctx; p++) {
-            h_rtt[r * max_ctx + p] = next_slot % pool_size;
-            next_slot++;
-        }
-    cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-
-    int* h_rpi = (int*)malloc(sz_rpi);
-    for (int b = 0; b < B; b++) h_rpi[b] = b;
-    cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
-
-    int* h_kvi = (int*)malloc(sz_kvi);
-    h_kvi[0] = 0;
-    for (int b = 0; b < B; b++) h_kvi[b + 1] = h_kvi[b] + kv_lens[b];
-    cudaMemcpy(d_kvi, h_kvi, sz_kvi, cudaMemcpyHostToDevice);
-
-    int* h_qoi = (int*)malloc(sz_qoi);
-    h_qoi[0] = 0;
-    for (int b = 0; b < B; b++) h_qoi[b + 1] = h_qoi[b] + q_lens[b];
-    cudaMemcpy(d_qoi, h_qoi, sz_qoi, cudaMemcpyHostToDevice);
-
-    // CPU reference
-    float* h_q_f = (float*)malloc(total_q * Hq * HEAD_DIM * sizeof(float));
-    float* h_k_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    float* h_v_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < total_q * Hq * HEAD_DIM; i++) h_q_f[i] = bf2f(h_q[i]);
-    for (int i = 0; i < pool_size * Hkv * HEAD_DIM; i++) {
-        h_k_f[i] = bf2f(h_k_pool[i]);
-        h_v_f[i] = bf2f(h_v_pool[i]);
-    }
-    float* h_o_ref = (float*)calloc(total_q * Hq * HEAD_DIM, sizeof(float));
-    cpu_paged_prefill_ref(h_q_f, h_k_f, h_v_f, h_rtt, h_rpi, h_kvi, h_qoi,
-                             nullptr, 0, 0,
-                             B, Hq, Hkv, HEAD_DIM, max_ctx, causal, h_o_ref);
+    float* qf = to_floats(rig.h_q, rig.q_elems);
+    float* kf = to_floats(rig.h_k, rig.kv_elems);
+    float* vf = to_floats(rig.h_v, rig.kv_elems);
+    float* ref = (float*)calloc(rig.q_elems, sizeof(float));
+    cpu_paged_prefill_ref(qf, kf, vf, rig.h_rtt.data(), rig.h_rpi.data(),
+                          rig.h_kvi.data(), rig.h_qoi.data(),
+                          nullptr, 0, 0,
+                          B, Hq, Hkv, HEAD_DIM, rig.max_ctx, causal, ref);
 
     int *d_qtb, *d_qti;
     int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
-    // Kernel launch
-    AttentionParams<bf16> p = {};
-    p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM;
-    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx;
-    p.q_len = total_q;
-    p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
-    p.mask = nullptr; p.mask_b_stride = 0;
-    p.mask_h_stride = 0; p.mask_l_stride = 0;
-    p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
-    p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
-    p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
+    AttentionParams<bf16> p = rig.base_params();
+    p.causal_offset = causal ? 0 : -1;
     p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
-    p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
-
     dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
     cudaDeviceSynchronize();
-
-    bf16* h_o_bf = (bf16*)malloc(sz_q);
-    cudaMemcpy(h_o_bf, d_o, sz_q, cudaMemcpyDeviceToHost);
-    float* h_o_got = (float*)malloc(total_q * Hq * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < total_q * Hq * HEAD_DIM; i++) h_o_got[i] = bf2f(h_o_bf[i]);
-
-    const float atol = 0.01f, rtol = 0.01f;
-    bool pass = true;
-    float max_err = 0.0f;
-    for (int i = 0; i < total_q * Hq * HEAD_DIM; i++) {
-        float e = fabsf(h_o_got[i] - h_o_ref[i]);
-        if (e > max_err) max_err = e;
-        if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
-    }
-
-    print_paged_row(cfg, max_err, pass);
-
-    free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
-    free(h_kvi); free(h_qoi); free(h_q_f); free(h_k_f); free(h_v_f);
-    free(h_o_ref); free(h_o_bf); free(h_o_got);
-    cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
-    cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_qoi);
     cudaFree(d_qtb); cudaFree(d_qti);
-    return pass ? 0 : 1;
+
+    int fail = rig.check(cfg, ref);
+    free(qf); free(kf); free(vf); free(ref);
+    return fail;
 }
 
 // ======================================================================
@@ -560,141 +437,49 @@ static int run_prefill_test(int B, int Hq, int Hkv,
 template <int HEAD_DIM>
 static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     srand(seed);
-    int B = 1;
-    int total_q = q_len;
-    int seq_len = q_len;  // pure prefill: kv_len == q_len
-    int max_ctx = seq_len + 16;
-    int pool_size = B * max_ctx;
-    int num_reqs = B + 4;
+    std::vector<int> ql = {q_len}, kl = {q_len};
+    PagedRig rig(1, Hq, Hkv, HEAD_DIM, ql, kl,
+                 /*ragged=*/true, /*split_partials=*/false);
+    rig.fill_data();
+    rig.fill_indices();
+    rig.alloc_mask(q_len, q_len);
+    // 4D causal mask [B, 1, q_len, q_len], True=keep.
+    for (int qi = 0; qi < q_len; qi++)
+        for (int kj = 0; kj < q_len; kj++)
+            rig.h_mask[qi * q_len + kj] = (kj <= qi);
+    rig.upload_mask();
 
     char cfg[80];
     snprintf(cfg, sizeof(cfg), "PREFILL-MASK Hq=%d Hkv=%d D=%d q_len=%d",
              Hq, Hkv, HEAD_DIM, q_len);
     fflush(stdout);
 
-    size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
-    size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
-    size_t sz_rpi = (size_t)B * sizeof(int);
-    size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
-    size_t sz_qoi = (size_t)(B + 1) * sizeof(int);
-    size_t sz_mask = (size_t)B * q_len * q_len * sizeof(bool);
-
-    bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int *d_rtt, *d_rpi;
-    int *d_kvi, *d_qoi;
-    bool *d_mask;
-    cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
-    cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
-    cudaMalloc(&d_rtt, sz_rtt); cudaMalloc(&d_rpi, sz_rpi);
-    cudaMalloc(&d_kvi, sz_kvi); cudaMalloc(&d_qoi, sz_qoi);
-    cudaMalloc(&d_mask, sz_mask);
-
-    auto rnd = [&]() { return (rand() / (float)RAND_MAX) * 2.0f - 1.0f; };
-
-    bf16* h_q = (bf16*)malloc(sz_q);
-    for (size_t i = 0; i < sz_q / sizeof(bf16); i++) h_q[i] = f2bf(rnd());
-    cudaMemcpy(d_q, h_q, sz_q, cudaMemcpyHostToDevice);
-
-    bf16* h_k_pool = (bf16*)malloc(sz_kv);
-    bf16* h_v_pool = (bf16*)malloc(sz_kv);
-    for (size_t i = 0; i < sz_kv / sizeof(bf16); i++) {
-        h_k_pool[i] = f2bf(rnd());
-        h_v_pool[i] = f2bf(rnd());
-    }
-    cudaMemcpy(d_k_pool, h_k_pool, sz_kv, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_pool, h_v_pool, sz_kv, cudaMemcpyHostToDevice);
-
-    int* h_rtt = (int*)malloc(sz_rtt);
-    int next_slot = 0;
-    for (int r = 0; r < num_reqs; r++)
-        for (int p = 0; p < max_ctx; p++) {
-            h_rtt[r * max_ctx + p] = next_slot % pool_size;
-            next_slot++;
-        }
-    cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-
-    int* h_rpi = (int*)malloc(sz_rpi);
-    h_rpi[0] = 0;
-    cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
-
-    int* h_kvi = (int*)malloc(sz_kvi);
-    h_kvi[0] = 0; h_kvi[1] = seq_len;
-    cudaMemcpy(d_kvi, h_kvi, sz_kvi, cudaMemcpyHostToDevice);
-
-    int* h_qoi = (int*)malloc(sz_qoi);
-    h_qoi[0] = 0; h_qoi[1] = q_len;
-    cudaMemcpy(d_qoi, h_qoi, sz_qoi, cudaMemcpyHostToDevice);
-
-    // 4D causal mask [B, 1, q_len, q_len], True=keep.
-    bool* h_mask = (bool*)malloc(sz_mask);
-    for (int qi = 0; qi < q_len; qi++)
-        for (int kj = 0; kj < q_len; kj++)
-            h_mask[qi * q_len + kj] = (kj <= qi);
-    cudaMemcpy(d_mask, h_mask, sz_mask, cudaMemcpyHostToDevice);
-
-    float* h_q_f = (float*)malloc(total_q * Hq * HEAD_DIM * sizeof(float));
-    float* h_k_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    float* h_v_f = (float*)malloc(pool_size * Hkv * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < total_q * Hq * HEAD_DIM; i++) h_q_f[i] = bf2f(h_q[i]);
-    for (int i = 0; i < pool_size * Hkv * HEAD_DIM; i++) {
-        h_k_f[i] = bf2f(h_k_pool[i]);
-        h_v_f[i] = bf2f(h_v_pool[i]);
-    }
-    float* h_o_ref = (float*)calloc(total_q * Hq * HEAD_DIM, sizeof(float));
+    float* qf = to_floats(rig.h_q, rig.q_elems);
+    float* kf = to_floats(rig.h_k, rig.kv_elems);
+    float* vf = to_floats(rig.h_v, rig.kv_elems);
+    float* ref = (float*)calloc(rig.q_elems, sizeof(float));
     // CPU ref with causal=0 so it consults the mask (not the causal flag).
-    cpu_paged_prefill_ref(h_q_f, h_k_f, h_v_f, h_rtt, h_rpi, h_kvi, h_qoi,
-                             h_mask, q_len, q_len,
-                             B, Hq, Hkv, HEAD_DIM, max_ctx, 0, h_o_ref);
+    cpu_paged_prefill_ref(qf, kf, vf, rig.h_rtt.data(), rig.h_rpi.data(),
+                          rig.h_kvi.data(), rig.h_qoi.data(),
+                          rig.h_mask, q_len, q_len,
+                          1, Hq, Hkv, HEAD_DIM, rig.max_ctx, 0, ref);
 
-    std::vector<int> q_lens(B, q_len);
     int *d_qtb, *d_qti;
-    int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
+    int num_q_tiles = make_q_tile_mapping(ql, &d_qtb, &d_qti);
 
-    AttentionParams<bf16> p = {};
-    p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM;
-    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx;
-    p.q_len = B * q_len;
+    AttentionParams<bf16> p = rig.base_params();
     p.causal_offset = -1; p.use_mask = 1;
-    p.mask = d_mask; p.mask_b_stride = q_len * q_len;
-    p.mask_h_stride = 0; p.mask_l_stride = q_len;
-    p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
-    p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
-    p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
+    p.mask = rig.d_mask; p.mask_b_stride = q_len * q_len;
+    p.mask_l_stride = q_len;
     p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
-    p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
-
     dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
     cudaDeviceSynchronize();
-
-    bf16* h_o_bf = (bf16*)malloc(sz_q);
-    cudaMemcpy(h_o_bf, d_o, sz_q, cudaMemcpyDeviceToHost);
-    float* h_o_got = (float*)malloc(total_q * Hq * HEAD_DIM * sizeof(float));
-    for (int i = 0; i < total_q * Hq * HEAD_DIM; i++) h_o_got[i] = bf2f(h_o_bf[i]);
-
-    const float atol = 0.01f, rtol = 0.01f;
-    bool pass = true;
-    float max_err = 0.0f;
-    for (int i = 0; i < total_q * Hq * HEAD_DIM; i++) {
-        float e = fabsf(h_o_got[i] - h_o_ref[i]);
-        if (e > max_err) max_err = e;
-        if (e > atol + rtol * fabsf(h_o_ref[i])) { pass = false; break; }
-    }
-
-    print_paged_row(cfg, max_err, pass);
-
-    free(h_q); free(h_k_pool); free(h_v_pool); free(h_rtt); free(h_rpi);
-    free(h_kvi); free(h_qoi); free(h_mask); free(h_q_f); free(h_k_f); free(h_v_f);
-    free(h_o_ref); free(h_o_bf); free(h_o_got);
-    cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
-    cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_qoi);
-    cudaFree(d_mask);
     cudaFree(d_qtb); cudaFree(d_qti);
-    return pass ? 0 : 1;
+
+    int fail = rig.check(cfg, ref);
+    free(qf); free(kf); free(vf); free(ref);
+    return fail;
 }
 
 // ======================================================================
@@ -702,61 +487,16 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
 // ======================================================================
 template <int HEAD_DIM>
 static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
-    int max_ctx = max(16384, seq_len + 16);
-    int pool_size = B * (seq_len + 16);
-    int num_reqs = B;
+    PagedRig rig(B, Hq, Hkv, HEAD_DIM, std::vector<int>(B, 1),
+                 std::vector<int>(B, seq_len), /*ragged=*/false,
+                 /*split_partials=*/true,
+                 /*ctx=*/max(16384, seq_len + 16),
+                 /*pool=*/B * (seq_len + 16), /*reqs=*/B);
+    rig.fill_data();
+    rig.fill_indices();
 
-    size_t sz_q  = (size_t)B * Hq * HEAD_DIM * sizeof(bf16);
-    size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
-    size_t sz_rpi = (size_t)B * sizeof(int);
-    size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
-    size_t sz_op = (size_t)B * Hq * MAX_SPLITS * HEAD_DIM * sizeof(float);
-    size_t sz_ml = (size_t)B * Hq * MAX_SPLITS * 2 * sizeof(float);
-
-    bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int *d_rtt, *d_rpi;
-    int *d_kvi;
-    float *d_op, *d_ml;
-    cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
-    cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
-    cudaMalloc(&d_rtt, sz_rtt); cudaMalloc(&d_rpi, sz_rpi);
-    cudaMalloc(&d_kvi, sz_kvi);
-    cudaMalloc(&d_op, sz_op); cudaMalloc(&d_ml, sz_ml);
-
-    bf16* tmp = (bf16*)malloc(sz_kv > sz_q ? sz_kv : sz_q);
-    for (size_t i = 0; i < sz_q / sizeof(bf16); i++) tmp[i] = f2bf(randf());
-    cudaMemcpy(d_q, tmp, sz_q, cudaMemcpyHostToDevice);
-    for (size_t i = 0; i < sz_kv / sizeof(bf16); i++) tmp[i] = f2bf(randf());
-    cudaMemcpy(d_k_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
-
-    int* h_rtt = (int*)malloc(sz_rtt);
-    for (int r = 0; r < num_reqs; r++)
-        for (int p = 0; p < max_ctx; p++)
-            h_rtt[r * max_ctx + p] = (r * max_ctx + p) % pool_size;
-    cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-    int* h_rpi = (int*)malloc(sz_rpi);
-    for (int b = 0; b < B; b++) h_rpi[b] = b;
-    cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
-    int* h_kvi = (int*)malloc(sz_kvi);
-    h_kvi[0] = 0;
-    for (int b = 0; b < B; b++) h_kvi[b + 1] = h_kvi[b] + seq_len;
-    cudaMemcpy(d_kvi, h_kvi, sz_kvi, cudaMemcpyHostToDevice);
-
-    AttentionParams<bf16> p = {};
-    p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM;
-    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx;
-    p.causal_offset = 0; p.use_mask = 0;
-    p.mask = nullptr; p.mask_b_stride = 0;
-    p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
-    p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
-    p.kv_indptr = d_kvi; p.qo_indptr = nullptr;
-    p.o_ptr = d_o; p.o_part = d_op; p.ml_part = d_ml;
-
+    AttentionParams<bf16> p = rig.base_params();
+    p.causal_offset = 0;
     auto launch = [&]() {
         dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
     };
@@ -769,77 +509,24 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     snprintf(cfg, sizeof(cfg), "DEC B=%2d Hq=%2d Hk=%d kv=%4d D=%3d",
              B, Hq, Hkv, seq_len, HEAD_DIM);
     print_bench_row(cfg, r);
-
-    free(tmp); free(h_rtt); free(h_rpi); free(h_kvi);
-    cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
-    cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_op); cudaFree(d_ml);
 }
 
 template <int HEAD_DIM>
 static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int causal) {
-    int total_q = B * q_len;
-    int max_ctx = kv_len + 16;
-    int pool_size = B * max_ctx;
-    int num_reqs = B;
-
-    size_t sz_q  = (size_t)total_q * Hq * HEAD_DIM * sizeof(bf16);
-    size_t sz_kv = (size_t)pool_size * Hkv * HEAD_DIM * sizeof(bf16);
-    size_t sz_rtt = (size_t)num_reqs * max_ctx * sizeof(int);
-    size_t sz_rpi = (size_t)B * sizeof(int);
-    size_t sz_kvi = (size_t)(B + 1) * sizeof(int);
-    size_t sz_qoi = (size_t)(B + 1) * sizeof(int);
-
-    bf16 *d_q, *d_o, *d_k_pool, *d_v_pool;
-    int *d_rtt, *d_rpi;
-    int *d_kvi, *d_qoi;
-    cudaMalloc(&d_q, sz_q); cudaMalloc(&d_o, sz_q);
-    cudaMalloc(&d_k_pool, sz_kv); cudaMalloc(&d_v_pool, sz_kv);
-    cudaMalloc(&d_rtt, sz_rtt); cudaMalloc(&d_rpi, sz_rpi);
-    cudaMalloc(&d_kvi, sz_kvi); cudaMalloc(&d_qoi, sz_qoi);
-
-    bf16* tmp = (bf16*)malloc(sz_kv > sz_q ? sz_kv : sz_q);
-    for (size_t i = 0; i < sz_q / sizeof(bf16); i++) tmp[i] = f2bf(randf());
-    cudaMemcpy(d_q, tmp, sz_q, cudaMemcpyHostToDevice);
-    for (size_t i = 0; i < sz_kv / sizeof(bf16); i++) tmp[i] = f2bf(randf());
-    cudaMemcpy(d_k_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v_pool, tmp, sz_kv, cudaMemcpyHostToDevice);
-
-    int* h_rtt = (int*)malloc(sz_rtt);
-    for (int r = 0; r < num_reqs; r++)
-        for (int p = 0; p < max_ctx; p++)
-            h_rtt[r * max_ctx + p] = (r * max_ctx + p) % pool_size;
-    cudaMemcpy(d_rtt, h_rtt, sz_rtt, cudaMemcpyHostToDevice);
-    int* h_rpi = (int*)malloc(sz_rpi);
-    for (int b = 0; b < B; b++) h_rpi[b] = b;
-    cudaMemcpy(d_rpi, h_rpi, sz_rpi, cudaMemcpyHostToDevice);
-    int* h_kvi = (int*)malloc(sz_kvi);
-    h_kvi[0] = 0;
-    for (int b = 0; b < B; b++) h_kvi[b + 1] = h_kvi[b] + kv_len;
-    cudaMemcpy(d_kvi, h_kvi, sz_kvi, cudaMemcpyHostToDevice);
-    int* h_qoi = (int*)malloc(sz_qoi);
-    h_qoi[0] = 0;
-    for (int b = 0; b < B; b++) h_qoi[b + 1] = h_qoi[b] + q_len;
-    cudaMemcpy(d_qoi, h_qoi, sz_qoi, cudaMemcpyHostToDevice);
+    PagedRig rig(B, Hq, Hkv, HEAD_DIM, std::vector<int>(B, q_len),
+                 std::vector<int>(B, kv_len), /*ragged=*/true,
+                 /*split_partials=*/false, /*ctx=*/0, /*pool=*/0, /*reqs=*/B);
+    rig.fill_data();
+    rig.fill_indices();
 
     std::vector<int> q_lens(B, q_len);
     int *d_qtb, *d_qti;
     int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
-    AttentionParams<bf16> p = {};
-    p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
-    p.head_dim = HEAD_DIM;
-    p.q_l_stride = Hq * HEAD_DIM; p.q_h_stride = HEAD_DIM; p.q_d_stride = 1;
-    p.max_context_len = max_ctx;
-    p.q_len = B * q_len;
-    p.causal_offset = causal ? 0 : -1; p.use_mask = 0;
-    p.mask = nullptr; p.mask_b_stride = 0;
-    p.scale = 1.0f / sqrtf((float)HEAD_DIM);
-    p.q_ptr = d_q; p.k_ptr = d_k_pool; p.v_ptr = d_v_pool;
-    p.req_to_token = d_rtt; p.req_pool_indices = d_rpi;
-    p.kv_indptr = d_kvi; p.qo_indptr = d_qoi;
+    AttentionParams<bf16> p = rig.base_params();
+    p.causal_offset = causal ? 0 : -1;
     p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
-    p.o_ptr = d_o; p.o_part = nullptr; p.ml_part = nullptr;
 
     auto launch = [&]() {
         dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
@@ -864,10 +551,6 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     snprintf(cfg, sizeof(cfg), "PRE B=%d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d c=%d",
              B, Hq, Hkv, q_len, kv_len, HEAD_DIM, causal);
     print_bench_row(cfg, r);
-
-    free(tmp); free(h_rtt); free(h_rpi); free(h_kvi); free(h_qoi);
-    cudaFree(d_q); cudaFree(d_o); cudaFree(d_k_pool); cudaFree(d_v_pool);
-    cudaFree(d_rtt); cudaFree(d_rpi); cudaFree(d_kvi); cudaFree(d_qoi);
     cudaFree(d_qtb); cudaFree(d_qti);
 }
 

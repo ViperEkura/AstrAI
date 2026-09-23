@@ -7,15 +7,19 @@ import torch
 
 from astrai.inference.scheduler import InferenceScheduler
 from astrai.inference.task import GenerationResult
+from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
 from astrai.trainer.rollout import (
     BaseRewardModel,
     RawRollout,
+    RolloutEvaluator,
     RolloutGenerator,
     RolloutResult,
     RolloutRunner,
     RolloutVersionError,
+    SamplingParams,
 )
-from tests.helpers import FakeTokenizer, make_model
+from tests.conftest import skip_lt2_cuda
+from tests.helpers import FakeExecutor, FakeTokenizer, make_model
 
 
 class ConstantRewardModel(BaseRewardModel):
@@ -146,13 +150,15 @@ def _make_generator(device, **kw):
         max_len=kw.get("max_position_embeddings", 128),
     )
     generator = RolloutGenerator(
-        scheduler=scheduler,
+        backend=ColocatedBackend(scheduler),
         tokenizer=tokenizer,
-        max_tokens=kw.get("max_tokens", 8),
-        group_size=kw.get("group_size", 2),
-        temperature=kw.get("temperature", 1.0),
-        top_k=kw.get("top_k", 0),
-        top_p=kw.get("top_p", 1.0),
+        params=SamplingParams(
+            max_tokens=kw.get("max_tokens", 8),
+            group_size=kw.get("group_size", 2),
+            temperature=kw.get("temperature", 1.0),
+            top_k=kw.get("top_k", 0),
+            top_p=kw.get("top_p", 1.0),
+        ),
     )
     return generator, model
 
@@ -175,16 +181,186 @@ def test_rollout_generator_uses_eval_and_restores_mode(device):
     gen, model = _make_generator(device, group_size=1, max_tokens=2)
     model.train()
     seen_training = []
-    original = gen.scheduler.run_batch
+    original = gen.backend.scheduler.run_batch
 
     def recording_run_batch(*args, **kwargs):
         seen_training.append(model.training)
         return original(*args, **kwargs)
 
-    gen.scheduler.run_batch = recording_run_batch
+    gen.backend.scheduler.run_batch = recording_run_batch
     gen.generate(_make_instruction_batch(n=1))
     assert seen_training == [False]
     assert model.training is True
+
+
+def test_generate_params_override_training_defaults(device):
+    """A per-call SamplingParams overrides group size and token budget."""
+    gen, _ = _make_generator(device, group_size=2, max_tokens=8)
+    batch = _make_instruction_batch(n=2)
+
+    default = gen.generate(batch)
+    assert default.responses.shape[1] == 2
+
+    override = gen.generate(
+        batch, SamplingParams(group_size=1, max_tokens=1, temperature=1.0)
+    )
+    assert override.responses.shape[:2] == (2, 1)
+    assert override.responses.shape[2] <= 1
+    # The generator's training defaults are untouched by the override.
+    assert gen.params.group_size == 2
+    assert gen.generate(batch).responses.shape[1] == 2
+
+
+def test_rollout_evaluator_reports_reward_metrics_and_leaves_cache(device):
+    """The val evaluator scores under its own params; the replay cache,
+    its cadence counter, and the cache key stay exactly as they were."""
+    runner, _ = _make_runner(device, group_size=2, max_tokens=4, rollout_interval=10)
+    batch = _make_instruction_batch(n=2)
+
+    result, is_fresh = runner(batch)
+    assert is_fresh
+    cache_before = runner._cache
+    steps_before = runner._steps_since_rollout
+
+    evaluator = RolloutEvaluator(
+        generator=runner.generator,
+        reward_model=ConstantRewardModel(2.0),
+        params=SamplingParams(group_size=1, max_tokens=2, temperature=0.0),
+    )
+    metrics = evaluator.evaluate(batch)
+
+    assert metrics["reward_mean"] == pytest.approx(2.0)
+    assert metrics["reward_std"] == pytest.approx(0.0)
+    assert metrics["num_responses"] == 2.0  # B=2 prompts x G=1 override
+    assert metrics["response_len_mean"] <= 2.0
+    assert runner._cache is cache_before
+    assert runner._cache_key == runner._batch_key(batch)
+    assert runner._steps_since_rollout == steps_before
+
+
+def _make_replica_pair():
+    """A training model on cuda:0 and a diverged replica on cuda:1."""
+    train_model, _ = make_model("cuda:0", max_position_embeddings=128)
+    replica_model, _ = make_model("cuda:1", max_position_embeddings=128)
+    with torch.no_grad():
+        for p in replica_model.parameters():
+            p.add_(1.0)
+    return train_model, replica_model
+
+
+@skip_lt2_cuda
+def test_replica_backend_generation_and_output_device():
+    """A replica on cuda:1 generates under its own scheduler and the
+    generator lands rollout tensors on the training device."""
+    train_model, replica_model = _make_replica_pair()
+    replica_model.load_state_dict(train_model.state_dict())
+    tokenizer = FakeTokenizer(with_chat_template=True)
+    backend = ReplicaBackend(
+        model=replica_model,
+        tokenizer=tokenizer,
+        device="cuda:1",
+        max_batch_size=8,
+        max_seq_len=128,
+    )
+    generator = RolloutGenerator(
+        backend=backend,
+        tokenizer=tokenizer,
+        params=SamplingParams(group_size=2, max_tokens=4),
+        output_device=torch.device("cuda", 0),
+    )
+
+    rollout = generator.generate(_make_instruction_batch(n=2))
+
+    assert rollout.responses.shape[:2] == (2, 2)
+    assert rollout.responses.device == torch.device("cuda", 0)
+    assert rollout.logprobs_old.device == torch.device("cuda", 0)
+    # The replica never toggles the shared training model: it stays eval.
+    assert replica_model.training is False
+
+
+@skip_lt2_cuda
+def test_p2p_publisher_copies_weights_and_advances_version():
+    train_model, replica_model = _make_replica_pair()
+    tokenizer = FakeTokenizer(with_chat_template=True)
+    backend = ReplicaBackend(
+        model=replica_model,
+        tokenizer=tokenizer,
+        device="cuda:1",
+        max_batch_size=8,
+        max_seq_len=128,
+    )
+    publisher = P2PCopyPublisher(backend)
+
+    with torch.no_grad():
+        for p in train_model.parameters():
+            p.mul_(2.0).add_(1.0)
+    publisher.publish(3, train_model)
+
+    assert backend.policy_version == 3
+    for (name, src), (name2, dst) in zip(
+        train_model.state_dict().items(), backend.model.state_dict().items()
+    ):
+        assert name == name2
+        assert torch.equal(dst.to(src.device), src)
+    # A second publish reuses the cached pairs and keeps versions monotone.
+    publisher.publish(4, train_model)
+    assert backend.policy_version == 4
+
+
+@skip_lt2_cuda
+def test_online_optimizer_step_syncs_replica_atomically():
+    """strategy.optimizer_step advances the replica's weights and version
+    inside one commit — the cross-GPU rollout contract."""
+    from astrai.trainer.strategy import GRPOStrategy
+    from tests.helpers import make_frozen
+
+    train_model, replica_model = _make_replica_pair()
+    tokenizer = FakeTokenizer(with_chat_template=True)
+    backend = ReplicaBackend(
+        model=replica_model,
+        tokenizer=tokenizer,
+        device="cuda:1",
+        max_batch_size=8,
+        max_seq_len=128,
+    )
+    runner = RolloutRunner(
+        generator=RolloutGenerator(
+            backend=backend,
+            tokenizer=tokenizer,
+            params=SamplingParams(group_size=2, max_tokens=4),
+            output_device=torch.device("cuda", 0),
+        ),
+        reward_model=ConstantRewardModel(),
+        rollout_interval=2,
+    )
+    strategy = GRPOStrategy(
+        model=train_model,
+        device="cuda:0",
+        old_model=None,
+        ref_model=make_frozen(train_model, "cuda:0"),
+        clip_eps=0.2,
+        kl_coef=0.01,
+        group_size=2,
+        model_fn=None,
+        executor=FakeExecutor(),
+    )
+    strategy.set_rollout_runner(runner)
+    strategy.set_weight_publishers([P2PCopyPublisher(backend)])
+
+    for p in train_model.parameters():
+        p.grad = torch.ones_like(p)
+    optimizer = torch.optim.SGD(train_model.parameters(), lr=0.1)
+    before = next(train_model.parameters()).detach().clone()
+    strategy.optimizer_step(optimizer)
+
+    assert not torch.equal(next(train_model.parameters()), before)
+    assert backend.policy_version == 1
+    assert runner.policy_version == 1
+    for (name, src), (name2, dst) in zip(
+        train_model.state_dict().items(), backend.model.state_dict().items()
+    ):
+        assert name == name2
+        assert torch.equal(dst.to(src.device), src)
 
 
 def test_rollout_generator_serializes_generation_and_policy_update(device):
@@ -198,13 +374,30 @@ def test_rollout_generator_serializes_generation_and_policy_update(device):
 
     _assert_interleaved(
         lambda: gen.generate(_make_instruction_batch(n=1)),
-        lambda: gen.apply_weight_update(1, update_finished.set),
+        lambda: gen.apply_weight_update(1, lambda _version: update_finished.set()),
         started=generation_started,
         release=allow_generation_to_finish,
         finished=update_finished,
     )
 
     assert update_finished.is_set()
+    assert gen.policy_version == 1
+
+
+def test_apply_weight_update_hands_derived_version_inside_lock(device):
+    gen, _ = _make_generator(device, group_size=1, max_tokens=2)
+    seen = {}
+
+    def record(policy_version):
+        # The target version is derived under the lock and passed in; the
+        # live version has not moved yet because the commit follows the
+        # update — weight publishers rely on exactly this ordering.
+        seen["arg"] = policy_version
+        seen["live_during"] = gen.backend.scheduler.policy_version
+
+    gen.apply_weight_update(None, record)
+
+    assert seen == {"arg": 1, "live_during": 0}
     assert gen.policy_version == 1
 
 
@@ -219,7 +412,7 @@ def test_rollout_generator_serializes_direct_scheduler_update(device):
     rollout = []
 
     def update_scheduler_directly():
-        gen.scheduler.update_weights(1)
+        gen.backend.scheduler.update_weights(1)
         update_finished.set()
 
     _assert_interleaved(
@@ -236,14 +429,14 @@ def test_rollout_generator_serializes_direct_scheduler_update(device):
 
 def test_rollout_generator_keeps_generation_start_version(device):
     gen, _ = _make_generator(device, group_size=1, max_tokens=2)
-    original_run_batch = gen.scheduler.run_batch
+    original_run_batch = gen.backend.scheduler.run_batch
 
     def update_after_generation(*args, **kwargs):
         result = original_run_batch(*args, **kwargs)
-        gen.scheduler.update_weights(1)
+        gen.backend.scheduler.update_weights(1)
         return result
 
-    gen.scheduler.run_batch = update_after_generation
+    gen.backend.scheduler.run_batch = update_after_generation
 
     rollout = gen.generate(_make_instruction_batch(n=1))
 
@@ -286,7 +479,7 @@ def test_rollout_generator_rejects_failed_requests(device):
             GenerationResult([], [], "rejected", "kv_cache_allocation_failed"),
         ]
 
-    gen.scheduler.run_batch = failed_run_batch
+    gen.backend.scheduler.run_batch = failed_run_batch
 
     with pytest.raises(
         RuntimeError,
@@ -475,7 +668,7 @@ def test_rollout_runner_publishes_cache_before_concurrent_policy_update(device):
 
     _assert_interleaved(
         produce_rollout,
-        lambda: runner.apply_weight_update(1, update_finished.set),
+        lambda: runner.apply_weight_update(1, lambda _version: update_finished.set()),
         started=final_validation_started,
         release=allow_final_validation_to_finish,
         finished=update_finished,

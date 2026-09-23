@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -80,7 +81,10 @@ class _CMakeBuildExt(_build_ext):
         if cmake is None:
             raise RuntimeError("cmake not found on PATH; install it to build kernels")
 
-        parallel = os.environ.get("BUILD_PARALLEL", "4")
+        # Job-level parallelism: one nvcc job per compile unit x arch pass;
+        # each job already pools its own ptxas via --threads. Default fills
+        # the box (capped), BUILD_PARALLEL overrides.
+        parallel = os.environ.get("BUILD_PARALLEL", str(min(os.cpu_count() or 4, 32)))
         cfg = [
             cmake,
             "-S",
@@ -92,25 +96,49 @@ class _CMakeBuildExt(_build_ext):
             f"-DPY_SOABI={_python_soabi()}",
         ]
         arch = os.environ.get("ASTRAI_CUDA_ARCH")
-        if not arch:
-            arch = _detect_cuda_arch()
+        max_arch = None
+        try:
+            if arch:
+                # Accept a semicolon list ("80;89;120a"); the FP8 gate keys
+                # on the maximum, matching the CMake-side validation. The
+                # arch-specific 'a' suffix selects a compile pass, never a
+                # CC number, so the comparison strips it.
+                max_arch = max(
+                    int(re.sub(r"[^0-9]", "", a))
+                    for a in arch.split(";")
+                    if re.sub(r"[^0-9]", "", a)
+                )
+            else:
+                # No env: follow the local GPU (dev iteration — one arch,
+                # arch-specific where it matters). The mixed fleet is the
+                # explicit release opt-in (ASTRAI_CUDA_ARCH="80;89;120a").
+                # With no GPU either, CMake builds no kernel targets at all
+                # (there is no arch fallback), so this path may pass None.
+                arch = _detect_cuda_arch()
+                max_arch = int(re.sub(r"[^0-9]", "", arch)) if arch else None
+        except ValueError:
+            warnings.warn(
+                f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
+                "FP8 capability will be decided by CMake.",
+                stacklevel=2,
+            )
         if arch:
-            try:
-                if int(str(arch)) < 89:
-                    warnings.warn(
-                        f"FP8 operator disabled: CUDA compute capability {arch} "
-                        "requires 89 or newer.",
-                        stacklevel=2,
-                    )
-            except ValueError:
+            if max_arch is not None and max_arch < 89:
                 warnings.warn(
-                    f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
-                    "FP8 capability will be decided by CMake.",
+                    f"FP8 operator disabled: CUDA compute capability {arch} "
+                    "requires 89 or newer.",
                     stacklevel=2,
                 )
             cfg.append(f"-DASTRAI_CUDA_ARCH={arch}")
-        subprocess.run(cfg, check=True)
-        subprocess.run([cmake, "--build", str(build_dir), "-j", parallel], check=True)
+        # CUDACXX: a cold-cache configure cannot find nvcc when it is off
+        # PATH — and caches the failure.
+        env = dict(os.environ)
+        if (nvcc := _find_nvcc()) and not env.get("CUDACXX"):
+            env["CUDACXX"] = nvcc
+        subprocess.run(cfg, check=True, env=env)
+        subprocess.run(
+            [cmake, "--build", str(build_dir), "-j", parallel], check=True, env=env
+        )
 
         # After compilation finishes, verify mandatory CUDA kernels to confirm build succeeded.
         # CMake may report partial‑target success even if some architecture‑specific kernels are skipped.
@@ -130,11 +158,25 @@ class _CMakeBuildExt(_build_ext):
             )
 
 
+def _find_nvcc():
+    """nvcc path: PATH first, then the standard toolkit locations."""
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return nvcc
+    for root in (
+        os.environ.get("CUDA_HOME"),
+        os.environ.get("CUDA_PATH"),
+        "/usr/local/cuda",
+    ):
+        if root and (Path(root) / "bin" / "nvcc").is_file():
+            return str(Path(root) / "bin" / "nvcc")
+    return None
+
+
 def _cuda_toolkit_version():
-    import shutil
     import subprocess
 
-    nvcc = shutil.which("nvcc")
+    nvcc = _find_nvcc()
     if nvcc is None:
         return None
     try:
@@ -153,14 +195,20 @@ def _cuda_toolkit_version():
 def _detect_cuda_arch():
     """Detect real GPU compute capability via torch (nvidia-smi may be spoofed).
 
-    Returns something like ``"89"`` or ``"103"``, or ``None`` if unavailable.
+    Returns a token like ``"89"``, ``"103"`` or ``"120a"`` (``None`` if
+    unavailable). CC 12.0 gains the arch-specific suffix: the gemm's fp8
+    block_scale cell lives only in that pass, and an sm_120 device selects
+    the arch-specific image anyway.
     """
     try:
         import torch
 
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability()
-            return f"{major}{minor}"
+            arch = f"{major}{minor}"
+            if arch == "120":
+                arch += "a"
+            return arch
     except Exception:
         pass
     return None

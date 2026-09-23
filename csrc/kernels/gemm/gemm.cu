@@ -1,21 +1,26 @@
-// GEMM family binding (module `gemm`): the single quantized-GEMM entry
-// ``quant_gemm`` — every dtype pairing (bf16 / int8 / fp8 operands, per-
-// operand scales) dispatches over one dtype-generic kernel family. The
-// policy instantiation space compiles one explicit instantiation per dtype
+// GEMM family, typed host layer (module `gemm`): the dtype-pair registry, the
+// single quantized-GEMM entry, and the planner's C++ face — probe, row
+// injection, runtime configuration and the tile vocabulary, all declared in
+// gemm/api.h. The pybind surface (argument marshalling, the dict shapes, the
+// module registration) lives in bindings.cu; this TU holds no py:: type.
+// torch/extension.h is here for the torch::Tensor spelling only.
+//
+// The policy instantiation space compiles one explicit instantiation per dtype
 // pair (one per .cu below), so the heavy template work runs as parallel
-// nvcc jobs. This TU keeps the dtype-pair switch + pybind; the C tests
-// instantiate from the headers instead.
+// nvcc jobs. This TU keeps the dtype-pair switch; the C tests instantiate from
+// the headers instead.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/core/ScalarType.h>
 #include <cstdint>
-#include <torch/extension.h>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
-#include "common/device.cuh"
 #include "gemm.cuh"
+#include "gemm/api.h"
 #include "quantize/checks.h"
-#include "quantize/common.h"
 
 using namespace astrai;
 using namespace astrai::quant;
@@ -23,26 +28,33 @@ using namespace astrai::quant;
 namespace astrai {
 namespace gemm {
 
+// The dtype-pair table: one line per supported pair — (torch ScalarType,
+// element type) per operand — and the single source this TU's consumers
+// stamp: the extern template declarations below and the dispatch / probe
+// lookups further down. A pair is added once here and cannot reach one
+// consumer without the other. (The extern block used to be hand-maintained
+// beside the switch, and had already grown two bf16 x fp8 entries with no
+// instantiation TU behind them.) The CMake gemm module entry carries one
+// instantiation TU per line — kept together by hand, and a line with no TU
+// behind it fails the link loudly.
+#define ASTRAI_GEMM_PAIRS(X)                                                 \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kBFloat16, __nv_bfloat16)      \
+    X(torch::kBFloat16, __nv_bfloat16, torch::kChar, int8_t)                 \
+    X(torch::kChar, int8_t, torch::kChar, int8_t)                            \
+    X(torch::kFloat8_e4m3fn, __nv_fp8_e4m3, torch::kFloat8_e4m3fn,           \
+      __nv_fp8_e4m3)                                                         \
+    X(torch::kFloat8_e5m2, __nv_fp8_e5m2, torch::kFloat8_e5m2, __nv_fp8_e5m2)
+
 // The per-pair specializations are explicitly instantiated in their own TUs
 // (gemm_bf16_bf16.cu etc.), one nvcc job per dtype pair. These extern
-// template declarations keep the bindings below from re-instantiating: the
-// address-of forms are references to the externally defined symbols only.
+// template declarations keep the dispatch switch below from re-instantiating:
+// the address-of forms are references to the externally defined symbols only.
 // (They must sit here, outside the anonymous namespace — nvcc rejects
 // extern template declarations in an anonymous namespace.)
-extern template void gemm_dispatch<__nv_bfloat16, __nv_bfloat16>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_bfloat16, int8_t>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<int8_t, int8_t>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>(
-    GemmParams, cudaStream_t, bool, bool);
-extern template void gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>(
-    GemmParams, cudaStream_t, bool, bool);
+#define ASTRAI_GEMM_EXTERN(SA, TA, SB, TB) \
+    extern ASTRAI_GEMM_INSTANTIATE(TA, TB);
+ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_EXTERN)
+#undef ASTRAI_GEMM_EXTERN
 
 namespace {
 
@@ -100,29 +112,11 @@ QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent,
     return {s.data_ptr<float>(), s.numel() == 1 ? 0 : (int)extent};
 }
 
-// py::object -> torch::Tensor with a uniform error message; a none object
-// stays undefined (callers gate on is_none()).
-torch::Tensor cast_tensor_arg(const py::object& o, const char* name) {
-    try {
-        return o.cast<torch::Tensor>();
-    } catch (const py::cast_error&) {
-        TORCH_CHECK(false, name, " must be a torch.Tensor or None");
-        return {};
-    }
-}
-
-// The dtype-pair dispatch switch below replaces a hand-maintained if/else
-// chain: each supported (activation, weight) pair selects its
-// gemm_dispatch specialization exactly once, and an unsupported pair raises
-// with the actual operand dtypes in the message instead of a hardcoded
-// list that can drift out of sync. The specializations are explicitly
-// instantiated in their own TUs (one nvcc job per dtype pair), so the
-// switch is nothing but a jump table over resolved function pointers —
-// the extern template declarations above keep any re-instantiation out of
-// this TU. pack_dtypes is constexpr, so every case label is a compile-time
-// constant and the switch lowers to one indexed branch, no
-// runtime-initialized state. The function is not constexpr only because
-// the default arm throws.
+// The lookup key both stamped switches below pack their case labels with:
+// one u16 per pair, so every label is a compile-time constant and the switch
+// lowers to one indexed branch with no runtime-initialized state. An
+// unsupported pair raises with the actual operand dtypes in the message
+// instead of a hardcoded list that can drift.
 using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
@@ -130,49 +124,198 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
            static_cast<uint8_t>(b);
 }
 
+// The unsupported-pair arm, one spelling for the two lookups below: the
+// switch's own default carries it, so the non-void lookups cannot fall off
+// their end. The message names the operand dtypes it actually got instead of
+// a hardcoded list that can drift.
+#define ASTRAI_GEMM_UNSUPPORTED_PAIR(SA, SB)                            \
+    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(SA), \
+                " x ", toString(SB),                                    \
+                ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "  \
+                "bf16 x bf16 (W16A16), or matching fp8 x fp8")
+
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
+#define GEMM_CASE(SA, TA, SB, TB) \
+    case pack_dtypes(SA, SB):     \
+        return &gemm_dispatch<TA, TB>;
     switch (pack_dtypes(a, b)) {
-        case pack_dtypes(torch::kBFloat16, torch::kBFloat16):
-            return &gemm_dispatch<__nv_bfloat16, __nv_bfloat16>;
-        case pack_dtypes(torch::kBFloat16, torch::kChar):
-            return &gemm_dispatch<__nv_bfloat16, int8_t>;
-        case pack_dtypes(torch::kChar, torch::kChar):
-            return &gemm_dispatch<int8_t, int8_t>;
-        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e4m3fn):
-            return &gemm_dispatch<__nv_bfloat16, __nv_fp8_e4m3>;
-        case pack_dtypes(torch::kBFloat16, torch::kFloat8_e5m2):
-            return &gemm_dispatch<__nv_bfloat16, __nv_fp8_e5m2>;
-        case pack_dtypes(torch::kFloat8_e4m3fn, torch::kFloat8_e4m3fn):
-            return &gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3>;
-        case pack_dtypes(torch::kFloat8_e5m2, torch::kFloat8_e5m2):
-            return &gemm_dispatch<__nv_fp8_e5m2, __nv_fp8_e5m2>;
-        default:
-            TORCH_CHECK(false,
-                        "unsupported operand dtype pair ", toString(a), " x ", toString(b),
-                        ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "
-                        "bf16 x bf16 (W16A16), bf16 x fp8 (W-F8A16), or "
-                        "matching fp8 x fp8");
+        ASTRAI_GEMM_PAIRS(GEMM_CASE)
+    default:
+        ASTRAI_GEMM_UNSUPPORTED_PAIR(a, b);
     }
+#undef GEMM_CASE
+}
+
+// Host-only functions that run the planner without a launch (the
+// autotuner's coverage check).
+using GemmProbeFn =
+    std::pair<PlanDecision, PlanQuery> (*)(int64_t, int64_t, int64_t, int64_t,
+                                           bool, bool, const DeviceFacts&);
+
+GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
+#define PROBE_CASE(SA, TA, SB, TB) \
+    case pack_dtypes(SA, SB):      \
+        return &plan_probe_for<TA, TB>;
+    switch (pack_dtypes(a, b)) {
+        ASTRAI_GEMM_PAIRS(PROBE_CASE)
+    default:
+        ASTRAI_GEMM_UNSUPPORTED_PAIR(a, b);
+    }
+#undef PROBE_CASE
 }
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Planner introspection: the Python tooling's C++ face. The planner is
+// GPU-free by design, so the probe launches nothing. Rows reach the planner
+// through configure()'s rows channel; injected rows rank BELOW the override
+// rows (plan_table.h), keeping the override tier authoritative.
+// ---------------------------------------------------------------------------
+
+PlanProbe plan_probe(int64_t m, int64_t n, int64_t k, at::ScalarType dt_a,
+                     at::ScalarType dt_b, bool trans_a, bool trans_b,
+                     int64_t batch) {
+    const auto [decision, query] = find_gemm_probe(dt_a, dt_b)(
+        m, n, k, batch, trans_a, trans_b, astrai::device_facts());
+    PlanProbe r;
+    r.source = decision.source;
+    r.cta = decision.recipe.cta;
+    r.stages = decision.recipe.stages;
+    r.raster = decision.raster;
+    r.kk = decision.recipe.kk;
+    r.perf_class = query.perf_class;
+    r.crosswise = query.crosswise;
+    return r;
+}
+
+namespace {
+
+// Install one row tier from a spec (a row-file path when one opens, else
+// inline row text) and remember the spec, so the config state can hand back a
+// value that re-installs it. `label` is what a parse error reports.
+int install_rows(RowSource& tier, const char* label, const std::string& source) {
+    std::vector<TableRow> rows;
+    if (!parse_plan_table_file(source, rows))
+        parse_plan_table_text(source, label, rows);
+    const int installed = (int)rows.size();
+    tier.set_from(source, std::move(rows));
+    return installed;
+}
+
+RowSource& row_tier(RowTier tier) {
+    return tier == RowTier::Injected ? plan_table_injected_source()
+                                     : plan_table_override_source();
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Runtime configuration: the backing of astrai.extension.plan. Every knob is
+// tri-state — an absent patch field leaves it unchanged, an explicit value wins
+// over the one-time env seed. Rows are addressed by tier (`rows` + `tier`), the
+// all-tiers-off switch is its own field, and the staging keys are positive
+// enables: tma=false forces cp.async staging, mx=false knocks the sm_120a
+// block-scale cell out (the A/B knobs).
+// ---------------------------------------------------------------------------
+
+GemmConfigState config_state() {
+    GemmConfigState s;
+    s.planner = kPlannerModeNames[gemm_planner_mode()];  // resolves unset
+    s.planner_mode = gemm_config().planner.load(std::memory_order_relaxed);
+    s.log = gemm_plan_log_enabled();
+    s.table_off = gemm_table_off();
+    s.override_rows = (int)plan_table_override_source().size();
+    s.override_source = plan_table_override_source().source();
+    s.injected_rows = (int)plan_table_injected_source().size();
+    s.injected_source = plan_table_injected_source().source();
+    s.staging_tma = !gemm_tma_staging_disabled();
+    s.staging_mx = !gemm_mx_cell_disabled();
+    return s;
+}
+
+GemmConfigState configure(const GemmConfigPatch& patch) {
+    gemm_config_seed_once();
+    if (patch.planner_mode.has_value()) {
+        const int mode = *patch.planner_mode;
+        if (mode < -1 || mode >= kPlannerModeCount)
+            throw std::invalid_argument("planner mode must be -1..2");
+        gemm_config().planner = mode;
+    }
+    if (patch.log.has_value())
+        gemm_config().log = *patch.log ? 1 : 0;
+    if (patch.staging_tma.has_value())
+        gemm_config().tma_disabled = *patch.staging_tma ? 0 : 1;
+    if (patch.staging_mx.has_value())
+        gemm_config().mx_disabled = *patch.staging_mx ? 0 : 1;
+    if (patch.table_off.has_value())
+        gemm_config().table_off = *patch.table_off ? 1 : 0;
+    if (patch.rows.has_value()) {
+        const RowTier which = patch.tier.value_or(RowTier::Override);
+        if (patch.rows->empty()) {
+            row_tier(which).clear();
+        } else {
+            install_rows(row_tier(which),
+                         which == RowTier::Injected ? "injected rows"
+                                                    : "override rows",
+                         *patch.rows);
+        }
+    }
+    return config_state();
+}
+
+// The recipe vocabulary per (crosswise, operand widths) — every
+// (CTA class, stages, kK) the launch ladders instantiate for that staging
+// pair, deduped on the dispatch key, in dispatch (manifest) order. Rows are
+// (crosswise, ba, bb, cta, stages, kk, bm, bn, wm, wn, threads, smem);
+// a row's numbers spell its canonical name,
+// Tile_<bm>x<bn>x<kk>_W<wm>x<wn>_S<stages> — the bench's own spelling —
+// which is how the Python tooling joins rows with dataset recipe strings
+// without keeping a second copy of the vocabulary. (2,1) covers the mixed
+// W8A16 class, whose congruent staging runs the conservative
+// ladder too (manifest_kind's fallback); (1,2) matches no supported pair.
+std::vector<std::vector<int>> tile_vocabulary() {
+    const std::pair<int, int> widths[] = {{2, 2}, {2, 1}, {1, 1}};
+    std::vector<std::vector<int>> out;
+    for (int crosswise = 0; crosswise <= 1; ++crosswise)
+        for (const auto& [ba, bb] : widths)
+            for (const GemmRecipe& r : gemm_recipes_for(crosswise != 0, ba, bb))
+                out.push_back({crosswise, ba, bb, r.cta, r.stages, r.kk,
+                               r.bm, r.bn, r.wm, r.wn, r.threads, r.smem});
+    return out;
+}
+
+// The TileClass spellings, in enum order — what a row's cta ordinal expands
+// to in the compiled-in tables (the GENERATED block's paste target). Owned
+// here so the sweep's C++ emitter needs no Python-side copy of the names.
+std::vector<const char*> tile_class_names() {
+    static constexpr const char* kNames[] = {
+        "kSmall64", "kNarrow128x64", "kBig128", "kWide128x256",
+        "kTall64x128"};
+    static_assert((int)TileClass::kTall64x128 ==
+                      (int)(sizeof(kNames) / sizeof(kNames[0])) - 1,
+                  "kNames is indexed by TileClass: keep it in enum order");
+    return std::vector<const char*>(kNames, kNames + sizeof(kNames) / sizeof(kNames[0]));
+}
+
+// ---------------------------------------------------------------------------
 // The single quantized-GEMM entry (one kernel for every cell, the only
-// export). The dtype pair picks the mma mode:
+// kernel-facing export). The dtype pair picks the mma mode:
 //   bf16 x bf16 (W16A16)        — no scales
 //   bf16 x int8 (W8A16)         — b_scale required
 //   int8 x int8 (W8A8)          — both scales required
-//   bf16 x fp8 (W-F8A16)        — b_scale optional (in-register hardware
-//                                  widen to the bf16 mma)
 //   fp8 x fp8, matching formats — both scales optional
 // Scale arity is validated per side: int8 requires its dequant scale, fp8
 // takes one optionally (per-tensor scalar or the operand's extent), bf16
 // rejects one (nothing to dequant). The body packs GemmParams (batch
 // broadcast rules, zero-copy transposed views, fused bf16 bias) and hands
 // it to the dtype-pair dispatch.
-torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
-                         py::object b_scale, bool trans_a, bool trans_b,
-                         py::object bias) {
+// ---------------------------------------------------------------------------
+torch::Tensor quant_gemm_impl(torch::Tensor a, torch::Tensor b,
+                              c10::optional<torch::Tensor> a_scale,
+                              c10::optional<torch::Tensor> b_scale,
+                              bool trans_a, bool trans_b,
+                              c10::optional<torch::Tensor> bias) {
     const auto dt_a = a.scalar_type(), dt_b = b.scalar_type();
     const bool i8a = dt_a == torch::kChar, i8b = dt_b == torch::kChar;
     const bool f8a = dt_a == torch::kFloat8_e4m3fn || dt_a == torch::kFloat8_e5m2;
@@ -186,17 +329,17 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
     }
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t n = trans_b ? b.size(-2) : b.size(-1);
-    auto opt_scale = [&](py::object s, int64_t extent, const char* name,
-                         bool i8_side, bool bf16_side) -> QuantScale {
-        if (s.is_none()) {
+    auto opt_scale = [&](const c10::optional<torch::Tensor>& s, int64_t extent,
+                         const char* name, bool i8_side,
+                         bool bf16_side) -> QuantScale {
+        if (!s.has_value()) {
             TORCH_CHECK(!i8_side, "quant_gemm: ", name,
                         " is required for an int8 operand");
             return {nullptr, 0};
         }
-        torch::Tensor t = cast_tensor_arg(s, name);
         TORCH_CHECK(!bf16_side, "quant_gemm: ", name,
                     " given for a bf16 operand (nothing to dequant)");
-        return resolve_quant_scale(t, extent, name);
+        return resolve_quant_scale(*s, extent, name);
     };
     const QuantScale sa = opt_scale(a_scale, m, "a_scale", i8a, b16a);
     const QuantScale sb = opt_scale(b_scale, n, "b_scale", i8b, b16b);
@@ -207,7 +350,7 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
                 "a and b must be 2D or 3D (batched)");
     TORCH_CHECK(a.device() == b.device(), "a and b must share device");
     torch::Tensor bias_t;
-    if (!bias.is_none()) bias_t = cast_tensor_arg(bias, "bias");
+    if (bias.has_value()) bias_t = *bias;
     const at::cuda::OptionalCUDAGuard guard(a.device());
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -268,10 +411,3 @@ torch::Tensor quant_gemm(torch::Tensor a, torch::Tensor b, py::object a_scale,
 
 }  // namespace gemm
 }  // namespace astrai
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
-          py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
-          py::arg("trans_a") = false, py::arg("trans_b") = true,
-          py::arg("bias") = py::none());
-}

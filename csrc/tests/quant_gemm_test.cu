@@ -244,6 +244,35 @@ static bool check_all_layouts(const std::vector<float>& ha,
     return ok;
 }
 
+// Shorthands over check_gemm for the two repeating dispatch shapes: a
+// pinned Policy the plan ladder would not route the shape to, and the
+// production dtype-generic dispatch at explicit trans flags.
+template <typename ElemA, typename ElemB, typename Policy,
+          typename OutT = __nv_bfloat16>
+static bool check_pinned(const float* ha, const float* hb, int m, int n, int k,
+                         int a_ld, int b_ld, int a_rm, int b_rm,
+                         const char* tag, float tol,
+                         const std::vector<float>& b_scale = {},
+                         const std::vector<float>& a_scale = {}) {
+    return check_gemm<ElemA, ElemB, OutT>(
+        ha, hb, m, n, k, a_ld, b_ld, a_rm, b_rm, tag, tol,
+        [](GemmParams& p) { launch_policy<Policy>(p, 0); }, b_scale, a_scale);
+}
+
+template <typename ElemA, typename ElemB, typename OutT = __nv_bfloat16>
+static bool check_dispatch(const float* ha, const float* hb, int m, int n, int k,
+                           int a_ld, int b_ld, int a_rm, int b_rm,
+                           const char* tag, float tol, bool ta, bool tb,
+                           const std::vector<float>& b_scale = {},
+                           const std::vector<float>& a_scale = {}) {
+    return check_gemm<ElemA, ElemB, OutT>(
+        ha, hb, m, n, k, a_ld, b_ld, a_rm, b_rm, tag, tol,
+        [ta, tb](GemmParams& p) {
+            gemm_dispatch<ElemA, ElemB, OutT>(p, 0, ta, tb);
+        },
+        b_scale, a_scale);
+}
+
 // ---------------------------------------------------------------------------
 // fp8 e4m3 GEMM — all four operand layouts x K-tiles x production routes
 // ---------------------------------------------------------------------------
@@ -251,13 +280,10 @@ static bool check_all_layouts(const std::vector<float>& ha,
 // Big-CTA policies for the direct-layout cases: kK/Stages vary per case;
 // the fast interior loop follows the dual-congruous rule, grouped raster 8
 // matches the production dispatch.
-template <typename LA, typename LB>
-constexpr bool kCaseFast =
-    !std::is_same_v<LA, ColMajor> && !std::is_same_v<LB, RowMajor>;
 template <typename LA, typename LB, int kK, int Stages>
 using CasePolicy = GemmPolicy<
     __nv_fp8_e4m3, __nv_fp8_e4m3, LA, LB,
-    GemmTileConfig<Shape<128, 128, kK>, Shape<64, 32>, Stages, kCaseFast<LA, LB>>,
+    GemmTileConfig<Shape<128, 128, kK>, Shape<64, 32>, Stages>,
     RowMajor, __nv_bfloat16>;
 
 // fp8 e4m3 layout case: direct big-CTA policy (dispatch=0), the production
@@ -349,10 +375,10 @@ static bool test_dtype_combos() {
     // big/small tile variants (the plan ladder routes 256x256 to the small
     // CTA, so the big CTA needs pinning).
     using Bf16Big =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
+        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
     using Bf16Small =
-        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3_Fast,
+        GemmPolicy<__nv_bfloat16, __nv_bfloat16, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3,
                    RowMajor, __nv_bfloat16>;
     printf("W16A16 (bf16 x bf16, all layouts):\n");
     for (int k : {64, 128, 320, 512}) {
@@ -361,14 +387,12 @@ static bool test_dtype_combos() {
         printf(" 256x256x%d:\n", k);
         all &= check_all_layouts<__nv_bfloat16>(ha, hb, 256, 256, k, "w16a16",
                                                 0.02f);
-        all &= check_gemm<__nv_bfloat16>(
+        all &= check_pinned<__nv_bfloat16, __nv_bfloat16, Bf16Big>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w16a16 big 128x128", 0.02f,
-            [&](GemmParams& p) { launch_policy<Bf16Big>(p, 0); });
-        all &= check_gemm<__nv_bfloat16>(
+            "w16a16 big 128x128", 0.02f);
+        all &= check_pinned<__nv_bfloat16, __nv_bfloat16, Bf16Small>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w16a16 small 64x64", 0.02f,
-            [&](GemmParams& p) { launch_policy<Bf16Small>(p, 0); });
+            "w16a16 small 64x64", 0.02f);
     }
 
     // W8A16 weight-only: bf16 activation x per-channel-scaled int8 weight.
@@ -377,22 +401,27 @@ static bool test_dtype_combos() {
     // production dispatch (NN takes the direct mixed instantiation), with
     // pinned tile variants the plan ladder would not route 256x256 to.
     using MixedBig =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
     using MixedSmall =
-        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3_Fast,
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x64x64_W16x32_S3,
+                   RowMajor, __nv_bfloat16>;
+    // The tall 64x128 CTA: plan rows route production shapes to it, so its
+    // ring and epilogue reclaim need a cell the correctness suite launches.
+    using MixedTall =
+        GemmPolicy<__nv_bfloat16, int8_t, RowMajor, ColMajor, Tile_64x128x32_W32x32_S3,
                    RowMajor, __nv_bfloat16>;
     using MixedTT =
         GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
     using TTSmallS2 =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_64x64x64_W16x32_S2_Fast,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_64x64x64_W16x32_S2,
                    RowMajor, __nv_bfloat16>;
     using TTNarrow =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x64x64_W32x32_S2_Fast,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x64x64_W32x32_S2,
                    RowMajor, __nv_bfloat16>;
     using TTBigFast =
-        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
+        GemmPolicy<__nv_bfloat16, int8_t, ColMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                    RowMajor, __nv_bfloat16>;
     using MixedTN =
         GemmPolicy<__nv_bfloat16, int8_t, ColMajor, RowMajor, Tile_128x128x64_W64x32_S2,
@@ -408,43 +437,38 @@ static bool test_dtype_combos() {
         printf(" 256x256x%d:\n", k);
         all &= check_all_layouts<__nv_bfloat16, int8_t>(ha, hb, 256, 256, k,
                                                         "w8a16", 0.02f, scale);
-        all &= check_gemm<__nv_bfloat16, int8_t>(
+        all &= check_pinned<__nv_bfloat16, int8_t, MixedBig>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w8a16 big 128x128", 0.02f,
-            [&](GemmParams& p) { launch_policy<MixedBig>(p, 0); }, scale);
-        all &= check_gemm<__nv_bfloat16, int8_t>(
+            "w8a16 big 128x128", 0.02f, scale);
+        all &= check_pinned<__nv_bfloat16, int8_t, MixedSmall>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-            "w8a16 small 64x64", 0.02f,
-            [&](GemmParams& p) { launch_policy<MixedSmall>(p, 0); }, scale);
+            "w8a16 small 64x64", 0.02f, scale);
+        all &= check_pinned<__nv_bfloat16, int8_t, MixedTall>(
+            ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
+            "w8a16 tall 64x128 kk32 s3", 0.02f, scale);
         if (k == 320) {
             // Crosswise/dual-row-major big CTA pinned (the planner routes
             // 256x256 crosswise to the small CTA).
             const std::vector<float> ha_t = transpose(ha, 256, k);
             const std::vector<float> hb_t = transpose(hb, 256, k);
-            all &= check_gemm<__nv_bfloat16, int8_t>(
+            all &= check_pinned<__nv_bfloat16, int8_t, MixedTT>(
                 ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT big", 0.02f,
-                [&](GemmParams& p) { launch_policy<MixedTT>(p, 0); }, scale);
-            all &= check_gemm<__nv_bfloat16, int8_t>(
+                "w8a16 TT big", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, TTSmallS2>(
                 ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT smallS2", 0.02f,
-                [&](GemmParams& p) { launch_policy<TTSmallS2>(p, 0); }, scale);
-            all &= check_gemm<__nv_bfloat16, int8_t>(
+                "w8a16 TT smallS2", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, TTNarrow>(
                 ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT narrow", 0.02f,
-                [&](GemmParams& p) { launch_policy<TTNarrow>(p, 0); }, scale);
-            all &= check_gemm<__nv_bfloat16, int8_t>(
+                "w8a16 TT narrow", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, TTBigFast>(
                 ha_t.data(), hb.data(), 256, 256, k, 256, k, 0, 0,
-                "w8a16 TT bigfast", 0.02f,
-                [&](GemmParams& p) { launch_policy<TTBigFast>(p, 0); }, scale);
-            all &= check_gemm<__nv_bfloat16, int8_t>(
+                "w8a16 TT bigfast", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, MixedTN>(
                 ha_t.data(), hb_t.data(), 256, 256, k, 256, 256, 0, 1,
-                "w8a16 TN big", 0.02f,
-                [&](GemmParams& p) { launch_policy<MixedTN>(p, 0); }, scale);
-            all &= check_gemm<__nv_bfloat16, int8_t>(
+                "w8a16 TN big", 0.02f, scale);
+            all &= check_pinned<__nv_bfloat16, int8_t, MixedNN>(
                 ha.data(), hb_t.data(), 256, 256, k, k, 256, 1, 1,
-                "w8a16 NN big", 0.02f,
-                [&](GemmParams& p) { launch_policy<MixedNN>(p, 0); }, scale);
+                "w8a16 NN big", 0.02f, scale);
         }
     }
 
@@ -459,13 +483,9 @@ static bool test_dtype_combos() {
         const std::vector<float> ha_t = transpose(ha, 100, 96);
         const std::vector<float> hb_t = transpose(hb, 130, 96);
         printf("W8A16 odd shape (100x130x96, TN):\n");
-        all &= check_gemm<__nv_bfloat16, int8_t>(
+        all &= check_dispatch<__nv_bfloat16, int8_t>(
             ha_t.data(), hb_t.data(), 100, 130, 96, 100, 130, 0, 1,
-            "w8a16 TN odd", 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_bfloat16, int8_t>(p, 0, true, false);
-            },
-            scale);
+            "w8a16 TN odd", 0.02f, /*ta=*/true, /*tb=*/false, scale);
     }
 
     // W8A8 dynamic: per-row-scaled int8 activation x per-channel-scaled
@@ -474,7 +494,7 @@ static bool test_dtype_combos() {
     // plus a pinned big-CTA instantiation at k=320.
     {
         using W8A8Big =
-            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2_Fast,
+            GemmPolicy<int8_t, int8_t, RowMajor, ColMajor, Tile_128x128x64_W64x32_S2,
                        RowMajor, __nv_bfloat16>;
         printf("W8A8 (int8 act x int8 weight, all layouts):\n");
         for (int k : {64, 320, 512}) {
@@ -486,11 +506,9 @@ static bool test_dtype_combos() {
             all &= check_all_layouts<int8_t>(ha, hb, 256, 256, k, "w8a8",
                                              0.02f, cscale, rscale);
             if (k == 320) {
-                all &= check_gemm<int8_t, int8_t>(
+                all &= check_pinned<int8_t, int8_t, W8A8Big>(
                     ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-                    "w8a8 big 128x128", 0.02f,
-                    [&](GemmParams& p) { launch_policy<W8A8Big>(p, 0); },
-                    cscale, rscale);
+                    "w8a8 big 128x128", 0.02f, cscale, rscale);
             }
         }
     }
@@ -509,68 +527,25 @@ static bool test_dtype_combos() {
                                                         rscale);
     }
 
-    // W-F8A16 weight-only: bf16 activation x per-channel-scaled e4m3
-    // weight. The weight dequantizes in-register through the hardware
-    // fp8->fp16 widen + exact bf16 rounding; row 0 is seeded with exact
-    // zeros and subnormal-magnitude values (0.001 < 2^-6) so those paths
-    // are exercised, and the mirrored pair follows. Pinned big CTA at
-    // k=320 covers the Tile_128x128x64_W64x32_S2_Fast instantiation the planner would not
-    // route 256x256 to.
-    {
-        using F8Big = GemmPolicy<__nv_bfloat16, __nv_fp8_e4m3, RowMajor,
-                                 ColMajor, Tile_128x128x64_W64x32_S2_Fast, RowMajor,
-                                 __nv_bfloat16>;
-        printf("W-F8A16 (bf16 act x e4m3 weight, all layouts):\n");
-        for (int k : {64, 320}) {
-            std::vector<float> ha, hb;
-            prep(ha, hb, 256, 256, k, 222 + k);
-            const std::vector<float> scale = div_row_scales(hb, 256, k, 448.f);
-            for (int j = 0; j < 16; ++j)
-                hb[j] = j < 8 ? 0.f : 0.001f;  // +0 and e4m3 subnormals
-            printf(" 256x256x%d:\n", k);
-            all &= check_all_layouts<__nv_bfloat16, __nv_fp8_e4m3>(
-                ha, hb, 256, 256, k, "w-f8a16", 0.02f, scale);
-            if (k == 320) {
-                all &= check_gemm<__nv_bfloat16, __nv_fp8_e4m3>(
-                    ha.data(), hb.data(), 256, 256, k, k, k, 1, 0,
-                    "w-f8a16 big 128x128", 0.02f,
-                    [&](GemmParams& p) { launch_policy<F8Big>(p, 0); },
-                    scale);
-            }
-        }
-        printf("A-F8W16 (e4m3 act x bf16 weight, all layouts):\n");
-        for (int k : {64, 320}) {
-            std::vector<float> ha, hb;
-            prep(ha, hb, 256, 256, k, 333 + k);
-            const std::vector<float> rscale = div_row_scales(ha, 256, k, 448.f);
-            printf(" 256x256x%d:\n", k);
-            all &= check_all_layouts<__nv_fp8_e4m3, __nv_bfloat16>(
-                ha, hb, 256, 256, k, "a-f8w16", 0.02f, {}, rscale);
-        }
-    }
-
     // fp32 output (OutT = float): one fixed narrow-CTA policy and one
     // production-planned route through the dtype-generic dispatch. The
     // narrow tile's 32KB output fits the 36KB reclaimed operand rings
     // (launch_plan compile-time-reroutes the 128x128 CTA for fat outputs).
     using Fp8F32Out =
         GemmPolicy<__nv_fp8_e4m3, __nv_fp8_e4m3, RowMajor, ColMajor,
-                   Tile_128x64x64_W32x32_S2_Fast, RowMajor, float>;
+                   Tile_128x64x64_W32x32_S2, RowMajor, float>;
     printf("fp8 operands, fp32 output:\n");
     for (int k : {64, 320, 512}) {
         std::vector<float> ha, hb;
         prep(ha, hb, 300, 200, k, 4321 + k);
         char tag[24];
         snprintf(tag, sizeof(tag), "f32-out K%d", k);
-        all &= check_gemm<__nv_fp8_e4m3, __nv_fp8_e4m3, float>(
-            ha.data(), hb.data(), 300, 200, k, k, k, 1, 0, tag, 0.02f,
-            [&](GemmParams& p) { launch_policy<Fp8F32Out>(p, 0); });
+        all &= check_pinned<__nv_fp8_e4m3, __nv_fp8_e4m3, Fp8F32Out, float>(
+            ha.data(), hb.data(), 300, 200, k, k, k, 1, 0, tag, 0.02f);
         snprintf(tag, sizeof(tag), "f32-out disp K%d", k);
-        all &= check_gemm<__nv_fp8_e4m3, __nv_fp8_e4m3, float>(
+        all &= check_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3, float>(
             ha.data(), hb.data(), 300, 200, k, k, k, 1, 0, tag, 0.02f,
-            [&](GemmParams& p) {
-                gemm_dispatch<__nv_fp8_e4m3, __nv_fp8_e4m3, float>(p, 0, false, true);
-            });
+            /*ta=*/false, /*tb=*/true);
     }
     return all;
 }
@@ -669,7 +644,6 @@ static void bench_dtype_combos() {
         bench_combo<bf16_, bf16_>(s.m, s.n, s.k, "W16A16", 0, 0);
         bench_combo<bf16_, int8_t>(s.m, s.n, s.k, "W8A16", 0, 127.f);
         bench_combo<int8_t, int8_t>(s.m, s.n, s.k, "W8A8", 127.f, 127.f);
-        bench_combo<bf16_, __nv_fp8_e4m3>(s.m, s.n, s.k, "W-F8A16", 0, 448.f);
         bench_combo<__nv_fp8_e4m3, __nv_fp8_e4m3>(s.m, s.n, s.k, "F8A8 e4m3", 0, 0);
         bench_combo<__nv_fp8_e5m2, __nv_fp8_e5m2>(s.m, s.n, s.k, "F8A8 e5m2", 0, 0);
     }

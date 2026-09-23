@@ -2,7 +2,7 @@
 
 Every dtype pairing the gemm dispatch instantiates, as an activation-kind
 x weight-kind grid: W16A16 (bf16 x bf16), W8A16 (bf16 activations against
-int8 or fp8 e4m3/e5m2 weights, per-channel scales), W8A8 (int8 x int8,
+int8 weights, per-channel scales), W8A8 (int8 x int8,
 per-row activations), and the symmetric-fp8 training pair (matching
 formats, per-tensor activations). All modes run the NT orientation the
 linear path uses (activation ``[M][K]``, weight ``[N][K]``); quantize
@@ -50,8 +50,6 @@ FP8_FORMATS = (
 GEMM_COMBOS = (
     ("w16a16", "bf16", "bf16"),
     ("w8a16", "bf16", "int8"),
-    ("w8a16_f8e4m3", "bf16", "f8e4m3"),
-    ("w8a16_f8e5m2", "bf16", "f8e5m2"),
     ("w8a8", "int8", "int8"),
     ("f8a8_e4m3", "f8e4m3", "f8e4m3"),
     ("f8a8_e5m2", "f8e5m2", "f8e5m2"),
@@ -60,10 +58,21 @@ OP_ORDER = ("bf16", *(label for label, _, _ in GEMM_COMBOS))
 
 
 def parse_positive_ints(value: str) -> tuple[int, ...]:
-    try:
-        values = tuple(dict.fromkeys(int(item.strip()) for item in value.split(",")))
-    except ValueError as exc:
-        raise click.BadParameter("expected comma-separated integers") from exc
+    """START:END:STEP (end inclusive) or a comma list — same grid format as
+    the -m/-n/-k options in the other bench scripts."""
+    value = value.strip()
+    if ":" in value:
+        start, stop, step = (int(x) for x in value.split(":"))
+        if step <= 0 or stop < start:
+            raise click.BadParameter("want START:END:STEP with positive step")
+        values = tuple(range(start, stop + 1, step))
+    else:
+        try:
+            values = tuple(
+                dict.fromkeys(int(item.strip()) for item in value.split(","))
+            )
+        except ValueError as exc:
+            raise click.BadParameter("expected comma-separated integers") from exc
     if not values or any(item <= 0 for item in values):
         raise click.BadParameter("values must be positive integers")
     return values
@@ -119,9 +128,9 @@ def quantize_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric fp8 quantization onto the format's finite range.
 
-    Weights go per-channel (``[N]`` scales, the W-F8A16 pairing);
-    activations per-tensor (one scalar, the F8A8 training pairing). The
-    kernel applies the inverse scales in its epilogue.
+    Weights go per-channel (``[N]`` scales); activations per-tensor (one
+    scalar, the F8A8 training pairing). The kernel applies the inverse
+    scales in its epilogue.
     """
     amax = t.float().abs().amax(dim=-1 if per_channel else None, keepdim=True)
     scale = amax.clamp_min(1e-12) / max_val
@@ -218,10 +227,12 @@ def benchmark_gemm(
     help="Optional JSON evidence path (kept out of the repository).",
 )
 @click.option(
+    "-m",
     "--m-values",
     default="512,2048,4096",
     show_default=True,
     callback=lambda _c, _p, v: parse_positive_ints(v),
+    help="M grid: START:END:STEP (end inclusive) or a comma list.",
 )
 @click.option(
     "--shape",

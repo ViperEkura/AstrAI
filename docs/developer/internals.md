@@ -86,7 +86,12 @@ $$ L_{\text{GRPO}} = -\mathbb{E}_t\left[\min\left(\rho_t A,\; \text{clip}\left(\
 
 Where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the per-token importance sampling ratio. Online rollout records $\log \pi_{\text{old}}$ when each token is sampled and reuses those values directly during training; offline batches may fall back to a synchronized `old_model`. Advantages are derived from scalar per-response rewards, group-normalized, and broadcast across all response tokens. Only response tokens contribute to the loss.
 
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`.
+Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. Optional
+`clip_eps_low`/`clip_eps_high` values enable DAPO-style asymmetric clipping;
+unset values inherit `clip_eps` for backward-compatible symmetric clipping.
+The `loss_aggregation` switch selects token-level DAPO weighting or equal
+sequence weighting. Optional `overlong_max_len`/`overlong_buffer_len` settings
+add the DAPO linear soft-overlong penalty before group advantage normalization.
 
 ### MoE Load Balancing
 

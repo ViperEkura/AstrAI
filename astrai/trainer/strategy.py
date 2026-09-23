@@ -1,7 +1,9 @@
 """Training strategy implementations with factory pattern."""
 
+import math
 from abc import ABC
 from dataclasses import dataclass
+from numbers import Real
 from typing import (
     Any,
     Callable,
@@ -24,6 +26,7 @@ from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
 from astrai.parallel.cp import LossReduction, TokenLoss
 from astrai.parallel.executor import broadcast_state_dict
+from astrai.trainer.backend import WeightPublisher
 from astrai.trainer.rollout import RolloutResult
 
 
@@ -57,6 +60,71 @@ def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
+#: Model-dtype byte budget for one row-chunk of the deferred lm_head matmul
+#: in :func:`_chunked_token_logprobs`.  64 MB of bf16 logits per chunk keeps
+#: the fp32 upcast + logsumexp workspace well under a quarter gigabyte while
+#: amortizing the GEMM over hundreds of rows.
+_CHUNK_LOGIT_BYTES = 64 * 1024 * 1024
+
+
+def _chunked_token_logprobs(hidden_states: Tensor, weight: Tensor, targets: Tensor):
+    """Per-token log-probs without materializing the full ``[N, S, V]`` tensor.
+
+    The model forward is taken with ``skip_lm_head=True`` so only the
+    post-norm hidden states ``[N, S, H]`` exist; rows are then pushed
+    through ``lm_head`` in chunks sized by :data:`_CHUNK_LOGIT_BYTES`.
+    Each chunk computes the same expression as the full-tensor path —
+    ``gather(log_softmax(logits.float()))[target] == logits[target].float()
+    - logsumexp(logits.float())`` — so results agree up to bf16 GEMM
+    tiling noise.  No-grad callers only (autograd would retain every
+    chunk's logits, defeating the point).
+    """
+    n, s, hidden = hidden_states.shape
+    flat_hidden = hidden_states.reshape(n * s, hidden)
+    flat_targets = targets.reshape(n * s)
+    vocab, dtype_bytes = weight.shape[0], weight.element_size()
+    rows_per_chunk = max(1, _CHUNK_LOGIT_BYTES // (vocab * dtype_bytes))
+    weight_t = weight.t()
+    out = torch.empty(n * s, dtype=torch.float32, device=hidden_states.device)
+    for start in range(0, n * s, rows_per_chunk):
+        end = min(start + rows_per_chunk, n * s)
+        logits = flat_hidden[start:end] @ weight_t
+        logits = logits.float()
+        picked = logits.gather(-1, flat_targets[start:end].unsqueeze(-1)).squeeze(-1)
+        out[start:end] = picked - torch.logsumexp(logits, dim=-1)
+    return out.view(n, s)
+
+
+def _importance_ratio_metrics(
+    ratio: Tensor, token_masks: Tensor, clip_low: float, clip_high: float
+) -> Dict[str, Tensor]:
+    """Drift observability for the importance ratio ``exp(logπ - logπ_old)``.
+
+    Reports the ratio distribution over valid tokens plus the fraction
+    touching the clip band — a cheap canary for replayed rollouts going
+    stale (``max_policy_lag`` too loose) or behaviour log-probs that no
+    longer match the sampling policy.
+    """
+    with torch.no_grad():
+        valid = token_masks.bool()
+        zero = ratio.sum() * 0.0
+        if not bool(valid.any()):
+            return {
+                "ratio_mean": zero,
+                "ratio_min": zero,
+                "ratio_max": zero,
+                "clip_fraction": zero,
+            }
+        ratios = ratio[valid]
+        clipped = ((ratios < 1 - clip_low) | (ratios > 1 + clip_high)).float().mean()
+        return {
+            "ratio_mean": ratios.mean(),
+            "ratio_min": ratios.min(),
+            "ratio_max": ratios.max(),
+            "clip_fraction": clipped,
+        }
+
+
 def get_logprobs(
     model: nn.Module,
     input_ids: Tensor,
@@ -75,6 +143,13 @@ def get_logprobs(
 
     Returns:
         Log probabilities with reduction applied over sequence dimension
+
+    Under ``torch.no_grad`` the forward runs with ``skip_lm_head=True`` and
+    log-probs are computed in row chunks from the hidden states (see
+    :func:`_chunked_token_logprobs`) — the reference/old-policy passes never
+    materialize the full ``[N, S, V]`` fp32 log-softmax.  With gradients
+    enabled, or when the model cannot skip its lm_head, the original
+    full-tensor path runs unchanged.
     """
     allowed_reductions = ["mean", "sum", "none"]
     if reduction not in allowed_reductions:
@@ -85,16 +160,38 @@ def get_logprobs(
     shifted_input_ids = input_ids[:, 1:]
     shifted_loss_mask = loss_mask[:, 1:]
 
-    outputs = model(
-        input_ids[:, :-1],
-        attn_mask[:, :, :-1, :-1] if attn_mask.dim() == 4 else attn_mask[:, :-1],
+    sliced_mask = (
+        attn_mask[:, :, :-1, :-1] if attn_mask.dim() == 4 else attn_mask[:, :-1]
     )
-    logits = outputs["logits"]
-    log_probs = torch.log_softmax(logits.float(), dim=-1)
+    use_chunked = (
+        not torch.is_grad_enabled()
+        and isinstance(model, nn.Module)
+        and getattr(model, "lm_head", None) is not None
+    )
+    if use_chunked:
+        try:
+            outputs = model(input_ids[:, :-1], sliced_mask, skip_lm_head=True)
+        except TypeError:
+            # Model or wrapper does not accept the kwarg; full path below.
+            outputs = None
+        if outputs is not None and outputs.get("logits") is not None:
+            # A wrapper silently ignored the flag; the chunked contract
+            # (logits is None) did not hold.
+            outputs = None
+    else:
+        outputs = None
+    if outputs is None:
+        outputs = model(input_ids[:, :-1], sliced_mask)
 
-    token_logprobs = torch.gather(
-        log_probs, dim=-1, index=shifted_input_ids.unsqueeze(-1)
-    ).squeeze(-1)
+    if outputs["logits"] is None:
+        token_logprobs = _chunked_token_logprobs(
+            outputs["hidden_states"], model.lm_head.weight, shifted_input_ids
+        )
+    else:
+        log_probs = torch.log_softmax(outputs["logits"].float(), dim=-1)
+        token_logprobs = torch.gather(
+            log_probs, dim=-1, index=shifted_input_ids.unsqueeze(-1)
+        ).squeeze(-1)
 
     if reduction == "mean":
         logprobs = (token_logprobs * shifted_loss_mask).sum(
@@ -384,6 +481,7 @@ class BaseStrategy(ABC):
         self._moe_metrics: Dict[str, float] = {}
         self.strategy_kwargs = kwargs
         self._rollout_runner = None
+        self._weight_publishers: Tuple[WeightPublisher, ...] = ()
 
     # ---------- token-mean two-phase protocol ----------
     # CP composes between the phases: astrai.parallel.cp.CPStrategy shards
@@ -557,11 +655,29 @@ class BaseStrategy(ABC):
         if self._rollout_runner is None:
             return optimizer.step()
 
+        def commit(policy_version: int):
+            result = optimizer.step()
+            # Publishers run inside the version lock so a backend can
+            # never observe new-version weights that are still stale.
+            for publisher in self._weight_publishers:
+                publisher.publish(policy_version, self.model)
+            return result
+
         # None lets the scheduler derive live+1 under the policy lock,
         # avoiding a read-compute-write race on policy_version.
-        result = self._rollout_runner.apply_weight_update(None, optimizer.step)
+        result = self._rollout_runner.apply_weight_update(None, commit)
         self._rollout_runner.step()
         return result
+
+    def set_weight_publishers(self, publishers) -> None:
+        """Inject :class:`~astrai.trainer.rollout.WeightPublisher` instances.
+
+        Each publisher is invoked inside the policy-version lock on every
+        online optimizer step, after ``optimizer.step()`` and before the
+        version commit — the seam where rollout-backend replicas receive
+        fresh weights atomically with the trainer's own publication.
+        """
+        self._weight_publishers = tuple(publishers)
 
     def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:
         """Run offline or online forward depending on runner injection."""
@@ -896,16 +1012,113 @@ class GRPOStrategy(BaseStrategy):
         old_model: Optional[nn.Module],
         ref_model: nn.Module,
         clip_eps: float = 0.2,
+        clip_eps_low: Optional[float] = None,
+        clip_eps_high: Optional[float] = None,
         kl_coef: float = 0.01,
         group_size: int = 4,
+        loss_aggregation: str = "token",
+        overlong_max_len: Optional[int] = None,
+        overlong_buffer_len: int = 0,
+        overlong_penalty_scale: float = 1.0,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
         self.old_model = old_model
         self.ref_model = ref_model
-        self.clip_eps = clip_eps
+        self.clip_eps = self._validate_clip_epsilon(clip_eps, "clip_eps", upper=True)
+        self.clip_eps_low = self._validate_clip_epsilon(
+            self.clip_eps if clip_eps_low is None else clip_eps_low,
+            "clip_eps_low",
+            upper=True,
+        )
+        self.clip_eps_high = self._validate_clip_epsilon(
+            self.clip_eps if clip_eps_high is None else clip_eps_high,
+            "clip_eps_high",
+        )
+        if self.clip_eps_high < self.clip_eps_low:
+            raise ValueError(
+                "clip_eps_high must be greater than or equal to clip_eps_low"
+            )
+        if loss_aggregation not in {"token", "sequence"}:
+            raise ValueError("loss_aggregation must be 'token' or 'sequence'")
+        self.loss_aggregation = loss_aggregation
+        self.overlong_max_len, self.overlong_buffer_len = (
+            self._validate_overlong_window(overlong_max_len, overlong_buffer_len)
+        )
+        self.overlong_penalty_scale = self._validate_non_negative_real(
+            overlong_penalty_scale, "overlong_penalty_scale"
+        )
         self.kl_coef = kl_coef
         self.group_size = group_size
+
+    @staticmethod
+    def _validate_clip_epsilon(value: float, name: str, upper: bool = False) -> float:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"{name} must be a real number")
+        value = float(value)
+        if not math.isfinite(value) or value < 0 or (upper and value >= 1):
+            interval = "[0, 1)" if upper else "[0, infinity)"
+            raise ValueError(f"{name} must be finite and in {interval}")
+        return value
+
+    @staticmethod
+    def _validate_non_negative_real(value: float, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise TypeError(f"{name} must be a real number")
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
+        return value
+
+    @staticmethod
+    def _validate_overlong_window(
+        max_len: Optional[int], buffer_len: int
+    ) -> tuple[Optional[int], int]:
+        if max_len is None:
+            if buffer_len != 0:
+                raise ValueError(
+                    "overlong_buffer_len requires overlong_max_len to be set"
+                )
+            return None, 0
+        if isinstance(max_len, bool) or not isinstance(max_len, int) or max_len <= 0:
+            raise ValueError("overlong_max_len must be a positive integer or None")
+        if (
+            isinstance(buffer_len, bool)
+            or not isinstance(buffer_len, int)
+            or buffer_len <= 0
+            or buffer_len > max_len
+        ):
+            raise ValueError(
+                "overlong_buffer_len must be a positive integer no greater "
+                "than overlong_max_len"
+            )
+        return max_len, buffer_len
+
+    def _reduce_token_loss(self, loss: Tensor, mask: Tensor) -> Tensor:
+        """Reduce response-token losses with GRPO or DAPO weighting."""
+        mask = mask.float()
+        if self.loss_aggregation == "token":
+            return (loss * mask).sum() / mask.sum().clamp(min=1.0)
+
+        lengths = mask.sum(dim=-1)
+        valid_sequences = lengths > 0
+        per_sequence = (loss * mask).sum(dim=-1) / lengths.clamp(min=1.0)
+        return (per_sequence * valid_sequences).sum() / valid_sequences.sum().clamp(
+            min=1
+        )
+
+    def _shape_overlong_rewards(
+        self, rewards: Tensor, token_masks: Tensor
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        if self.overlong_max_len is None:
+            return rewards, None
+
+        lengths = token_masks.sum(dim=-1)
+        penalty_start = self.overlong_max_len - self.overlong_buffer_len
+        penalty = ((penalty_start - lengths) / self.overlong_buffer_len).clamp(
+            min=-1.0, max=0.0
+        )
+        return rewards + self.overlong_penalty_scale * penalty, penalty
 
     def sync_old_model(self):
         """Copy current policy weights to old model."""
@@ -970,6 +1183,7 @@ class GRPOStrategy(BaseStrategy):
 
         # Group-normalized advantages from scalar per-response rewards.
         eps = 1e-8
+        rewards, overlong_penalty = self._shape_overlong_rewards(rewards, token_masks)
         mean = rewards.mean(dim=-1, keepdim=True)
         std = rewards.std(dim=-1, keepdim=True, unbiased=False)
         advantages = (rewards - mean) / (std + eps)
@@ -981,22 +1195,40 @@ class GRPOStrategy(BaseStrategy):
         ratio = torch.exp(log_ratio)
 
         surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        surr2 = (
+            torch.clamp(
+                ratio,
+                1 - self.clip_eps_low,
+                1 + self.clip_eps_high,
+            )
+            * advantages
+        )
         per_token_policy_loss = -torch.min(surr1, surr2)
-        token_count = token_masks.sum().clamp(min=1.0)
-        policy_loss = (per_token_policy_loss * token_masks).sum() / token_count
+        policy_loss = self._reduce_token_loss(per_token_policy_loss, token_masks)
 
         # KL penalty to frozen reference model with k1 estimator (non-negative):
         # k1 = π_ref / π_θ - log(π_ref / π_θ) - 1, where π_ref / π_θ = exp(log_ref - log_policy).
         log_ref_ratio = token_log_probs_ref - token_log_probs_policy
         r = torch.exp(log_ref_ratio)
         kl_per_token = r - torch.log(r + eps) - 1.0
-        kl_penalty = self.kl_coef * (kl_per_token * token_masks).sum() / token_count
+        kl_penalty = self.kl_coef * self._reduce_token_loss(kl_per_token, token_masks)
 
         task_loss = policy_loss + kl_penalty
+        metrics = {
+            "policy_loss": policy_loss,
+            "kl_loss": kl_penalty,
+        }
+        metrics.update(
+            _importance_ratio_metrics(
+                ratio, token_masks, self.clip_eps_low, self.clip_eps_high
+            )
+        )
+        if overlong_penalty is not None:
+            metrics["overlong_penalty_mean"] = overlong_penalty.mean()
+            metrics["overlong_fraction"] = (overlong_penalty < 0).float().mean()
         return self._loss_output(
             task_loss,
-            {"policy_loss": policy_loss, "kl_loss": kl_penalty},
+            metrics,
             aux_loss,
             policy_output.get("router_stats"),
         )
@@ -1228,6 +1460,9 @@ class PPOStrategy(BaseStrategy):
                 "policy_loss": policy_loss,
                 "value_loss": value_loss,
                 "explained_variance": explained_variance,
+                **_importance_ratio_metrics(
+                    ratio, token_masks, self.clip_eps, self.clip_eps
+                ),
             },
             policy_output["aux_loss"],
             policy_output.get("router_stats"),

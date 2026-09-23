@@ -145,6 +145,12 @@ with `--optimizer=muon_adamw`.
 | `--ppo_gamma` | PPO reward discount factor | 1.0 | `online_ppo` |
 | `--ppo_gae_lambda` | PPO GAE bias/variance trade-off | 0.95 | `online_ppo` |
 | `--ppo_vf_coef` | PPO value-loss coefficient | 0.5 | `online_ppo` |
+| `--grpo_clip_eps_low` | Optional lower clip epsilon; defaults to `grpo_clip_eps` | None | `grpo`, `online_grpo` |
+| `--grpo_clip_eps_high` | Optional upper clip epsilon for DAPO Clip-Higher | None | `grpo`, `online_grpo` |
+| `--grpo_loss_aggregation` | Loss weighting: DAPO-style `token` or equal-weight `sequence` | token | `grpo`, `online_grpo` |
+| `--grpo_overlong_max_len` | Optional maximum response length for DAPO soft overlong shaping | None | `grpo`, `online_grpo` |
+| `--grpo_overlong_buffer_len` | Linear penalty window before `grpo_overlong_max_len` | 0 | `grpo`, `online_grpo` |
+| `--grpo_overlong_penalty_scale` | Scale for the soft overlong reward penalty | 1.0 | `grpo`, `online_grpo` |
 | `--neftune_alpha` | NEFTune noise alpha (0=disabled, typical: 5.0) | 0.0 | `sft` |
 
 ### Online Rollout
@@ -175,6 +181,14 @@ provide a command-line option for configuring one.
 | `--rollout_dynamic_max_total_tokens_per_step` | Hard generated-token budget per training step | 262144 |
 | `--rollout_dynamic_max_pending_groups` | Maximum prompt groups admitted into one sampling step | 128 |
 | `--rollout_dynamic_seed` | Base seed for reproducible refill attempts (`None` uses `random_seed`) | None |
+| `--rollout_val_temperature` | Validation rollout temperature (`0` = greedy); unset inherits `rollout_temperature` | None |
+| `--rollout_val_top_p` | Validation top-p; unset inherits `rollout_top_p` | None |
+| `--rollout_val_top_k` | Validation top-k; unset inherits `rollout_top_k` | None |
+| `--rollout_val_max_tokens` | Validation max tokens; unset inherits `rollout_max_tokens` | None |
+| `--rollout_val_group_size` | Validation responses per prompt; unset inherits the strategy's group size | None |
+| `--rollout_device` | Device for the training rollout backend (e.g. `cuda:1`): a frozen replica with its own scheduler/KV pool, synced inside the policy-version lock each step; unset keeps the in-process colocated backend | None |
+| `--rollout_val_device` | Device for a dedicated validation rollout backend; unset shares the training backend | None |
+| `--rollout_pool_seq_len` | Sequence budget per rollout request when sizing the scheduler's KV pool (must cover longest prompt + `rollout_max_tokens`); unset uses the model's `max_position_embeddings`. Right-sizing is GBs: for the 1B policy the default 32768 window allocates ~3.2 GB of KV vs ~400 MB at 4096 | None |
 
 ### Scheduler
 
@@ -296,4 +310,4 @@ See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 
 ---
 
-> Document Update Time: 2026-08-22
+> Document Update Time: 2026-09-20

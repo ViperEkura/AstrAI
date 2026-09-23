@@ -600,6 +600,7 @@ classDiagram
             +GradSNRTracker grad_snr_tracker
             +DataLoader val_dataloader
             +Optional[float] val_loss
+            +Optional[RolloutEvaluator] val_evaluator
             +int world_size
             +int rank
             +ParallelTopology topology
@@ -627,7 +628,9 @@ classDiagram
             +compute_loss_output(batch) LossOutput
             +supports_online() bool
             +set_rollout_runner(runner)
+            +set_weight_publishers(publishers)
             +prepare_from_rollout(result) Dict
+            +validate_online(batch) Optional[LossOutput]
             +optimizer_step(optimizer)
         }
 
@@ -690,19 +693,56 @@ classDiagram
             +score(List[str] prompts, List[List[str]] responses) Tensor
         }
 
-        class RolloutGenerator {
-            +InferenceScheduler scheduler
+        class SamplingParams {
+            +float temperature
+            +float top_p
+            +int top_k
             +int max_tokens
             +int group_size
-            +float temperature
-            +int top_k
-            +float top_p
             +float frequency_penalty
             +int rep_window
+        }
+
+        class RolloutBackend {
+            <<protocol>>
+            +device
+            +int policy_version
+            +generate(prompt_ids_list, **kwargs)
+            +update_weights(policy_version) int
+            +apply_weight_update(policy_version, update)
+            +with_policy_snapshot(inspect)
+        }
+
+        class ColocatedBackend {
+            +InferenceScheduler scheduler
+            +generate(prompt_ids_list, **kwargs)
+        }
+
+        class ReplicaBackend {
+            +nn.Module model
+            +torch.device device
+            +InferenceScheduler scheduler
+            +generate(prompt_ids_list, **kwargs)
+        }
+
+        class WeightPublisher {
+            <<protocol>>
+            +publish(policy_version, source)
+        }
+
+        class P2PCopyPublisher {
+            +ReplicaBackend backend
+            +publish(policy_version, source)
+        }
+
+        class RolloutGenerator {
+            +RolloutBackend backend
+            +SamplingParams params
+            +output_device
             +int policy_version
             +update_weights(policy_version) int
             +apply_weight_update(policy_version, update)
-            +generate(batch) RawRollout
+            +generate(batch, params) RawRollout
         }
 
         class RolloutRunner {
@@ -713,6 +753,13 @@ classDiagram
             +step()
             +clear_cache()
             +__call__(batch) Tuple[RolloutResult, bool]
+        }
+
+        class RolloutEvaluator {
+            +RolloutGenerator generator
+            +BaseRewardModel reward_model
+            +SamplingParams params
+            +evaluate(batch) Dict[str, float]
         }
 
         class BaseScheduler {
@@ -805,6 +852,7 @@ classDiagram
             +on_train_end(context)
             +on_error(context)
             -_run_validation(context)
+            -_run_rollout_validation(context) Dict[str, float]
         }
 
         class CallbackFactory {
@@ -1487,9 +1535,15 @@ classDiagram
     AnthropicResponseBuilder ..> MessagesRequest : receives
     ProtocolHandler ..> StopChecker : creates
     ProtocolHandler ..> GenContext : creates
-    RolloutGenerator ..> InferenceScheduler : uses
+    RolloutGenerator ..> RolloutBackend : generates via
+    ColocatedBackend ..> InferenceScheduler : wraps
+    ReplicaBackend ..> InferenceScheduler : owns
+    P2PCopyPublisher ..> ReplicaBackend : syncs weights
+    BaseStrategy ..> WeightPublisher : commits publish
     RolloutRunner ..> RolloutGenerator : uses
     RolloutRunner ..> BaseRewardModel : uses
+    RolloutEvaluator ..> RolloutGenerator : uses
+    RolloutEvaluator ..> BaseRewardModel : uses
 
     %% --- Association (general usage) ---
     Trainer --> TrainConfig
@@ -1516,7 +1570,7 @@ classDiagram
 | **astrai.serialization** | Checkpoint | Model serialization |
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding | Neural network model |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
-| **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, RolloutGenerator, RolloutRunner | Training workflow |
+| **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model, BaseStrategy–GRPOStrategy, StrategyFactory, BaseScheduler–WSDScheduler, SchedulerFactory, TrainCallback(Protocol)–MetricCallback, CallbackFactory, RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator, RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher | Training workflow (online RL rollout via injectable backends) |
 | **astrai.inference** | InferenceEngine, InferenceScheduler, Executor, InferenceWorkspace, PagePool, TaskCacheManager, KVStorage, ReqToTokenPool, KVCache, Allocator, RadixCache, AllocationStrategy, ContiguousStrategy, PagedStrategy, Task, TaskManager, TaskStatus, StreamDecoder, GenerateResult, BaseSamplingStrategy–SamplingPipeline, FrequencyPenaltyStrategy, ProtocolHandler, ResponseBuilder, OpenAIResponseBuilder, AnthropicResponseBuilder, StopChecker, GenContext, StopInfo, ChatMessage, FunctionDef, ToolDef, ChatCompletionRequest, AnthropicMessage, MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service |
 | **astrai.extension** | `backend` policy package, `ops` kernel-wrapper package, `fp8.py` FP8 strategy layer, AttentionBackend, TorchNativeBackend, CudaBackend, FlashAttnBackend, attention, attn_backend, ATTN_BACKEND, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optim** | OptimizerFactory, MuonAdamW, NoraNadamW, ManoAdamW, composite_step/composite_zero_grad/composite_state_dict, partition_optimizer_parameters | Built-in optimizers (`muon_adamw` / `nora_nadamw` / `mano_adamw`) with shared composite-optimizer helpers |
@@ -1551,7 +1605,8 @@ classDiagram
 2. **Training Flow**: `Trainer` → `TrainContextBuilder` → `TrainContext`, uses `BaseStrategy` for loss, `BaseExecutor` for gradient accumulation + model distribution; with `cp_size > 1` the strategy is wrapped in `CPStrategy` (sequence sharding + ring attention)
 3. **Strategy Selection**: `StrategyFactory` creates strategy by `train_type`
 4. **Executor Selection**: `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
-5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.ops`. Attention uses cuda > flash > torch priority unless explicitly selected by `ASTR_BACKEND` or `attn_backend()`. Rotary embedding auto-dispatches to the CUDA op when supported, else torch complex multiply.
+5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.ops`. Attention uses cuda > flash > torch priority unless explicitly selected by `set_op("attention", ...)` or `attn_backend()`
+(the `ASTR_BACKEND` env var is a deprecated seed). Rotary embedding auto-dispatches to the CUDA op when supported, else torch complex multiply.
 6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` launch the world; `ParallelTopology` decomposes it into `dp × cp × tp` with one process group per mesh dimension — a singleton for inactive dimensions — `CPStrategy`/`CPState` shard sequences across cp ranks, and `TPState` shards Linear projections over features across tp ranks
 7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`
 8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata; `CheckpointCallback` performs rank-0 training saves, with extra state saved as `{key}.pt`
@@ -1559,4 +1614,4 @@ classDiagram
 10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
 11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` — structural subtyping for `AccumOptimizer` / `AccumScheduler` wrappers
 
-> Document Update Time: 2026-09-05
+> Document Update Time: 2026-09-20

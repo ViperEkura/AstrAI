@@ -7,8 +7,7 @@
 namespace astrai {
 namespace gemm {
 
-template void gemm_dispatch<int8_t, int8_t>(GemmParams, cudaStream_t, bool,
-                                            bool);
+ASTRAI_GEMM_INSTANTIATE(int8_t, int8_t);
 
 }  // namespace gemm
 }  // namespace astrai

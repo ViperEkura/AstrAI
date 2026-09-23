@@ -107,6 +107,7 @@ class AutoRegressiveLM(AutoModel):
         position_ids: Optional[Tensor] = None,
         fwd: Optional[str] = None,
         logits_positions: Optional[Tensor] = None,
+        skip_lm_head: bool = False,
     ) -> Dict[str, Tensor]:
         if fwd is None:
             if input_ids.ndim != 2:
@@ -148,7 +149,11 @@ class AutoRegressiveLM(AutoModel):
             hidden_states = self.norm(x[logits_positions])
         else:
             hidden_states = self.norm(x)
-        logits = self.lm_head(hidden_states)
+        # skip_lm_head returns post-norm hidden states only, with logits
+        # set to None: no-grad consumers compute per-token log-probs from
+        # hidden @ lm_head.T in row chunks instead of materializing the
+        # full [batch, seq, vocab] tensor (see trainer.strategy.get_logprobs).
+        logits = None if skip_lm_head else self.lm_head(hidden_states)
 
         output = {"logits": logits, "hidden_states": hidden_states}
         if aux_losses:

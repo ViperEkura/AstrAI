@@ -14,14 +14,6 @@
 //   v = h - s = (128 + u7) - (128 + 128*b7) = u - 128*b7 = the int8 value
 // Every intermediate lands on bf16-exact values (|v| <= 128), so no
 // rounding occurs anywhere.
-//
-// fp8 -> bf16 (W-F8A16 weight-only) instead rides the hardware widen
-// (cvt.rn.f16x2.e4m3x2 on sm_89+): an LOP3 exponent-rebias trick like
-// int8's mis-maps e4m3 subnormals (exp field 0) and maps NaN to a finite
-// value, while the hardware path is exact for normals, subnormals, +-0
-// and NaN. The f16 -> bf16 step is an fp32 round-trip rounding to nearest
-// — exact, because every fp8 value carries at most 4 significant bits and
-// bf16 holds 8.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -81,28 +73,6 @@ struct DequantPair<int8_t, __nv_bfloat16> {
         return expand(spread, spread);
     }
 };
-
-// fp8 widen via the hardware converter (exact incl. subnormals, +-0, NaN;
-// see the header comment). One cvt + one f32 round-trip per pair; the two
-// formats share the body — only the converter's interpretation constant
-// differs. The per-format specializations below stay explicit, so an
-// unsupported (SrcT, MmaT) pair still fails to compile.
-template <__nv_fp8_interpretation_t Fmt>
-struct Fp8WidenPair {
-    static __device__ __forceinline__ unsigned pair(unsigned short v) {
-        const __half2_raw h2 =
-            __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)v, Fmt);
-        const float2 f =
-            __half22float2(*reinterpret_cast<const __half2*>(&h2));
-        const __nv_bfloat162 b = __floats2bfloat162_rn(f.x, f.y);
-        return *reinterpret_cast<const unsigned*>(&b);
-    }
-};
-
-template <>
-struct DequantPair<__nv_fp8_e4m3, __nv_bfloat16> : Fp8WidenPair<__NV_E4M3> {};
-template <>
-struct DequantPair<__nv_fp8_e5m2, __nv_bfloat16> : Fp8WidenPair<__NV_E5M2> {};
 
 }  // namespace quant
 }  // namespace astrai

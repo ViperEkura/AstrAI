@@ -46,7 +46,10 @@ def _try_load(name: str) -> object:
     """Import and cache the ``name`` kernel module (lazy, one attempt).
 
     Returns the module, or ``None`` if it is unavailable. Cached so each
-    ``.so`` is imported at most once per process.
+    ``.so`` is imported at most once per process; a successful first import
+    invalidates the dispatch record caches, whose availability predicates
+    consult ``is_available`` (the only availability change that can happen
+    without a re-registration).
     """
     if name not in _modules:
         try:
@@ -54,6 +57,9 @@ def _try_load(name: str) -> object:
                 f".lib.{name}", package=__package__
             )
             _available[name] = True
+            from astrai.extension import dispatch
+
+            dispatch.invalidate()
         except ImportError:
             logger.warning("kernel '%s' failed to import; marking unavailable", name)
             _modules[name] = None

@@ -206,6 +206,48 @@ _SPECS = [
         help="GRPO clip epsilon.",
     ),
     OptSpec(
+        "grpo_clip_eps_low",
+        "Algorithm",
+        type=float,
+        default=None,
+        help="Optional lower GRPO clip epsilon; defaults to --grpo_clip_eps.",
+    ),
+    OptSpec(
+        "grpo_clip_eps_high",
+        "Algorithm",
+        type=float,
+        default=None,
+        help="Optional upper GRPO clip epsilon for DAPO Clip-Higher.",
+    ),
+    OptSpec(
+        "grpo_loss_aggregation",
+        "Algorithm",
+        choices=["token", "sequence"],
+        default="token",
+        help="Aggregate GRPO loss by token (DAPO) or equally by sequence.",
+    ),
+    OptSpec(
+        "grpo_overlong_max_len",
+        "Algorithm",
+        type=int,
+        default=None,
+        help="Optional response length limit for DAPO soft overlong shaping.",
+    ),
+    OptSpec(
+        "grpo_overlong_buffer_len",
+        "Algorithm",
+        type=int,
+        default=0,
+        help="Length of the linear DAPO overlong penalty window.",
+    ),
+    OptSpec(
+        "grpo_overlong_penalty_scale",
+        "Algorithm",
+        type=float,
+        default=1.0,
+        help="Scale applied to the DAPO soft overlong penalty.",
+    ),
+    OptSpec(
         "grpo_kl_coef",
         "Algorithm",
         type=float,
@@ -303,6 +345,46 @@ _SPECS = [
         type=int,
         default=None,
         help="Base refill seed (defaults to random_seed).",
+    ),
+    OptSpec(
+        "rollout_val_temperature",
+        "Algorithm",
+        help="Validation rollout temperature (0=greedy; unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_top_p",
+        "Algorithm",
+        help="Validation rollout top-p (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_top_k",
+        "Algorithm",
+        help="Validation rollout top-k (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_max_tokens",
+        "Algorithm",
+        help="Validation rollout max tokens (unset inherits training).",
+    ),
+    OptSpec(
+        "rollout_val_group_size",
+        "Algorithm",
+        help="Validation responses per prompt (unset inherits training group).",
+    ),
+    OptSpec(
+        "rollout_device",
+        "Algorithm",
+        help="Device for the training rollout backend, e.g. cuda:1 (unset: in-process).",
+    ),
+    OptSpec(
+        "rollout_val_device",
+        "Algorithm",
+        help="Device for a dedicated validation rollout backend (unset: shared).",
+    ),
+    OptSpec(
+        "rollout_pool_seq_len",
+        "Algorithm",
+        help="KV pool seq budget per rollout request (unset: model context window).",
     ),
     OptSpec("neftune_alpha", "Algorithm", help="NEFTune noise alpha."),
     OptSpec("val_split", "Validation", help="Validation split ratio."),
@@ -618,6 +700,12 @@ def train(
         "beta": kwargs.pop("dpo_beta"),
         "label_smoothing": kwargs.pop("label_smoothing"),
         "clip_eps": kwargs.pop("grpo_clip_eps"),
+        "clip_eps_low": kwargs.pop("grpo_clip_eps_low"),
+        "clip_eps_high": kwargs.pop("grpo_clip_eps_high"),
+        "loss_aggregation": kwargs.pop("grpo_loss_aggregation"),
+        "overlong_max_len": kwargs.pop("grpo_overlong_max_len"),
+        "overlong_buffer_len": kwargs.pop("grpo_overlong_buffer_len"),
+        "overlong_penalty_scale": kwargs.pop("grpo_overlong_penalty_scale"),
         "kl_coef": kwargs.pop("grpo_kl_coef"),
         "group_size": kwargs.pop("group_size"),
         "gamma": kwargs.pop("ppo_gamma"),
@@ -651,6 +739,14 @@ def train(
         "rollout_dynamic_max_pending_groups", 128
     )
     rollout_dynamic_seed = kwargs.pop("rollout_dynamic_seed", None)
+    rollout_val_temperature = kwargs.pop("rollout_val_temperature", None)
+    rollout_val_top_k = kwargs.pop("rollout_val_top_k", None)
+    rollout_val_top_p = kwargs.pop("rollout_val_top_p", None)
+    rollout_val_max_tokens = kwargs.pop("rollout_val_max_tokens", None)
+    rollout_val_group_size = kwargs.pop("rollout_val_group_size", None)
+    rollout_device = kwargs.pop("rollout_device", None)
+    rollout_val_device = kwargs.pop("rollout_val_device", None)
+    rollout_pool_seq_len = kwargs.pop("rollout_pool_seq_len", None)
     reward_model_fn: Callable[[], BaseRewardModel] | None = None
     critic_model_fn = None
     if train_type == "online_ppo":
@@ -831,6 +927,14 @@ def train(
         ),
         rollout_dynamic_max_pending_groups=rollout_dynamic_max_pending_groups,
         rollout_dynamic_seed=rollout_dynamic_seed,
+        rollout_val_temperature=rollout_val_temperature,
+        rollout_val_top_k=rollout_val_top_k,
+        rollout_val_top_p=rollout_val_top_p,
+        rollout_val_max_tokens=rollout_val_max_tokens,
+        rollout_val_group_size=rollout_val_group_size,
+        rollout_device=rollout_device,
+        rollout_val_device=rollout_val_device,
+        rollout_pool_seq_len=rollout_pool_seq_len,
         reward_model_fn=reward_model_fn,
         critic_model_fn=critic_model_fn,
         moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),

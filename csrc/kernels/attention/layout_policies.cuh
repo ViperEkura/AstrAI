@@ -24,7 +24,6 @@
 
 #define HOST_FORCEINLINE static __host__ __forceinline__
 #define DEVICE_FORCEINLINE static __device__ __forceinline__
-#define HOST_DEV_FORCEINLINE static __host__ __device__ __forceinline__
 
 namespace astrai {
 namespace attention {

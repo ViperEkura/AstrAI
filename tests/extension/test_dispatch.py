@@ -139,35 +139,43 @@ def test_nested_op_backend_scopes(toy_family):
         assert resolve("toy", dtype=torch.bfloat16).origin == "context"
 
 
-def test_env_entry_is_soft(toy_family, monkeypatch):
-    monkeypatch.setenv("ASTR_OPS", "toy=alpha")
+def test_set_op_entry_is_soft(toy_family):
+    dispatch.set_op("toy", "alpha")
     resolution = resolve("toy", dtype=torch.float32)
     assert resolution.record.obj == "beta-obj" and resolution.origin == "chain"
     assert resolve("toy", dtype=torch.bfloat16).origin == "env"
 
 
-def test_env_unknown_impl_ignored(toy_family, monkeypatch):
-    monkeypatch.setenv("ASTR_OPS", "toy=missing")
+def test_set_op_unknown_impl_ignored(toy_family):
+    dispatch.set_op("toy", "missing")
     assert resolve("toy", dtype=torch.float32).record.obj == "beta-obj"
 
 
-def test_env_profile_reference(toy_family, monkeypatch):
-    monkeypatch.setenv("ASTR_OPS", "profile=reference")
+def test_set_op_profile_reference(toy_family):
+    dispatch.set_op("profile", "reference")
     resolution = resolve("toy", dtype=torch.bfloat16)
     assert resolution.origin == "profile"
-    monkeypatch.setenv("ASTR_OPS", "toy=alpha,profile=reference")
+    dispatch.set_op("toy", "alpha")
     assert resolve("toy", dtype=torch.bfloat16).origin == "env"
 
 
-def test_legacy_env_alias(monkeypatch):
+def test_env_seed_and_alias(monkeypatch):
+    # The one-time seed: ASTR_OPS entries, with the legacy ASTR_BACKEND
+    # alias filling a family ASTR_OPS left unset.
     monkeypatch.setenv("ASTR_BACKEND", "torch_native")
+    dispatch._selection = None  # re-seed on the next lookup
     assert dispatch.env_selection("attention") == "torch_native"
     monkeypatch.setenv("ASTR_OPS", "attention=cuda")
+    dispatch._selection = None
     assert dispatch.env_selection("attention") == "cuda"
+    assert dispatch.parse_selections("toy=alpha,profile=reference") == {
+        "toy": "alpha",
+        "profile": "reference",
+    }
 
 
-def test_context_beats_env(toy_family, monkeypatch):
-    monkeypatch.setenv("ASTR_OPS", "toy=alpha")
+def test_context_beats_set_op(toy_family):
+    dispatch.set_op("toy", "alpha")
     with op_backend(toy="beta"):
         assert resolve("toy", dtype=torch.float32).origin == "context"
 

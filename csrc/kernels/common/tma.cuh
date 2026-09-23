@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <dlfcn.h>
 #include <mutex>
+#include <optional>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -131,11 +132,12 @@ struct TmaMapSpec {
 
 // Staging-layout -> map facts: the swizzled staging tiles ARE hardware TMA
 // modes (Swizzle<Bits, 3> members — kTmaMode marks them), so one trait over
-// the declared ComposedLayout carries everything compile-time-derivable:
-// the swizzle enum, and the box's inner extent — which SWIZZLE_* pins to
-// the mode's span (16B << Bits). The staging layout is the single source:
-// deriving the swizzle from sizeof(Elem) again (as the hand-built specs
-// once did) can drift from what the fragments actually read.
+// the declared ComposedLayout carries the swizzle width and the box's inner
+// extent — which SWIZZLE_* pins to the mode's span (16B << Bits). The
+// staging layout is the single source: the map's swizzle enum is decoded
+// from its kBits at encode time, not re-derived from sizeof(Elem) as the
+// hand-built specs once did, which could drift from what the fragments
+// actually read.
 template <typename StagedT>
 struct TmaSwizzleOf;  // undefined: only swizzled congruous staging feeds TMA
 
@@ -144,10 +146,6 @@ struct TmaSwizzleOf<ComposedLayout<SwzT, LayT>> {
     static_assert(SwzT::kTmaMode,
                   "TMA staging needs a hardware swizzle mode (Swizzle<1-3, 3>)");
     static constexpr int kBits = SwzT::kBits;
-    static constexpr CUtensorMapSwizzle kSwizzle =
-        kBits == 3 ? CU_TENSOR_MAP_SWIZZLE_128B
-                   : kBits == 2 ? CU_TENSOR_MAP_SWIZZLE_64B
-                                : CU_TENSOR_MAP_SWIZZLE_NONE;
     static constexpr uint32_t kBox0Bytes = 16u << kBits;  // the swizzle span
 };
 
@@ -201,16 +199,27 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
                                    rank3 ? s.batch_stride : (cuuint64_t)16};
     const cuuint32_t box[3] = {s.box0, s.box1, 1};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
-    const CUtensorMapSwizzle swz =
-        s.swizzle_bits == 3
-            ? CU_TENSOR_MAP_SWIZZLE_128B
-            : s.swizzle_bits == 2 ? CU_TENSOR_MAP_SWIZZLE_64B
-                                  : CU_TENSOR_MAP_SWIZZLE_NONE;
-    // Box inner extent must equal the swizzle span (128B/64B): the staging
-    // layouts are full-line swizzled.
-    if ((swz == CU_TENSOR_MAP_SWIZZLE_128B && s.box0 != 128) ||
-        (swz == CU_TENSOR_MAP_SWIZZLE_64B && s.box0 != 64))
-        return false;
+    // Hardware swizzle modes exist at 128B and 64B only. A staging layout
+    // narrower than that has no map to encode: one byte per element halves a
+    // line's chunk count, so kK=32 gives Swizzle<1, 3>. Degrading such a tile
+    // to SWIZZLE_NONE used to encode *successfully* while every fragment
+    // reader kept applying the layout's XOR — the two 16-element k-chunks of
+    // each row came out exchanged, silently (measured 2026-09-21: the W8A16
+    // and symmetric-fp8 kK=32 congruous tiles, max abs error ~0.7 on outputs
+    // of sigma ~0.1, while the cp.async twin of the same recipe was exact).
+    // Refuse the map instead, so the caller stages through that twin: it
+    // writes through the layout, and an absent [gemm-plan] tma=true line says
+    // so.
+    if (s.swizzle_bits != 3 && s.swizzle_bits != 2) return false;
+    const CUtensorMapSwizzle swz = s.swizzle_bits == 3
+                                       ? CU_TENSOR_MAP_SWIZZLE_128B
+                                       : CU_TENSOR_MAP_SWIZZLE_64B;
+    // The box's inner extent IS the swizzle span (16B << bits): these staging
+    // layouts are full-line swizzled. Redundant with the trait today — it
+    // derives both from one kBits — but the hand-built specs this layer once
+    // accepted could drift from what the fragments read, so the invariant
+    // stays stated (and cheap) at the encode boundary.
+    if (s.box0 != (16u << s.swizzle_bits)) return false;
     const CUresult r = fn(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, rank3 ? 3 : 2,
                           const_cast<void*>(s.ptr), dims, strides, box,
                           elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swz,
@@ -222,18 +231,32 @@ inline bool tma_encode(const TmaMapSpec& s, CUtensorMap* map) {
 // Exact-match descriptor cache: steady-state calls (same tensors, same
 // tile) hit; a rotating buffer (dynamic M) cycles the small ring. The
 // CUtensorMap is a POD the launcher copies into the kernel parameter.
+//
+// The descriptor is returned BY VALUE, and that is load-bearing. A miss
+// overwrites the ring's oldest slot, and a hit can hand back the very slot
+// the next miss is about to reuse — so a pointer into the ring is only
+// valid until the following lookup, not for the caller's lifetime. The
+// operand pair is exactly two lookups: holding A's pointer across B's let
+// B's eviction rewrite A in place, and both operands then went out as the
+// same map. That is not a wrong answer a cheap test catches — the A tile's
+// TMA transfers B's box, the byte count stops matching the pipeline's
+// expected transaction, and the mbarrier never completes (measured
+// 2026-09-14: hard hang on w8a8 m=1 n=6144 k=1536 with the 128x64x64 s2
+// tile, reproducible on devices 0-3, absent under compute-sanitizer
+// because its allocator shifts the operand addresses and rotates the ring
+// differently).
 class TmaMapCache {
   public:
-    const CUtensorMap* lookup(const TmaMapSpec& s) {
+    std::optional<CUtensorMap> lookup(const TmaMapSpec& s) {
         const std::lock_guard<std::mutex> lock(mu_);
         for (Entry& e : entries_)
-            if (e.used && matches(e, s)) return &e.map;
+            if (e.used && matches(e, s)) return e.map;
         Entry& e = entries_[next_];
-        if (!tma_encode(s, &e.map)) return nullptr;
+        if (!tma_encode(s, &e.map)) return std::nullopt;
         e.used = true;
         e.spec = s;
         next_ = (next_ + 1) % kCap;
-        return &e.map;
+        return e.map;
     }
 
   private:

@@ -24,6 +24,7 @@ from astrai.extension import (
     TorchNativeBackend,
     attention,
     attn_backend,
+    dispatch,
     get_backend,
 )
 
@@ -61,31 +62,31 @@ def test_backend_can_read_only_context_selection():
     assert get_backend(use_default=False) is None
 
 
-def test_context_beats_environment_backend(monkeypatch):
-    """An explicit attn_backend() context wins over ASTR_BACKEND."""
-    monkeypatch.setenv("ASTR_BACKEND", "torch_native")
+def test_context_beats_set_op_backend():
+    """An explicit attn_backend() context wins over set_op."""
+    dispatch.set_op("attention", "torch_native")
     with attn_backend("cuda"):
         assert isinstance(get_backend(), CudaBackend)
         assert isinstance(get_backend(use_default=False), CudaBackend)
 
 
-def test_environment_backend_used_without_context(monkeypatch):
-    monkeypatch.setenv("ASTR_BACKEND", "torch_native")
+def test_set_op_backend_used_without_context():
+    dispatch.set_op("attention", "torch_native")
     assert isinstance(get_backend(), TorchNativeBackend)
     assert isinstance(get_backend(use_default=False), TorchNativeBackend)
 
 
-def test_explicit_backend_mismatch_raises(monkeypatch):
-    monkeypatch.delenv("ASTR_BACKEND", raising=False)
+def test_explicit_backend_mismatch_raises():
+    dispatch.set_op("attention", None)
     q = torch.zeros(1, 2, 4, 8, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="Explicitly-set backend"):
         with attn_backend("cuda"):
             attention(q, q, q)  # cuda + no KV cache -> cannot handle
 
 
-def test_implicit_backend_falls_back_when_incapable(monkeypatch):
-    """An implicit (env) backend that cannot run the call falls back."""
-    monkeypatch.setenv("ASTR_BACKEND", "cuda")
+def test_implicit_backend_falls_back_when_incapable():
+    """An implicit (set_op) backend that cannot run the call falls back."""
+    dispatch.set_op("attention", "cuda")
     q = torch.zeros(1, 2, 4, 8, dtype=torch.float32)  # fp32: cuda kernels can't
     out = attention(q, q, q, fwd="prefill", is_causal=True)
     assert out.shape == q.shape

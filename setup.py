@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -98,17 +99,23 @@ class _CMakeBuildExt(_build_ext):
         max_arch = None
         try:
             if arch:
-                # Accept a semicolon list ("80;89;120"); the FP8 gate keys
-                # on the maximum, matching the CMake-side validation.
-                max_arch = max(int(a) for a in arch.split(";") if a.strip())
+                # Accept a semicolon list ("80;89;120a"); the FP8 gate keys
+                # on the maximum, matching the CMake-side validation. The
+                # arch-specific 'a' suffix selects a compile pass, never a
+                # CC number, so the comparison strips it.
+                max_arch = max(
+                    int(re.sub(r"[^0-9]", "", a))
+                    for a in arch.split(";")
+                    if re.sub(r"[^0-9]", "", a)
+                )
             else:
-                # Native default: the build follows the local GPU (dev
-                # iteration — one arch; gemm adds its 'a' slice). The
-                # mixed fleet is the explicit release opt-in
-                # (ASTRAI_CUDA_ARCH="80;89;120"), and the CMake-side
-                # default serves GPU-less builds.
+                # No env: follow the local GPU (dev iteration — one arch,
+                # arch-specific where it matters). The mixed fleet is the
+                # explicit release opt-in (ASTRAI_CUDA_ARCH="80;89;120a").
+                # With no GPU either, CMake builds no kernel targets at all
+                # (there is no arch fallback), so this path may pass None.
                 arch = _detect_cuda_arch()
-                max_arch = int(arch) if arch else None
+                max_arch = int(re.sub(r"[^0-9]", "", arch)) if arch else None
         except ValueError:
             warnings.warn(
                 f"Could not parse ASTRAI_CUDA_ARCH={arch!r}; "
@@ -188,14 +195,20 @@ def _cuda_toolkit_version():
 def _detect_cuda_arch():
     """Detect real GPU compute capability via torch (nvidia-smi may be spoofed).
 
-    Returns something like ``"89"`` or ``"103"``, or ``None`` if unavailable.
+    Returns a token like ``"89"``, ``"103"`` or ``"120a"`` (``None`` if
+    unavailable). CC 12.0 gains the arch-specific suffix: the gemm's fp8
+    block_scale cell lives only in that pass, and an sm_120 device selects
+    the arch-specific image anyway.
     """
     try:
         import torch
 
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability()
-            return f"{major}{minor}"
+            arch = f"{major}{minor}"
+            if arch == "120":
+                arch += "a"
+            return arch
     except Exception:
         pass
     return None

@@ -53,21 +53,14 @@ struct gemm_elem_traits<int8_t> {
 
 // MMA compute type per operand pair — the tensor-core input type both
 // operands are brought to before mma.sync. Promotes to bf16 m16n8k16 when
-// int8 rides exactly one side (W8A16, A8W16) or when exactly one side is
-// fp8 and the other bf16; symmetric pairs keep their native mma
-// (bf16 pass-through, fp8 mma, s8 mma with int32 accumulators).
+// int8 rides exactly one side (W8A16, A8W16, the only supported mixed
+// pair); symmetric pairs keep their native mma (bf16 pass-through, fp8 mma,
+// s8 mma with int32 accumulators).
 template <typename ElemA, typename ElemB>
 struct gemm_mma_traits {
-    static constexpr bool kFp8A =
-        std::is_same_v<ElemA, __nv_fp8_e4m3> || std::is_same_v<ElemA, __nv_fp8_e5m2>;
-    static constexpr bool kFp8B =
-        std::is_same_v<ElemB, __nv_fp8_e4m3> || std::is_same_v<ElemB, __nv_fp8_e5m2>;
     static constexpr bool kI8A = std::is_same_v<ElemA, int8_t>;
     static constexpr bool kI8B = std::is_same_v<ElemB, int8_t>;
-    static constexpr bool kPromote =
-        (kI8A != kI8B) ||
-        ((kFp8A != kFp8B) && (std::is_same_v<ElemA, __nv_bfloat16> ||
-                              std::is_same_v<ElemB, __nv_bfloat16>));
+    static constexpr bool kPromote = (kI8A != kI8B);
     using MmaT = std::conditional_t<kPromote, __nv_bfloat16, ElemA>;
     static constexpr bool kDequantA = !std::is_same_v<ElemA, MmaT>;
     static constexpr bool kDequantB = !std::is_same_v<ElemB, MmaT>;

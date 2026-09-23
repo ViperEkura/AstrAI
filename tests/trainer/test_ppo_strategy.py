@@ -458,7 +458,9 @@ def test_online_call_returns_finite_loss(ppo_strategy):
             pass
 
         def apply_weight_update(self, policy_version, update):
-            return update()
+            if policy_version is None:
+                policy_version = self.policy_version + 1
+            return update(policy_version)
 
     strategy.set_rollout_runner(_RecordingRunner())
     out = strategy({"instruction": ["x"]})
@@ -466,3 +468,6 @@ def test_online_call_returns_finite_loss(ppo_strategy):
     assert "policy_loss" in out["metrics"]
     assert "value_loss" in out["metrics"]
     assert "explained_variance" in out["metrics"]
+    for name in ("ratio_mean", "ratio_min", "ratio_max", "clip_fraction"):
+        assert name in out["metrics"]
+        assert out["metrics"][name] == out["metrics"][name]  # finite floats

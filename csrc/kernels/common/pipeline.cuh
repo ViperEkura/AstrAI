@@ -1,15 +1,12 @@
 // Async data-movement vocabulary: the raw cp.async / mbarrier PTX sites
-// plus the stage-pipeline abstractions built on them. Two generations of
-// backing primitive, one producer/consumer surface (selected with
-// `if constexpr (Arch::kHasMbarrier)`):
+// plus the stage-pipeline abstraction built on cp.async.
 //   PipelineSync<Stages>      sm_80/89: cp.async wait_group + __syncthreads
-//   PipelineMbarrier<Stages>  sm_90+:   per-stage mbarrier with expect_tx
-//                             (CUTLASS PipelineTmaAsync semantics)
-// The mbarrier body compiles only on sm_90+; earlier passes leave the class
-// inert so the template can still name it. Phase protocol: stage s uses
-// barrier s % Stages; the consumer tracks a per-barrier parity bit that
-// flips when the barrier's arrival count trips; producers arrive_expect_tx
-// before issuing the stage's copies; consumers wait_parity then read.
+// The mbarrier sites (init / arrive_expect_tx / wait_parity) are the shared
+// vocabulary the gemm TMA path builds its per-stage ring from. Phase
+// protocol: stage s uses barrier s % Stages; the consumer tracks a
+// per-barrier parity bit that flips when the barrier's arrival count trips;
+// producers arrive_expect_tx before issuing the stage's copies; consumers
+// wait_parity then read.
 
 #pragma once
 
@@ -197,39 +194,5 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* bar,
     (void)parity;
 #endif
 }
-
-// sm_90+ ring: one mbarrier per stage slot. Arrive count 1 (the single
-// TMA-issuing producer thread arrives with expect_tx; CTA-wide consumers
-// only wait — the compute-side release for stage reuse is the consumer's
-// own arrive, kept out of this minimal surface until warp specialization
-// lands, at which point it mirrors PipelineTmaAsync's full handshake).
-template <int Stages>
-struct PipelineMbarrier {
-    static_assert(Stages >= 1, "a pipeline needs at least one stage");
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    uint64_t barriers[Stages];
-
-    __device__ __forceinline__ void init(uint32_t producer_count = 1) {
-        if (threadIdx.x == 0) {
-            for (int s = 0; s < Stages; ++s)
-                mbarrier_init(&barriers[s], producer_count);
-        }
-        __syncthreads();
-    }
-
-    // Producer, once per stage: arm the byte count, then issue the TMA
-    // copies targeting this stage's slot.
-    __device__ __forceinline__ void producer_commit(int stage, uint32_t bytes) {
-        mbarrier_arrive_expect_tx(&barriers[stage % Stages], bytes);
-    }
-
-    // Consumer: wait for trip `use` of stage slot (use = tile / Stages);
-    // parity alternates each reuse.
-    __device__ __forceinline__ void consumer_wait(int stage, int use) {
-        mbarrier_wait_parity(&barriers[stage % Stages],
-                             static_cast<uint32_t>(use & 1));
-    }
-#endif
-};
 
 }  // namespace astrai

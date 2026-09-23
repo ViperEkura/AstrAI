@@ -11,21 +11,22 @@ import argparse
 import json
 import os
 import re
-import subprocess
-import sys
 from dataclasses import dataclass
-from math import prod
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
 import tqdm
 from datasets import load_dataset
 
+from astrai.bench import (
+    deduplicate,
+    generate_batch,
+    load_jsonl,
+    report,
+    save_json,
+    score_results,
+    test_all,
+)
 from astrai.inference import InferenceEngine, build_engine
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 HUMANEVAL_HF_DATASET = "openai/openai_humaneval"
 
@@ -73,21 +74,6 @@ def download(path: str):
     print(f"  saved {len(ds)} problems to {path}")
 
 
-def load_jsonl(path: str) -> List[dict]:
-    rows = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
-def save_json(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 def trim_stop(text: str) -> str:
     for stop in STOP_SEQUENCES:
         idx = text.find(stop)
@@ -121,38 +107,6 @@ def extract_body(code: str, entry_point: str) -> Optional[str]:
 
     body = "\n".join(body_lines)
     return body if body.strip() else None
-
-
-def deduplicate(seq: Sequence[str]) -> List[str]:
-    seen = set()
-    return [x for x in seq if not (x in seen or seen.add(x))]
-
-
-def generate_batch(
-    engine: InferenceEngine,
-    prompt: str,
-    n: int,
-    batch_size: int,
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    top_k: int,
-) -> List[str]:
-    completions = []
-    remaining = n
-    while remaining > 0:
-        current = min(batch_size, remaining)
-        outputs = engine.generate(
-            prompt=[prompt] * current,
-            stream=False,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-        )
-        completions.extend(outputs if isinstance(outputs, list) else [outputs])
-        remaining -= current
-    return deduplicate(completions)
 
 
 def extract_completions(
@@ -198,100 +152,13 @@ def generate_all(
     return results
 
 
-def execute_one(args: tuple) -> bool:
-    full_code, entry_point, timeout = args
-    try:
-        r = subprocess.run(
-            [sys.executable, "-c", full_code],
-            capture_output=True,
-            timeout=timeout,
-        )
-        return r.returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
-    except Exception:
-        return False
-
-
-def test_one(item: dict, cfg: EvalConfig, pool=None) -> Tuple[str, int, int]:
-    from concurrent.futures import ProcessPoolExecutor
-
-    task_id = item["task_id"]
-    completions = item["completions"]
+def he_codes(item: dict, test_timeout: float):
+    """(task_id, [(full_code, timeout), ...]) — prompt + completion + test block."""
     codes = [
-        (
-            item["prompt"] + c + "\n" + item["test"],
-            item["entry_point"],
-            cfg.test_timeout,
-        )
-        for c in completions
+        (item["prompt"] + c + "\n" + item["test"], test_timeout)
+        for c in item["completions"]
     ]
-    n = len(codes)
-
-    def _run(p):
-        return sum(1 for ok in p.map(execute_one, codes) if ok)
-
-    if pool is not None:
-        passed = _run(pool)
-    else:
-        with ProcessPoolExecutor(max_workers=cfg.test_workers) as p:
-            passed = _run(p)
-
-    return task_id, n, passed
-
-
-def test_all(
-    items: Sequence[dict],
-    cfg: EvalConfig,
-) -> Iterator[Tuple[str, int, int]]:
-    from concurrent.futures import ProcessPoolExecutor
-
-    pool = ProcessPoolExecutor(max_workers=cfg.test_workers)
-    try:
-        for item in tqdm.tqdm(items, desc="Testing", unit="problem"):
-            yield test_one(item, cfg, pool)
-    finally:
-        pool.shutdown(wait=True)
-
-
-def pass_at_k(n: int, c: int, k: int) -> float:
-    if n - c < k:
-        return 1.0
-    return 1.0 - float(prod(1.0 - k / np.arange(n - c + 1, n + 1)))
-
-
-def score_results(
-    results: Iterator[Tuple[str, int, int]],
-    k_values: Tuple[int, ...],
-) -> Dict:
-    """Score pass@k for each problem.
-
-    k values are filtered per-problem: if a problem has n < k samples
-    (e.g. after deduplication), pass@k is not computed for that problem.
-    The summary averages only over problems where the k was computed.
-    """
-    scores = {k: [] for k in k_values}
-    output = {}
-    for task_id, n, passed in results:
-        entry = {"task_id": task_id, "n": n, "passed": passed}
-        for k in k_values:
-            if k <= n:
-                pk = round(pass_at_k(n, passed, k), 4)
-                entry[f"pass@{k}"] = pk
-                scores[k].append(pk)
-            else:
-                entry[f"pass@{k}"] = None
-        output[task_id] = entry
-
-    summary = {}
-    for k in k_values:
-        vals = scores[k]
-        if vals:
-            summary[f"pass@{k}"] = round(float(np.mean(vals)), 4)
-        else:
-            summary[f"pass@{k}"] = None
-    output["_summary"] = summary
-    return output
+    return item["task_id"], codes
 
 
 def run_pipeline(cfg: EvalConfig) -> Dict:
@@ -324,7 +191,11 @@ def run_pipeline(cfg: EvalConfig) -> Dict:
         if cfg.generate_only:
             return {}
 
-    results = test_all(generated, cfg)
+    results = test_all(
+        generated,
+        lambda it: he_codes(it, cfg.test_timeout),
+        cfg.test_workers,
+    )
     scored = score_results(results, cfg.k_values)
     return scored
 
@@ -372,18 +243,6 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
         test_timeout=args.test_timeout,
         problem_indices=args.problems,
     )
-
-
-def report(scored: Dict):
-    summary = scored.pop("_summary", {})
-    print(f"\n{'=' * 60}")
-    for k, v in summary.items():
-        if v is not None:
-            print(f"  {k}: {v:.2%}")
-        else:
-            print(f"  {k}: N/A")
-    print(f"{'=' * 60}")
-    scored["_summary"] = summary
 
 
 def main():

@@ -47,6 +47,11 @@ from astrai.trainer.rollout import (
     SamplingParams,
 )
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
+from astrai.trainer.training_telemetry import (
+    NullTrainingTelemetry,
+    TrainingTelemetry,
+    create_training_telemetry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,9 @@ class TrainContext:
     #: Online-strategy validation: reward-statistics evaluator under its
     #: own sampling params. ``None`` keeps the legacy validate_online path.
     val_evaluator: Optional["RolloutEvaluator"] = field(default=None)
+    training_telemetry: TrainingTelemetry | NullTrainingTelemetry = field(
+        default_factory=NullTrainingTelemetry
+    )
 
     world_size: int = field(default=1)
     rank: int = field(default=0)
@@ -284,6 +292,7 @@ class TrainContextBuilder:
             consumed_samples=state.consumed_samples,
             checkpoint=state.checkpoint,
             param_path=self._param_path,
+            training_telemetry=create_training_telemetry(self.config),
         )
 
     def _prepare_model(

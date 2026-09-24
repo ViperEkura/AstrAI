@@ -57,6 +57,16 @@ class RolloutBackend(Protocol):
     def policy_version(self) -> int:
         """Version of the weights used for subsequent generations."""
 
+    @property
+    def runtime_released(self) -> bool:
+        """Whether the inference runtime is released."""
+
+    def release(self) -> bool:
+        """Release inference runtime resources."""
+
+    def resume(self) -> bool:
+        """Restore inference runtime resources."""
+
     def generate(self, prompt_ids_list: List[List[int]], **kwargs):
         """Run prefill+decode to completion; see ``run_batch`` for kwargs."""
 
@@ -90,6 +100,16 @@ class ColocatedBackend:
     @property
     def policy_version(self) -> int:
         return self.scheduler.policy_version
+
+    @property
+    def runtime_released(self) -> bool:
+        return self.scheduler.runtime_released
+
+    def release(self) -> bool:
+        return self.scheduler.release()
+
+    def resume(self) -> bool:
+        return self.scheduler.resume()
 
     def generate(self, prompt_ids_list: List[List[int]], **kwargs):
         model = self.scheduler._executor.model
@@ -148,6 +168,16 @@ class ReplicaBackend:
     @property
     def policy_version(self) -> int:
         return self.scheduler.policy_version
+
+    @property
+    def runtime_released(self) -> bool:
+        return self.scheduler.runtime_released
+
+    def release(self) -> bool:
+        return self.scheduler.release()
+
+    def resume(self) -> bool:
+        return self.scheduler.resume()
 
     def generate(self, prompt_ids_list: List[List[int]], **kwargs):
         with _device_context(self.device):

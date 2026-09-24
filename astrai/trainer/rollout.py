@@ -183,6 +183,16 @@ class RolloutGenerator:
         with self._weight_lock:
             return self.backend.update_weights(policy_version)
 
+    def release(self) -> bool:
+        """Release inference-only memory between colocated rollout phases."""
+        with self._weight_lock:
+            return self.backend.release()
+
+    def resume(self) -> bool:
+        """Restore inference-only memory before the next rollout phase."""
+        with self._weight_lock:
+            return self.backend.resume()
+
     def apply_weight_update(
         self, policy_version: Optional[int], update: Callable[[int], T]
     ) -> T:
@@ -228,6 +238,8 @@ class RolloutGenerator:
         """
         effective = self.params if params is None else params
         with self._weight_lock:
+            if self.backend.runtime_released:
+                raise RuntimeError("Rollout runtime is released; call resume() first")
             return self.backend.with_policy_snapshot(
                 lambda generation_version: self._generate_eval(
                     batch, generation_version, effective
@@ -471,6 +483,15 @@ class RolloutRunner:
     def update_weights(self, policy_version: int) -> int:
         """Publish the shared policy's new version to the rollout backend."""
         return self.generator.update_weights(policy_version)
+
+    def release(self) -> bool:
+        """Drop cached rollout tensors and release inference-only GPU memory."""
+        self.clear_cache()
+        return self.generator.release()
+
+    def resume(self) -> bool:
+        """Restore inference-only GPU memory for the next rollout."""
+        return self.generator.resume()
 
     def apply_weight_update(
         self, policy_version: Optional[int], update: Callable[[int], T]

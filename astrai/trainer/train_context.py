@@ -41,6 +41,7 @@ from astrai.trainer.backend import (
 from astrai.trainer.metric_util import GradSNRTracker
 from astrai.trainer.optional_extras import restore_checkpoint_extras
 from astrai.trainer.rollout import (
+    DynamicSamplingConfig,
     RolloutEvaluator,
     RolloutGenerator,
     RolloutRunner,
@@ -652,6 +653,26 @@ class TrainContextBuilder:
                 reward_model=reward_model,
                 rollout_interval=cfg.rollout_interval,
                 max_policy_lag=cfg.rollout_max_policy_lag,
+                dynamic_sampling=DynamicSamplingConfig(
+                    enabled=cfg.rollout_dynamic_sampling,
+                    variance_threshold=cfg.rollout_dynamic_variance_threshold,
+                    max_refill_rounds=cfg.rollout_dynamic_max_refill_rounds,
+                    max_generated_tokens_per_group=(
+                        cfg.rollout_dynamic_max_generated_tokens_per_group
+                    ),
+                    max_wall_time_per_group=(
+                        cfg.rollout_dynamic_max_wall_time_per_group
+                    ),
+                    max_total_rollout_tokens_per_step=(
+                        cfg.rollout_dynamic_max_total_tokens_per_step
+                    ),
+                    max_pending_groups=cfg.rollout_dynamic_max_pending_groups,
+                    base_seed=(
+                        cfg.random_seed
+                        if cfg.rollout_dynamic_seed is None
+                        else cfg.rollout_dynamic_seed
+                    ),
+                ),
             )
         )
         # Validation rolls out under its own sampling params (e.g. greedy

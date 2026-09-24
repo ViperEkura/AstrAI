@@ -412,6 +412,9 @@ class TrainContextBuilder:
             cp_state = CPState(self._topology)
         kwargs = dict(cfg.strategy_kwargs)
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
+        kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
+        kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)
+        kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
         if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"):
             kwargs["ref_model"] = create_ref_model(
                 cfg.model_fn,
@@ -445,7 +448,45 @@ class TrainContextBuilder:
             # implements the token-mean two-phase protocol; CPStrategy owns
             # the shard entry and the loss rescale.
             context.strategy = CPStrategy(context.strategy, cp_state)
+        self._restore_reference_model(context)
         return kwargs
+
+    def _restore_reference_model(self, context: TrainContext) -> None:
+        """Pin the resumed strategy's KL anchor to the checkpoint's reference.
+
+        ``create_ref_model`` always rebuilds the reference from the
+        *restored* actor, so without the persisted copy a resume would
+        silently move the DPO/GRPO KL target — a different optimization
+        objective after the restart.  Fresh runs keep the actor-derived
+        reference (that *is* the intended anchor); warm starts via
+        ``param_path`` without ``resume=True`` likewise.
+        """
+        cfg = self.config
+        ref_model = getattr(context.strategy, "ref_model", None)
+        if ref_model is None:
+            return
+        checkpoint = context.checkpoint
+        saved = checkpoint.extra.get("reference_model") if checkpoint else None
+        if saved is not None:
+            ref_model.load_state_dict(saved)
+            return
+        if not self._resume or checkpoint is None:
+            return
+        if cfg.allow_reference_reanchor:
+            logger.warning(
+                "resume checkpoint has no 'reference_model' extra: "
+                "re-anchoring the frozen reference to the resumed actor "
+                "(allow_reference_reanchor=True) — the KL/DPO target "
+                "changed across this resume"
+            )
+            return
+        raise ValueError(
+            "resume checkpoint has no 'reference_model' extra, but strategy "
+            f"'{cfg.strategy}' trains against a frozen reference; rebuilding "
+            "it from the resumed actor would silently change the KL/DPO "
+            "anchor. Save checkpoints with save_reference_model=True, or "
+            "pass allow_reference_reanchor=True to accept the new anchor."
+        )
 
     def _validate_tp(self) -> None:
         """Guard the tensor-parallel support surface at build time."""

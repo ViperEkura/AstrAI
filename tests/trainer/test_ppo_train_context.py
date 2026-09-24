@@ -170,6 +170,10 @@ def test_builder_resumes_critic_from_checkpoint(device, temp_dir, monkeypatch):
             "scheduler": policy_scheduler.state_dict(),
             "value_model": saved_critic.state_dict(),
             "value_optimizer": saved_optimizer.state_dict(),
+            # Resume with a frozen reference requires the persisted anchor.
+            "reference_model": {
+                key: value.clone() for key, value in model.state_dict().items()
+            },
         },
         meta={"policy_version": 3},
     )
@@ -295,7 +299,8 @@ def test_save_extra_persists_critic_state(device):
 
     extra = CheckpointCallback.save_extra(context)
 
-    assert set(extra) == {"value_model", "value_optimizer"}
+    # rng_state rides along on every checkpoint via the extras registry.
+    assert set(extra) == {"value_model", "value_optimizer", "rng_state"}
     saved = extra["value_model"]
     live = critic.state_dict()
     assert set(saved) == set(live)

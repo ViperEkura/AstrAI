@@ -242,6 +242,19 @@ class CheckpointCallback(TrainCallback):
             critic_optimizer = getattr(context.strategy, "critic_optimizer", None)
             if critic_optimizer is not None:
                 extra["value_optimizer"] = critic_optimizer.state_dict()
+        # The frozen KL/DPO anchor must survive resumes exactly as it was at
+        # run start: rebuilding it from the resumed actor would silently
+        # change the optimization objective (train_config.
+        # allow_reference_reanchor is the explicit opt-out on load).
+        ref_model = getattr(context.strategy, "ref_model", None)
+        save_ref = getattr(
+            getattr(context, "config", None), "save_reference_model", True
+        )
+        if ref_model is not None and save_ref:
+            extra["reference_model"] = {
+                key: value.detach().cpu()
+                for key, value in ref_model.state_dict().items()
+            }
         return extra
 
 

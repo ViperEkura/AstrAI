@@ -82,25 +82,32 @@ class Trainer:
                         break
                     with executor.accumulate(context.model):
                         self._call_callbacks("on_batch_begin", context)
-                        loss_output = context.strategy(batch)
-                        context.loss = loss_output["loss"].item()
-                        context.metrics = loss_output["metrics"]
-                        stand_loss = loss_output["loss"] / executor.grad_accum_steps
-                        executor.backward(stand_loss)
+                        # One batch may expand into several learner updates
+                        # (online RL: one rollout round -> minibatches x
+                        # update epochs); each yielded step gets its own
+                        # backward and, when the accumulation window syncs,
+                        # its own optimizer step.
+                        last_output = None
+                        for loss_output in context.strategy.training_steps(batch):
+                            last_output = loss_output
+                            stand_loss = loss_output["loss"] / executor.grad_accum_steps
+                            executor.backward(stand_loss)
+
+                            if executor.sync_gradients:
+                                self._call_callbacks("before_optimizer_step", context)
+                                context.strategy.optimizer_step(context.optimizer)
+                                context.optimizer.zero_grad()
+
+                                if context.scheduler:
+                                    context.scheduler.step()
+
+                                self._call_callbacks("after_optimizer_step", context)
+                        context.loss = last_output["loss"].item()
+                        context.metrics = last_output["metrics"]
                         context.consumed_samples += (
                             context.config.batch_per_device * context.dp_size
                         )
                         self._call_callbacks("on_batch_end", context)
-
-                        if executor.sync_gradients:
-                            self._call_callbacks("before_optimizer_step", context)
-                            context.strategy.optimizer_step(context.optimizer)
-                            context.optimizer.zero_grad()
-
-                            if context.scheduler:
-                                context.scheduler.step()
-
-                            self._call_callbacks("after_optimizer_step", context)
 
                 self._call_callbacks("on_epoch_end", context)
 

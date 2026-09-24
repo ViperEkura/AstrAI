@@ -213,11 +213,21 @@ Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
 rollout sampling parameters but does not yet offer a CLI argument for the reward
 model factory.
 
+The training executor owns the model boundary used by rollout. Single-device
+training passes its model directly; DDP passes the replicated underlying module
+while keeping the wrapper for training and gradient synchronization.
+Because rollout uses the unwrapped, rank-local replica without DDP collectives,
+different ranks may generate different response lengths before returning to a
+synchronized wrapped training step. Multi-process online training therefore
+requires `dp_mode="ddp"`. Distributed FSDP and `torch.compile` do not yet
+expose a supported in-process inference view, so online strategies reject those
+configurations before constructing the scheduler.
+
 ### Rollout backends and validation sampling
 
 Where generation physically runs is a *backend* choice
-(`astrai/trainer/backend.py`): by default the scheduler wraps the training
-model object in-process (`ColocatedBackend`, weight updates are free).
+(`astrai/trainer/backend.py`): by default the scheduler wraps the executor-provided
+inference model view in-process (`ColocatedBackend`, weight updates are free).
 `--rollout_device cuda:1` instead builds a frozen replica on that device
 with its own scheduler and KV pool; a `P2PCopyPublisher` copies the
 training weights into the replica inside the policy-version lock on every

@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -45,14 +46,24 @@ def strip_compile_prefix(
     return state_dict
 
 
+@dataclass(frozen=True)
+class RolloutCapabilities:
+    """Executor support for sharing its training model with inference."""
+
+    supports_in_process: bool
+    reason: Optional[str] = None
+
+
 def broadcast_state_dict(
     state_dict: Optional[Dict[str, torch.Tensor]],
     src: int = 0,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Broadcast a state_dict from *src* rank to all ranks.
 
-    Tensors stay on their original device (GPU) for the broadcast.
-    All ranks must call this collectively.
+    CPU tensors stay on CPU. Accelerator tensors are mapped to each rank's
+    current local device before the broadcast, so rank-local model copies do
+    not accidentally allocate on the source rank's GPU. All ranks must call
+    this collectively.
 
     On non-distributed runs, returns *state_dict* unchanged.
     """
@@ -64,10 +75,8 @@ def broadcast_state_dict(
     # Broadcast metadata (keys, shapes, dtypes, device kind) so non-src
     # ranks can allocate matching empty tensors on their own device.
     if rank == src:
-        first = next(iter(state_dict.values()), None)
-        on_cuda = first is not None and first.is_cuda
         metadata = [
-            (k, tuple(v.shape), v.dtype, on_cuda) for k, v in state_dict.items()
+            (k, tuple(v.shape), v.dtype, str(v.device)) for k, v in state_dict.items()
         ]
     else:
         metadata = None
@@ -75,20 +84,38 @@ def broadcast_state_dict(
     dist.broadcast_object_list(metadata_list, src=src)
     metadata = metadata_list[0]
 
-    # Non-src ranks allocate empty tensors with the broadcasted metadata.
-    # The allocation must sit on *this* rank's local device: process groups
-    # are pinned per-rank via ``device_id=``, so NCCL rejects a tensor
-    # allocated on the src rank's device (and the cross-GPU allocation
-    # would be wrong here anyway).
+    # Non-src ranks reuse a compatible local state dict when one is available.
+    # This is the common DDP path and, importantly, preserves each rank's local
+    # device. FSDP may only materialize the full state dict on src; in that
+    # case allocate on the current local accelerator rather than copying the
+    # source rank's device index (for example cuda:0 onto rank 1).
     if rank != src:
-        device = (
-            torch.device("cuda", torch.cuda.current_device())
-            if any(m[3] for m in metadata)
-            else torch.device("cpu")
+        can_reuse_local = state_dict is not None and all(
+            key in state_dict
+            and tuple(state_dict[key].shape) == shape
+            and state_dict[key].dtype == dtype
+            for key, shape, dtype, _device in metadata
         )
-        state_dict = {
-            k: torch.empty(s, dtype=d, device=device) for k, s, d, _ in metadata
-        }
+        if can_reuse_local:
+            state_dict = {key: state_dict[key] for key, *_rest in metadata}
+        else:
+
+            def local_device(source_device: str) -> torch.device:
+                device = torch.device(source_device)
+                if device.type == "cuda" and torch.cuda.is_available():
+                    return torch.device("cuda", torch.cuda.current_device())
+                if (
+                    device.type == "xpu"
+                    and hasattr(torch, "xpu")
+                    and torch.xpu.is_available()
+                ):
+                    return torch.device("xpu", torch.xpu.current_device())
+                return device
+
+            state_dict = {
+                key: torch.empty(shape, dtype=dtype, device=local_device(source_device))
+                for key, shape, dtype, source_device in metadata
+            }
 
     # Broadcast each tensor in-place.
     for tensor in state_dict.values():
@@ -185,6 +212,19 @@ class BaseExecutor:
         return model, optimizer, scheduler
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
+        return model
+
+    def rollout_capabilities(self) -> RolloutCapabilities:
+        """Describe whether an in-process rollout may share this model."""
+        return RolloutCapabilities(supports_in_process=True)
+
+    def model_for_inference(self, model: nn.Module) -> nn.Module:
+        """Return the executor-owned model view supported by inference."""
+        capabilities = self.rollout_capabilities()
+        if not capabilities.supports_in_process:
+            raise RuntimeError(
+                capabilities.reason or "In-process rollout is unsupported"
+            )
         return model
 
     def _no_sync(self, model: nn.Module):
@@ -303,6 +343,12 @@ class DDPExecutor(BaseExecutor):
             return model.no_sync()
         return contextlib.nullcontext()
 
+    def model_for_inference(self, model: nn.Module) -> nn.Module:
+        model = super().model_for_inference(model)
+        if isinstance(model, DDP):
+            return model.module
+        return model
+
     def unwrap_model(self, model: nn.Module):
         if isinstance(model, DDP):
             return strip_compile_prefix(model.module.state_dict())
@@ -356,6 +402,17 @@ class FSDPExecutor(BaseExecutor):
             len(list(model.children())),
         )
         return model
+
+    def rollout_capabilities(self) -> RolloutCapabilities:
+        if self.use_distributed:
+            return RolloutCapabilities(
+                supports_in_process=False,
+                reason=(
+                    "Distributed FSDP online rollout is not supported: inference "
+                    "requires a replicated model view, but parameters are sharded"
+                ),
+            )
+        return super().rollout_capabilities()
 
     @contextmanager
     def _no_sync(self, model: nn.Module):

@@ -1333,9 +1333,16 @@ classDiagram
             +get_last_lr()
         }
 
+        class RolloutCapabilities {
+            +bool supports_in_process
+            +Optional[str] reason
+        }
+
         class BaseExecutor {
             +GradientState gradient_state
             +prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap, after_wrap) tuple
+            +rollout_capabilities() RolloutCapabilities
+            +model_for_inference(model) nn.Module
             +accumulate(model) context manager
             +backward(loss)
             +unwrap_model(model) dict
@@ -1352,12 +1359,14 @@ classDiagram
         class DDPExecutor {
             -_prepare_model(model) nn.Module
             -_no_sync(model) context manager
+            +model_for_inference(model) nn.Module
             +unwrap_model(model) dict
         }
 
         class FSDPExecutor {
             -_prepare_model(model) nn.Module
             -_no_sync(model) context manager
+            +rollout_capabilities() RolloutCapabilities
             +unwrap_model(model) Optional[dict]
             +clip_grad_norm(model, max_norm) float
         }
@@ -1607,7 +1616,7 @@ classDiagram
 4. **Executor Selection**: `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
 5. **Inference Flow**: `InferenceEngine` → `InferenceScheduler` → `AutoRegressiveLM`, backed by `PagePool` + `KVCache` + `SamplingPipeline`. `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.ops`. Attention uses cuda > flash > torch priority unless explicitly selected by `set_op("attention", ...)` or `attn_backend()`
 (the `ASTR_BACKEND` env var is a deprecated seed). Rotary embedding auto-dispatches to the CUDA op when supported, else torch complex multiply.
-6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` launch the world; `ParallelTopology` decomposes it into `dp × cp × tp` with one process group per mesh dimension — a singleton for inactive dimensions — `CPStrategy`/`CPState` shard sequences across cp ranks, and `TPState` shards Linear projections over features across tp ranks
+6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` launch the world; `ParallelTopology` decomposes it into `dp × cp × tp` with one process group per mesh dimension — a singleton for inactive dimensions — `CPStrategy`/`CPState` shard sequences across cp ranks, and `TPState` shards Linear projections over features across tp ranks. Online rollout obtains an inference model view from the training executor: DDP uses its replicated underlying module, while distributed FSDP and torch.compile are rejected before scheduler construction.
 7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`
 8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata; `CheckpointCallback` performs rank-0 training saves, with extra state saved as `{key}.pt`
 9. **Scheduler**: `SchedulerFactory` creates `CosineScheduler`/`SGDRScheduler`/`WSDScheduler`

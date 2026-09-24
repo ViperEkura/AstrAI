@@ -3,16 +3,27 @@
 // No torch dependency; pure CUDA.
 //
 // The paged and contiguous kernels are unified by the KVSource policy
-// (ContigKV / PagedKV from layout_policies.cuh), so each launcher struct
+// (ContigKV<T> / PagedKV<T> from layout_policies.cuh), so each launcher struct
 // below is templated on KV and the paged dispatch is just the same launcher
 // instantiated with PagedKV.  Only the grid/split math differs, and that is
-// covered by KV::host_q_len / KV::host_kv_len. For the same reason the
-// dispatch_* entries funnel through one impl per family
-// (dispatch_prefill_impl / dispatch_decode_impl), so the MMA/scalar selection
-// lives in one place instead of once per entry.
+// covered by KV::host_kv_len. For the same reason the dispatch_* entries
+// funnel through one impl per family (dispatch_prefill_impl /
+// dispatch_decode_impl), so the MMA/scalar selection lives in one place
+// instead of once per entry.
+//
+// The element type is a template parameter of every entry, and it rides on the
+// KV instantiation (KV::Elem) from there down: the torch-facing .cu entries
+// pick it from ASTRAI_ATTN_DTYPE_LIST (attention/dtype_list.cuh) and the C++
+// harnesses pass it directly, so nothing here reads a runtime dtype tag and the
+// params POD carries none.
+
+#include <cstdio>
+#include <cstdlib>
 
 #include <cuda_runtime.h>
 #include <algorithm>
+
+#include "common/dtype.cuh"
 #include "common/launch.cuh"
 #include "layout_policies.cuh"
 #include "prefill_split_q.cuh"
@@ -24,6 +35,18 @@
 
 namespace astrai {
 namespace attention {
+
+// A head dim no kernel was instantiated for: the torch entry validates the
+// granularity and the Python backend gates the set (drift-asserted against
+// HEAD_DIMS), so this is the loud belt-and-braces arm of the switches below —
+// the launch discipline: never run a kernel that was not built for the shape.
+[[noreturn]] inline void head_dim_fatal(int head_dim) {
+    std::fprintf(stderr,
+                 "ASTRAI: attention: head_dim %d has no kernel instantiation "
+                 "(instantiated: 32, 64, 128, 256)\n",
+                 head_dim);
+    std::exit(EXIT_FAILURE);
+}
 
 // Split-KV: compute number of splits to fill all SMs for small-batch decode.
 // Caps splits so each split processes at least `min_tiles_per_split` tiles,
@@ -120,9 +143,10 @@ template <> struct PrefillConfigMap<256, true>  : PrefillKernelConfig<16> {};
 template <typename QSchedule, typename KV>
 struct PrefillLauncherMMA {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
+    static void launch(AttentionParams& p, cudaStream_t stream) {
         using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
-        using Traits = KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES>;
+        using Traits = KernelTraits<HEAD_DIM, Config::BC, Config::WARPS,
+                                    Config::STAGES, typename KV::Elem>;
         // GQA head packing: HB = min(G, WARPS) q-heads of one kv-head group
         // share each block's K/V stream (~HB× less global K/V traffic).
         // Each head gets WPH = WARPS/HB 16-row chunks per block, so per-head
@@ -146,7 +170,7 @@ struct PrefillLauncherMMA {
 template <typename QSchedule, typename KV>
 struct PrefillLauncherScalar {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
+    static void launch(AttentionParams& p, cudaStream_t stream) {
         constexpr int G = (HEAD_DIM == 32) ? 4 : 8, ROWS = 64, P_BC = 32;
         dim3 grid(QSchedule::host_q_blocks(p, ROWS), p.q_head,
                   QSchedule::host_grid_batch(p));
@@ -162,7 +186,7 @@ struct PrefillLauncherScalar {
 // + KV source), so one implementation carries the MMA/scalar selection and the
 // causal/mask ladder for both.
 template <typename QSchedule, typename KV, int HEAD_DIM>
-static inline void dispatch_prefill_impl(AttentionParams<bf16>& p,
+static inline void dispatch_prefill_impl(AttentionParams& p,
                                          cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
     bool has_mask = (p.use_mask && p.mask);
@@ -173,14 +197,28 @@ static inline void dispatch_prefill_impl(AttentionParams<bf16>& p,
                          HEAD_DIM, p, stream);
 }
 
-template <int HEAD_DIM>
-static inline void dispatch_prefill(AttentionParams<bf16>& p, cudaStream_t stream) {
-    dispatch_prefill_impl<DenseQSchedule, ContigKV, HEAD_DIM>(p, stream);
+// One entry per family: T is the element type (the whole dtype axis), the head
+// dim is switched here because it selects tile configs, not storage.
+template <typename T>
+static inline void dispatch_prefill(AttentionParams& p, cudaStream_t stream) {
+    switch (p.head_dim) {
+        case 32:  dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 32>(p, stream); break;
+        case 64:  dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 64>(p, stream); break;
+        case 128: dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 128>(p, stream); break;
+        case 256: dispatch_prefill_impl<DenseQSchedule, ContigKV<T>, 256>(p, stream); break;
+        default:  head_dim_fatal(p.head_dim);
+    }
 }
 
-template <int HEAD_DIM>
-static inline void dispatch_paged_prefill(AttentionParams<bf16>& p, cudaStream_t stream) {
-    dispatch_prefill_impl<PackedQSchedule, PagedKV, HEAD_DIM>(p, stream);
+template <typename T>
+static inline void dispatch_paged_prefill(AttentionParams& p, cudaStream_t stream) {
+    switch (p.head_dim) {
+        case 32:  dispatch_prefill_impl<PackedQSchedule, PagedKV<T>, 32>(p, stream); break;
+        case 64:  dispatch_prefill_impl<PackedQSchedule, PagedKV<T>, 64>(p, stream); break;
+        case 128: dispatch_prefill_impl<PackedQSchedule, PagedKV<T>, 128>(p, stream); break;
+        case 256: dispatch_prefill_impl<PackedQSchedule, PagedKV<T>, 256>(p, stream); break;
+        default:  head_dim_fatal(p.head_dim);
+    }
 }
 
 // ======================================================================
@@ -195,7 +233,7 @@ static inline void dispatch_paged_prefill(AttentionParams<bf16>& p, cudaStream_t
 template <typename KV>
 struct DecodeLauncherMMA {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
+    static void launch(AttentionParams& p, cudaStream_t stream) {
         int G = p.q_head / p.kv_head;
         constexpr int MAX_G = 16;
         int num_passes = (G + MAX_G - 1) / MAX_G;
@@ -204,7 +242,7 @@ struct DecodeLauncherMMA {
         int tiles_total = (kv_len + BC - 1) / BC;
         p.num_splits = compute_num_splits(p.batch * p.kv_head * num_passes, tiles_total, 2);
         constexpr int STAGES = 2;
-        using Traits = KernelTraits<HEAD_DIM, BC, 1, STAGES>;
+        using Traits = KernelTraits<HEAD_DIM, BC, 1, STAGES, typename KV::Elem>;
         dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
         attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask>
             <<<grid, 32, 0, stream>>>(p);
@@ -216,11 +254,11 @@ struct DecodeLauncherMMA {
 template <typename KV>
 struct DecodeLauncherScalar {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams<bf16>& p, cudaStream_t stream) {
+    static void launch(AttentionParams& p, cudaStream_t stream) {
         int kv_len = KV::host_kv_len(p);
         int chunks_total = (kv_len + DC_CHUNK - 1) / DC_CHUNK;
         p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
-        size_t smem = 2 * DC_CHUNK * p.head_dim * sizeof(bf16);
+        size_t smem = 2 * DC_CHUNK * p.head_dim * sizeof(typename KV::Elem);
         int group_size = p.q_head / p.kv_head;
         int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
         dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
@@ -238,7 +276,7 @@ struct DecodeLauncherScalar {
 // Same funnel as prefill: the entry's only difference is the KV policy, which
 // also parameterizes the combine pass reducing the split partials.
 template <typename KV, int HEAD_DIM>
-static inline void dispatch_decode_impl(AttentionParams<bf16>& p,
+static inline void dispatch_decode_impl(AttentionParams& p,
                                         cudaStream_t stream) {
     bool is_causal = (p.causal_offset >= 0);
     bool has_mask = (p.use_mask && p.mask);
@@ -252,14 +290,26 @@ static inline void dispatch_decode_impl(AttentionParams<bf16>& p,
     ASTRAI_LAUNCH_CHECK();
 }
 
-template <int HEAD_DIM>
-static inline void dispatch_decode(AttentionParams<bf16>& p, cudaStream_t stream) {
-    dispatch_decode_impl<ContigKV, HEAD_DIM>(p, stream);
+template <typename T>
+static inline void dispatch_decode(AttentionParams& p, cudaStream_t stream) {
+    switch (p.head_dim) {
+        case 32:  dispatch_decode_impl<ContigKV<T>, 32>(p, stream); break;
+        case 64:  dispatch_decode_impl<ContigKV<T>, 64>(p, stream); break;
+        case 128: dispatch_decode_impl<ContigKV<T>, 128>(p, stream); break;
+        case 256: dispatch_decode_impl<ContigKV<T>, 256>(p, stream); break;
+        default:  head_dim_fatal(p.head_dim);
+    }
 }
 
-template <int HEAD_DIM>
-static inline void dispatch_paged_decode(AttentionParams<bf16>& p, cudaStream_t stream) {
-    dispatch_decode_impl<PagedKV, HEAD_DIM>(p, stream);
+template <typename T>
+static inline void dispatch_paged_decode(AttentionParams& p, cudaStream_t stream) {
+    switch (p.head_dim) {
+        case 32:  dispatch_decode_impl<PagedKV<T>, 32>(p, stream); break;
+        case 64:  dispatch_decode_impl<PagedKV<T>, 64>(p, stream); break;
+        case 128: dispatch_decode_impl<PagedKV<T>, 128>(p, stream); break;
+        case 256: dispatch_decode_impl<PagedKV<T>, 256>(p, stream); break;
+        default:  head_dim_fatal(p.head_dim);
+    }
 }
 
 }  // namespace attention

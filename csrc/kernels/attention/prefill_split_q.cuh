@@ -9,30 +9,18 @@
 namespace astrai {
 namespace attention {
 
-using bf16 = __nv_bfloat16;
-
 // v9: group-split register blocking. G threads cooperate on one query row,
 // each owning HEAD_DIM/G dims of qreg[]/acc[]. IsCausal and HasMask are
 // compile-time bools — the compiler eliminates dead branches.
-// Unified across contiguous and paged (SGLang flat-pool) K/V via KV.
-// Templated on <HEAD_DIM, KV, G, ROWS, P_BC, IsCausal, HasMask>.
+// Unified across contiguous and paged (SGLang flat-pool) K/V via KV, and
+// across precisions via KV::Elem.
+// Templated on <HEAD_DIM, QSchedule, KV, G, ROWS, P_BC, IsCausal, HasMask>.
 // group_reduce_sum<G> lives in common/reduce.cuh (astrai::).
-
-// load 8 contiguous bf16 from (16-byte aligned) smem as one float4
-__device__ __forceinline__ void ld8(const bf16* p, float* o) {
-    float4 raw = *reinterpret_cast<const float4*>(p);
-    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
-#pragma unroll
-    for (int j = 0; j < 4; j++) {
-        float2 f = __bfloat1622float2(h[j]);
-        o[2 * j] = f.x;
-        o[2 * j + 1] = f.y;
-    }
-}
 
 template <int HEAD_DIM, typename QSchedule, typename KV, int G, int ROWS, int P_BC,
           bool IsCausal, bool HasMask>
-__global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
+__global__ void attn_prefill_split_q_kernel_t(AttentionParams p) {
+    using T = typename KV::Elem;
     constexpr int DPT = HEAD_DIM / G;
 
     int batch, q_tile;
@@ -50,17 +38,18 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     const int kv_head = q_head / (p.q_head / p.kv_head);
     const KVContext kctx = KV::template make_ctx<HEAD_DIM>(p, batch, kv_head);
 
-    __shared__ __align__(16) bf16 sK[P_BC * HEAD_DIM];
-    __shared__ __align__(16) bf16 sV[P_BC * HEAD_DIM];
+    __shared__ __align__(16) T sK[P_BC * HEAD_DIM];
+    __shared__ __align__(16) T sV[P_BC * HEAD_DIM];
 
     // Q: stride-based load [batch, q_head, q_len, head_dim]
+    const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
     const int q_base = QSchedule::q_base(p, batch, q_head);
     float qreg[DPT];
     if (q_row < q_len) {
         int q_off = q_base + q_row * p.q_l_stride + gpos * DPT * p.q_d_stride;
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            qreg[i] = __bfloat162float(p.q_ptr[q_off + i * p.q_d_stride]);
+            qreg[i] = ElemTrait<T>::to_float(q_gmem[q_off + i * p.q_d_stride]);
     }
 
     SoftmaxState sm;
@@ -104,12 +93,12 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
 
         int mask_row_base = mask_batch_base + q_row * p.mask_l_stride;
         for (int s = 0; s < lim; s++) {
-            const bf16* kr = sK + s * HEAD_DIM + gpos * DPT;
+            const T* kr = sK + s * HEAD_DIM + gpos * DPT;
             float part = 0.0f;
 #pragma unroll
             for (int i = 0; i < DPT; i += 8) {
                 float k8[8];
-                ld8(kr + i, k8);
+                astrai::load8<T>(kr + i, k8);
 #pragma unroll
                 for (int j = 0; j < 8; j++)
                     part = fmaf(qreg[i + j], k8[j], part);
@@ -125,11 +114,11 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
             float al, be;
             softmax_step(sm, dot, 1.0f, al, be);
 
-            const bf16* vr = sV + s * HEAD_DIM + gpos * DPT;
+            const T* vr = sV + s * HEAD_DIM + gpos * DPT;
 #pragma unroll
             for (int i = 0; i < DPT; i += 8) {
                 float v8[8];
-                ld8(vr + i, v8);
+                astrai::load8<T>(vr + i, v8);
 #pragma unroll
                 for (int j = 0; j < 8; j++)
                     acc[i + j] = fmaf(v8[j], be, acc[i + j] * al);
@@ -141,9 +130,10 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams<bf16> p) {
     if (q_row < q_len) {
         int o_off = q_base + q_row * p.q_l_stride + gpos * DPT * p.q_d_stride;
         float rl = (sm.l > 1e-20f) ? (1.0f / sm.l) : 0.0f;
+        T* __restrict__ o_gmem = static_cast<T*>(p.o_ptr);
 #pragma unroll
         for (int i = 0; i < DPT; i++)
-            p.o_ptr[o_off + i * p.q_d_stride] = __float2bfloat16(acc[i] * rl);
+            o_gmem[o_off + i * p.q_d_stride] = ElemTrait<T>::from_float(acc[i] * rl);
     }
 }
 

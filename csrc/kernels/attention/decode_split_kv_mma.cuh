@@ -18,9 +18,11 @@ namespace attention {
 // IsCausal and HasMask are compile-time bools — no runtime branch in the
 // inner compute loop.
 //
-// Traits = KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2>.
+// Traits = KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
 template <typename Traits, typename KV, bool IsCausal, bool HasMask>
-__global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
+__global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
+    using T = typename Traits::Elem;
+
     const int lane = threadIdx.x;
     const int gid = lane >> 2;
     const int tid4 = lane & 3;
@@ -41,16 +43,17 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
 
     // Double-buffered shared memory for K/V (no sQ needed)
-    __shared__ __align__(16) bf16 sK[Traits::STAGES * Traits::BC * Traits::LD];
-    __shared__ __align__(16) bf16 sV[Traits::STAGES * Traits::BC * Traits::LD];
+    __shared__ __align__(16) T sK[Traits::STAGES * Traits::BC * Traits::LD];
+    __shared__ __align__(16) T sV[Traits::STAGES * Traits::BC * Traits::LD];
 
     // Load Q directly from global into mma A-operand registers.
+    const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
     const int q_base = KV::q_decode_base(p, batch, q_head0);
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(p.q_ptr + q_base, p.q_h_stride, p.q_d_stride,
+    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_h_stride, p.q_d_stride,
                                   qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[Traits::DN8][4];
@@ -82,8 +85,8 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams<bf16> p) {
     const int ntiles = ti_end - ti_begin;
 
     auto process_tile = [&](int it, int buf) {
-        const bf16* bK = sK + buf * Traits::BC * Traits::LD;
-        const bf16* bV = sV + buf * Traits::BC * Traits::LD;
+        const T* bK = sK + buf * Traits::BC * Traits::LD;
+        const T* bV = sV + buf * Traits::BC * Traits::LD;
         int kv0 = (ti_begin + it) * Traits::BC;
 
         float Sacc[Traits::NC8][4];

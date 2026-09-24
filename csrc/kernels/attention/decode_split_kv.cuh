@@ -13,23 +13,28 @@ constexpr int DC_CHUNK = 64;
 
 // Scalar split-KV decode (fallback for sm < 80, no tensor cores), unified
 // across contiguous and paged (SGLang flat-pool) K/V via the KV template
-// parameter.  For decode the query is the last token, so its valid range
-// [0, seq_len) IS the causal range; KV::decode_attend_len expresses that
-// bound per addressing mode (contig clips to causal_offset, paged = seq_len).
+// parameter, and across precisions via its element type (KV::Elem).  For
+// decode the query is the last token, so its valid range [0, seq_len) IS the
+// causal range; KV::decode_attend_len expresses that bound per addressing
+// mode (contig clips to causal_offset, paged = seq_len).
 template <int HEAD_DIM, typename KV, bool IsCausal, bool HasMask>
-__global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
+__global__ void attn_decode_split_kv_kernel(AttentionParams p) {
+    using T = typename KV::Elem;
+
     int batch = blockIdx.x / p.kv_head;
     int kv_head = blockIdx.x % p.kv_head;
     int split = blockIdx.z;
     int lane = threadIdx.x;
     int hd_per_thread = p.head_dim / 32;
 
+    const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
+
     const int seq_len = KV::kv_len(p, batch);
     const KVContext kctx = KV::template make_ctx<HEAD_DIM>(p, batch, kv_head);
 
-    extern __shared__ __align__(16) bf16 smem[];
-    bf16* k_smem = smem;
-    bf16* v_smem = smem + DC_CHUNK * p.head_dim;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    T* k_smem = reinterpret_cast<T*>(smem_raw);
+    T* v_smem = k_smem + DC_CHUNK * p.head_dim;
 
     // Split-KV: each split processes a contiguous subset of chunks
     int chunks_total = (seq_len + DC_CHUNK - 1) / DC_CHUNK;
@@ -58,7 +63,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             int q_off = KV::q_decode_base(p, batch, safe_head)
                       + lane * hd_per_thread * p.q_d_stride;
             for (int i = 0; i < hd_per_thread; i++)
-                q_reg[i] = __bfloat162float(p.q_ptr[q_off + i * p.q_d_stride]);
+                q_reg[i] = ElemTrait<T>::to_float(q_gmem[q_off + i * p.q_d_stride]);
         }
 
         int mask_base = batch * p.mask_b_stride + safe_head * p.mask_h_stride;
@@ -84,7 +89,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
             for (int s = 0; s < this_chunk; s++) {
                 float partial = 0.0f;
                 for (int i = 0; i < hd_per_thread; i++)
-                    partial += q_reg[i] * __bfloat162float(
+                    partial += q_reg[i] * ElemTrait<T>::to_float(
                         k_smem[s * p.head_dim + lane * hd_per_thread + i]);
                 partial = warp_reduce_sum(partial) * p.scale;
 
@@ -102,7 +107,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
                 softmax_step(sm, partial, 1.0f, alpha, beta);
 
                 for (int i = 0; i < hd_per_thread; i++) {
-                    float vv = __bfloat162float(v_smem[s * p.head_dim + lane * hd_per_thread + i]);
+                    float vv = ElemTrait<T>::to_float(v_smem[s * p.head_dim + lane * hd_per_thread + i]);
                     acc_reg[i] = fmaf(acc_reg[i], alpha, vv * beta);
                 }
             }
@@ -128,9 +133,11 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams<bf16> p) {
 
 // Split-combine: merges the per-split partials (o_part/ml_part) into the
 // final normalised O.  KV selects the O addressing (contig batch stride vs
-// paged row stride).
+// paged row stride) and the output element type (KV::Elem).
 template <typename KV>
-__global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
+__global__ void attn_decode_combine_kernel(AttentionParams p) {
+    using T = typename KV::Elem;
+
     int bh = blockIdx.x;
     int d = threadIdx.x;
     if (d >= p.head_dim) return;
@@ -155,7 +162,7 @@ __global__ void attn_decode_combine_kernel(AttentionParams<bf16> p) {
 
     float inv = (st.l > 1e-20f) ? (1.0f / st.l) : 0.0f;
     int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
-    p.o_ptr[o_off] = __float2bfloat16(acc * inv);
+    static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
 }
 
 }  // namespace attention

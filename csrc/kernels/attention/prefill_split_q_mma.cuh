@@ -20,14 +20,17 @@ namespace attention {
 // all warps of a block cover the same token range, keeping the causal sweep
 // end block-uniform.  G=1 (MHA) degenerates to the unpadded layout.
 //
-// KV = ContigKV (dense [batch, kv_head, kv_len, head_dim]) or PagedKV
-//      (flat pool + req_to_token, ragged batches via qo_indptr/kv_indptr).
+// KV = ContigKV<T> (dense [batch, kv_head, kv_len, head_dim]) or
+//      PagedKV<T>  (flat pool + req_to_token, ragged batches via
+//      qo_indptr/kv_indptr); T is the element type (Traits::Elem).
 // IsCausal and HasMask are compile-time bools — the compiler eliminates all
 // dead branches in the inner compute loop (FA2-style).
 //
-// Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2>.
+// Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2, Elem>.
 template <typename Traits, typename QSchedule, typename KV, bool IsCausal, bool HasMask>
-__global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
+__global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
+    using T = typename Traits::Elem;
+
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int gid = lane >> 2;   // 0..7
@@ -59,16 +62,17 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
 
     // Static shared memory: double-buffered K/V (no sQ — Q goes direct
     // to registers in mma A-operand layout).
-    __shared__ __align__(16) bf16 sK[Traits::STAGES * Traits::BC * Traits::LD];
-    __shared__ __align__(16) bf16 sV[Traits::STAGES * Traits::BC * Traits::LD];
+    __shared__ __align__(16) T sK[Traits::STAGES * Traits::BC * Traits::LD];
+    __shared__ __align__(16) T sV[Traits::STAGES * Traits::BC * Traits::LD];
 
     // Load Q fragments straight from global into mma A-operand layout.
+    const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
     const int q_base = QSchedule::q_base(p, batch, q_head);
     const int qra = qrow0 + gid;
     const int qrb = qrow0 + gid + 8;
     const bool va = qra < q_len, vb = qrb < q_len;
     unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(p.q_ptr + q_base, p.q_l_stride, p.q_d_stride,
+    load_q_mma_frags<Traits::KD>(q_gmem + q_base, p.q_l_stride, p.q_d_stride,
                                   qra, qrb, va, vb, tid4, Qa);
 
     float Oacc[Traits::DN8][4];
@@ -113,8 +117,8 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
         __syncthreads();
         if (ti < t_end) load_tile(ti + 1, (ti + 1) & 1);
 
-        const bf16* bK = sK + buf * Traits::BC * Traits::LD;
-        const bf16* bV = sV + buf * Traits::BC * Traits::LD;
+        const T* bK = sK + buf * Traits::BC * Traits::LD;
+        const T* bV = sV + buf * Traits::BC * Traits::LD;
         int kv0 = ti * Traits::BC;
 
         // Warp-level causal skip (dead branch eliminated when IsCausal == false)
@@ -139,24 +143,21 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams<bf16> p) {
         }
     }
 
-    // ---- write output: packed bf16x2 stores ----
+    // ---- write output: packed element-pair stores ----
     float rl0 = (l0 > 1e-20f) ? (1.0f / l0) : 0.0f;
     float rl1 = (l1 > 1e-20f) ? (1.0f / l1) : 0.0f;
+    T* __restrict__ o_gmem = static_cast<T*>(p.o_ptr);
     const int o_base = QSchedule::q_base(p, batch, q_head);
     #pragma unroll
     for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
         int d = dn8 * 8 + 2 * tid4;
         if (active && qr0 < q_len) {
-            __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][0] * rl0,
-                                                      Oacc[dn8][1] * rl0);
-            *reinterpret_cast<__nv_bfloat162*>(
-                &p.o_ptr[o_base + qr0 * p.q_l_stride + d * p.q_d_stride]) = v;
+            astrai::store2<T>(o_gmem + o_base + qr0 * p.q_l_stride + d * p.q_d_stride,
+                      Oacc[dn8][0] * rl0, Oacc[dn8][1] * rl0);
         }
         if (active && qr1 < q_len) {
-            __nv_bfloat162 v = __floats2bfloat162_rn(Oacc[dn8][2] * rl1,
-                                                     Oacc[dn8][3] * rl1);
-            *reinterpret_cast<__nv_bfloat162*>(
-                &p.o_ptr[o_base + qr1 * p.q_l_stride + d * p.q_d_stride]) = v;
+            astrai::store2<T>(o_gmem + o_base + qr1 * p.q_l_stride + d * p.q_d_stride,
+                      Oacc[dn8][2] * rl1, Oacc[dn8][3] * rl1);
         }
     }
 }

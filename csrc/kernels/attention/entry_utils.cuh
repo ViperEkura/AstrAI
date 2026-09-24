@@ -1,52 +1,47 @@
 #pragma once
 #include <float.h>
+
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
-#include "common.h"
 
-// Dispatch head_dim: shared macro — avoids C++20 lambda template syntax.
-// Usage: DISPATCH_HEAD_DIM(hd, fn, args...)
-//   Expands to: fn<32>(args...); fn<64>(args...); etc.
-#define DISPATCH_HEAD_DIM(hd, fn, ...) \
-    switch (hd) { \
-        case 32:  fn<32>(__VA_ARGS__); break; \
-        case 64:  fn<64>(__VA_ARGS__); break; \
-        case 128: fn<128>(__VA_ARGS__); break; \
-        case 256: fn<256>(__VA_ARGS__); break; \
-        default: \
-            TORCH_CHECK(false, "unsupported head_dim ", hd, \
-                         " (supported: 32, 64, 128, 256)"); \
-    }
+#include "common.h"
 
 namespace astrai {
 namespace attention {
 
-using bf16 = __nv_bfloat16;
-
 // ---- Micro-checks shared by the packers ----
-inline void check_bf16(const torch::Tensor& t, const char* name) {
-    TORCH_CHECK(t.is_cuda() && t.dtype() == torch::kBFloat16,
-                name, " must be a CUDA bf16 tensor");
-}
-
 inline void check_int32(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_cuda() && t.dtype() == torch::kInt32,
                 name, " must be a CUDA int32 tensor");
 }
 
+// ---- Element type ----
+// Every kernel reads q, k and v through ONE element type and writes O with it,
+// so the three must agree. Which scalar types have a kernel behind them is the
+// entry's switch over ASTRAI_ATTN_DTYPE_LIST (attention/dtype_list.cuh), taken
+// on q's type; nothing is recorded on the params — the element type reaches the
+// kernel as a template parameter.
+inline void check_qkv_dtype(const torch::Tensor& q, const torch::Tensor& k,
+                            const torch::Tensor& v) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(),
+                "Q/K/V must be CUDA tensors");
+    TORCH_CHECK(k.scalar_type() == q.scalar_type(), "K dtype must match Q (",
+                q.scalar_type(), "), got ", k.scalar_type());
+    TORCH_CHECK(v.scalar_type() == q.scalar_type(), "V dtype must match Q (",
+                q.scalar_type(), "), got ", v.scalar_type());
+}
+
 // Scalar knobs every packer shares: the causal flag and the mask-present
 // bit (an optional holding an undefined tensor counts as "no mask").
-template <typename P>
 inline void start_pack(const c10::optional<torch::Tensor>& mask,
-                       int64_t causal_offset, P& p) {
+                       int64_t causal_offset, AttentionParams& p) {
     p.causal_offset = (int)causal_offset;
     p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
 }
 
 // Default scale resolution + null output pointers; the entry .cu fills
 // o_ptr / split partials right after packing.
-template <typename P>
-inline void finish_pack(double scale, P& p) {
+inline void finish_pack(double scale, AttentionParams& p) {
     p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
     p.o_ptr = nullptr;
     p.o_part = nullptr;
@@ -57,8 +52,7 @@ inline void finish_pack(double scale, P& p) {
 // owns — including empty split ranges, which store m = -FLT_MAX so the combine
 // skips them. Allocators are therefore left uninitialized (torch::empty); the
 // per-call memset (torch::zeros / torch::full) was pure overhead.
-template<typename P>
-inline void alloc_split_partials(P& p) {
+inline void alloc_split_partials(AttentionParams& p) {
     auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto o_part = torch::empty(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
     auto ml_part = torch::empty(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, 2}, fopt);
@@ -67,11 +61,12 @@ inline void alloc_split_partials(P& p) {
 }
 
 // Split partials: validate caller-provided buffers or allocate fresh ones.
-template <typename P>
+// Always fp32: they are online-softmax accumulators, independent of the
+// precision the Q/K/V buffers carry.
 inline void resolve_split_buffers(
     const c10::optional<torch::Tensor>& o_part_buf,
     const c10::optional<torch::Tensor>& ml_part_buf,
-    P& p) {
+    AttentionParams& p) {
     if (o_part_buf.has_value() && ml_part_buf.has_value()
         && o_part_buf->defined() && ml_part_buf->defined()) {
         TORCH_CHECK(o_part_buf->scalar_type() == torch::kFloat32, "o_part_buf must be f32");
@@ -94,8 +89,8 @@ inline void resolve_split_buffers(
 }
 
 // ---- Shared Q-dims + strides extraction ----
-template <typename P>
-inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout, P& p) {
+inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout,
+                                       AttentionParams& p) {
     if (layout == BLHD) q = q.transpose(1, 2);
     p.batch = (int)q.size(0);
     p.q_head = (int)q.size(1);
@@ -118,24 +113,22 @@ inline int bc_stride(const torch::Tensor& m, int dim) {
 }
 
 // 2D masks: batch stride only, head/q strides broadcast away.
-template <typename P>
-inline void set_mask_2d(const torch::Tensor& m, P& p) {
+inline void set_mask_2d(const torch::Tensor& m, AttentionParams& p) {
     p.mask_b_stride = (int)m.stride(0);
     p.mask_h_stride = 0;
     p.mask_l_stride = 0;
     p.mask = m.data_ptr<bool>();
 }
 
-template <typename P>
-inline void set_mask_null(P& p) {
+inline void set_mask_null(AttentionParams& p) {
     p.mask = nullptr;
     p.mask_b_stride = 0;
     p.mask_h_stride = 0;
     p.mask_l_stride = 0;
 }
 
-template <typename P>
-inline void pack_mask(const c10::optional<torch::Tensor>& mask, P& p) {
+inline void pack_mask(const c10::optional<torch::Tensor>& mask,
+                      AttentionParams& p) {
     if (p.use_mask) {
         auto m = mask.value();
         TORCH_CHECK(m.is_cuda(), "mask must be on CUDA");
@@ -165,7 +158,6 @@ inline void pack_mask(const c10::optional<torch::Tensor>& mask, P& p) {
 }
 
 // ---- attn_pack_params (contiguous KV) ----
-template<typename T>
 inline void attn_pack_params(
     torch::Tensor q,
     torch::Tensor k,
@@ -174,13 +166,11 @@ inline void attn_pack_params(
     int64_t causal_offset,
     double scale,
     int64_t layout,
-    AttentionParams<T>& p
+    AttentionParams& p
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 
-    check_bf16(q, "q");
-    check_bf16(k, "k");
-    check_bf16(v, "v");
+    check_qkv_dtype(q, k, v);
     TORCH_CHECK(k.sizes() == v.sizes(), "K and V must have identical shapes");
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4, "Q/K/V must be 4D");
     extract_q_dims_and_strides(q, layout, p);
@@ -202,9 +192,9 @@ inline void attn_pack_params(
 
     start_pack(mask, causal_offset, p);
 
-    p.q_ptr = (const T*)q.data_ptr();
-    p.k_ptr = (const T*)k.data_ptr();
-    p.v_ptr = (const T*)v.data_ptr();
+    p.q_ptr = q.data_ptr();
+    p.k_ptr = k.data_ptr();
+    p.v_ptr = v.data_ptr();
     p.new_k_ptr = nullptr;
     p.new_v_ptr = nullptr;
     finish_pack(scale, p);
@@ -216,7 +206,6 @@ inline void attn_pack_params(
 // Flat-pool tensor checks, common dim/stride extraction and raw pointers.
 // Batch resolution differs (decode: q rows; prefill: req_pool_indices) and
 // stays at the caller, as do the head_dim granularity checks.
-template <typename T>
 inline void pack_paged_common(
     torch::Tensor& q,
     torch::Tensor& k_cache,
@@ -224,11 +213,9 @@ inline void pack_paged_common(
     torch::Tensor& req_to_token,
     torch::Tensor& req_pool_indices,
     torch::Tensor& kv_indptr,
-    AttentionParams<T>& p)
+    AttentionParams& p)
 {
-    check_bf16(q, "q");
-    check_bf16(k_cache, "k_cache");
-    check_bf16(v_cache, "v_cache");
+    check_qkv_dtype(q, k_cache, v_cache);
     check_int32(req_to_token, "req_to_token");
     check_int32(req_pool_indices, "req_pool_indices");
     check_int32(kv_indptr, "kv_indptr");
@@ -248,9 +235,9 @@ inline void pack_paged_common(
     p.q_h_stride = (int)q.stride(1);
     p.q_d_stride = (int)q.stride(2);
 
-    p.k_ptr = (const T*)k_cache.data_ptr();
-    p.v_ptr = (const T*)v_cache.data_ptr();
-    p.q_ptr = (const T*)q.data_ptr();
+    p.k_ptr = k_cache.data_ptr();
+    p.v_ptr = v_cache.data_ptr();
+    p.q_ptr = q.data_ptr();
     p.req_to_token = req_to_token.data_ptr<int>();
     p.req_pool_indices = req_pool_indices.data_ptr<int>();
     p.kv_indptr = kv_indptr.data_ptr<int>();
@@ -260,7 +247,6 @@ inline void pack_paged_common(
 // ---- attn_pack_paged_decode_params ----
 // SGLang-style: flat KV pool + req_to_token indexing + variable
 // seq_lens via kv_indptr.  Q is [batch, q_head, head_dim] (q_len=1 per req).
-template<typename T>
 inline void attn_pack_paged_decode_params(
     torch::Tensor q,
     torch::Tensor k_cache,
@@ -273,7 +259,7 @@ inline void attn_pack_paged_decode_params(
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
-    AttentionParams<T>& p
+    AttentionParams& p
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 
@@ -289,8 +275,9 @@ inline void attn_pack_paged_decode_params(
         auto nk = new_k.value();
         auto nv = new_v.value();
         TORCH_CHECK(nk.is_cuda() && nv.is_cuda(), "new K/V must be CUDA tensors");
-        TORCH_CHECK(nk.dtype() == torch::kBFloat16 && nv.dtype() == torch::kBFloat16,
-                    "new K/V must be bf16");
+        TORCH_CHECK(nk.scalar_type() == q.scalar_type()
+                        && nv.scalar_type() == q.scalar_type(),
+                    "new K/V dtype must match Q");
         TORCH_CHECK(nk.dim() == 3 && nv.dim() == 3,
                     "new K/V must be 3D [batch, kv_head, head_dim]");
         TORCH_CHECK(nk.sizes() == nv.sizes(), "new K and V must have identical shapes");
@@ -300,8 +287,8 @@ inline void attn_pack_paged_decode_params(
                     && nk.size(2) == p.head_dim, "new K/V shape mismatch");
         TORCH_CHECK(nk.stride(2) == 1 && nv.stride(2) == 1,
                     "new K/V head_dim must be contiguous");
-        p.new_k_ptr = (const T*)nk.data_ptr();
-        p.new_v_ptr = (const T*)nv.data_ptr();
+        p.new_k_ptr = nk.data_ptr();
+        p.new_v_ptr = nv.data_ptr();
         p.new_kv_b_stride = (int)nk.stride(0);
         p.new_kv_h_stride = (int)nk.stride(1);
     } else {
@@ -326,7 +313,6 @@ inline void attn_pack_paged_decode_params(
 // ---- attn_pack_paged_prefill_params ----
 // SGLang-style: flat KV pool + req_to_token + ragged batch via qo_indptr.
 // Q is [total_q, q_head, head_dim] (flattened across all requests).
-template<typename T>
 inline void attn_pack_paged_prefill_params(
     torch::Tensor q,
     torch::Tensor k_cache,
@@ -340,7 +326,7 @@ inline void attn_pack_paged_prefill_params(
     c10::optional<torch::Tensor> mask,
     int64_t causal_offset,
     double scale,
-    AttentionParams<T>& p
+    AttentionParams& p
 ) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 

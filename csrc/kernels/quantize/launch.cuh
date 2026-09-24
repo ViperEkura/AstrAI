@@ -15,6 +15,7 @@
 #include <torch/extension.h>
 
 #include "checks.h"
+#include "common/dtype.cuh"
 #include "common.h"
 #include "quantize.cuh"
 
@@ -24,15 +25,17 @@ namespace quant {
 // Dtype dispatch over the merged quantize launcher: one case per supported
 // input dtype for a (possibly mixed) fp8 output pair; the default is a hard
 // error (entry-checked, so unreachable — never a silent bf16 re-route).
+// Element types are the shared vocabulary's names (common/dtype.cuh), the same
+// ones attention and gemm instantiate.
 template <typename Fp8TA, typename Fp8TB>
 inline void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
                              cudaStream_t stream) {
     switch (x.scalar_type()) {
     case torch::kBFloat16:
-        launch_fp8_quantize<Fp8TA, __nv_bfloat16, Fp8TB>(p, stream);
+        launch_fp8_quantize<Fp8TA, bf16, Fp8TB>(p, stream);
         break;
     case torch::kHalf:
-        launch_fp8_quantize<Fp8TA, __nv_half, Fp8TB>(p, stream);
+        launch_fp8_quantize<Fp8TA, fp16, Fp8TB>(p, stream);
         break;
     case torch::kFloat32:
         launch_fp8_quantize<Fp8TA, float, Fp8TB>(p, stream);
@@ -49,11 +52,11 @@ inline void launch_quantize_for(const torch::Tensor& x, const QuantParams& p,
                                 bool a_e5m2, bool b_e5m2,
                                 cudaStream_t stream) {
     if (a_e5m2)
-        b_e5m2 ? launch_for_dtype<__nv_fp8_e5m2, __nv_fp8_e5m2>(x, p, stream)
-               : launch_for_dtype<__nv_fp8_e5m2, __nv_fp8_e4m3>(x, p, stream);
+        b_e5m2 ? launch_for_dtype<fp8_e5m2, fp8_e5m2>(x, p, stream)
+               : launch_for_dtype<fp8_e5m2, fp8_e4m3>(x, p, stream);
     else
-        b_e5m2 ? launch_for_dtype<__nv_fp8_e4m3, __nv_fp8_e5m2>(x, p, stream)
-               : launch_for_dtype<__nv_fp8_e4m3, __nv_fp8_e4m3>(x, p, stream);
+        b_e5m2 ? launch_for_dtype<fp8_e4m3, fp8_e5m2>(x, p, stream)
+               : launch_for_dtype<fp8_e4m3, fp8_e4m3>(x, p, stream);
 }
 
 // The delayed-scaling ring as raw device pointers. Offsets are RingLayout's;

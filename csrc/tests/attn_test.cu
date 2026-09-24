@@ -12,8 +12,9 @@ nvcc -I csrc/kernels -arch=sm_89 -O3 \
 
 using namespace astrai::attention;
 
-struct DecodeDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_decode<H>(p, 0); } };
-struct PrefillDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_prefill<H>(p, 0); } };
+// The dispatchers take the element type and resolve head_dim internally, so a
+// case is one call — no per-head-dim functor (the harness stays torch-free).
+using bf16 = astrai::bf16;
 
 // Split-K scratch (torch-free)
 struct DecodeScratch {
@@ -21,7 +22,7 @@ struct DecodeScratch {
     float* ml_part = nullptr;
 };
 
-static void setup_scratch(AttentionParams<bf16>& p, DecodeScratch& sc) {
+static void setup_scratch(AttentionParams& p, DecodeScratch& sc) {
     int max_splits = 32;
     cudaMalloc(&sc.o_part, (size_t)p.batch * p.q_head * max_splits * p.head_dim * sizeof(float));
     cudaMalloc(&sc.ml_part, (size_t)p.batch * p.q_head * max_splits * 2 * sizeof(float));
@@ -53,7 +54,7 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D,
     for (size_t i = 0; i < nKV; i++) tmp[i] = f2bf(hV[i]);
     cudaMemcpy(dV, tmp, nKV * 2, cudaMemcpyHostToDevice);
 
-    AttentionParams<bf16> p = {};
+    AttentionParams p = {};
     p.batch = B; p.q_head = Hq; p.kv_head = Hk; p.q_len = ql; p.kv_len = kl;
     p.head_dim = D; p.use_mask = 0; p.causal_offset = causal ? 0 : -1;
     p.scale = 1.0f / sqrtf((float)D);
@@ -64,9 +65,9 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D,
     if (decode) {
         setup_scratch(p, sc);
         p.o_part = sc.o_part; p.ml_part = sc.ml_part;
-        dispatch_by_head_dim(D, DecodeDispatch{p});
+        dispatch_decode<bf16>(p, 0);
     } else {
-        dispatch_by_head_dim(D, PrefillDispatch{p});
+        dispatch_prefill<bf16>(p, 0);
     }
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
@@ -117,7 +118,7 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D,
     cudaMemcpy(dV, tmp, nKV * 2, cudaMemcpyHostToDevice);
     delete[] tmp;
 
-    AttentionParams<bf16> p = {};
+    AttentionParams p = {};
     p.batch = B; p.q_head = Hq; p.kv_head = Hk; p.q_len = ql; p.kv_len = kl;
     p.head_dim = D; p.use_mask = 0; p.causal_offset = causal ? 0 : -1;
     p.scale = 1.0f / sqrtf((float)D);
@@ -133,8 +134,8 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D,
     double flops = 4.0 * B * Hq * (double)ql * kl * D;
     if (causal) flops *= 0.5;
     BenchResult r = decode
-        ? bench_kernel([&] { dispatch_by_head_dim(D, DecodeDispatch{p}); }, 3, 10, flops)
-        : bench_kernel([&] { dispatch_by_head_dim(D, PrefillDispatch{p}); }, 3, 10, flops);
+        ? bench_kernel([&] { dispatch_decode<bf16>(p, 0); }, 3, 10, flops)
+        : bench_kernel([&] { dispatch_prefill<bf16>(p, 0); }, 3, 10, flops);
 
     char cfg[64];
     snprintf(cfg, sizeof(cfg), "B=%2d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d causal=%d",

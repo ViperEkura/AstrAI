@@ -11,8 +11,8 @@
 
 using namespace astrai::attention;
 
-struct PagedDecodeDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_decode<H>(p, 0); } };
-struct PagedPrefillDispatch { AttentionParams<bf16>& p; template<int H> void operator()() { dispatch_paged_prefill<H>(p, 0); } };
+// Element type is the dispatcher's parameter; head_dim resolves inside.
+using bf16 = astrai::bf16;
 
 static int make_q_tile_mapping(const std::vector<int>& q_lens,
                                int** d_batch, int** d_tile) {
@@ -271,8 +271,8 @@ struct PagedRig {
     }
 
     // Common launch parameters; callers tweak causal/mask/q-tile fields.
-    AttentionParams<bf16> base_params() {
-        AttentionParams<bf16> p = {};
+    AttentionParams base_params() {
+        AttentionParams p = {};
         p.batch = B; p.q_head = Hq; p.kv_head = Hkv;
         p.head_dim = D; p.q_len = total_q;
         p.q_l_stride = Hq * D; p.q_h_stride = D; p.q_d_stride = 1;
@@ -332,9 +332,9 @@ static int run_decode_test(int B, int Hq, int Hkv, int max_seq,
                          rig.h_kvi.data(), nullptr, 0,
                          B, Hq, Hkv, HEAD_DIM, rig.max_ctx, ref);
 
-    AttentionParams<bf16> p = rig.base_params();
+    AttentionParams p = rig.base_params();
     p.causal_offset = causal ? 0 : -1;
-    dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
+    dispatch_paged_decode<bf16>(p, 0);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -377,10 +377,10 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq,
                          rig.h_kvi.data(), rig.h_mask, rig.max_sl,
                          B, Hq, Hkv, HEAD_DIM, rig.max_ctx, ref);
 
-    AttentionParams<bf16> p = rig.base_params();
+    AttentionParams p = rig.base_params();
     p.causal_offset = -1; p.use_mask = 1;
     p.mask = rig.d_mask; p.mask_b_stride = rig.max_sl;
-    dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
+    dispatch_paged_decode<bf16>(p, 0);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -418,11 +418,11 @@ static int run_prefill_test(int B, int Hq, int Hkv,
     int *d_qtb, *d_qti;
     int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
-    AttentionParams<bf16> p = rig.base_params();
+    AttentionParams p = rig.base_params();
     p.causal_offset = causal ? 0 : -1;
     p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
-    dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
+    dispatch_paged_prefill<bf16>(p, 0);
     cudaDeviceSynchronize();
     cudaFree(d_qtb); cudaFree(d_qti);
 
@@ -467,13 +467,13 @@ static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     int *d_qtb, *d_qti;
     int num_q_tiles = make_q_tile_mapping(ql, &d_qtb, &d_qti);
 
-    AttentionParams<bf16> p = rig.base_params();
+    AttentionParams p = rig.base_params();
     p.causal_offset = -1; p.use_mask = 1;
     p.mask = rig.d_mask; p.mask_b_stride = q_len * q_len;
     p.mask_l_stride = q_len;
     p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
-    dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
+    dispatch_paged_prefill<bf16>(p, 0);
     cudaDeviceSynchronize();
     cudaFree(d_qtb); cudaFree(d_qti);
 
@@ -495,10 +495,10 @@ static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     rig.fill_data();
     rig.fill_indices();
 
-    AttentionParams<bf16> p = rig.base_params();
+    AttentionParams p = rig.base_params();
     p.causal_offset = 0;
     auto launch = [&]() {
-        dispatch_by_head_dim(HEAD_DIM, PagedDecodeDispatch{p});
+        dispatch_paged_decode<bf16>(p, 0);
     };
     // Decode: q_len=1, query is the last token → attends to all [0, seq_len).
     // FLOPs = 2 * (QK^T + PV) = 4 * B * Hq * seq_len * D.
@@ -523,13 +523,13 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     int *d_qtb, *d_qti;
     int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
-    AttentionParams<bf16> p = rig.base_params();
+    AttentionParams p = rig.base_params();
     p.causal_offset = causal ? 0 : -1;
     p.q_tile_to_batch = d_qtb; p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
 
     auto launch = [&]() {
-        dispatch_by_head_dim(HEAD_DIM, PagedPrefillDispatch{p});
+        dispatch_paged_prefill<bf16>(p, 0);
     };
     // FLOPs = 2 * (QK^T + PV) = 4 * effective_qk_pairs * Hq * D.
     // Non-causal: effective = q_len * kv_len.

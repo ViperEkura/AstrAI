@@ -1,4 +1,5 @@
 #include "dispatchers.cuh"
+#include "dtype_list.cuh"
 #include "entry_utils.cuh"
 
 using namespace astrai::attention;
@@ -20,7 +21,7 @@ torch::Tensor attn_paged_prefill(
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AttentionParams<bf16> p;
+    AttentionParams p;
     attn_pack_paged_prefill_params(q, k_cache, v_cache,
                                      req_to_token, req_pool_indices,
                                      kv_indptr, qo_indptr,
@@ -28,9 +29,15 @@ torch::Tensor attn_paged_prefill(
                                     causal_offset, scale, p);
 
     auto O = torch::empty({q.size(0), q.size(1), q.size(2)}, q.options());
-    p.o_ptr = (bf16*)O.data_ptr();
+    p.o_ptr = O.data_ptr();
 
-    DISPATCH_HEAD_DIM(p.head_dim, dispatch_paged_prefill, p, stream);
+    switch (q.scalar_type()) {
+#define ASTRAI_ATTN_DTYPE_ROW(tag, type) \
+        case tag: dispatch_paged_prefill<type>(p, stream); break;
+        ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
+#undef ASTRAI_ATTN_DTYPE_ROW
+        default: attn_dtype_unsupported(q.scalar_type());
+    }
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }

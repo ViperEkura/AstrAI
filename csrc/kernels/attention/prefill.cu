@@ -1,4 +1,5 @@
 #include "dispatchers.cuh"
+#include "dtype_list.cuh"
 #include "entry_utils.cuh"
 
 using namespace astrai::attention;
@@ -15,15 +16,21 @@ torch::Tensor attn_prefill(
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AttentionParams<bf16> p;
+    AttentionParams p;
     attn_pack_params(q, k, v, mask, causal_offset, scale, layout, p);
     TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
 
     auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
-    p.o_ptr = (bf16*)O_view.data_ptr();
+    p.o_ptr = O_view.data_ptr();
 
-    DISPATCH_HEAD_DIM(p.head_dim, dispatch_prefill, p, stream);
+    switch (q.scalar_type()) {
+#define ASTRAI_ATTN_DTYPE_ROW(tag, type) \
+        case tag: dispatch_prefill<type>(p, stream); break;
+        ASTRAI_ATTN_DTYPE_LIST(ASTRAI_ATTN_DTYPE_ROW)
+#undef ASTRAI_ATTN_DTYPE_ROW
+        default: attn_dtype_unsupported(q.scalar_type());
+    }
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }

@@ -1,6 +1,6 @@
 #pragma once
 
-// Pure POD header
+// Pure POD header (no CUDA, no torch).
 
 namespace astrai {
 namespace attention {
@@ -30,14 +30,19 @@ constexpr int HOST_Q_TILE_ROWS = 64;
 // this is a POD shared by both paths rather than two parallel structs that
 // drift out of sync.
 //
+// Dtype-agnostic by design: q/k/v/o pointers are void* and the element type is
+// a compile-time kernel parameter, so ONE struct (and one packer) serves every
+// precision. Each instantiation casts these pointers once at entry (through the
+// KV policy's Elem); device code never branches on a dtype, and nothing in the
+// struct has to name one.
+//
 // Pointer/flag members carry default member initializers: the pointers gate
 // optional paths via null checks (new_k_ptr, mask, o_part, ...), so a stack
-// `AttentionParams<T> p;` left partially packed must never see garbage
+// `AttentionParams p;` left partially packed must never see garbage
 // non-null pointers or a garbage use_mask/causal_offset — that class of bug
 // reads through wild addresses. NSDMI keeps the struct an aggregate (C++17)
 // and trivially copyable, so `= {}`, memcpy-style packing and by-value kernel
 // params all behave exactly as before.
-template<typename T, typename AT = float>
 struct AttentionParams {
     // Shape
     int batch;
@@ -53,14 +58,15 @@ struct AttentionParams {
     int causal_offset = -1;
     int use_mask = 0;
 
-    // pointers
-    const T* __restrict__ q_ptr = nullptr;
-    const T* __restrict__ k_ptr = nullptr;
-    const T* __restrict__ v_ptr = nullptr;
-    const T* __restrict__ new_k_ptr = nullptr;
-    const T* __restrict__ new_v_ptr = nullptr;
-    T* __restrict__ o_ptr = nullptr;
+    // pointers (element type = the kernel's element-type parameter)
+    const void* __restrict__ q_ptr = nullptr;
+    const void* __restrict__ k_ptr = nullptr;
+    const void* __restrict__ v_ptr = nullptr;
     const bool* __restrict__ mask = nullptr;
+    void* __restrict__ o_ptr = nullptr;
+
+    const void* __restrict__ new_k_ptr = nullptr;
+    const void* __restrict__ new_v_ptr = nullptr;
 
     // strides
     int q_b_stride;
@@ -90,10 +96,10 @@ struct AttentionParams {
     int num_q_tiles;
     int max_context_len; // req_to_token stride (dim 1)
 
-    // Decode split-KV workspace
+    // Decode split-KV workspace (fp32 online-softmax accumulators, always)
     int num_splits;
-    AT* __restrict__ o_part = nullptr;
-    AT* __restrict__ ml_part = nullptr;
+    float* __restrict__ o_part = nullptr;
+    float* __restrict__ ml_part = nullptr;
 };
 
 }  // namespace attention

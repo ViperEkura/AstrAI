@@ -593,9 +593,11 @@ class CudaBackend(AttentionBackend):
         is_causal: bool,
         fwd: Optional[str],
     ) -> bool:
-        # The CUDA kernels are bf16-only, support head_dim in
-        # HEAD_DIMS, and need a KV cache (decode/prefill); everything
-        # else falls back down the priority list to torch.
+        # The CUDA kernels take one precision per build — bf16 today, and the
+        # instantiated set lives in csrc/kernels/attention/dtype_list.cuh
+        # (ASTRAI_ATTN_DTYPE_LIST) — support head_dim in HEAD_DIMS, and need a
+        # KV cache (decode/prefill); everything else falls back down the
+        # priority list to torch.
         return (
             fwd in ("prefill", "decode")
             and kv_cache is not None

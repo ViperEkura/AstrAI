@@ -305,7 +305,10 @@ def test_save_extra_persists_critic_state(device):
     live = critic.state_dict()
     assert set(saved) == set(live)
     for key in saved:
-        assert torch.equal(saved[key], live[key])
+        # Module snapshots are detached CPU copies: checkpoints load on CPU,
+        # so the file must not carry CUDA device indices.
+        assert saved[key].device.type == "cpu"
+        assert torch.equal(saved[key], live[key].cpu())
 
 
 def test_save_extra_without_critic_has_no_value_entries(device):

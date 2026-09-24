@@ -27,7 +27,10 @@ from astrai.trainer.metric_util import (
     ctx_get_moe_metric,
     ctx_get_val_loss,
 )
-from astrai.trainer.optional_extras import checkpoint_extras
+from astrai.trainer.optional_extras import (
+    checkpoint_extras,
+    snapshot_component_extras,
+)
 from astrai.trainer.train_context import TrainContext
 
 logger = logging.getLogger(__name__)
@@ -233,28 +236,17 @@ class CheckpointCallback(TrainCallback):
             obj = getattr(context, name, None)
             if obj:
                 extra[name] = obj.state_dict()
-        # Optional components (fp8 rings today) join via the extras registry —
-        # the checkpoint itself stays unaware of them.
+        # Global accelerator state (fp8 rings, RNG) via the extras registry.
         extra.update(checkpoint_extras())
-        critic = getattr(context.strategy, "critic", None)
-        if critic is not None:
-            extra["value_model"] = critic.state_dict()
-            critic_optimizer = getattr(context.strategy, "critic_optimizer", None)
-            if critic_optimizer is not None:
-                extra["value_optimizer"] = critic_optimizer.state_dict()
-        # The frozen KL/DPO anchor must survive resumes exactly as it was at
-        # run start: rebuilding it from the resumed actor would silently
-        # change the optimization objective (train_config.
-        # allow_reference_reanchor is the explicit opt-out on load).
-        ref_model = getattr(context.strategy, "ref_model", None)
-        save_ref = getattr(
-            getattr(context, "config", None), "save_reference_model", True
+        # Strategy-owned tensor state (critic, frozen reference, ...) via the
+        # declarative table in optional_extras: which keys exist, where the
+        # state lives and how it is snapshotted are declared once there, so
+        # the checkpoint callback never grows per-component branches.
+        extra.update(
+            snapshot_component_extras(
+                context.strategy, getattr(context, "config", None)
+            )
         )
-        if ref_model is not None and save_ref:
-            extra["reference_model"] = {
-                key: value.detach().cpu()
-                for key, value in ref_model.state_dict().items()
-            }
         return extra
 
 

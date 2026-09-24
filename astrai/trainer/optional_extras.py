@@ -11,7 +11,10 @@ Adding a component = one ``(key, provider, restorer)`` triple below; the
 checkpoint callback and ``TrainContextBuilder`` stay untouched.
 """
 
+import random
 from typing import Any
+
+import torch
 
 
 def _quantize_mod():
@@ -36,9 +39,47 @@ def _fp8_restore(sd: dict) -> None:
         mod.fp8_load_state_dict(sd)
 
 
+def _rng_extra() -> dict:
+    """Snapshot every RNG the training loop draws from.
+
+    Covers python's ``random``, torch CPU and (when initialized) CUDA
+    generators, and numpy if installed.  Without this, a resumed run's
+    dropout masks, init draws, and rollout sampling diverge from the
+    uninterrupted run from the very first step.
+    """
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    try:
+        import numpy as np
+    except ImportError:
+        return state
+    state["numpy"] = np.random.get_state()
+    return state
+
+
+def _rng_restore(state: dict) -> None:
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        # Tolerate a device-count change across the resume: restore what
+        # fits rather than failing the whole load.
+        torch.cuda.set_rng_state_all(state["torch_cuda"][: torch.cuda.device_count()])
+    if "numpy" in state:
+        import numpy as np
+
+        np.random.set_state(state["numpy"])
+
+
 # (checkpoint key, snapshot provider, restorer) — provider returns None when
 # the component has nothing to persist under the current configuration.
-_EXTRAS: tuple[tuple[str, Any, Any], ...] = (("fp8_state", _fp8_extra, _fp8_restore),)
+_EXTRAS: tuple[tuple[str, Any, Any], ...] = (
+    ("fp8_state", _fp8_extra, _fp8_restore),
+    ("rng_state", _rng_extra, _rng_restore),
+)
 
 
 def checkpoint_extras() -> dict[str, Any]:

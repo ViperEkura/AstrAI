@@ -9,6 +9,7 @@ from typing import (
     Callable,
     ClassVar,
     Dict,
+    Iterator,
     List,
     Optional,
     Tuple,
@@ -21,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.optim import Optimizer
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
@@ -56,8 +58,15 @@ class ForwardResult:
 
 
 def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
-    """Move batch tensors to specified device with non-blocking transfer."""
-    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+    """Move batch tensors to specified device with non-blocking transfer.
+
+    Non-tensor values (e.g. the rollout's per-response ``finish_reasons``)
+    pass through untouched — only tensors can carry a device.
+    """
+    return {
+        key: value.to(device, non_blocking=True) if isinstance(value, Tensor) else value
+        for key, value in batch.items()
+    }
 
 
 #: Model-dtype byte budget for one row-chunk of the deferred lm_head matmul
@@ -93,6 +102,68 @@ def _chunked_token_logprobs(hidden_states: Tensor, weight: Tensor, targets: Tens
         picked = logits.gather(-1, flat_targets[start:end].unsqueeze(-1)).squeeze(-1)
         out[start:end] = picked - torch.logsumexp(logits, dim=-1)
     return out.view(n, s)
+
+
+def _chunked_token_logprobs_grad(
+    hidden_states: Tensor, weight: Tensor, targets: Tensor
+) -> Tensor:
+    """Gradient-enabled twin of :func:`_chunked_token_logprobs`.
+
+    Each row-chunk's lm_head matmul + logsumexp runs under non-reentrant
+    activation checkpointing: the forward frees the chunk's logits right
+    after producing its per-token log-probs, and the backward recomputes
+    one chunk at a time.  Autograd therefore never retains the full
+    ``[N, S, V]`` logits tensor (nor one copy per chunk), while the
+    hidden-state and lm_head gradients match the full-tensor path up to
+    GEMM tiling noise.  Gradients reach ``weight`` through the closure —
+    non-reentrant checkpoint re-runs the body with grad enabled during
+    backward, so closed-over parameters receive their grads naturally.
+    """
+    n, s, hidden = hidden_states.shape
+    flat_hidden = hidden_states.reshape(n * s, hidden)
+    flat_targets = targets.reshape(n * s)
+    vocab, dtype_bytes = weight.shape[0], weight.element_size()
+    rows_per_chunk = max(1, _CHUNK_LOGIT_BYTES // (vocab * dtype_bytes))
+
+    def chunk_logprobs(chunk_hidden: Tensor, chunk_targets: Tensor) -> Tensor:
+        logits = (chunk_hidden @ weight.t()).float()
+        picked = logits.gather(-1, chunk_targets.unsqueeze(-1)).squeeze(-1)
+        return picked - torch.logsumexp(logits, dim=-1)
+
+    pieces = []
+    for start in range(0, n * s, rows_per_chunk):
+        end = min(start + rows_per_chunk, n * s)
+        pieces.append(
+            torch_checkpoint(
+                chunk_logprobs,
+                flat_hidden[start:end],
+                flat_targets[start:end],
+                use_reentrant=False,
+            )
+        )
+    return torch.cat(pieces).view(n, s)
+
+
+def _truncation_metric(finish_reasons: List[List[str]]) -> Dict[str, Tensor]:
+    """Response-termination observability from rollout finish reasons.
+
+    Distinguishes natural stops from length-truncated generations: a high
+    truncation rate means the overlong penalty (and PPO's no-bootstrap-at-
+    truncation convention) dominates the objective rather than the task
+    reward.  Empty when the rollout carried no finish reasons (offline
+    batches, or rollouts produced before the field existed).
+    """
+    flat = [reason for group in finish_reasons for reason in group]
+    if not flat:
+        return {}
+    return {
+        "truncation_rate": torch.tensor(
+            sum(1 for reason in flat if reason == "length") / len(flat)
+        ),
+        "stop_rate": torch.tensor(
+            sum(1 for reason in flat if reason == "stop") / len(flat)
+        ),
+    }
 
 
 def _importance_ratio_metrics(
@@ -131,6 +202,7 @@ def get_logprobs(
     attn_mask: Tensor,
     loss_mask: Tensor,
     reduction: str,
+    grad_chunked: bool = False,
 ) -> LogprobsOutput:
     """Compute token-wise log probabilities from model outputs.
 
@@ -140,6 +212,8 @@ def get_logprobs(
         attn_mask: Attention mask passed to the model (may include causal).
         loss_mask: Per-token mask for loss reduction.
         reduction: How to reduce over sequence dimension ("mean", "sum", "none")
+        grad_chunked: Opt in to the checkpointed chunked lm_head even with
+            gradients enabled (see :func:`_chunked_token_logprobs_grad`).
 
     Returns:
         Log probabilities with reduction applied over sequence dimension
@@ -148,8 +222,9 @@ def get_logprobs(
     log-probs are computed in row chunks from the hidden states (see
     :func:`_chunked_token_logprobs`) — the reference/old-policy passes never
     materialize the full ``[N, S, V]`` fp32 log-softmax.  With gradients
-    enabled, or when the model cannot skip its lm_head, the original
-    full-tensor path runs unchanged.
+    enabled the full-tensor path runs unless ``grad_chunked`` is set (or the
+    model cannot skip its lm_head), in which case the checkpointed chunked
+    path computes the same log-probs without retaining the logits.
     """
     allowed_reductions = ["mean", "sum", "none"]
     if reduction not in allowed_reductions:
@@ -164,9 +239,9 @@ def get_logprobs(
         attn_mask[:, :, :-1, :-1] if attn_mask.dim() == 4 else attn_mask[:, :-1]
     )
     use_chunked = (
-        not torch.is_grad_enabled()
-        and isinstance(model, nn.Module)
+        isinstance(model, nn.Module)
         and getattr(model, "lm_head", None) is not None
+        and (grad_chunked or not torch.is_grad_enabled())
     )
     if use_chunked:
         try:
@@ -184,7 +259,12 @@ def get_logprobs(
         outputs = model(input_ids[:, :-1], sliced_mask)
 
     if outputs["logits"] is None:
-        token_logprobs = _chunked_token_logprobs(
+        chunk_fn = (
+            _chunked_token_logprobs_grad
+            if torch.is_grad_enabled()
+            else _chunked_token_logprobs
+        )
+        token_logprobs = chunk_fn(
             outputs["hidden_states"], model.lm_head.weight, shifted_input_ids
         )
     else:
@@ -248,6 +328,7 @@ def rollout_token_logprobs(
     prompt_mask: Tensor,
     responses: Tensor,
     response_masks: Tensor,
+    grad_chunked: bool = False,
 ) -> LogprobsOutput:
     """Per-response-token log probabilities for a grouped rollout batch.
 
@@ -281,7 +362,14 @@ def rollout_token_logprobs(
 
     # get_logprobs returns [B*G, S-1] (S = prompt_len + response_len).
     # Response token logprobs occupy the last ``response_len`` positions.
-    output = get_logprobs(model, full_sequences, attn_mask, full_masks, "none")
+    output = get_logprobs(
+        model,
+        full_sequences,
+        attn_mask,
+        full_masks,
+        "none",
+        grad_chunked=grad_chunked,
+    )
     output["logprobs"] = output["logprobs"][:, prompt_len - 1 :].view(
         batch_size, group_size, response_len
     )
@@ -478,10 +566,29 @@ class BaseStrategy(ABC):
         self.device = device
         self.executor = kwargs.pop("executor", None)
         self.moe_aux_loss_coef = kwargs.pop("moe_aux_loss_coef", 0.01)
+        self.rl_update_epochs = self._validate_update_epochs(
+            kwargs.pop("rl_update_epochs", 1)
+        )
+        self.rl_minibatch_prompts = kwargs.pop("rl_minibatch_prompts", None)
+        if self.rl_minibatch_prompts is not None and (
+            isinstance(self.rl_minibatch_prompts, bool)
+            or not isinstance(self.rl_minibatch_prompts, int)
+            or self.rl_minibatch_prompts < 1
+        ):
+            raise ValueError("rl_minibatch_prompts must be a positive integer or None")
+        self.gradient_chunked_logprobs = bool(
+            kwargs.pop("gradient_chunked_logprobs", False)
+        )
         self._moe_metrics: Dict[str, float] = {}
         self.strategy_kwargs = kwargs
         self._rollout_runner = None
         self._weight_publishers: Tuple[WeightPublisher, ...] = ()
+
+    @staticmethod
+    def _validate_update_epochs(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("rl_update_epochs must be a positive integer")
+        return value
 
     # ---------- token-mean two-phase protocol ----------
     # CP composes between the phases: astrai.parallel.cp.CPStrategy shards
@@ -690,6 +797,66 @@ class BaseStrategy(ABC):
 
         train_batch = self.prepare_from_rollout(result)
         return self.compute_loss_output(train_batch)
+
+    def training_steps(self, batch: Dict[str, Tensor]) -> Iterator[LossOutput]:
+        """Yield one :class:`LossOutput` per learner update for this batch.
+
+        The trainer iterates this instead of calling the strategy once, so
+        one incoming batch can expand into several backward/optimizer-step
+        cycles.  In online mode that is the RL scheduling split — one
+        rollout round is collected once under a fixed policy, then consumed
+        for ``rl_update_epochs`` passes of ``rl_minibatch_prompts``-sized
+        learner updates (classic PPO-style multiple epochs over one batch).
+        Offline mode yields exactly once, preserving the historical
+        one-call-per-batch contract.
+
+        Each optimizer step still goes through
+        :meth:`optimizer_step`, so weight publication and policy-version
+        advancement happen once per learner update; note that online mode
+        therefore assumes ``grad_accum_steps=1`` (accumulating >1 turns the
+        minibatch updates into one merged step and inflates the runner's
+        replay counter).
+        """
+        if self._rollout_runner is None:
+            yield self.compute_loss_output(batch)
+            return
+
+        result, is_fresh = self._rollout_runner(batch)
+        if is_fresh:
+            self._on_rollout_refresh()
+        prepared = self.prepare_from_rollout(result)
+        slices = self._split_rollout_batch(prepared)
+        for _ in range(self.rl_update_epochs):
+            for chunk in slices:
+                yield self.compute_loss_output(chunk)
+
+    def _split_rollout_batch(self, prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Slice one prepared rollout batch along the prompt dimension.
+
+        Every prepared tensor's leading dim is the prompt count B, and the
+        group dimension rides along inside each slice — GRPO advantages are
+        group-normalized from per-group rewards, so slicing along B never
+        re-mixes groups, and PPO's rollout-pinned advantages/returns are
+        shared views rather than recomputed targets.
+        """
+        size = self.rl_minibatch_prompts
+        if size is None:
+            return [prepared]
+        first = prepared[next(iter(prepared))]
+        total = first.shape[0]
+        if size >= total:
+            return [prepared]
+        return [
+            {
+                key: (
+                    value[begin : begin + size]
+                    if isinstance(value, Tensor) and value.shape[0] == total
+                    else value
+                )
+                for key, value in prepared.items()
+            }
+            for begin in range(0, total, size)
+        ]
 
 
 class StrategyFactory(BaseFactory["BaseStrategy"]):
@@ -900,6 +1067,7 @@ class DPOStrategy(BaseStrategy):
             full_mask,
             concat_loss_mask,
             self.reduction,
+            grad_chunked=self.gradient_chunked_logprobs,
         )
         log_pi = policy_output["logprobs"]
         aux_loss = policy_output["aux_loss"]
@@ -1154,7 +1322,12 @@ class GRPOStrategy(BaseStrategy):
             prompt_mask = prompts.ne(0)
 
         policy_output = rollout_token_logprobs(
-            self.model, prompts, prompt_mask, responses, masks
+            self.model,
+            prompts,
+            prompt_mask,
+            responses,
+            masks,
+            grad_chunked=self.gradient_chunked_logprobs,
         )
         token_log_probs_policy = policy_output["logprobs"]
         aux_loss = policy_output["aux_loss"]
@@ -1216,6 +1389,7 @@ class GRPOStrategy(BaseStrategy):
         if overlong_penalty is not None:
             metrics["overlong_penalty_mean"] = overlong_penalty.mean()
             metrics["overlong_fraction"] = (overlong_penalty < 0).float().mean()
+        metrics.update(_truncation_metric(batch.get("finish_reasons") or []))
         return self._loss_output(
             task_loss,
             metrics,
@@ -1234,6 +1408,7 @@ class GRPOStrategy(BaseStrategy):
             "masks": result.response_mask,
             "rewards": result.rewards,
             "logprobs_old": result.logprobs_old,
+            "finish_reasons": result.finish_reasons,
         }
 
 
@@ -1375,6 +1550,7 @@ class PPOStrategy(BaseStrategy):
             "logprobs_old": result.logprobs_old,
             "advantages": result.advantages,
             "returns": result.returns,
+            "finish_reasons": result.finish_reasons,
         }
 
     def supports_online(self) -> bool:
@@ -1411,7 +1587,12 @@ class PPOStrategy(BaseStrategy):
             )
 
         policy_output = rollout_token_logprobs(
-            self.model, prompts, prompt_mask, responses, masks
+            self.model,
+            prompts,
+            prompt_mask,
+            responses,
+            masks,
+            grad_chunked=self.gradient_chunked_logprobs,
         )
         token_log_probs_policy = policy_output["logprobs"]
 
@@ -1453,6 +1634,7 @@ class PPOStrategy(BaseStrategy):
                 **_importance_ratio_metrics(
                     ratio, token_masks, self.clip_eps, self.clip_eps
                 ),
+                **_truncation_metric(batch.get("finish_reasons") or []),
             },
             policy_output["aux_loss"],
             policy_output.get("router_stats"),

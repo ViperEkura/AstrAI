@@ -11,6 +11,8 @@ class Embedding(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((vocab_size, embedding_dim)))
         self.neftune_noise_alpha = neftune_alpha
+        # Same contract as Linear: never leak torch.empty bytes to callers.
+        self.reset_parameters()
 
     def set_neftune_alpha(self, alpha: float):
         self.neftune_noise_alpha = alpha

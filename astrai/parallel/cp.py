@@ -246,6 +246,12 @@ class CPStrategy:
         # are refused at construction, so there is no rollout dispatch here.
         return self.compute_loss_output(batch)
 
+    def training_steps(self, batch: Dict[str, Tensor]) -> Any:
+        # Must not fall through to __getattr__: the inner strategy's default
+        # training_steps calls its own compute_loss_output, bypassing the
+        # CP shard. Re-yield through the wrapper instead.
+        yield self.compute_loss_output(batch)
+
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         return self.compute_loss_output(batch)["loss"]
 

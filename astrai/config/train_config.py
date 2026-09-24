@@ -82,6 +82,11 @@ class TrainConfig(BaseConfig):
         rollout_pool_seq_len (Optional[int]): Sequence budget per rollout request when sizing the rollout scheduler's KV pool. None uses the model's ``max_position_embeddings``. Must cover the longest prompt plus ``rollout_max_tokens`` or ``run_batch`` rejects the request. Right-sizing pays off: the pool holds ``2 × layers × (batch_capacity × seq) × kv_heads × head_dim`` bytes — for the 1B policy (24 layers, 4 KV heads, head_dim 64, bf16) the default 32768 context allocates ~3.2 GB against ~400 MB at 4096. Defaults to None.
         rollout_device (Optional[str]): Device for the training rollout backend, e.g. ``"cuda:1"``. None keeps the in-process colocated backend (generation shares the training model object; weight updates are free). Setting it builds a frozen replica whose weights are copied to inside the policy-version lock every optimizer step — the copy is a full state transfer (e.g. ~2GB/step for 1B bf16), so pay it only when backend isolation is worth it. Defaults to None.
         rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
+        rl_update_epochs (int): Learner passes over one collected online rollout round (classic PPO-style multiple epochs per batch). Each pass recomputes the loss against the round's fixed rewards/logprobs_old and takes its own optimizer steps. Values >1 trade on-policy freshness for sample efficiency; watch ``clip_fraction`` for stale-ratio blowup. Requires ``grad_accum_steps=1`` online. Defaults to 1.
+        rl_minibatch_prompts (Optional[int]): Prompts per learner update within one rollout round; None updates on the whole round at once. Slicing always keeps prompt groups intact, and PPO's rollout-pinned advantages are shared views, so targets never shift between updates. Each minibatch update is a full optimizer step (and a weight publication). Defaults to None.
+        gradient_chunked_logprobs (bool): Compute training-path log-probs through the checkpointed chunked lm_head instead of materializing the full ``[N, S, V]`` logits (gradients identical up to GEMM tiling noise; peak memory drops by the logits tensor). Off keeps the historical full-tensor path. Defaults to False.
+        save_reference_model (bool): Persist the frozen reference model as a ``reference_model`` checkpoint extra whenever the strategy has one (DPO/GRPO/PPO KL anchor). Resuming without it would silently re-anchor the KL target to the resumed actor. Adds one extra weight copy per checkpoint. Defaults to True.
+        allow_reference_reanchor (bool): Escape hatch for resuming a reference-model strategy from a checkpoint saved without ``reference_model``: False (default) fails the resume explicitly, True proceeds with the reference re-anchored to the resumed actor and logs a warning. Defaults to False.
         reward_model_fn (Optional[Callable]): Factory for reward model, required for online RL strategies. Defaults to None.
         critic_model_fn (Optional[Callable]): Factory for the value (critic) model, required for online_ppo. Defaults to None.
         critic_optimizer_fn (Optional[Callable]): Factory for the critic optimizer; None reuses optimizer_fn. Defaults to None.
@@ -149,6 +154,11 @@ class TrainConfig(BaseConfig):
     rollout_pool_seq_len: Optional[int] = None
     rollout_device: Optional[str] = None
     rollout_val_device: Optional[str] = None
+    rl_update_epochs: int = 1
+    rl_minibatch_prompts: Optional[int] = None
+    gradient_chunked_logprobs: bool = False
+    save_reference_model: bool = True
+    allow_reference_reanchor: bool = False
     reward_model_fn: Optional[Callable] = None
     critic_model_fn: Optional[Callable] = None
     critic_optimizer_fn: Optional[Callable] = None
@@ -229,6 +239,7 @@ class TrainConfig(BaseConfig):
         "val_step",
         "rollout_interval",
         "rollout_max_tokens",
+        "rl_update_epochs",
     )
     def _validate_positive_int(cls, v: int) -> int:
         if v <= 0:
@@ -293,10 +304,10 @@ class TrainConfig(BaseConfig):
             raise ValueError(f"rollout_val_group_size must be >= 1, got {v}")
         return v
 
-    @field_validator("rollout_pool_seq_len")
-    def _validate_rollout_pool_seq_len(cls, v: Optional[int]) -> Optional[int]:
+    @field_validator("rollout_pool_seq_len", "rl_minibatch_prompts")
+    def _validate_optional_positive_int(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
-            raise ValueError(f"rollout_pool_seq_len must be positive, got {v}")
+            raise ValueError(f"must be positive or None, got {v}")
         return v
 
     @field_validator("rollout_device", "rollout_val_device")

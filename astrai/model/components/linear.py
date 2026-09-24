@@ -12,6 +12,10 @@ class Linear(nn.Module):
         self.weight = nn.Parameter(torch.empty((out_dim, in_dim)))
         self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
         self.init_std = init_std
+        # A module must never hand out the bytes torch.empty left behind;
+        # models built through AutoRegressiveLM re-init via apply(), but
+        # standalone components have no such pass.
+        self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.normal_(self.weight, mean=0.0, std=self.init_std)

@@ -9,6 +9,16 @@ Layer 3 — ``BaseKVCache``:    shared fields for all cache modes
 
 These classes have no knowledge of tasks, allocation policies, or scheduling.
 They are the "dumb" physical storage layer.
+
+Lives on the model side: the cache layout follows the model structure
+(n_layers / n_kv_heads / head_dim come from the model config) and the tensor
+fields are the attention kernel's input protocol — the attention backend
+consumes ``kv_cache`` directly.  The inference-side allocation and reuse
+policies (``astrai.inference.cache.pool`` / ``.strategy``) stay in the
+inference package and import these buffers, which keeps the dependency one
+way: inference → model.  Before the split this module lived at
+``astrai/inference/cache/buffer.py``, which made the model package import the
+inference package (through its ``__init__``) on every model import.
 """
 
 import threading

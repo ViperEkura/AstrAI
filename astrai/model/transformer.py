@@ -5,13 +5,13 @@ import torch.nn as nn
 from torch import Tensor
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.inference.cache import KVCache
 from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
+from astrai.model.kv_cache import KVCache
 
 
 def process_attention_mask(

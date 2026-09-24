@@ -85,7 +85,7 @@ except Exception:
     _flash_attn = None
 
 if TYPE_CHECKING:
-    from astrai.inference.cache import KVCache
+    from astrai.model.kv_cache import KVCache
 
 logger = logging.getLogger(__name__)
 

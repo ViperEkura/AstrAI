@@ -7,9 +7,9 @@ from torch import Tensor
 
 from astrai.extension.backend import apply_rotary_emb, attention
 from astrai.factory import BaseFactory
-from astrai.inference.cache import KVCache
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
+from astrai.model.kv_cache import KVCache
 
 
 class AttnFactory(BaseFactory[nn.Module]):

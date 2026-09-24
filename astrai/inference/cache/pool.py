@@ -16,13 +16,6 @@ from typing import Dict, List, Optional
 
 import torch
 
-from astrai.inference.cache.buffer import (
-    DecodeKVCache,
-    KVCache,
-    KVStorage,
-    PrefillKVCache,
-    ReqToTokenPool,
-)
 from astrai.inference.cache.strategy import (
     AllocationStrategy,
     Allocator,
@@ -32,6 +25,13 @@ from astrai.inference.cache.strategy import (
     TaskCacheState,
 )
 from astrai.inference.workspace import Q_TILE_ROWS, InferenceWorkspace
+from astrai.model.kv_cache import (
+    DecodeKVCache,
+    KVCache,
+    KVStorage,
+    PrefillKVCache,
+    ReqToTokenPool,
+)
 
 # Re-export everything so existing ``from astrai.inference.cache import ...``
 # continues to work unchanged after the file split.

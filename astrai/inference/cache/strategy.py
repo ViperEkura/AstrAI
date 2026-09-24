@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, OrderedDict
 
-from astrai.inference.cache.buffer import ReqToTokenPool
+from astrai.model.kv_cache import ReqToTokenPool
 
 # ---- data contract: per-task slot state ----
 

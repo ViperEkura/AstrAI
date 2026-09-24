@@ -4,10 +4,10 @@ from typing import Optional, TypedDict
 import torch.nn as nn
 from torch import Tensor
 
-from astrai.inference.cache import KVCache
 from astrai.model.components.attention import AttnFactory
 from astrai.model.components.mlp import FFNFactory, RouterStats
 from astrai.model.components.norm import RMSNorm
+from astrai.model.kv_cache import KVCache
 
 
 class DecoderOutput(TypedDict):

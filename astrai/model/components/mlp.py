@@ -59,11 +59,21 @@ class DeepSeekMoE(nn.Module):
         norm_topk_prob: bool = True,
     ):
         super().__init__()
+        if n_routed_experts <= 0:
+            raise ValueError("n_routed_experts must be positive")
+        if n_shared_experts < 0:
+            raise ValueError("n_shared_experts must be non-negative")
+        if n_activated_experts <= 0:
+            raise ValueError("n_activated_experts must be positive")
+        if n_activated_experts > n_routed_experts:
+            raise ValueError("n_activated_experts cannot exceed n_routed_experts")
+        if topk_method not in (None, "greedy"):
+            raise ValueError(f"unsupported topk_method: {topk_method!r}")
         self.dim = dim
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
         self.n_activated_experts = n_activated_experts
-        self.topk_method = topk_method
+        self.topk_method = topk_method or "greedy"
         self.norm_topk_prob = norm_topk_prob
 
         expert_dim_ffn = (
@@ -116,24 +126,36 @@ class DeepSeekMoE(nn.Module):
             / self.n_shared_experts
         )
 
+    def _select_experts(self, router_logits: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Return FP32 probabilities and the actual dispatch decision."""
+        router_probs = torch.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_indices = torch.topk(
+            router_probs,
+            self.n_activated_experts,
+            dim=-1,
+            sorted=False,
+        )
+        if self.norm_topk_prob:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return router_probs, topk_weights, topk_indices
+
     def _routed_forward(self, x: Tensor, include_aux_loss: bool) -> FFNOutput:
         N, D = x.shape
         K = self.n_activated_experts
         E = self.n_routed_experts
 
         router_logits = self.router(x)
-        router_probs = torch.softmax(router_logits.float(), dim=-1).to(x.dtype)
-
-        topk_weights, topk_indices = torch.topk(router_probs, K, dim=-1, sorted=False)
-        if self.norm_topk_prob:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        # Select experts from FP32 probabilities. Casting the full distribution
+        # to BF16 first can collapse close candidates into ties and change the
+        # selected expert set.
+        router_probs, topk_weights, topk_indices = self._select_experts(router_logits)
 
         aux_loss = None
         router_stats = None
         if include_aux_loss:
             expert_load = F.one_hot(topk_indices, num_classes=E).float()
             expert_load = expert_load.mean(dim=(0, 1))
-            router_prob = router_probs.float().mean(dim=0)
+            router_prob = router_probs.mean(dim=0)
             aux_loss = E * (expert_load * router_prob).sum()
             router_stats = {
                 "probs": router_probs.detach(),
@@ -145,7 +167,7 @@ class DeepSeekMoE(nn.Module):
         flat_experts = topk_indices.reshape(-1)
         sorted_experts, order = torch.sort(flat_experts)
         flat_tokens = x.repeat_interleave(K, dim=0)[order]
-        flat_weights = topk_weights.reshape(-1, 1)[order]
+        flat_weights = topk_weights.to(x.dtype).reshape(-1, 1)[order]
         boundaries = torch.cumsum(
             torch.bincount(sorted_experts, minlength=E), dim=0
         ).tolist()

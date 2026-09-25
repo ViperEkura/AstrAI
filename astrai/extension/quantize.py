@@ -62,6 +62,7 @@ from dataclasses import dataclass
 import torch
 from torch.library import Library
 
+from astrai.extension.fp8_slots import fp8_slot_of, refresh_slots
 from astrai.extension.loader import get_module, is_available
 
 # ---------------------------------------------------------------------------
@@ -163,9 +164,11 @@ _active_config: ContextVar[_ActiveConfig | None] = ContextVar(
 # machine owned — the per-weight meta registry (delayed-scaling rings, the
 # version-keyed weight-cast cache, the checkpoint pending queue, the
 # generation counter invalidating that cache) — lives in the C++ op's
-# translation unit (``csrc/kernels/gemm/fp8_linear.cu``), keyed the
-# same way (data_ptr, shape, dtype) with the same registration-order
-# snapshot contract.
+# translation unit (``csrc/kernels/gemm/fp8_linear.cu``). A meta is addressed
+# by its module's *slot* when the dispatcher knows one (``fp8_slots``: a
+# stable module path, so a replaced weight parameter keeps its history) and by
+# ``(data_ptr, shape, dtype)`` otherwise; the snapshot binds slotted entries by
+# name and falls back to registration order for the rest.
 _default_enabled = False
 _default_recipe = FP8Recipe()
 _default_format = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -250,12 +253,19 @@ class fp8_autocast:
     def __enter__(self) -> "fp8_autocast":
         if self._config.enabled:
             _install_linear_override()
+            # A parameter swapped since the slots were assigned (TP sharding,
+            # FSDP, a graph buffer) would silently fall back to the
+            # address-keyed path and lose its amax history. One attribute read
+            # per slot repairs it here, once per region.
+            refresh_slots()
         self._tokens.append(_active_config.set(self._config))
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         token = self._tokens.pop()
         _active_config.reset(token)
+        if self._config.enabled and is_available("gemm"):
+            get_module("gemm").fp8_clear_act_cache()
         return False
 
     def __call__(self, func):
@@ -306,6 +316,11 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
         # the rings without folding or advancing them. This host bool is also
         # the seam a CUDA-graph device flag replaces (TE's
         # skip_fp8_weight_update).
+        #
+        # ``slot`` names the module the weight belongs to (see fp8_slots), so
+        # the C++ state attaches to the module rather than to whatever tensor
+        # holds its weight; -1 (no slot table, a bare call, the benches) keeps
+        # the original address-keyed lookup.
         recipe = cfg.recipe
         return get_module("gemm").fp8_linear(
             x,
@@ -318,6 +333,7 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
             recipe.margin,
             cfg.fp8_format[0],
             cfg.fp8_format[1],
+            fp8_slot_of(w),
         )
     return torch.ops.aten.linear.default.redispatch(
         torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd),

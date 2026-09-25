@@ -924,6 +924,7 @@ def test_weight_cast_cache_reuses_and_invalidates():
     dev = torch.device("cuda")
     gemm = _gemm()
     gemm.fp8_reset()
+    gemm.fp8_set_act_cache(False)
     x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
     w = torch.randn(32, 64, device=dev, dtype=torch.bfloat16)
     bias = torch.zeros(32, device=dev, dtype=torch.bfloat16)
@@ -980,6 +981,7 @@ def test_weight_cast_cache_reuses_and_invalidates():
         assert stats["quantize"] == 2  # a restore re-publishes scales
     finally:
         gemm.fp8_reset()
+        gemm.fp8_set_act_cache(True)
 
 
 @skip_no_fp8

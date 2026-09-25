@@ -33,8 +33,8 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
-#include "shape.cuh"
-#include "tensor.cuh"
+#include "common/shape.cuh"
+#include "common/tensor.cuh"
 
 #define DEVICE_FORCEINLINE static __device__ __forceinline__
 

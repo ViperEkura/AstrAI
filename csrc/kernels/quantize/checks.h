@@ -3,7 +3,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Exception.h>
 
-#include "common.h"
+#include "quantize/common.h"
 
 // Torch-bound entry validation for the fp8 family. quantize/common.h stays
 // torch-free (pure POD/traits); this header owns the runtime capability

@@ -4,7 +4,7 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "common.h"
+#include "attention/common.h"
 
 namespace astrai {
 namespace attention {

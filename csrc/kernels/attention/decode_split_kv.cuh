@@ -1,10 +1,10 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <float.h>
-#include "common.h"
+#include "attention/common.h"
 #include "common/reduce.cuh"
-#include "layout_policies.cuh"
-#include "softmax.cuh"
+#include "attention/layout_policies.cuh"
+#include "attention/softmax.cuh"
 
 namespace astrai {
 namespace attention {

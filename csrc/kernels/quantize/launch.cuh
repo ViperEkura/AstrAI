@@ -14,10 +14,10 @@
 #include <cstdint>
 #include <torch/extension.h>
 
-#include "checks.h"
+#include "quantize/checks.h"
 #include "common/dtype.cuh"
-#include "common.h"
-#include "quantize.cuh"
+#include "quantize/common.h"
+#include "quantize/quantize.cuh"
 
 namespace astrai {
 namespace quant {

@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include "gemm.cuh"
+#include "gemm/gemm.cuh"
 #include "gemm/api.h"
 #include "quantize/checks.h"
 

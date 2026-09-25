@@ -1,6 +1,6 @@
 #pragma once
 #include <cuda_bf16.h>
-#include "common.h"
+#include "attention/common.h"
 #include "common/dtype.cuh"
 
 // ============================================================================

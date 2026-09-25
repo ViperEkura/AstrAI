@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-#include "shape.cuh"
+#include "common/shape.cuh"
 
 namespace astrai {
 

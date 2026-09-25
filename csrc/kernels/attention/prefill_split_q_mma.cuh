@@ -1,9 +1,9 @@
 #pragma once
 #include <cfloat>
 #include <cuda_bf16.h>
-#include "common.h"
-#include "layout_policies.cuh"
-#include "mma_utils.cuh"
+#include "attention/common.h"
+#include "attention/layout_policies.cuh"
+#include "attention/mma_utils.cuh"
 
 namespace astrai {
 namespace attention {

@@ -1,6 +1,6 @@
 #include <torch/extension.h>
 
-#include "gated_deltanet.h"
+#include "gated_deltanet/gated_deltanet.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gated_deltanet_fwd", &gated_deltanet_fwd,

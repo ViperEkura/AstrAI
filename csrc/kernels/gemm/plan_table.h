@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "common/device.cuh"
-#include "policy.cuh"
+#include "gemm/policy.cuh"
 
 namespace astrai {
 namespace gemm {

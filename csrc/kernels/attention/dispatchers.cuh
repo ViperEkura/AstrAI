@@ -25,12 +25,12 @@
 
 #include "common/dtype.cuh"
 #include "common/launch.cuh"
-#include "layout_policies.cuh"
-#include "prefill_split_q.cuh"
-#include "decode_split_kv.cuh"
+#include "attention/layout_policies.cuh"
+#include "attention/prefill_split_q.cuh"
+#include "attention/decode_split_kv.cuh"
 #ifndef ASTRAI_NO_MMA
-#include "prefill_split_q_mma.cuh"
-#include "decode_split_kv_mma.cuh"
+#include "attention/prefill_split_q_mma.cuh"
+#include "attention/decode_split_kv_mma.cuh"
 #endif
 
 namespace astrai {

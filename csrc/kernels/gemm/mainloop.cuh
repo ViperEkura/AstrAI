@@ -12,8 +12,8 @@
 #include "common/tma.cuh"
 #include "common/tensor.cuh"
 #include "gemm/common.h"
-#include "load.cuh"
-#include "policy.cuh"
+#include "gemm/load.cuh"
+#include "gemm/policy.cuh"
 #include "quantize/dequant.cuh"
 
 namespace astrai {

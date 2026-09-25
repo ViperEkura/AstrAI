@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <torch/extension.h>
 
-#include "launch.cuh"
+#include "quantize/launch.cuh"
 
 using namespace astrai::quant;
 

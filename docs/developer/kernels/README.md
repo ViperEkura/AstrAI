@@ -384,7 +384,7 @@ csrc/
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-Two conventions the tree encodes. (1) A family folder holds the device
+Three conventions the tree encodes. (1) A family folder holds the device
 headers **and** the entry `.cu` that binds them — attention is the model
 (four thin entry TUs over `dispatchers.cuh`); gemm is the outlier: its typed
 host layer (`gemm.cu` — the dtype-pair registry and the `api.h`
@@ -394,6 +394,19 @@ per-dtype instantiation gets its own nvcc job. (2) The standalone C++ harnesses 
 carries its own `nvcc` line so a correctness test can run without torch.
 The `bench/` python tools are the reproduce path for the numbers quoted in
 the operator docs and in the workspace `notes/` — a tool cited as a *gate*
-belongs in the tree, not in a scratch directory.
+belongs in the tree, not in a scratch directory. (3) **One include root,
+`csrc/kernels`, and every project include spelled from it in full**
+(`"gemm/mainloop.cuh"`, `"common/mma.cuh"`) rather than by bare file name:
+three headers are called `common.h` and two `launch.cuh`, so a bare include's
+meaning would depend on the directory it happens to sit in and a file move
+could silently retarget it. The one exception is the harness-local
+`test_utils.cuh`, which lives in `csrc/tests/` outside the root and reaches
+`bench/bench_tile_sweep.cu` through that harness's extra `-I csrc/tests`.
+`tests/extension/test_csrc_layout.py` pins the convention — the include-root
+directory set is closed, every project include is root-qualified and resolves
+to exactly one file, and the headers that include torch are exactly the
+declared host surface (that split is what keeps the `csrc/tests/*.cu`
+harnesses torch-free). A new family directory is registered in that test's
+`KERNEL_DIRS` and in this section together.
 
-> Document Update Time: 2026-09-21
+> Document Update Time: 2026-09-25

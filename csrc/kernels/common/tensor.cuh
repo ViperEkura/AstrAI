@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-#include "swizzle.cuh"
+#include "common/swizzle.cuh"
 
 namespace astrai {
 

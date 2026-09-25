@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "common.h"
+#include "quantize/common.h"
 #include "common/launch.cuh"
 #include "common/reduce.cuh"
 

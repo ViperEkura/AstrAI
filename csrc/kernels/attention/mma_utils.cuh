@@ -6,7 +6,7 @@
 #include "common/pipeline.cuh"
 #include "common/mma.cuh"
 #include "common/dtype.cuh"
-#include "softmax.cuh"
+#include "attention/softmax.cuh"
 
 // Predicated cp.async (4-operand form) requires CUDA 11.2+.
 // Tensor-core mma.sync requires sm_80+ (guarded at build time by

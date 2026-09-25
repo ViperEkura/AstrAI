@@ -1,6 +1,6 @@
-#include "dispatchers.cuh"
-#include "dtype_list.cuh"
-#include "entry_utils.cuh"
+#include "attention/dispatchers.cuh"
+#include "attention/dtype_list.cuh"
+#include "attention/entry_utils.cuh"
 
 using namespace astrai::attention;
 

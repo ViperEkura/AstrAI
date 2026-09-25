@@ -21,12 +21,12 @@
 #include "common/pipeline.cuh"
 #include "common/device.cuh"
 #include "common/launch.cuh"
-#include "epilogue.cuh"
+#include "gemm/epilogue.cuh"
 #include "gemm/common.h"
 #include "gemm/plan_table.h"
-#include "mainloop.cuh"
-#include "policy.cuh"
-#include "scheduler.cuh"
+#include "gemm/mainloop.cuh"
+#include "gemm/policy.cuh"
+#include "gemm/scheduler.cuh"
 
 namespace astrai {
 namespace gemm {

@@ -18,7 +18,7 @@
 #include <cuda_bf16.h>
 
 #include "common/launch.cuh"
-#include "gated_deltanet.h"
+#include "gated_deltanet/gated_deltanet.h"
 
 namespace {
 

@@ -36,7 +36,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "swizzle.cuh"
+#include "common/swizzle.cuh"
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 #define ASTRAI_TMA_ENABLED 1

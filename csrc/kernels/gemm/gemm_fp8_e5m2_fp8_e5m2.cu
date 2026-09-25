@@ -2,7 +2,7 @@
 // instantiation per unit keeps the heavy template work in parallel nvcc
 // jobs; gemm.cu addresses the specialization through its extern template
 // declarations.
-#include "gemm.cuh"
+#include "gemm/gemm.cuh"
 
 namespace astrai {
 namespace gemm {

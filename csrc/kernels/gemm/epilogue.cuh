@@ -7,7 +7,7 @@
 #include "common/swizzle.cuh"
 #include "common/tensor.cuh"
 #include "gemm/common.h"
-#include "policy.cuh"
+#include "gemm/policy.cuh"
 
 namespace astrai {
 namespace gemm {

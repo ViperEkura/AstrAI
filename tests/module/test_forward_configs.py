@@ -24,6 +24,18 @@ CONFIGS = [
     pytest.param(
         {
             **TINY_CONFIG,
+            "attn_type": "gdn",
+            "gdn_num_key_heads": 2,
+            "gdn_num_value_heads": 4,
+            "gdn_key_head_dim": 3,
+            "gdn_value_head_dim": 2,
+            "gdn_conv_kernel_size": 3,
+        },
+        id="gated_deltanet_mlp",
+    ),
+    pytest.param(
+        {
+            **TINY_CONFIG,
             "attn_type": "gqa",
             "ffn_type": "moe",
             "n_routed_experts": 4,
@@ -159,6 +171,68 @@ def test_model_forward_with_padding(config_kwargs, device):
 
     assert output["logits"].shape == (batch_size, seq_len, config.vocab_size)
     assert not torch.isnan(output["logits"]).any()
+
+
+def test_gated_deltanet_forward_backward_and_causal_prefix():
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        attn_type="gdn",
+        gdn_num_key_heads=2,
+        gdn_num_value_heads=4,
+        gdn_key_head_dim=3,
+        gdn_value_head_dim=2,
+        gdn_conv_kernel_size=3,
+    )
+    model = AutoRegressiveLM(config)
+    model.train()
+    input_ids = torch.randint(0, config.vocab_size, (2, 8))
+    outputs = model(input_ids)
+    outputs["logits"].square().mean().backward()
+
+    layer = model.layers[0].attention
+    assert layer.q_proj.weight.grad is not None
+    assert torch.isfinite(layer.q_proj.weight.grad).all()
+    assert layer.beta_proj.weight.grad is not None
+    assert torch.isfinite(layer.beta_proj.weight.grad).all()
+
+    model.eval()
+    original = torch.tensor([[1, 2, 3, 4]])
+    changed_suffix = torch.tensor([[1, 2, 8, 9]])
+    with torch.no_grad():
+        original_logits = model(original)["logits"]
+        changed_logits = model(changed_suffix)["logits"]
+    torch.testing.assert_close(original_logits[:, :2], changed_logits[:, :2])
+
+
+def test_gated_deltanet_rejects_inference_cache():
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(**TINY_CONFIG, attn_type="gdn")
+    model = AutoRegressiveLM(config)
+    with pytest.raises(NotImplementedError, match="not wired into the paged cache"):
+        model(torch.tensor([1, 2]), kv_cache=object(), fwd="decode")
+
+
+def test_gated_deltanet_rejects_invalid_configuration():
+    from pydantic import ValidationError
+
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    with pytest.raises(
+        ValidationError, match="gated deltanet dimensions must be positive"
+    ):
+        AutoRegressiveLMConfig(**TINY_CONFIG, attn_type="gdn", gdn_key_head_dim=0)
+
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        attn_type="gdn",
+        gdn_num_key_heads=2,
+        gdn_num_value_heads=3,
+    )
+    with pytest.raises(ValueError, match="must be divisible"):
+        AutoRegressiveLM(config)
 
 
 def test_moe_per_layer_ffn_resolution():

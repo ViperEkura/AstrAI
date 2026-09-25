@@ -6,7 +6,8 @@ from pydantic.dataclasses import dataclass
 from astrai.config.base import BaseConfig
 from astrai.factory import BaseFactory
 
-_ATTN_TYPES = frozenset({"gqa", "mla"})
+_ATTN_TYPES = frozenset({"gqa", "mla", "gdn"})
+_ENCODER_ATTN_TYPES = frozenset({"gqa", "mla"})
 _FFN_TYPES = frozenset({"mlp", "moe"})
 
 
@@ -50,7 +51,12 @@ class AutoRegressiveLMConfig(BaseModelConfig):
         max_position_embeddings (Optional[int]): Maximum sequence length the model was trained with. Defaults to None.
         rope_theta (Optional[float]): Base frequency for RoPE. Defaults to None.
         rope_scaling (Optional[dict]): RoPE scaling config, e.g. {"type": "linear", "factor": 4.0}. Defaults to None.
-        attn_type (str): Attention type: 'gqa' or 'mla'. Defaults to "gqa".
+        attn_type (str): Attention type: 'gqa', 'mla', or 'gated_deltanet'. Defaults to "gqa".
+        gdn_num_key_heads (Optional[int]): Gated DeltaNet key/query head count. Defaults to num_attention_heads.
+        gdn_num_value_heads (Optional[int]): Gated DeltaNet value head count. Defaults to num_attention_heads.
+        gdn_key_head_dim (Optional[int]): Gated DeltaNet key/query head dimension. Defaults to hidden_size / num_attention_heads.
+        gdn_value_head_dim (Optional[int]): Gated DeltaNet value head dimension. Defaults to hidden_size / num_attention_heads.
+        gdn_conv_kernel_size (int): Gated DeltaNet causal local-convolution width. Defaults to 4.
         num_attention_heads (Optional[int]): Number of query attention heads. Defaults to None.
         num_key_value_heads (Optional[int]): Number of key/value heads for GQA. Defaults to None.
         use_qk_norm (Optional[bool]): Whether to apply RMSNorm to Q/K. Defaults to None.
@@ -87,6 +93,11 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     kv_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
+    gdn_num_key_heads: Optional[int] = None
+    gdn_num_value_heads: Optional[int] = None
+    gdn_key_head_dim: Optional[int] = None
+    gdn_value_head_dim: Optional[int] = None
+    gdn_conv_kernel_size: int = 4
     ffn_type: str = "mlp"
     n_routed_experts: Optional[int] = None
     n_shared_experts: Optional[int] = None
@@ -111,6 +122,23 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     def _validate_ffn_type(cls, v: str) -> str:
         if v not in _FFN_TYPES:
             raise ValueError(f"ffn_type must be one of {sorted(_FFN_TYPES)}, got {v!r}")
+        return v
+
+    @field_validator(
+        "gdn_num_key_heads",
+        "gdn_num_value_heads",
+        "gdn_key_head_dim",
+        "gdn_value_head_dim",
+    )
+    def _validate_gated_deltanet_dimensions(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 1:
+            raise ValueError(f"gated deltanet dimensions must be positive, got {v}")
+        return v
+
+    @field_validator("gdn_conv_kernel_size")
+    def _validate_gdn_conv_kernel_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"gdn_conv_kernel_size must be at least 1, got {v}")
         return v
 
     @field_validator("decoder_sparse_step")
@@ -165,9 +193,9 @@ class EncoderConfig(BaseModelConfig):
 
     @field_validator("attn_type")
     def _validate_attn_type(cls, v: str) -> str:
-        if v not in _ATTN_TYPES:
+        if v not in _ENCODER_ATTN_TYPES:
             raise ValueError(
-                f"attn_type must be one of {sorted(_ATTN_TYPES)}, got {v!r}"
+                f"attn_type must be one of {sorted(_ENCODER_ATTN_TYPES)}, got {v!r}"
             )
         return v
 

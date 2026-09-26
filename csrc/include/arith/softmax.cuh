@@ -1,11 +1,10 @@
 // Shared online-softmax recurrence — pure CUDA, no torch.
 //
-// One sentinel policy for every attention consumer: the scalar prefill and
-// decode kernels, the split-KV combine, and the MMA tile softmax
-// (mma_utils.cuh).  While the running max is still -FLT_MAX (no valid key
-// seen yet), __expf(score - max) == __expf(0) == 1 would admit masked-out
-// terms with weight 1 — a fully-masked row/split must stay l == 0 so it
-// normalises to 0 instead of mean(V).
+// One sentinel policy for every attention consumer: the split-KV combine and
+// the MMA tile softmax (mma_utils.cuh).  While the running max is still
+// -FLT_MAX (no valid key seen yet), __expf(score - max) == __expf(0) == 1
+// would admit masked-out terms with weight 1 — a fully-masked row/split must
+// stay l == 0 so it normalises to 0 instead of mean(V).
 
 #pragma once
 

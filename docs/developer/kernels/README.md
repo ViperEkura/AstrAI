@@ -93,8 +93,9 @@ package and `loader.py` simply finds no `.so` files. When the env is unset,
 `setup.py` auto-detects the real GPU through `torch.cuda.get_device_capability()`
 (CC 12.0 reports `120a`, so a dev build gets the full-rate fp8 cell):
 
-- **sm_80+** (Ampere and later): enables the tensor-core MMA path
-  (`mma.sync.m16n8k16.bf16` for bf16 attention, `mma.sync.m16n8k32` for FP8).
+- **sm_80+** (Ampere and later): the minimum for the attention family — the
+  kernels are tensor-core only (`mma.sync.m16n8k16.bf16` for bf16 attention,
+  `mma.sync.m16n8k32` for FP8); there is no scalar fallback.
 - **sm_89+**: required for the FP8 family (`quantize`) — FP8 tensor-core
   instructions only exist on Ada/Hopper and newer. On older architectures,
   CMake emits a warning and skips the `quantize` target so the remaining CUDA
@@ -104,9 +105,6 @@ package and `loader.py` simply finds no `.so` files. When the env is unset,
   configure time — the plain fp8 instruction decodes at half rate on sm_120,
   and the runtime route keys on the device's `cc == 120`, so the mismatch is
   silent without the warning.
-- **`-DASTRAI_NO_MMA`** is a manual escape hatch only — the build never defines
-  it automatically. To disable the MMA path, add it to `NVCC_FLAGS` yourself;
-  all supported build targets are sm_80+.
 
 ### Build configuration
 

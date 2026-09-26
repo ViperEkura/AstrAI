@@ -8,7 +8,7 @@
 // production .cu is then exactly one torch-facing function.
 //
 // The kernel bodies live in the family headers
-// (kernel/attention_{prefill_split_q,decode_split_kv}[_mma].cuh).
+// (kernel/attention_{prefill_split_q,decode_split_kv}_mma.cuh).
 
 #pragma once
 
@@ -18,15 +18,11 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 
-#include <kernel/attention_decode_split_kv.cuh>
-#include <kernel/attention_prefill_split_q.cuh>
+#include <kernel/attention_decode_split_kv_mma.cuh>
+#include <kernel/attention_prefill_split_q_mma.cuh>
 #include <memory/layout_policies.cuh>
 #include <utils/attention_common.h>
 #include <utils/launch.cuh>
-#ifndef ASTRAI_NO_MMA
-#include <kernel/attention_decode_split_kv_mma.cuh>
-#include <kernel/attention_prefill_split_q_mma.cuh>
-#endif
 
 namespace astrai {
 namespace attention {
@@ -34,8 +30,8 @@ namespace attention {
 // A head dim no kernel was instantiated for: the torch entry validates the
 // granularity and the Python backend gates the set (drift-asserted against
 // HEAD_DIMS), so this is the loud belt-and-braces arm of the switches in
-// the .cu dispatchers — the launch discipline: never run a kernel that was
-// not built for the shape.
+// the dispatchers below — the launch discipline: never run a kernel that
+// was not built for the shape.
 [[noreturn]] inline void head_dim_fatal(int head_dim) {
     std::fprintf(stderr,
                  "ASTRAI: attention: head_dim %d has no kernel instantiation "
@@ -82,14 +78,12 @@ inline int compute_num_splits(int base_blocks, int tiles_total,
     } while (0)
 
 // ======================================================================
-// Kernel-family launchers — ONE place picks the MMA or the scalar
-// implementation.  Both families expose the same launcher interface (static
-// launch<HEAD_DIM, IsCausal, HasMask>); ASTRAI_NO_MMA (the manual escape
-// hatch the build never sets) swaps both families at once, instead of the
-// choice being repeated at each dispatch site.
+// Kernel-family launchers. Every supported build target is sm_80+, so the
+// tensor-core kernels are the only implementations: both families expose
+// the same static launch<HEAD_DIM, IsCausal, HasMask> interface and the
+// dispatchers below name only these.
 // ======================================================================
 
-#ifndef ASTRAI_NO_MMA
 template <int BC_>
 struct PrefillKernelConfig {
     static constexpr int BC = BC_;
@@ -114,7 +108,7 @@ template <> struct PrefillConfigMap<256, false> : PrefillKernelConfig<16> {};
 template <> struct PrefillConfigMap<256, true>  : PrefillKernelConfig<16> {};
 
 template <typename QSchedule, typename KV>
-struct PrefillLauncherMMA {
+struct PrefillLauncher {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams& p, cudaStream_t stream) {
         using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
@@ -138,32 +132,13 @@ struct PrefillLauncherMMA {
         ASTRAI_LAUNCH_CHECK();
     }
 };
-template <typename QSchedule, typename KV>
-using PrefillLauncher = PrefillLauncherMMA<QSchedule, KV>;
-#else
-template <typename QSchedule, typename KV>
-struct PrefillLauncherScalar {
-    template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams& p, cudaStream_t stream) {
-        constexpr int G = (HEAD_DIM == 32) ? 4 : 8, ROWS = 64, P_BC = 32;
-        dim3 grid(QSchedule::host_q_blocks(p, ROWS), p.q_head,
-                  QSchedule::host_grid_batch(p));
-        dim3 block(G, ROWS);
-        attn_prefill_split_q_kernel_t<HEAD_DIM, QSchedule, KV, G, ROWS, P_BC,
-                                      IsCausal, HasMask>
-            <<<grid, block, 0, stream>>>(p);
-        ASTRAI_LAUNCH_CHECK();
-    }
-};
-#endif
 
-#ifndef ASTRAI_NO_MMA
 // BC=16: halves smem (16KB vs 32KB) → doubles occupancy (6 vs 3 blocks/SM).
 // For D=256, BC=16 also reduces register pressure (fewer Sacc/PV frags),
 // enabling STAGES=2 (double-buffer) within the 32KB smem budget — eliminates
 // the 176-byte spill that STAGES=1+BC=32 suffered.
 template <typename KV>
-struct DecodeLauncherMMA {
+struct DecodeLauncher {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
     static void launch(AttentionParams& p, cudaStream_t stream) {
         int G = p.q_head / p.kv_head;
@@ -182,39 +157,16 @@ struct DecodeLauncherMMA {
         ASTRAI_LAUNCH_CHECK();
     }
 };
-template <typename KV>
-using DecodeLauncher = DecodeLauncherMMA<KV>;
-#else
-template <typename KV>
-struct DecodeLauncherScalar {
-    template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams& p, cudaStream_t stream) {
-        int kv_len = KV::host_kv_len(p);
-        int chunks_total = (kv_len + DC_CHUNK - 1) / DC_CHUNK;
-        p.num_splits = compute_num_splits(p.batch * p.kv_head, chunks_total);
-        size_t smem = 2 * DC_CHUNK * p.head_dim * sizeof(typename KV::Elem);
-        int group_size = p.q_head / p.kv_head;
-        int g = min(group_size, 32);  // cap at 32 to respect 1024-thread limit
-        dim3 grid(p.batch * p.kv_head, 1, p.num_splits);
-        dim3 block(32, g);
-        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(
-            attn_decode_split_kv_kernel<HEAD_DIM, KV, IsCausal, HasMask>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem));
-        attn_decode_split_kv_kernel<HEAD_DIM, KV, IsCausal, HasMask>
-            <<<grid, block, smem, stream>>>(p);
-        ASTRAI_LAUNCH_CHECK();
-    }
-};
-#endif
 
-// The family dispatchers — shared between the production .cu entries and
-// the standalone torch-free harnesses (attn_test.cu / attn_paged_test.cu),
+// ======================================================================
+// Family dispatchers — shared between the production .cu entries and the
+// standalone torch-free harnesses (attn_test.cu / attn_paged_test.cu),
 // which compile them directly instead of linking the .o (a .o link would
 // drag the pybind module and its torch dependency in).  T is the element
 // type; the head dim is switched inside because it selects tile configs,
 // not storage.  The four entries differ only in the policy pair, so they
 // funnel into one impl per family.
+// ======================================================================
 
 template <typename QSchedule, typename KV, int HEAD_DIM>
 static inline void dispatch_prefill_impl(AttentionParams& p,

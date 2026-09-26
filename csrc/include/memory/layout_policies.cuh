@@ -327,24 +327,5 @@ struct PagedKV {
     }
 };
 
-// Scalar K/V tile fill shared by the non-MMA kernels: copies one chunk into
-// linear (unswizzled) shared memory, zero-filling invalid slots.  AddrFn
-// maps (kc, d) -> KVAddr; tid/stride carry the caller's thread mapping.
-template <typename T, typename AddrFn>
- static DEVICE_FORCEINLINE void fill_kv_smem(
-    T* k_smem, T* v_smem, int elems, int head_dim,
-    int kv_base, int tid, int stride, const AddrFn& addr)
-{
-    for (int i = tid; i < elems; i += stride) {
-        int s = i / head_dim;
-        int d = i % head_dim;
-        KVAddr a = addr(kv_base + s, d);
-        k_smem[i] = a.valid ? *reinterpret_cast<const T*>(a.k)
-                            : ElemTrait<T>::from_float(0.0f);
-        v_smem[i] = a.valid ? *reinterpret_cast<const T*>(a.v)
-                            : ElemTrait<T>::from_float(0.0f);
-    }
-}
-
 }  // namespace attention
 }  // namespace astrai

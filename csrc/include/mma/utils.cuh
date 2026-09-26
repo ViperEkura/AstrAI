@@ -10,9 +10,8 @@
 #include <arith/softmax.cuh>
 
 // Predicated cp.async (4-operand form) requires CUDA 11.2+.
-// Tensor-core mma.sync requires sm_80+ (guarded at build time by
-// ASTRAI_NO_MMA); each element type carries its own floor in
-// MmaShapeFor::kMinArch.
+// Tensor-core mma.sync requires sm_80+; each element type carries its own
+// floor in MmaShapeFor::kMinArch.
 #if CUDART_VERSION < 11020
 #error "AstrAI CUDA kernels require CUDA 11.2 or later (CUDART_VERSION >= 11020)."
 #endif

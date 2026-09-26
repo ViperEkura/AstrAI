@@ -193,7 +193,7 @@ int main() {
     {
         // B, Hq, Hk, q_len, kv_len, D, causal
         const int configs[][7] = {
-            {1,2,1,64,128,32,0},     // scalar fallback D=32
+            {1,2,1,64,128,32,0},     // smallest head_dim D=32
             {1,4,2,256,256,32,1},     // causal D=32 dispatch
             {1,2,1,64,128,64,0},     // tiny: B,Hq,Hk,q,kv,D,causal
             {1,4,2,256,256,64,1},     // causal D=64 dispatch

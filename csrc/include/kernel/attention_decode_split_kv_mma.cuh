@@ -173,5 +173,39 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     }
 }
 
+// Split-combine: merges the per-split partials (o_part/ml_part) into the
+// final normalised O.  KV selects the O addressing (contig batch stride vs
+// paged row stride) and the output element type (KV::Elem).
+template <typename KV>
+__global__ void attn_decode_combine_kernel(AttentionParams p) {
+    using T = typename KV::Elem;
+
+    int bh = blockIdx.x;
+    int d = threadIdx.x;
+    if (d >= p.head_dim) return;
+
+    int batch = bh / p.q_head;
+    int q_head = bh % p.q_head;
+
+    size_t split_base = (size_t)bh * MAX_SPLITS;
+    const float* mlp = p.ml_part + split_base * 2;
+    const float* op = p.o_part + split_base * p.head_dim;
+
+    SoftmaxState st;
+    float acc = 0.0f;
+    for (int s = 0; s < p.num_splits; s++) {
+        float mi = mlp[s * 2];
+        if (mi <= -FLT_MAX) continue;
+        float li = mlp[s * 2 + 1];
+        float corr, e;
+        softmax_step(st, mi, li, corr, e);
+        acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
+    }
+
+    float inv = (st.l > 1e-20f) ? (1.0f / st.l) : 0.0f;
+    int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
+    static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
+}
+
 }  // namespace attention
 }  // namespace astrai

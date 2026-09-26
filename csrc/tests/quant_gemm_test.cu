@@ -4,7 +4,7 @@ quant_gemm family test: correctness for every operand dtype combination
 per-row / per-channel scales, fp32 output) + a per-combination TFLOPS table
 over llama-linear shapes through the production NT route.
 
-nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
+nvcc -I csrc/include -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
     -o /tmp/quant_gemm_test && /tmp/quant_gemm_test
 */
 
@@ -19,8 +19,8 @@ nvcc -I csrc/kernels -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
 #include <type_traits>
 #include <vector>
 
-#include "common/launch.cuh"
-#include "gemm/gemm.cuh"
+#include <utils/launch.cuh>
+#include <kernel/gemm.cuh>
 
 using namespace astrai::quant;
 using namespace astrai::gemm;

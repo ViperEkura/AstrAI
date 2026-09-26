@@ -103,7 +103,7 @@ set(CMAKE_CUDA_ARCHITECTURES "${ASTRAI_CUDA_ARCH_LIST}"
     CACHE STRING "CUDA architectures (derived from ASTRAI_CUDA_ARCH)" FORCE)
 
 # Kernel registry — one module per entry: name (.so / pybind name, globally
-# unique across families), then its source paths under kernels/ (whitespace-
+# unique across families), then its source paths under csrc/ (whitespace-
 # separated, so a long list may wrap across lines with indentation: a module
 # may span several TUs; gemm is split into per-dtype-pair instantiation units
 # (one explicit gemm_dispatch instantiation each), so the heavy template work
@@ -158,7 +158,7 @@ foreach(entry IN LISTS KERNEL_MODULES)
     list(REMOVE_AT _parts 0)
     # Whitespace, not just spaces: the source list may wrap across lines.
     separate_arguments(_srcs NATIVE_COMMAND "${_parts}")
-    list(TRANSFORM _srcs PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/kernels/")
+    list(TRANSFORM _srcs PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
     add_library(${name} MODULE ${_srcs})
 
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
@@ -183,7 +183,7 @@ foreach(entry IN LISTS KERNEL_MODULES)
         CUDA_ARCHITECTURES "${_target_arches}")
 
     target_include_directories(${name} PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/kernels"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
         "${TORCH_HOME}/include"
         "${TORCH_HOME}/include/torch/csrc/api/include"
         "${PYTHON_INCLUDE_DIR}")

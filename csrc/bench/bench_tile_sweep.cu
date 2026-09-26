@@ -13,7 +13,7 @@ production classes, so a win is attributable to a single axis.
 
 Compiled standalone (no CMake target), like the C tests:
 
-    nvcc -I csrc/kernels -I csrc/tests -arch=sm_89 -std=c++20 -O3 \
+    nvcc -I csrc/include -I csrc/tests -arch=sm_89 -std=c++20 -O3 \
         csrc/bench/bench_tile_sweep.cu -o /tmp/tile_sweep && /tmp/tile_sweep
     # also build and sweep the int8 candidate set (~2x compile):
     nvcc ... -DASTRAI_SWEEP_INT8=1 ... --dtype both
@@ -57,8 +57,8 @@ that computes the wrong thing is not a win.
 #include <type_traits>
 #include <vector>
 
-#include "common/device.cuh"
-#include "gemm/gemm.cuh"
+#include <utils/device.cuh>
+#include <kernel/gemm.cuh>
 
 using namespace astrai;
 using namespace astrai::gemm;

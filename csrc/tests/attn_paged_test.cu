@@ -1,5 +1,5 @@
 // Compile:
-//   nvcc -I csrc/kernels -arch=sm_89 -O3 --use_fast_math --ptxas-options=-O3 \
+//   nvcc -I csrc/include -arch=sm_89 -O3 --use_fast_math --ptxas-options=-O3 \
 //        --extra-device-vectorization -Xcompiler -fopenmp \
 //        csrc/tests/attn_paged_test.cu \
 //        -o /tmp/test_paged && /tmp/test_paged
@@ -7,7 +7,7 @@
 #include <cstring>
 #include <vector>
 #include "test_utils.cuh"
-#include "attention/dispatchers.cuh"
+#include <kernel/attention_dispatch.cuh>
 
 using namespace astrai::attention;
 

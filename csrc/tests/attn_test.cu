@@ -2,13 +2,13 @@
 Pure-C test — uses shared dispatcher.  Combines the decode (split-KV) and
 prefill (split-Q) correctness checks + benchmarks into one binary; one
 harness serves both (decode allocates the split scratch).
-nvcc -I csrc/kernels -arch=sm_89 -O3 \
+nvcc -I csrc/include -arch=sm_89 -O3 \
     --use_fast_math --ptxas-options=-O3 --extra-device-vectorization \
     -Xcompiler -fopenmp csrc/tests/attn_test.cu -o test && ./test
 */
 
 #include "test_utils.cuh"
-#include "attention/dispatchers.cuh"
+#include <kernel/attention_dispatch.cuh>
 
 using namespace astrai::attention;
 

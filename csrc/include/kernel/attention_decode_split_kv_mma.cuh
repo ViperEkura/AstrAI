@@ -10,17 +10,15 @@
 namespace astrai {
 namespace attention {
 
-// Split-K (FlashDecoding) tensor-core decode via GQA head-packing, unified
-// across contiguous and paged (SGLang flat-pool) K/V via the KV template
-// parameter.  Decode has q_len == 1, so we pack G = q_head/kv_head query
-// heads into the M=16 rows of mma.sync.m16n8k16, turning G independent GEMVs
-// into a single GEMM that reuses each loaded K/V tile across all G heads.
+// Split-K (FlashDecoding) tensor-core decode, unified across contiguous
+// and paged K/V via the KV template parameter. Decode has q_len == 1, so
+// the G = q_head/kv_head query heads pack into the M=16 rows of
+// mma.sync.m16n8k16, turning G independent GEMVs into one GEMM reusing
+// each K/V tile across all G heads (head-packing details in the prefill
+// kernel header).
 //
-// KV = ContigKV (dense tensors) or PagedKV (flat pool + req_to_token).
-// IsCausal and HasMask are compile-time bools — no runtime branch in the
-// inner compute loop.
-//
-// Traits = KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
+// KV = ContigKV or PagedKV; IsCausal/HasMask compile-time. Traits =
+// KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
 template <typename Traits, typename KV, bool IsCausal, bool HasMask>
 __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     using T = typename Traits::Elem;
@@ -79,10 +77,9 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
             });
     };
 
-    // ---- Multi-stage cp.async pipeline ----
-    // Prologue loads STAGES tiles; each loop iteration waits only for the
-    // oldest outstanding group (wait_group<STAGES-1>) so the STAGES-1 newer
-    // tile loads stay in flight and overlap with the current tile's compute.
+    // ---- Multi-stage cp.async pipeline: wait only for the oldest group
+    // (wait_group<STAGES-1>) so newer loads stay in flight over the
+    // current tile's compute. ----
     constexpr int STAGES = Traits::STAGES;
     const int ntiles = ti_end - ti_begin;
 
@@ -94,9 +91,8 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         float Sacc[Traits::NC8][4];
         mma_compute_scores<Traits>(Qa, bK, p.scale, lane, Sacc);
 
-        // Decode: q_len=1, so qrow0=qrow1=0.  Paged treats [0, seq_len) as
-        // the causal range (query is the last token); contig clips to the
-        // causal_offset bound.  Dead code eliminated when IsCausal == false.
+        // Decode: q_len=1 so qrow0=qrow1=0. Paged treats [0, seq_len) as
+        // the causal range; contig clips to the causal_offset bound.
         int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
         mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc,
                                           0, 0,
@@ -174,8 +170,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
 }
 
 // Split-combine: merges the per-split partials (o_part/ml_part) into the
-// final normalised O.  KV selects the O addressing (contig batch stride vs
-// paged row stride) and the output element type (KV::Elem).
+// final normalised O (KV selects the O addressing and element type).
 template <typename KV>
 __global__ void attn_decode_combine_kernel(AttentionParams p) {
     using T = typename KV::Elem;

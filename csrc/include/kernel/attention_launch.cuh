@@ -1,14 +1,9 @@
-// Shared attention launch vocabulary — the pieces every attention .cu needs
-// but that belong to no single entry: the split-KV heuristic, the head_dim
-// guard, the causal×mask dispatch ladder, the kernel-family launchers with
-// their tile-config maps (the launchers take the Q-schedule and KV policies
-// as template parameters, so the contiguous and paged entries share them),
-// and the four family dispatchers. Pure CUDA, no torch: the standalone
+// Shared attention launch vocabulary — split-KV heuristic, head_dim guard,
+// causal×mask dispatch ladder, kernel-family launchers with their tile-config
+// maps, and the four family dispatchers. Pure CUDA, no torch: the standalone
 // harnesses compile the exact code the production dispatch runs, and each
-// production .cu is then exactly one torch-facing function.
-//
-// The kernel bodies live in the family headers
-// (kernel/attention_{prefill_split_q,decode_split_kv}_mma.cuh).
+// production .cu is then exactly one torch-facing function. Kernel bodies
+// live in kernel/attention_{prefill_split_q,decode_split_kv}_mma.cuh.
 
 #pragma once
 
@@ -27,11 +22,9 @@
 namespace astrai {
 namespace attention {
 
-// A head dim no kernel was instantiated for: the torch entry validates the
-// granularity and the Python backend gates the set (drift-asserted against
-// HEAD_DIMS), so this is the loud belt-and-braces arm of the switches in
-// the dispatchers below — the launch discipline: never run a kernel that
-// was not built for the shape.
+// A head dim no kernel was instantiated for — the launch discipline: never
+// run a kernel that was not built for the shape (the Python backend gates
+// the same set, drift-asserted against HEAD_DIMS).
 [[noreturn]] inline void head_dim_fatal(int head_dim) {
     std::fprintf(stderr,
                  "ASTRAI: attention: head_dim %d has no kernel instantiation "
@@ -40,16 +33,11 @@ namespace attention {
     std::exit(EXIT_FAILURE);
 }
 
-// Split-KV: compute number of splits to fill all SMs for small-batch decode.
-// Caps splits so each split processes at least `min_tiles_per_split` tiles,
-// avoiding excessive loop/prologue overhead when tiles are small.
-//
-// Target total grid blocks (`TARGET_BLOCKS`) rather than scaling splits by SM
-// count.  Decode blocks are single-warp (32 threads) and a SM hosts ~11 of
-// them, so the old `2*sm/base` cap badly undersplit at large batch (B=16 got
-// 3 splits, optimal ~8).  Measured (grid search): bandwidth saturates
-// near 256-512 total blocks; 512 minimizes worst-case latency across the
-// B x kv grid; more is pure oversplit overhead.
+// Split-KV: fill all SMs for small-batch decode, targeting total grid
+// blocks rather than scaling by SM count (measured: bandwidth saturates
+// near 256-512 blocks; 512 minimizes worst-case latency over the B×kv
+// grid). Caps splits so each processes at least `min_tiles_per_split`
+// tiles — more is pure oversplit overhead.
 constexpr int DECODE_TARGET_BLOCKS = 512;
 inline int compute_num_splits(int base_blocks, int tiles_total,
                               int min_tiles_per_split = 1) {
@@ -58,12 +46,9 @@ inline int compute_num_splits(int base_blocks, int tiles_total,
     return std::max(1, std::min(n, std::min(max_by_work, MAX_SPLITS)));
 }
 
-// Dispatch IsCausal × HasMask — eliminates the duplicated 4-way if/else
-// ladder in each dispatcher.  FN must be a function template
-// <int HEAD_DIM, bool IsCausal, bool HasMask>; HEAD_DIM is forwarded as the
-// first template argument so callers only spell it once.
-//
-// Usage:
+// Dispatch IsCausal × HasMask. FN is a function template
+// <int HEAD_DIM, bool IsCausal, bool HasMask>; HEAD_DIM forwards first so
+// callers spell it once:
 //   DISPATCH_CAUSAL_MASK(is_causal, has_mask,
 //                        launcher<KV>::template launch, HEAD_DIM, p, stream);
 #define DISPATCH_CAUSAL_MASK(is_causal, has_mask, FN, HEAD_DIM, ...) \
@@ -77,12 +62,9 @@ inline int compute_num_splits(int base_blocks, int tiles_total,
         } \
     } while (0)
 
-// ======================================================================
-// Kernel-family launchers. Every supported build target is sm_80+, so the
-// tensor-core kernels are the only implementations: both families expose
-// the same static launch<HEAD_DIM, IsCausal, HasMask> interface and the
-// dispatchers below name only these.
-// ======================================================================
+// Kernel-family launchers. Every supported target is sm_80+, so the
+// tensor-core kernels are the only implementations; both families expose
+// the same static launch<HEAD_DIM, IsCausal, HasMask> interface.
 
 template <int BC_>
 struct PrefillKernelConfig {
@@ -91,10 +73,8 @@ struct PrefillKernelConfig {
     static constexpr int STAGES = 2;
 };
 
-// Compile-time prefill tile-config map (BC by head_dim × causal).  The
-// contiguous and paged entries share it: they differ only in the policy
-// pair, which parameterizes the same kernel templates.  Unsupported head
-// dimensions intentionally have no mapping.
+// Prefill tile-config map (BC by head_dim × causal), shared by the
+// contiguous and paged entries. Unsupported head dims have no mapping.
 template <int HEAD_DIM, bool IsCausal>
 struct PrefillConfigMap;
 
@@ -114,11 +94,10 @@ struct PrefillLauncher {
         using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
         using Traits = KernelTraits<HEAD_DIM, Config::BC, Config::WARPS,
                                     Config::STAGES, typename KV::Elem>;
-        // GQA head packing: HB = min(G, WARPS) q-heads of one kv-head group
-        // share each block's K/V stream (~HB× less global K/V traffic).
-        // Each head gets WPH = WARPS/HB 16-row chunks per block, so per-head
-        // rows drop from 64 to BR*WPH while total mma work per K/V byte is
-        // unchanged.  G=1 (MHA) reproduces the historical grid exactly.
+        // GQA head packing: HB = min(G, WARPS) q-heads share each block's
+        // K/V stream (~HB× less traffic); G=1 (MHA) reproduces the
+        // historical grid exactly. See the prefill kernel header for the
+        // full warp-to-head/chunk mapping.
         const int G = p.q_head / p.kv_head;
         const int HB = std::min(G, Config::WARPS);
         const int WPH = Config::WARPS / HB;
@@ -133,10 +112,9 @@ struct PrefillLauncher {
     }
 };
 
-// BC=16: halves smem (16KB vs 32KB) → doubles occupancy (6 vs 3 blocks/SM).
-// For D=256, BC=16 also reduces register pressure (fewer Sacc/PV frags),
-// enabling STAGES=2 (double-buffer) within the 32KB smem budget — eliminates
-// the 176-byte spill that STAGES=1+BC=32 suffered.
+// BC=16: halves smem (16KB vs 32KB) → doubles occupancy; for D=256 it also
+// cuts register pressure enough for STAGES=2 within the 32KB budget,
+// eliminating the 176-byte spill of STAGES=1+BC=32.
 template <typename KV>
 struct DecodeLauncher {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
@@ -158,15 +136,12 @@ struct DecodeLauncher {
     }
 };
 
-// ======================================================================
 // Family dispatchers — shared between the production .cu entries and the
-// standalone torch-free harnesses (attn_test.cu / attn_paged_test.cu),
-// which compile them directly instead of linking the .o (a .o link would
-// drag the pybind module and its torch dependency in).  T is the element
-// type; the head dim is switched inside because it selects tile configs,
-// not storage.  The four entries differ only in the policy pair, so they
-// funnel into one impl per family.
-// ======================================================================
+// standalone torch-free harnesses, which compile them directly (a .o link
+// would drag the pybind module and torch in). T is the element type; the
+// head dim switches here because it selects tile configs, not storage. The
+// four entries differ only in the policy pair, so they funnel into one impl
+// per family.
 
 template <typename QSchedule, typename KV, int HEAD_DIM>
 static inline void dispatch_prefill_impl(AttentionParams& p,
@@ -234,7 +209,7 @@ static inline void dispatch_paged_prefill(AttentionParams& p,
 }
 
 // Decode funnel: the causal/mask ladder plus the combine pass reducing the
-// split partials (the combine kernel is KV-parameterized addressing).
+// split partials.
 template <typename KV, int HEAD_DIM>
 static inline void dispatch_decode_impl(AttentionParams& p,
                                         cudaStream_t stream) {

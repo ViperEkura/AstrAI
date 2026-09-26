@@ -10,24 +10,18 @@
 namespace astrai {
 namespace attention {
 
-// Tensor-core prefill flash attention (raw mma.sync PTX), unified across
-// contiguous and paged (SGLang flat-pool) K/V via the KV template parameter.
-// One warp owns BR=16 query rows. S = Q@K^T and O = P@V run on bf16 tensor
-// cores via mma.sync.m16n8k16 (f32 accumulate).
+// Tensor-core prefill flash attention, unified across contiguous and paged
+// K/V via the KV template parameter; S = Q@K^T and O = P@V run on
+// mma.sync.m16n8k16 (f32 accumulate), one warp owning BR=16 query rows.
 //
 // GQA head packing (FA2/FA3-style): HB = min(G, WARPS) query heads of one
-// kv-head group share a block's K/V tiles, so each K/V element is read from
-// global memory once per block instead of once per q head (~HB× less K/V
-// traffic).  WARPS = WPH × HB: warp w handles head slot w/WPH, chunk w%WPH;
-// all warps of a block cover the same token range, keeping the causal sweep
-// end block-uniform.  G=1 (MHA) degenerates to the unpadded layout.
+// kv-head group share a block's K/V tiles (~HB× less K/V traffic).
+// WARPS = WPH × HB: warp w handles head slot w/WPH, chunk w%WPH; all warps
+// of a block cover the same token range, keeping the causal sweep end
+// block-uniform. G=1 (MHA) degenerates to the unpadded layout.
 //
-// KV = ContigKV<T> (dense [batch, kv_head, kv_len, head_dim]) or
-//      PagedKV<T>  (flat pool + req_to_token, ragged batches via
-//      qo_indptr/kv_indptr); T is the element type (Traits::Elem).
-// IsCausal and HasMask are compile-time bools — the compiler eliminates all
-// dead branches in the inner compute loop (FA2-style).
-//
+// KV = ContigKV<T> or PagedKV<T> (T = Traits::Elem); IsCausal/HasMask are
+// compile-time bools — dead branches eliminated in the compute loop.
 // Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2, Elem>.
 template <typename Traits, typename QSchedule, typename KV, bool IsCausal, bool HasMask>
 __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
@@ -49,9 +43,9 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     const int kv_head = blockIdx.y / BPG;
     const int slot = blockIdx.y - kv_head * BPG;
     const int head_idx = slot * HB + warp / WPH;
-    // G % HB tail blocks have idle head slots: clamp to the last head so all
-    // warps do valid work (cp.async + __syncthreads stay block-uniform) and
-    // just skip the O store via `active`.
+    // G % HB tail blocks: clamp idle head slots to the last head so
+    // cp.async + __syncthreads stay block-uniform; skip the O store via
+    // `active`.
     const bool active = head_idx < G;
     const int q_head = kv_head * G + min(head_idx, G - 1);
     const int qrow0 = row_base + chunk * Traits::BR;
@@ -62,8 +56,8 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     const int causal_off = KV::causal_offset(p, batch, q_len);
     const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
 
-    // Static shared memory: double-buffered K/V (no sQ — Q goes direct
-    // to registers in mma A-operand layout).
+    // Static shared memory: double-buffered K/V (Q goes straight to
+    // registers in mma A-operand layout).
     __shared__ __align__(16) T sK[Traits::STAGES * Traits::BC * Traits::LD];
     __shared__ __align__(16) T sV[Traits::STAGES * Traits::BC * Traits::LD];
 
@@ -87,9 +81,8 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
     const int qr0 = qrow0 + gid;
     const int qr1 = qrow0 + gid + 8;
 
-    // Causal tile-skip bounds (dead code when IsCausal == false).
-    // max_kv is per-warp (its own 16 rows); block_max_kv is the last row of
-    // the whole block's range and must be uniform for the shared sweep loop.
+    // Causal tile-skip bounds (dead code when IsCausal == false): max_kv is
+    // per-warp; block_max_kv must be uniform for the shared sweep loop.
     const int max_kv = qrow0 + Traits::BR - 1 + causal_off;
     const int block_max_kv = row_base + WPH * Traits::BR - 1 + causal_off;
 

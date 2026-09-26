@@ -130,7 +130,7 @@ set(KERNEL_MODULES
 if(ASTRAI_CUDA_ARCH_LIST)
     if(ASTRAI_CUDA_ARCH_MAX GREATER_EQUAL 89)
         list(APPEND KERNEL_MODULES
-            "quantize|quantize/quantize.cu"
+            "quantize|quantize.cu"
             "gemm|gemm/gemm.cu
                   gemm/bindings.cu
                   gemm/fp8_linear.cu

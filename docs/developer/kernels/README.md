@@ -16,7 +16,7 @@ maps to one family of translation units under `csrc/` (headers live in the `csrc
 | `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
 | `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary embedding (cos/sin lookup + rotation) |
-| `quantize` | `quantize/quantize.cu` | FP8 quantization kernels (sm_89+) |
+| `quantize` | `quantize.cu` | FP8 quantization kernels (sm_89+) |
 | `gemm` | `gemm/gemm.cu` + per-dtype-pair `gemm_*.cu` | dtype-generic tensor-core GEMM binding + one explicit `gemm_dispatch` instantiation per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+) |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
@@ -30,7 +30,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Operator | Doc | Kernel module | Python entry |
 |---|---|---|---|
-| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (headers: `csrc/include/`) | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
+| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize.cu` (headers: `csrc/include/`) | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
 | GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/ops/gemm.py` |
 | Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (headers: `csrc/include/`) | `astrai/extension/ops/attention.py`; dispatch `astrai/extension/backend/attention.py` |
 | Rotary embedding | [rotary.md](rotary.md) | `csrc/rotary_emb.cu` | `astrai/extension/ops/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
@@ -367,7 +367,7 @@ csrc/
 │   ├── bindings.cu                   #   pybind surface: marshalling, dict shapes, PYBIND11_MODULE
 │   ├── fp8_linear.cu                 #   the fp8 training linear (fwd+bwd) as one C++ autograd::Function
 │   └── gemm_bf16_* / gemm_*.cu       #   per-pair explicit gemm_dispatch instantiation units (one nvcc job each; plan_table-free)
-├── quantize/quantize.cu              # binding only (module quantize)
+├── quantize.cu                       # FP8 quantize binding only (module quantize; kernels in include/kernel/quantize.cuh)
 ├── gated_deltanet/                   # chunked GDN fwd/bwd kernels written in-TU + bindings.cu (→ module gated_deltanet)
 ├── rotary_emb.cu                     # rotary embedding (kernel + binding in one file) → module rotary_emb
 ├── bench/                            # measurement + dispatch-analysis tooling, run from the repo root as `python csrc/bench/<tool>.py`

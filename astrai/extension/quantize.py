@@ -1,7 +1,7 @@
 """Quantization: every scheme's policy and integration in one module.
 
 The policy layer over the kernel side's single quantize family
-(``csrc/quantize/`` — the fp8 quantize kernels plus the int8
+(``csrc/quantize.cu`` — the fp8 quantize entry plus the int8
 dequant the GEMM family consumes). Stateless kernel adapters live one
 layer down (``ops/quantize.py`` / ``ops/gemm.py`` — the only modules
 touching the pybind).

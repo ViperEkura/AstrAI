@@ -1,4 +1,11 @@
-#include <kernel/attention_dispatch.cuh>
+// GQA prefill flash attention, contiguous K/V — the torch-facing entry,
+// one function per module. Everything device-side (kernel templates,
+// launchers, the dtype/head_dim dispatchers) lives in the shared family
+// headers: kernel/attention_launch.cuh and
+// kernel/attention_prefill_split_q[_mma].cuh (paged_prefill.cu instantiates
+// the same templates with PackedQSchedule+PagedKV).
+
+#include <kernel/attention_launch.cuh>
 #include <launcher/dtype_list.h>
 #include <launcher/entry_utils.h>
 

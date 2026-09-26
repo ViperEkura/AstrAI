@@ -1,9 +1,11 @@
 #pragma once
+
 #include <cfloat>
 #include <cuda_bf16.h>
-#include <utils/attention_common.h>
+
 #include <memory/layout_policies.cuh>
 #include <mma/utils.cuh>
+#include <utils/attention_common.h>
 
 namespace astrai {
 namespace attention {
@@ -132,12 +134,13 @@ __global__ void attn_prefill_split_q_mma_kernel(AttentionParams p) {
             int maxc1 = IsCausal ? min(seq_len, causal_off + qr1 + 1)
                                  : seq_len;
             mma_softmax_tile<Traits, HasMask>(kv0, maxc0, maxc1,
-                                               qr0, qr1,
-                                               p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                                               batch, q_head, q_head,
-                                               p.mask,
-                                               va, vb,
-                                               Sacc, Oacc, m0, m1, l0, l1, lane);
+                                              qr0, qr1,
+                                              p.mask_b_stride, p.mask_h_stride,
+                                              p.mask_l_stride,
+                                              batch, q_head, q_head,
+                                              p.mask,
+                                              va, vb,
+                                              Sacc, Oacc, m0, m1, l0, l1, lane);
 
             mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
         }

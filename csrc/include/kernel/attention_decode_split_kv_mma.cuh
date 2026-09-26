@@ -1,9 +1,11 @@
 #pragma once
+
 #include <cfloat>
 #include <cuda_bf16.h>
-#include <utils/attention_common.h>
+
 #include <memory/layout_policies.cuh>
 #include <mma/utils.cuh>
+#include <utils/attention_common.h>
 
 namespace astrai {
 namespace attention {
@@ -97,12 +99,13 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         // causal_offset bound.  Dead code eliminated when IsCausal == false.
         int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
         mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc,
-                                           0, 0,
-                                            p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                                            batch, q_head0 + gid, q_head0 + gid + 8,
-                                            p.mask,
-                                            va, vb,
-                                            Sacc, Oacc, m0, m1, l0, l1, lane);
+                                          0, 0,
+                                          p.mask_b_stride, p.mask_h_stride,
+                                          p.mask_l_stride,
+                                          batch, q_head0 + gid, q_head0 + gid + 8,
+                                          p.mask,
+                                          va, vb,
+                                          Sacc, Oacc, m0, m1, l0, l1, lane);
 
         mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
     };

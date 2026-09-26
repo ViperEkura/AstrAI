@@ -309,7 +309,7 @@ csrc/
 │   ├── kernel/                       # entry __global__ and their composition (humming's rule: what the code IS, not which family owns it)
 │   │   ├── gemm.cuh                  #     GEMM orchestrator + launch machinery (no torch; reaches the planner through policy.cuh declarations)
 │   │   ├── gemm_mainloop.cuh         #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
-│   │   ├── attention_dispatch.cuh    #     pure-CUDA launchers: dispatch_decode/prefill(_impl) funnel (+paged), split-K math
+│   │   ├── attention_launch.cuh      #     pure-CUDA launch vocabulary: launchers + tile-config maps + dispatch_decode/prefill(_paged) funnels, split-K math
 │   │   ├── attention_decode_split_kv.cuh / _mma.cuh      # decode kernel, scalar / MMA (split-KV)
 │   │   ├── attention_prefill_split_q.cuh / _mma.cuh      # prefill kernel, scalar / MMA (split-Q, GQA head packing)
 │   │   └── quantize.cuh              #     quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
@@ -347,7 +347,7 @@ csrc/
 │       ├── dtype_list.h              #     attention ASTRAI_ATTN_DTYPE_LIST + c10 dispatch entries
 │       ├── entry_utils.h             #     attention torch binding helpers (DISPATCH_HEAD_DIM, pack_*_params)
 │       └── gated_deltanet.h          #     the family's two entry declarations (torch::Tensor signatures)
-├── attention/                        # family translation units only
+├── attention/                        # family translation units only (one torch entry each; kernels/launchers/dispatch in the shared kernel/ headers)
 │   ├── decode.cu                     #   → module attn_decode
 │   ├── prefill.cu                    #   → module attn_prefill
 │   ├── paged_decode.cu               #   → module attn_paged_decode

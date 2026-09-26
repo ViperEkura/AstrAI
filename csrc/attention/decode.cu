@@ -1,4 +1,11 @@
-#include <kernel/attention_dispatch.cuh>
+// GQA decode (split-KV FlashDecoding), contiguous K/V — the torch-facing
+// entry, one function per module. Everything device-side (kernel templates,
+// launchers, the dtype/head_dim dispatchers) lives in the shared family
+// headers: kernel/attention_launch.cuh and
+// kernel/attention_decode_split_kv[_mma].cuh (paged_decode.cu instantiates
+// the same templates with PagedKV).
+
+#include <kernel/attention_launch.cuh>
 #include <launcher/dtype_list.h>
 #include <launcher/entry_utils.h>
 

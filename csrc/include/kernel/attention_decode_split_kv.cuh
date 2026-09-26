@@ -1,10 +1,12 @@
 #pragma once
+
+#include <cfloat>
 #include <cuda_bf16.h>
-#include <float.h>
-#include <utils/attention_common.h>
+
 #include <arith/reduce.cuh>
-#include <memory/layout_policies.cuh>
 #include <arith/softmax.cuh>
+#include <memory/layout_policies.cuh>
+#include <utils/attention_common.h>
 
 namespace astrai {
 namespace attention {
@@ -107,7 +109,8 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams p) {
                 softmax_step(sm, partial, 1.0f, alpha, beta);
 
                 for (int i = 0; i < hd_per_thread; i++) {
-                    float vv = ElemTrait<T>::to_float(v_smem[s * p.head_dim + lane * hd_per_thread + i]);
+                    const int d_off = s * p.head_dim + lane * hd_per_thread + i;
+                    float vv = ElemTrait<T>::to_float(v_smem[d_off]);
                     acc_reg[i] = fmaf(acc_reg[i], alpha, vv * beta);
                 }
             }

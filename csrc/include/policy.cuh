@@ -1,7 +1,7 @@
 #pragma once
-// Kernel policy layer: shared-memory budget, occupancy hint and the single
-// Policy type the kernel takes (CUTLASS-style consolidation of traits +
-// layout tags + scheduling knobs). Dtype-generic via gemm_elem_traits.
+// Kernel policy layer: smem budget, occupancy hint, the single Policy type
+// the kernel takes, and the runtime planning vocabulary. Dtype-generic via
+// gemm_elem_traits.
 
 #include <cuda_fp8.h>
 #include <atomic>
@@ -460,23 +460,17 @@ struct GemmPolicy {
 };
 
 // ---------------------------------------------------------------------------
-// Runtime planning vocabulary. The kernel-side headers (gemm.cuh and below)
-// plan a launch through these value types, the launch-side runtime knobs and
-// one planner-entry declaration whose definition lives in
-// launcher/planning.h — the single host-side unit that compiles the planner
-// chain and the row tables. Keeping the vocabulary here means the heavy
-// per-dtype kernel TUs reference the planner through declarations only
-// (plan_table.h stops being compiled once per dtype pair), while the launch
-// side still sees the same types the planner decides on.
+// Runtime planning vocabulary. Keeping it here means the per-dtype kernel
+// TUs reference the planner through declarations only (plan_table.h is
+// compiled once per binary, in planning.h's TU) while the launch side sees
+// the same types the planner decides on.
 // ---------------------------------------------------------------------------
 
-// Launch-side runtime configuration: the backing state of the runtime plan
-// API (astrai.extension.ops.gemm's set_* functions and the gemm
-// ``configure`` binding). One knob per launch-time switch, each a tri-state
-// atomic — -1 means "unset, the one-time env seed decides" (seeded in
-// plan_table.h, next to the row sources it also seeds), any other value is
-// explicit and wins. Lives here rather than plan_table.h so the three
-// launch-side knobs below are defined where their callers compile.
+// Launch-side runtime config (ops.gemm set_* / the configure binding), one
+// tri-state atomic per switch: -1 = unset (the one-time env seed in
+// plan_table.h decides), anything else is explicit and wins. Here rather
+// than plan_table.h so the knobs below are defined where their callers
+// compile.
 struct GemmConfig {
     std::atomic<int> planner{-1};      // 0 table-only, 1 hybrid (table -> model), 2 model-only
     std::atomic<int> log{-1};          // [gemm-plan] stderr log on/off
@@ -490,14 +484,13 @@ inline GemmConfig& gemm_config() {
     return cfg;
 }
 
-void gemm_config_seed_once();  // defined in plan_table.h (env migration seed)
+void gemm_config_seed_once();  // plan_table.h (env seed)
 
 // Dtype-class ids the plan-table rows key on.
 enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
 
-// One launchable tile configuration, runtime form. The manifest types are
-// the compiled truth; every consumer — row tables, the analytical model,
-// the launchers, the tile_vocabulary binding — names tiles through this.
+// One launchable tile configuration, runtime form; every consumer names
+// tiles through this.
 struct GemmRecipe {
     int cta;      // TileClass ordinal — the row-file serialization key
     int stages;   // ring depth
@@ -508,9 +501,8 @@ struct GemmRecipe {
     int smem;     // ring bytes at this staging pair's operand widths
 };
 
-// Everything one plan decision is priced against (shape, the table key it
-// derives from, operand widths, the queried device). Assembled once per
-// launch by plan_query and passed as one value.
+// Everything a plan decision is priced against, assembled once per launch
+// by plan_query.
 struct PlanQuery {
     int64_t m = 0;
     int64_t n = 0;
@@ -532,22 +524,16 @@ struct PlanQuery {
     DeviceFacts dev{};
 };
 
-// One dispatch decision: the recipe, the resolved raster (a row's literal,
-// or plan_raster at the recipe's geometry), and the planner that made it.
-// source is that planner's own name — the log line and the probe dict
-// report it verbatim.
+// One dispatch decision; source is the deciding planner's own name (the
+// log line and the probe dict report it verbatim).
 struct PlanDecision {
     GemmRecipe recipe;
     int raster;
     const char* source;
 };
 
-// The planner entry and the three launch-side knobs. The knobs are inline
-// here (their callers are the kernel TUs, which must not reach plan_table.h);
-// plan_dispatch is defined non-inline in launcher/planning.h — the
-// single-inclusion unit that compiles the planner chain. A TU that includes
-// planning.h twice over is a multiple-definition link error, which is the
-// enforcement.
+// The knobs are inline (kernel TUs must not reach plan_table.h);
+// plan_dispatch is planning.h's non-inline single-inclusion entry.
 PlanDecision plan_dispatch(const PlanQuery& q);
 inline bool gemm_plan_log_enabled() {
     gemm_config_seed_once();

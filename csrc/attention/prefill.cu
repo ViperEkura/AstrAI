@@ -5,10 +5,11 @@
 
 #include <kernel/attention_launch.cuh>
 #include <launcher/attention.h>
-#include <launcher/dtype_list.h>
-#include <launcher/entry_utils.h>
+#include <launcher/attention_dtypes.h>
+#include <launcher/attention_entry.h>
 
-using namespace astrai::attention;
+namespace astrai {
+namespace attention {
 
 torch::Tensor attn_prefill(
     torch::Tensor q,
@@ -41,14 +42,17 @@ torch::Tensor attn_prefill(
     return O;
 }
 
+}  // namespace attention
+}  // namespace astrai
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_prefill", &attn_prefill,
+    m.def("attn_prefill", &astrai::attention::attn_prefill,
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),
         py::arg("mask") = py::none(),
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,
-        py::arg("layout") = (int64_t)BHLD,
+        py::arg("layout") = (int64_t)astrai::attention::BHLD,
         "GQA prefill (tensor-core mma on sm_80+)");
 }

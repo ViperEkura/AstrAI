@@ -1,4 +1,8 @@
 #pragma once
+// Attention's torch-entry marshalling layer: micro-checks, split-partial
+// allocation and the three params packers, shared by the four attention
+// entry .cu files (gemm's equivalent lives in gemm.cu; quantize's in
+// quantize_entry.h).
 #include <float.h>
 
 #include <torch/extension.h>
@@ -18,7 +22,7 @@ inline void check_int32(const torch::Tensor& t, const char* name) {
 // ---- Element type ----
 // Every kernel reads q, k and v through ONE element type and writes O with it,
 // so the three must agree. Which scalar types have a kernel behind them is the
-// entry's switch over ASTRAI_ATTN_DTYPE_LIST (attention/dtype_list.cuh), taken
+// entry's switch over ASTRAI_ATTN_DTYPE_LIST (launcher/attention_dtypes.h), taken
 // on q's type; nothing is recorded on the params — the element type reaches the
 // kernel as a template parameter.
 inline void check_qkv_dtype(const torch::Tensor& q, const torch::Tensor& k,

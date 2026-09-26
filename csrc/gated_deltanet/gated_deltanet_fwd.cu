@@ -185,6 +185,9 @@ __global__ void gated_deltanet_fwd_gates_kernel(
 
 }  // namespace
 
+namespace astrai {
+namespace gdn {
+
 std::vector<torch::Tensor> gated_deltanet_fwd(
     torch::Tensor q,
     torch::Tensor k,
@@ -269,3 +272,6 @@ std::vector<torch::Tensor> gated_deltanet_fwd(
 
     return {q_out, k_out, v_out, g_out, beta_out};
 }
+
+}  // namespace gdn
+}  // namespace astrai

@@ -5,10 +5,11 @@
 
 #include <kernel/attention_launch.cuh>
 #include <launcher/attention.h>
-#include <launcher/dtype_list.h>
-#include <launcher/entry_utils.h>
+#include <launcher/attention_dtypes.h>
+#include <launcher/attention_entry.h>
 
-using namespace astrai::attention;
+namespace astrai {
+namespace attention {
 
 torch::Tensor attn_paged_decode(
     torch::Tensor q,
@@ -63,8 +64,11 @@ torch::Tensor attn_paged_decode(
     return O;
 }
 
+}  // namespace attention
+}  // namespace astrai
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_paged_decode", &attn_paged_decode,
+    m.def("attn_paged_decode", &astrai::attention::attn_paged_decode,
         py::arg("q"),
         py::arg("k_cache"),
         py::arg("v_cache"),

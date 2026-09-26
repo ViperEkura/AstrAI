@@ -5,10 +5,11 @@
 
 #include <kernel/attention_launch.cuh>
 #include <launcher/attention.h>
-#include <launcher/dtype_list.h>
-#include <launcher/entry_utils.h>
+#include <launcher/attention_dtypes.h>
+#include <launcher/attention_entry.h>
 
-using namespace astrai::attention;
+namespace astrai {
+namespace attention {
 
 torch::Tensor attn_decode(
     torch::Tensor q,
@@ -45,15 +46,18 @@ torch::Tensor attn_decode(
     return O;
 }
 
+}  // namespace attention
+}  // namespace astrai
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("attn_decode", &attn_decode,
+    m.def("attn_decode", &astrai::attention::attn_decode,
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),
         py::arg("mask") = py::none(),
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,
-        py::arg("layout") = (int64_t)BHLD,
+        py::arg("layout") = (int64_t)astrai::attention::BHLD,
         py::arg("o_part_buf") = py::none(),
         py::arg("ml_part_buf") = py::none(),
         "GQA decode (tensor-core head-packing on sm_80+)");

@@ -40,8 +40,12 @@ RES_USAGE_RE = re.compile(r"^\s*REG:(\d+)\s+STACK:(\d+)")
 # nvcc embeds the TU's on-disk path into the anonymous-namespace segment of
 # symbols defined in one: _GLOBAL__N__<16hex>_<dir>_<file>_cu_<rest>. A pure
 # file move keeps the SASS but mangles this name segment, so a move-adjudicating
-# comparison normalizes it away first.
-ANON_NAMESPACE_RE = re.compile(r"_GLOBAL__N__[0-9a-f]+_[A-Za-z0-9_]*_cu_")
+# comparison normalizes it away first. Two spellings exist: the TU-qualified
+# form (<hash>_<dir>_<file>_cu_) and the bare form (<hash> glued straight to
+# the symbol name — gated_deltanet's kernels land there, and the hash also
+# changes when an unrelated namespace block is inserted around the TU's
+# definitions, so both must normalize).
+ANON_NAMESPACE_RE = re.compile(r"_GLOBAL__N__[0-9a-f]+")
 
 
 def find_cuobjdump() -> str:
@@ -181,7 +185,12 @@ def collect(cuobjdump: str, build_dir: Path) -> dict:
 
 
 def normalize_symbol(name: str) -> str:
-    return ANON_NAMESPACE_RE.sub("_GLOBAL__N___", name)
+    name = ANON_NAMESPACE_RE.sub("_GLOBAL__N___", name)
+    # The hash segment may also trail the _cu_ qualifier, glued to the
+    # symbol name proper (a third nvcc spelling): strip a run of hex
+    # immediately after "_cu_" as well, or the two builds of one TU under
+    # different namespace wrappers compare as different symbols.
+    return re.sub(r"(_cu_)[0-9a-f]+", r"\1", name)
 
 
 def compare(before: dict, after: dict, normalize: bool = False) -> int:

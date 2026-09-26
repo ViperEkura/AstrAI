@@ -33,8 +33,8 @@
 #include <vector>
 
 #include <launcher/api.h>
-#include <launcher/fp8_state.h>
-#include <launcher/launch.h>
+#include "fp8_state.h"
+#include <launcher/quantize_entry.h>
 
 namespace astrai {
 namespace fp8 {

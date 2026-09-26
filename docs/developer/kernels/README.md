@@ -335,16 +335,16 @@ csrc/
 │   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
 │   │   ├── attention_common.h        #     AttentionParams POD, TensorLayout enum
 │   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
-│   └── launcher/                     # THE HOST SURFACE — the only directory whose headers may touch torch/ATen/c10/Python
+│   └── launcher/                     # THE HOST SURFACE — the only directory whose headers may touch torch/ATen/c10/Python (files named BY FAMILY: <family>*.h = that family's surface)
 │       ├── api.h                     #     gemm C++ surface (declarations only, no py:: type)
 │       ├── planning.h                #     the planner chain + recipe vocabulary + plan_raster; plan_dispatch defined non-inline — SINGLE-INCLUSION (one TU per binary: gemm.cu or a standalone harness)
 │       ├── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
-│       ├── fp8_state.h               #     delayed-scaling rings, version-keyed weight cast cache, the meta registry + checkpoint snapshot/restore
-│       ├── checks.h                  #     quantize torch-bound entry validation (check_fp8_device)
-│       ├── launch.h                  #     quantize launcher + composed one-call API (torch-tensor level, no pybind)
-│       ├── dtype_list.h              #     attention ASTRAI_ATTN_DTYPE_LIST + c10 dispatch entries
-│       ├── entry_utils.h             #     attention torch binding helpers (DISPATCH_HEAD_DIM, pack_*_params)
-│       └── gated_deltanet.h          #     the family's two entry declarations (torch::Tensor signatures)
+│       ├── attention.h               #     attention entry declarations (astrai::attention)
+│       ├── attention_dtypes.h        #     attention ASTRAI_ATTN_DTYPE_LIST + generated unsupported-dtype refusal
+│       ├── attention_entry.h         #     attention torch→POD marshalling (pack_*_params, split-partial allocation)
+│       ├── gated_deltanet.h          #     the family's two entry declarations (astrai::gdn)
+│       ├── quantize_entry.h          #     quantize launcher + composed one-call API + input-dtype list (torch-tensor level, no pybind)
+│       └── fp8_checks.h              #     fp8 capability gate (check_fp8_device; shared by quantize + gemm bindings)
 ├── attention/                        # family translation units only (one torch entry each; kernels/launchers/dispatch in the shared kernel/ headers)
 │   ├── decode.cu                     #   → module attn_decode
 │   ├── prefill.cu                    #   → module attn_prefill
@@ -354,6 +354,7 @@ csrc/
 │   ├── gemm.cu                       #   typed host layer: dtype-pair registry + api.h implementations + the ONE planning.h includer
 │   ├── bindings.cu                   #   pybind surface: marshalling, dict shapes, PYBIND11_MODULE
 │   ├── fp8_linear.cu                 #   the fp8 training linear (fwd+bwd) as one C++ autograd::Function
+│   ├── fp8_state.h                   #   the fp8 training state machine (delayed-scaling rings, cast caches, meta registry) — a TU-local split of fp8_linear.cu, quoted-include
 │   └── gemm_bf16_* / gemm_*.cu       #   per-pair explicit gemm_dispatch instantiation units (one nvcc job each; plan_table-free)
 ├── quantize.cu                       # FP8 quantize binding only (module quantize; kernels in include/kernel/quantize.cuh)
 ├── gated_deltanet/                   # chunked GDN fwd/bwd kernels written in-TU + bindings.cu (→ module gated_deltanet)

@@ -20,7 +20,7 @@
 
 #include <kernel/gemm.cuh>
 #include <launcher/api.h>
-#include <launcher/checks.h>
+#include <launcher/fp8_checks.h>
 #include <launcher/planning.h>
 
 using namespace astrai;
@@ -127,13 +127,18 @@ constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
 
 // The unsupported-pair arm, one spelling for the two lookups below: the
 // switch's own default carries it, so the non-void lookups cannot fall off
-// their end. The message names the operand dtypes it actually got instead of
-// a hardcoded list that can drift.
-#define ASTRAI_GEMM_UNSUPPORTED_PAIR(SA, SB)                            \
-    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(SA), \
-                " x ", toString(SB),                                    \
-                ": expected bf16 x int8 (W8A16), int8 x int8 (W8A8), "  \
-                "bf16 x bf16 (W16A16), or matching fp8 x fp8")
+// their end. The expected-pairs text is generated from ASTRAI_GEMM_PAIRS
+// (the attention_dtypes.h pattern), so it cannot drift from the table.
+[[noreturn]] void unsupported_pair(c10::ScalarType a, c10::ScalarType b) {
+    std::string instantiated;
+#define ASTRAI_GEMM_PAIR_ROW(SA, TA, SB, TB)                             \
+    instantiated += std::string(instantiated.empty() ? "" : ", ") +      \
+                    toString(SA) + " x " + toString(SB);
+    ASTRAI_GEMM_PAIRS(ASTRAI_GEMM_PAIR_ROW)
+#undef ASTRAI_GEMM_PAIR_ROW
+    TORCH_CHECK(false, "unsupported operand dtype pair ", toString(a), " x ",
+                toString(b), " (instantiated: ", instantiated, ")");
+}
 
 GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 #define GEMM_CASE(SA, TA, SB, TB) \
@@ -142,7 +147,7 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
     switch (pack_dtypes(a, b)) {
         ASTRAI_GEMM_PAIRS(GEMM_CASE)
     default:
-        ASTRAI_GEMM_UNSUPPORTED_PAIR(a, b);
+        unsupported_pair(a, b);
     }
 #undef GEMM_CASE
 }
@@ -160,7 +165,7 @@ GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
     switch (pack_dtypes(a, b)) {
         ASTRAI_GEMM_PAIRS(PROBE_CASE)
     default:
-        ASTRAI_GEMM_UNSUPPORTED_PAIR(a, b);
+        unsupported_pair(a, b);
     }
 #undef PROBE_CASE
 }

@@ -15,7 +15,7 @@
 //     bindings.cu.
 //
 // Device facts need no declaration here (`astrai::device_facts()` in
-// common/device.cuh is already typed) and the vocabulary returns plain
+// utils/device.cuh is already typed) and the vocabulary returns plain
 // containers — the bindings marshall both directly.
 
 #include <c10/util/Optional.h>

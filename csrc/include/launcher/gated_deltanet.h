@@ -10,6 +10,9 @@
 
 #include <vector>
 
+namespace astrai {
+namespace gdn {
+
 std::vector<torch::Tensor> gated_deltanet_fwd(
     torch::Tensor q,
     torch::Tensor k,
@@ -29,3 +32,6 @@ std::vector<torch::Tensor> gated_deltanet_bwd(
     torch::Tensor do_grad,
     double scale
 );
+
+}  // namespace gdn
+}  // namespace astrai

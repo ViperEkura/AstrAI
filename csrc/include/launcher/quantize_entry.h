@@ -12,9 +12,10 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Optional.h>
 #include <cstdint>
+#include <string>
 #include <torch/extension.h>
 
-#include <launcher/checks.h>
+#include <launcher/fp8_checks.h>
 #include <utils/dtype.cuh>
 #include <utils/quantize_common.h>
 #include <kernel/quantize.cuh>
@@ -22,27 +23,43 @@
 namespace astrai {
 namespace quant {
 
-// Dtype dispatch over the merged quantize launcher: one case per supported
-// input dtype for a (possibly mixed) fp8 output pair; the default is a hard
-// error (entry-checked, so unreachable — never a silent bf16 re-route).
-// Element types are the shared vocabulary's names (common/dtype.cuh), the same
-// ones attention and gemm instantiate.
+// Quantize's instantiation list, the attention_dtypes.h shape: torch's own
+// ScalarType names the input dtype at the boundary, the C++ element type is
+// what the kernel takes as a template parameter. The refusal below is
+// generated from the same rows, so the supported set cannot drift.
+#define ASTRAI_QUANT_IN_DTYPES(X) \
+    X(torch::kBFloat16, bf16)     \
+    X(torch::kHalf, fp16)         \
+    X(torch::kFloat32, float)
+
+// A scalar type quantize has no kernel for: say which ones it does have,
+// read off the list above (the attention_dtypes.h pattern).
+[[noreturn]] inline void unsupported_quant_input(at::ScalarType st) {
+    std::string instantiated;
+#define ASTRAI_QUANT_NAME_ROW(S, T)                                    \
+    instantiated += std::string(instantiated.empty() ? "" : ", ") +    \
+                    toString(S);
+    ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_NAME_ROW)
+#undef ASTRAI_QUANT_NAME_ROW
+    TORCH_CHECK(false, "quantize has no kernel for ", toString(st),
+                " (instantiated: ", instantiated, ")");
+}
+
+// Dtype dispatch over the merged quantize launcher: one case per row above
+// for a (possibly mixed) fp8 output pair; the default is unreachable (the
+// entry gate above) but stays a hard error — never a silent re-route.
 template <typename Fp8TA, typename Fp8TB>
 inline void launch_for_dtype(const torch::Tensor& x, const QuantParams& p,
                              cudaStream_t stream) {
     switch (x.scalar_type()) {
-    case torch::kBFloat16:
-        launch_fp8_quantize<Fp8TA, bf16, Fp8TB>(p, stream);
+#define ASTRAI_QUANT_CASE(S, T) \
+    case S:                     \
+        launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream); \
         break;
-    case torch::kHalf:
-        launch_fp8_quantize<Fp8TA, fp16, Fp8TB>(p, stream);
-        break;
-    case torch::kFloat32:
-        launch_fp8_quantize<Fp8TA, float, Fp8TB>(p, stream);
-        break;
+        ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_CASE)
+#undef ASTRAI_QUANT_CASE
     default:
-        TORCH_CHECK(false, "unsupported quantize input dtype: ",
-                    x.scalar_type());
+        unsupported_quant_input(x.scalar_type());
     }
 }
 
@@ -149,10 +166,14 @@ inline QuantizeOutputs run_quantize(torch::Tensor x, torch::Tensor scale,
                                     c10::optional<int64_t> hist_len =
                                         c10::nullopt) {
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 ||
-                    x.scalar_type() == torch::kHalf ||
-                    x.scalar_type() == torch::kFloat32,
-                "x must be bf16, fp16 or fp32");
+    {
+        bool supported = false;
+#define ASTRAI_QUANT_SUPPORTED_ROW(S, T) \
+        supported = supported || x.scalar_type() == S;
+        ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_SUPPORTED_ROW)
+#undef ASTRAI_QUANT_SUPPORTED_ROW
+        if (!supported) unsupported_quant_input(x.scalar_type());
+    }
     const at::ScalarType out_dtype = dtype_a;
     const at::ScalarType t_dtype = dtype_b.has_value() ? *dtype_b : dtype_a;
     for (const at::ScalarType dt : {out_dtype, t_dtype})

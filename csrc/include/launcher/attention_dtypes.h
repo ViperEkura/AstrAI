@@ -12,7 +12,7 @@
 // The C++ harnesses (csrc/tests, no torch) never touch this header — they call
 // the dispatchers with an element type directly.
 //
-// Adding a precision = a row here + its ElemTrait (common/dtype.cuh) and, for
+// Adding a precision = a row here + its ElemTrait (utils/dtype.cuh) and, for
 // a tensor-core dtype, the MmaShapeFor/MmaOp cell (common/mma.cuh). Verified in
 // a scratch build with fp16: nothing else needs an edit.
 

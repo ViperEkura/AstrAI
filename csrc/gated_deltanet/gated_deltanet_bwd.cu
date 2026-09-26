@@ -281,6 +281,9 @@ __global__ void gated_deltanet_bwd_o_kernel(
 
 }  // namespace
 
+namespace astrai {
+namespace gdn {
+
 std::vector<torch::Tensor> gated_deltanet_bwd(
     torch::Tensor q,
     torch::Tensor k,
@@ -355,3 +358,6 @@ std::vector<torch::Tensor> gated_deltanet_bwd(
 
     return {dq, dk, dv_new, dh, dg};
 }
+
+}  // namespace gdn
+}  // namespace astrai

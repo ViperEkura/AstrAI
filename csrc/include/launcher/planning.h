@@ -3,7 +3,7 @@
 // recipe vocabulary it decides on, and the runtime knobs (config state and
 // row tables) it reads. Split out of kernel/gemm.cuh so the per-dtype
 // kernel TUs compile the device stack and reference the planner through the
-// declarations in policy.cuh — plan_table.h's 750 lines stop being dragged
+// declarations in policy.cuh — plan_table.h's 620 lines stop being dragged
 // through nvcc once per dtype pair.
 //
 // SINGLE-INCLUSION: plan_dispatch is defined NON-inline here, so exactly ONE

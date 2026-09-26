@@ -1,14 +1,18 @@
 // Entry points of the attention kernel modules.
 //
-// One declaration per entry (the gated_deltanet.h shape): the .cu files
-// implement these, bindings.cu hangs the pybind surface on them, and the
+// One declaration per entry (the api.h / gated_deltanet.h shape): the .cu
+// files implement these and attach each module's own pybind surface; the
 // device-side vocabulary (kernels, launchers, dispatchers) stays in the
 // kernel/ headers — pure CUDA, no torch.
 
 #pragma once
 
 #include <torch/extension.h>
+
 #include <c10/util/Optional.h>
+
+namespace astrai {
+namespace attention {
 
 torch::Tensor attn_decode(
     torch::Tensor q,
@@ -63,3 +67,6 @@ torch::Tensor attn_paged_prefill(
     int64_t causal_offset,
     double scale
 );
+
+}  // namespace attention
+}  // namespace astrai

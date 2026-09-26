@@ -5,7 +5,7 @@
 
 #include <utils/quantize_common.h>
 
-// Torch-bound entry validation for the fp8 family. quantize/common.h stays
+// Torch-bound entry validation for the fp8 family. utils/quantize_common.h stays
 // torch-free (pure POD/traits); this header owns the runtime capability
 // gate shared by the quantize and quant_gemm bindings.
 

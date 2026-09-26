@@ -26,7 +26,7 @@ layered directory:
 | `gemm/gemm.cu` | The typed host layer: the dtype-pair registry (`ASTRAI_GEMM_PAIRS`, one entry feeding both the `gemm_dispatch` and the `plan_probe_for` lookup; one extern-template declaration per pair, which is what keeps this TU from re-instantiating them) plus the `api.h` implementations. Holds no `py::` type |
 | `gemm/fp8_linear.cu` | The composed fp8 training linear (forward *and* backward) in one C++ `autograd::Function`, so only one entry call stays in Python; its per-call state machine (rings, weight cast cache, checkpoint snapshot) is `fp8_state.cuh` |
 | `gemm/bindings.cu` | The pybind surface of the module: None-tolerant argument marshalling, the dict shapes of both directions (the state report's keys and the config patch's `kPatchKeys` table — each key set spelled once, here, as the contract the Python tooling reads) and `PYBIND11_MODULE` → module `gemm`. `configure` takes one patch dict, so a knob's name has two homes total: this table and the Python signature |
-| `csrc/quantize.cu` | binding only: entry checks (`launcher/checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
+| `csrc/quantize.cu` | binding only: entry checks (`launcher/fp8_checks.h` device gate + scale validation), param packing, launch dispatch, pybind → module `quantize` |
 
 Scale semantics: `quantize` takes the quantization *multiplier*; the
 strategy layer passes `scale.reciprocal()` and the kernel multiplies by it.

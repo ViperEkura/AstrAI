@@ -594,7 +594,7 @@ class CudaBackend(AttentionBackend):
         fwd: Optional[str],
     ) -> bool:
         # The CUDA kernels take one precision per build — bf16 today, and the
-        # instantiated set lives in csrc/kernels/attention/dtype_list.cuh
+        # instantiated set lives in csrc/include/launcher/dtype_list.h
         # (ASTRAI_ATTN_DTYPE_LIST) — support head_dim in HEAD_DIMS, and need a
         # KV cache (decode/prefill); everything else falls back down the
         # priority list to torch.

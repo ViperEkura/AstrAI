@@ -6,7 +6,7 @@ available and CUDA is detected. This folder is the home of the
 per-kernel-family documentation — math contract first, then design notes;
 the family-wide infrastructure (build system, python extension layers,
 testing, file layout) lives at the bottom of this file. One folder here
-maps to one folder in `csrc/kernels/`.
+maps to one family of translation units under `csrc/` (headers live in the `csrc/include/` stage tree).
 
 ## Overview
 | Kernel | File | Description |
@@ -30,10 +30,10 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Operator | Doc | Kernel module | Python entry |
 |---|---|---|---|
-| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/kernels/quantize/` | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
-| GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/kernels/gemm/` | adapter `astrai/extension/ops/gemm.py` |
-| Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/kernels/attention/` | `astrai/extension/ops/attention.py`; dispatch `astrai/extension/backend/attention.py` |
-| Rotary embedding | [rotary.md](rotary.md) | `csrc/kernels/rotary_emb.cu` | `astrai/extension/ops/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
+| Quantize (FP8) | [quantize.md](quantize.md) | `csrc/quantize/` (headers: `csrc/include/`) | `astrai/extension/ops/quantize.py`; strategy layer `astrai/extension/quantize.py` (`fp8_autocast`, aten::linear override) |
+| GEMM / Linear (bf16 · fp8 · w8a16 · w8a8) | [gemm.md](gemm.md) | `csrc/gemm/` (headers: `csrc/include/`) | adapter `astrai/extension/ops/gemm.py` |
+| Attention (decode / paged / split-Q prefill, MMA variants) | [attention.md](attention.md) | `csrc/attention/` (headers: `csrc/include/`) | `astrai/extension/ops/attention.py`; dispatch `astrai/extension/backend/attention.py` |
+| Rotary embedding | [rotary.md](rotary.md) | `csrc/rotary_emb.cu` | `astrai/extension/ops/rotary.py`; dispatch `astrai/extension/backend/rotary.py` |
 
 One entry the table does not spell out: `gemm/` also carries the **fp8
 training** linear — `fp8_linear.cu` (the composed forward *and* backward in
@@ -242,7 +242,7 @@ cycle belong under `TYPE_CHECKING`.
 Each `csrc/tests/*.cu` file has the `nvcc` compile command in its header comment. Those lines carry the **reference box's** arch token (`sm_89`); substitute your own — this workspace's box is 8x RTX 5090 (`sm_120`), and an `sm_89` build only runs there through driver JIT. Example:
 
 ```bash
-nvcc -I csrc/kernels -arch=sm_120 -O3 --use_fast_math \
+nvcc -I csrc/include -arch=sm_120 -O3 --use_fast_math \
      --ptxas-options=-O3,-v --extra-device-vectorization \
      -Xcompiler -fopenmp csrc/tests/attn_test.cu -o /tmp/test && /tmp/test
 ```
@@ -257,12 +257,12 @@ Test files:
 
 ### Behavior-preservation gate (SASS digest)
 
-> **Status (2026-09-21): the tool is not in the tree.** `csrc/bench/sass_digest.py`
-> is cited below and in the workspace `notes/` as the adjudication gate for
-> zero-behavior refactors, but no ref of this repository has ever carried it
-> (`warp_report.py`, the other tool those notes call lost, *is* recoverable —
-> `git show backup/pre-squash-supply:csrc/bench/warp_report.py`). Rebuild it
-> from the description below before quoting it as a gate.
+> **Status (2026-09-26): the tool is in the tree** (`csrc/bench/sass_digest.py`,
+> 283 lines, retrieved from `backup/csrc-stage-relayout` and extended with
+> `--normalize-anon`: nvcc re-hashes a TU's on-disk path into the
+> anonymous-namespace segment of its symbols, so a pure file move keeps every
+> SASS body identical while renaming six symbols — that mode strips the
+> segment and is the adjudication form for move-only refactors).
 
 A refactor that claims to change nothing must prove it: `csrc/bench/sass_digest.py`
 hashes every kernel symbol's SASS (`cuobjdump -sass`) out of the compile-tree
@@ -294,7 +294,7 @@ median, one fact one home).
 
 Reproduce (decode + prefill in `attn_test.cu`, paged in `attn_paged_test.cu`):
 ```bash
-nvcc -I csrc/kernels -arch=sm_120 -O3 --use_fast_math \
+nvcc -I csrc/include -arch=sm_120 -O3 --use_fast_math \
      --ptxas-options=-O3,-v --extra-device-vectorization \
      -Xcompiler -fopenmp csrc/tests/attn_test.cu -o /tmp/test && /tmp/test
 ```
@@ -314,99 +314,104 @@ locally before acting on them.
 csrc/
 ├── CMakeLists.txt                    # CMake build: the KERNEL_MODULES registry (module name | its source TUs) + torch/pybind11 linking
 ├── __init__.py                       # build-time marker only (keeps `csrc` a setuptools package)
+├── include/                          # THE include root: every header, angle-bracket root-qualified (<kernel/gemm.cuh>)
+│   ├── policy.cuh                    #   cross-cutting: tile vocabulary + smem budget + GemmPolicy/manifests AND the runtime planning vocabulary (GemmRecipe/PlanQuery/GemmPerfClass/PlanDecision, GemmConfig + the three launch-side knobs)
+│   ├── scheduler.cuh                 #   cross-cutting: grouped/plain raster mapping
+│   ├── kernel/                       # entry __global__ and their composition (humming's rule: what the code IS, not which family owns it)
+│   │   ├── gemm.cuh                  #     GEMM orchestrator + launch machinery (no torch; reaches the planner through policy.cuh declarations)
+│   │   ├── gemm_mainloop.cuh         #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
+│   │   ├── attention_dispatch.cuh    #     pure-CUDA launchers: dispatch_decode/prefill(_impl) funnel (+paged), split-K math
+│   │   ├── attention_decode_split_kv.cuh / _mma.cuh      # decode kernel, scalar / MMA (split-KV)
+│   │   ├── attention_prefill_split_q.cuh / _mma.cuh      # prefill kernel, scalar / MMA (split-Q, GQA head packing)
+│   │   └── quantize.cuh              #     quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
+│   ├── memory/                       # data movement with stage semantics
+│   │   ├── load.cuh                  #     gemm operand loaders (typed staged tiles, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
+│   │   ├── pipeline.cuh              #     raw cp.async 16B emitters + mbarrier PTX sites + PipelineSync stage pipeline
+│   │   ├── tma.cuh                   #     TMA staging (sm_90+): device cp.async.bulk.tensor emitters + host tensor-map encoding + exact-match cache
+│   │   └── layout_policies.cuh       #     attention KV addressing: DenseQSchedule/PackedQSchedule, ContigKV/PagedKV
+│   ├── mma/                          # tensor-core backends and fragment helpers
+│   │   ├── mma.cuh                   #     shared mma_sync<InT> + shapes + ldmatrix cores + typed fragment cells
+│   │   └── utils.cuh                 #     attention's ldmatrix/pack helpers + online-softmax tile path
+│   ├── epilogue/                     # moving/merging/writing results out
+│   │   └── writer.cuh                #     gemm fused bias + scale folding + bf16/fp32 smem scatter + copy-out
+│   ├── arith/                        # value transforms on register fragments
+│   │   ├── softmax.cuh               #     shared online-softmax recurrence (scalar kernels, MMA tile, split-KV combine)
+│   │   └── reduce.cuh                #     warp_reduce_max, atomic_max_float
+│   ├── datatype/                     # dtype traits and dequant primitives (stage-agnostic)
+│   │   └── dequant.cuh               #     in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
+│   ├── utils/                        # stage-agnostic vocabulary — the sink of the include graph
+│   │   ├── device.cuh                #     DeviceFacts geometry query (sms / smem opt-in / L2)
+│   │   ├── dtype.cuh                 #     element-type words (aliases + ElemTrait, torch at::ScalarType naming)
+│   │   ├── launch.cuh                #     launch-and-check macros, pure C
+│   │   ├── shape.cuh / swizzle.cuh / tensor.cuh   # static geometry / staging swizzle / Tensor<Engine, Layout>
+│   │   ├── gemm_common.h             #     layout tags, gemm_elem_traits, gemm_mma_traits, GemmParams POD
+│   │   ├── attention_common.h        #     AttentionParams POD, TensorLayout enum
+│   │   └── quantize_common.h         #     sm_at_least + kMinSmForFp8, QuantLayout, RingLayout, QuantParams POD
+│   └── launcher/                     # THE HOST SURFACE — the only directory whose headers may touch torch/ATen/c10/Python
+│       ├── api.h                     #     gemm C++ surface (declarations only, no py:: type)
+│       ├── planning.h                #     the planner chain + recipe vocabulary + plan_raster; plan_dispatch defined non-inline — SINGLE-INCLUSION (one TU per binary: gemm.cu or a standalone harness)
+│       ├── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded sources + GemmConfig seed
+│       ├── fp8_state.h               #     delayed-scaling rings, version-keyed weight cast cache, the meta registry + checkpoint snapshot/restore
+│       ├── checks.h                  #     quantize torch-bound entry validation (check_fp8_device)
+│       ├── launch.h                  #     quantize launcher + composed one-call API (torch-tensor level, no pybind)
+│       ├── dtype_list.h              #     attention ASTRAI_ATTN_DTYPE_LIST + c10 dispatch entries
+│       ├── entry_utils.h             #     attention torch binding helpers (DISPATCH_HEAD_DIM, pack_*_params)
+│       └── gated_deltanet.h          #     the family's two entry declarations (torch::Tensor signatures)
+├── attention/                        # family translation units only
+│   ├── decode.cu                     #   → module attn_decode
+│   ├── prefill.cu                    #   → module attn_prefill
+│   ├── paged_decode.cu               #   → module attn_paged_decode
+│   └── paged_prefill.cu              #   → module attn_paged_prefill
+├── gemm/                             # family translation units only (→ module gemm)
+│   ├── gemm.cu                       #   typed host layer: dtype-pair registry + api.h implementations + the ONE planning.h includer
+│   ├── bindings.cu                   #   pybind surface: marshalling, dict shapes, PYBIND11_MODULE
+│   ├── fp8_linear.cu                 #   the fp8 training linear (fwd+bwd) as one C++ autograd::Function
+│   └── gemm_bf16_* / gemm_*.cu       #   per-pair explicit gemm_dispatch instantiation units (one nvcc job each; plan_table-free)
+├── quantize/quantize.cu              # binding only (module quantize)
+├── gated_deltanet/                   # chunked GDN fwd/bwd kernels written in-TU + bindings.cu (→ module gated_deltanet)
+├── rotary_emb.cu                     # rotary embedding (kernel + binding in one file) → module rotary_emb
 ├── bench/                            # measurement + dispatch-analysis tooling, run from the repo root as `python csrc/bench/<tool>.py`
-│   ├── bench_tile_sweep.cu           #   cell-level tile/warp/kK sweep; compiles standalone from the nvcc line in its header (no CMake target), optional -DASTRAI_SWEEP_INT8 / _MIXED
-│   ├── benchmark_attention.py        #   the four attention kernels vs a single-launch torch SDPA
-│   ├── benchmark_layouts.py          #   the four operand layouts (NT/NN/TT/TN) end-to-end through the production dispatch
-│   ├── benchmark_logprobs_chunked.py #   interleaved A/B, full-tensor vs chunked no-grad logprobs (the RL path)
-│   ├── benchmark_quant_gemm.py       #   every dtype pair vs bf16 `F.linear` (the W16A16/W8A16/W8A8 grid)
-│   ├── benchmark_quantize_kernel.py  #   ncu target for the fp8 quantize kernels (pinned-clock cold-cache duration)
-│   ├── benchmark_rotary.py           #   fused rotary vs the torch fallback
+│   ├── bench_tile_sweep.cu           #   cell-level tile/warp/kK sweep; standalone nvcc line in its header (no CMake target)
+│   ├── benchmark_*.py                #   attention / layouts / logprobs / quant_gemm / quantize / rotary / gdn_ops benchmarks
 │   ├── diff_rows.py                  #   plan rows as the measured DIFF of the model, interleaved A/B — the row-emission gate
-│   ├── dispatch_grid.py              #   map the dispatch logic over a dense (m, n, k) grid, host-only, no launches
+│   ├── dispatch_grid.py              #   map the dispatch logic over a dense (m, n, k) grid, host-only
 │   ├── model_capture.py              #   offline capture harness: score a planner rule against saved measurements
+│   ├── sass_digest.py                #   the zero-behavior-refactor gate (per-symbol SASS digest; --normalize-anon for move-only refactors)
 │   └── tune_plan_table.py            #   plan-table pipeline: sweep candidates / validate holdouts / install rows
-├── kernels/
-│   ├── common/                       # cross-family pure-CUDA helpers (no torch)
-│   │   ├── device.cuh                #   DeviceFacts geometry query (sms / smem opt-in / L2); fp8 capability helpers live in quantize/common.h, the torch-bound gate in quantize/checks.h
-│   │   ├── mma.cuh                   #   shared mma_sync<InT> + mma_shape<InT> (bf16 m16n8k16 / fp8 m16n8k32) + ldmatrix_x2<T> and the per-lane ldmatrix cores + typed fragment cells (AFrag/BFrag/CFrag, by-reference fma/ldmatrix overloads)
-│   │   ├── pipeline.cuh              #   async data-movement vocabulary, one header: raw cp.async 16B emitters (fixed + runtime-src-size zfill) and the mbarrier PTX sites, plus the PipelineSync (sm_80/89 wait_group+syncthreads) stage pipeline
-│   │   ├── swizzle.cuh               #   staging-layout vocabulary: Swizzle/Shape/Stride/Layout + composition(Swizzle, Layout) in 16B-chunk units; per-tile SmemLayout types declared by the gemm collectives
-│   │   ├── tensor.cuh                #   tensor vocabulary, cute's Tensor<Engine, Layout>: PtrEngine/ArrayEngine, RingLayout/CellLayout, one Tensor type spelled directly (make_ring constructs the stage ring, stage_of slices a slot)
-│   │   ├── reduce.cuh                #   warp_reduce_max, atomic_max_float
-│   │   ├── shape.cuh                 #   static-geometry vocabulary: variadic Shape<...> + log2_const, split out of swizzle.cuh so mma/policy/epilogue spell a geometry without pulling the swizzle machinery in
-│   │   ├── launch.cuh                #   launch-and-check macros, pure C so csrc/tests and bench_tile_sweep share the production launch discipline (a rejected launch fails loudly instead of timing as a ~3us no-op)
-│   │   └── tma.cuh                   #   TMA staging (sm_90+): device cp.async.bulk.tensor emitters + mbarrier sites, host-side tensor-map encoding and its exact-match cache
-│   ├── attention/                    # attention family (module names keep the attn_* prefix)
-│   │   ├── common.h                  #   AttentionParams POD, TensorLayout enum (BHLD/BLHD)
-│   │   ├── softmax.cuh               #   shared online-softmax recurrence: one sentinel policy (SoftmaxState) for the scalar kernels, the MMA tile softmax and the split-KV combine
-│   │   ├── layout_policies.cuh       #   KV addressing policies: DenseQSchedule/PackedQSchedule, ContigKV/PagedKV
-│   │   ├── mma_utils.cuh             #   ldmatrix/pack helpers + online-softmax (bf16 mma via common/mma.cuh)
-│   │   ├── entry_utils.cuh           #   torch binding helpers: DISPATCH_HEAD_DIM, pack_*_params
-│   │   ├── dispatchers.cuh           #   pure-CUDA launchers: dispatch_decode/prefill(_impl) funnel (+paged), split-K math
-│   │   ├── decode_split_kv.cuh       #   decode kernel, scalar (split-KV)
-│   │   ├── decode_split_kv_mma.cuh   #   decode kernel, MMA + split-K
-│   │   ├── prefill_split_q.cuh       #   prefill kernel, scalar (split-Q)
-│   │   ├── prefill_split_q_mma.cuh   #   prefill kernel, MMA (split-Q, GQA head packing, packed/ragged Q schedule)
-│   │   ├── decode.cu                 #   → module attn_decode
-│   │   ├── prefill.cu                #   → module attn_prefill
-│   │   ├── paged_decode.cu           #   → module attn_paged_decode
-│   │   └── paged_prefill.cu          #   → module attn_paged_prefill
-│   ├── rotary_emb.cu                 # rotary embedding (kernel + binding in one file) → module rotary_emb
-│   ├── quantize/                     # quantize family (pure CUDA; checks.h is the torch-bound gate)
-│   │   ├── common.h                  #   sm_at_least + kMinSmForFp8 capability helpers, QuantLayout, RingLayout (the ring's slot offsets), QuantParams POD (raw __nv_fp8_* types)
-│   │   ├── checks.h                  #   torch-bound entry validation (check_fp8_device over ATen-cached properties)
-│   │   ├── dequant.cuh               #   in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
-│   │   ├── quantize.cuh              #   quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
-│   │   ├── launch.cuh                #   launcher + the composed one-call API, torch-tensor level with no pybind: the ring layout, dtype dispatch and output allocation that the bindings and the fp8 linear share
-│   │   └── quantize.cu               #   binding only (module quantize): validation, param packing, launch dispatch, pybind
-│   ├── gemm/                         # GEMM family, dtype-neutral (→ module gemm)
-│   │   ├── common.h                  #   layout tags, gemm_elem_traits<T>, gemm_mma_traits (MmaT promotion), GemmParams POD (no torch)
-│   │   ├── api.h                     #   the family's C++ surface (declarations only, template-free — including it instantiates no dtype-pair kernel): quant_gemm_impl, the planner face (PlanProbe / probe / GemmConfigPatch+configure), the vocabulary — no Python type in a signature
-│   │   ├── gemm.cuh                  #   GEMM umbrella: kernel orchestrator + host launch planning (no torch)
-│   │   ├── policy.cuh                #     Shape/TileConfig tile recipes + smem budget + GemmPolicy + TileManifest (+ kTileClassCta)
-│   │   ├── plan_table.h              #     AOT dispatch rows (TableRow): override/per-class builtin/degraded row sources
-│   │   ├── load.cuh                  #     operand loaders (typed staged tiles over declared layouts, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)
-│   │   ├── scheduler.cuh             #     grouped/plain raster mapping
-│   │   ├── mainloop.cuh              #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
-│   │   ├── epilogue.cuh              #     fused bias + scale folding + bf16/fp32 smem scatter + copy-out
-│   │   ├── fp8_linear.cu             #   the fp8 training linear (forward *and* backward) as one C++ autograd::Function: quantize rings, the pre-quantized GEMMs, the ring advance — it lives in this module because the module owns the dispatch state
-│   │   ├── fp8_state.cuh             #   what that function keeps between calls: the delayed-scaling rings (double-buffered scale pairs), the version-keyed weight cast cache, the meta registry + its checkpoint snapshot/restore
-│   │   ├── gemm_bf16_* / gemm_*.cu   #     per-pair explicit gemm_dispatch instantiation units (one nvcc job each)
-│   │   ├── gemm.cu                   #   typed host layer: dtype-pair registry + the api.h implementations (no py:: type)
-│   │   └── bindings.cu               #   pybind surface (module gemm): argument marshalling, the dict shapes of both directions (the state report's keys + the config patch's kPatchKeys table), PYBIND11_MODULE
 └── tests/
-    ├── test_utils.cuh                # Shared test utilities (now_ms, f2bf, bf2f, randf)
-    ├── attn_test.cu                  # Decode + prefill kernels
-    ├── attn_paged_test.cu            # Paged decode/prefill kernels
-    └── quant_gemm_test.cu           # GEMM correctness: fp8/bf16/int8 pairs across layouts/K tiles/ragged shapes + dtype-combo TFLOPS bench
+    ├── test_utils.cuh                # shared test utilities (now_ms, f2bf, bf2f, randf) — harness-local, outside the include root
+    ├── attn_test.cu                  # decode + prefill kernels
+    ├── attn_paged_test.cu            # paged decode/prefill kernels
+    └── quant_gemm_test.cu            # GEMM correctness + TFLOPS bench (includes launcher/planning.h: single-TU, torch-free)
 ```
 
 Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
 
-Three conventions the tree encodes. (1) A family folder holds the device
-headers **and** the entry `.cu` that binds them — attention is the model
-(four thin entry TUs over `dispatchers.cuh`); gemm is the outlier: its typed
-host layer (`gemm.cu` — the dtype-pair registry and the `api.h`
-implementations) is split from its pybind surface (`bindings.cu`), and each
-per-dtype instantiation gets its own nvcc job. (2) The standalone C++ harnesses (`csrc/tests/*.cu`,
-`bench/bench_tile_sweep.cu`) stay out of the CMake registry on purpose: each
-carries its own `nvcc` line so a correctness test can run without torch.
-The `bench/` python tools are the reproduce path for the numbers quoted in
-the operator docs and in the workspace `notes/` — a tool cited as a *gate*
-belongs in the tree, not in a scratch directory. (3) **One include root,
-`csrc/kernels`, and every project include spelled from it in full**
-(`"gemm/mainloop.cuh"`, `"common/mma.cuh"`) rather than by bare file name:
-three headers are called `common.h` and two `launch.cuh`, so a bare include's
-meaning would depend on the directory it happens to sit in and a file move
-could silently retarget it. The one exception is the harness-local
-`test_utils.cuh`, which lives in `csrc/tests/` outside the root and reaches
-`bench/bench_tile_sweep.cu` through that harness's extra `-I csrc/tests`.
-`tests/extension/test_csrc_layout.py` pins the convention — the include-root
-directory set is closed, every project include is root-qualified and resolves
-to exactly one file, and the headers that include torch are exactly the
-declared host surface (that split is what keeps the `csrc/tests/*.cu`
-harnesses torch-free). A new family directory is registered in that test's
-`KERNEL_DIRS` and in this section together.
+Three conventions the tree encodes. (1) **Stages, not families**: headers
+live under `csrc/include/<stage>/` by what they do (kernel / memory / mma /
+epilogue / arith / datatype / utils), the family directories hold only
+translation units, and `launcher/` is the host surface — the only directory
+whose headers may touch torch, which is what keeps the standalone
+`csrc/tests/*.cu` harnesses torch-free. The gemm→quantize include edges
+that forced a family-qualified tree before (`mainloop → dequant`,
+`fp8_linear → quantize launch`) are plain kernel→datatype and TU→launcher
+edges now. (2) The standalone harnesses stay out of the CMake registry on
+purpose: each carries its own `nvcc` line so a correctness test runs
+without torch; the `bench/` python tools are the reproduce path for the
+numbers in the operator docs and workspace `notes/`. (3) **One include
+root, `csrc/include`, every project include angle-bracket and
+root-qualified** (`<kernel/gemm.cuh>`, `<policy.cuh>`); quoted includes are
+the toolchain's plus the harness-local `test_utils.cuh`. A quoted project
+path would resolve through the includer's own directory first and silently
+change meaning on a move — the three same-named `common.h` are now
+`utils/{gemm,attention,quantize}_common.h` precisely so a spelling names
+one file. `tests/extension/test_csrc_layout.py` pins all of this — the
+stage set is closed, stage headers never include `launcher/` (zero
+exceptions since the planning split), `launcher/planning.h` has exactly one
+includer per binary, every project include is root-qualified, unshadowed
+and resolvable, and the harnesses stay torch-free. A new stage directory is
+registered in that test's `STAGES` and in this section together.
 
-> Document Update Time: 2026-09-25
+Compiled `.so` files are placed in `astrai/extension/lib/`, separate from Python source files.
+
+> Document Update Time: 2026-09-26

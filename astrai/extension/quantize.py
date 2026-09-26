@@ -1,7 +1,7 @@
 """Quantization: every scheme's policy and integration in one module.
 
 The policy layer over the kernel side's single quantize family
-(``csrc/kernels/quantize/`` — the fp8 quantize kernels plus the int8
+(``csrc/quantize/`` — the fp8 quantize kernels plus the int8
 dequant the GEMM family consumes). Stateless kernel adapters live one
 layer down (``ops/quantize.py`` / ``ops/gemm.py`` — the only modules
 touching the pybind).
@@ -22,7 +22,7 @@ FP8 (training stack):
 
 - ``FP8Recipe`` — scaling recipes (TE-style delayed scaling over an amax
   history window, or dynamic current-amax scaling)
-- ``gemm.fp8_linear`` (``csrc/kernels/gemm/fp8_linear.cu``) — the
+- ``gemm.fp8_linear`` (``csrc/gemm/fp8_linear.cu``) — the
   composed fwd+bwd: quantize, ring fold/advance, the weight-cast cache
   and all three GEMMs run in C++ behind a single Python->C++ crossing
 - ``fp8_autocast`` — the torch.autocast-style context (plus the
@@ -164,7 +164,7 @@ _active_config: ContextVar[_ActiveConfig | None] = ContextVar(
 # machine owned — the per-weight meta registry (delayed-scaling rings, the
 # version-keyed weight-cast cache, the checkpoint pending queue, the
 # generation counter invalidating that cache) — lives in the C++ op's
-# translation unit (``csrc/kernels/gemm/fp8_linear.cu``). A meta is addressed
+# translation unit (``csrc/gemm/fp8_linear.cu``). A meta is addressed
 # by its module's *slot* when the dispatcher knows one (``fp8_slots``: a
 # stable module path, so a replaced weight parameter keeps its history) and by
 # ``(data_ptr, shape, dtype)`` otherwise; the snapshot binds slotted entries by

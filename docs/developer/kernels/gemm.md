@@ -43,7 +43,7 @@ module), and `astrai/extension/quantize.py` is the strategy layer (fp8
 recipes, delayed / dynamic scaling, `fp8_autocast`, plus the int8
 quantizers). The composed fp8 linear — quantize, ring fold/advance, the
 weight-cast cache and all three GEMMs — lives in C++
-(`csrc/kernels/gemm/fp8_linear.cu`, compiled into the `gemm` module
+(`csrc/gemm/fp8_linear.cu`, compiled into the `gemm` module
 where the GEMM dispatch state lives) behind a single Python->C++ crossing;
 the strategy layer routes `aten::linear` to it on CUDA. The aten override
 installs lazily on the first fp8 activation (autocast enter or the global

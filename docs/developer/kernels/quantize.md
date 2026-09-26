@@ -1,6 +1,6 @@
 # Quantize (FP8)
 
-> Kernel modules `csrc/kernels/quantize/`; python adapters in
+> Kernel modules `csrc/quantize/`; python adapters in
 > `astrai/extension/ops/quantize.py`, strategy layer (recipes,
 > `fp8_autocast`, aten::linear override) in
 > `astrai/extension/quantize.py`.

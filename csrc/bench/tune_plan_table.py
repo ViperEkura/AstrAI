@@ -14,7 +14,7 @@ standalone scripts had.
 
 Row tables are served at runtime through ``ops.gemm.set_table`` (no
 rebuild, no environment variable); an emitted row file can also be pasted
-into csrc/kernels/gemm/plan_table.h's GENERATED block, which does require a
+into csrc/include/launcher/plan_table.h's GENERATED block, which does require a
 rebuild. The special ``model`` candidate measures every row tier off (the
 degraded rows) — the reference of the min-gain mode.
 """

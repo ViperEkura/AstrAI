@@ -44,7 +44,7 @@ FP8_FORMATS = (
 )
 
 # Every dtype pairing the gemm dispatch instantiates (find_gemm_dispatch in
-# csrc/kernels/gemm/gemm.cu): each row names the cell, then the activation
+# csrc/gemm/gemm.cu): each row names the cell, then the activation
 # and weight kinds. Asymmetric low-bit mixes — int8 x fp8, mismatched fp8
 # formats, quantized acts against bf16 weights — have no kernel and no row.
 GEMM_COMBOS = (

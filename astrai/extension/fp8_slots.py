@@ -1,6 +1,6 @@
 """Slot addressing for the fp8 per-module state.
 
-The C++ op (``csrc/kernels/gemm/fp8_linear.cu``) keeps per-weight state —
+The C++ op (``csrc/gemm/fp8_linear.cu``) keeps per-weight state —
 three delayed-scaling rings, the version-keyed weight-cast cache — in a
 process-wide registry. Its *original* key is the weight's
 ``(data_ptr, shape, dtype)``, discovered lazily on first use, and its

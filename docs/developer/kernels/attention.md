@@ -1,6 +1,6 @@
 # Attention
 
-> Kernel modules `csrc/kernels/attention/` (module list in the [family overview](README.md#overview)); 
+> Kernel modules `csrc/attention/` (module list in the [family overview](README.md#overview)); 
 > python adapters in `astrai/extension/ops/attention.py`, dispatch policy in `astrai/extension/backend/attention.py`.
 
 ## Attention Backend
@@ -177,7 +177,7 @@ decode bandwidth reduction.
 
 ## Gated DeltaNet CUDA kernels
 
-`csrc/kernels/gated_deltanet/` holds the kernels that had to be CUDA. The module
+`csrc/gated_deltanet/` holds the kernels that had to be CUDA. The module
 is `gated_deltanet` and exposes `gated_deltanet_fwd` and `gated_deltanet_bwd`; the
 Python wrappers live in `astrai/extension/ops/gdn.py`, where `gdn_fwd` mirrors the
 entry point it calls.

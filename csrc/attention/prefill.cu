@@ -1,8 +1,10 @@
-// GQA prefill flash attention, contiguous K/V — the torch entry.
-// Device-side code (kernels, launchers, dispatchers) is in
-// kernel/attention_launch.cuh + kernel/attention_prefill_split_q_mma.cuh.
+// GQA prefill flash attention, contiguous K/V — the implementation
+// of the entry declared in launcher/attention.h (the gated_deltanet_fwd.cu
+// shape). Device-side code (kernels, launchers, dispatchers) is in
+// kernel/attention_launch.cuh + kernel/attention_split_q.cuh.
 
 #include <kernel/attention_launch.cuh>
+#include <launcher/attention.h>
 #include <launcher/dtype_list.h>
 #include <launcher/entry_utils.h>
 
@@ -48,5 +50,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("causal_offset") = -1,
         py::arg("scale") = 0.0,
         py::arg("layout") = (int64_t)BHLD,
-        "GQA prefill (tensor-core mma on sm_80+, scalar fallback)");
+        "GQA prefill (tensor-core mma on sm_80+)");
 }

@@ -1,8 +1,10 @@
 // SGLang-style paged GQA decode (flat KV pool + req_to_token + kv_indptr)
-// — the torch entry. Device-side code (kernels, launchers, dispatchers) is
-// in kernel/attention_launch.cuh + kernel/attention_decode_split_kv_mma.cuh.
+// — the implementation of the entry declared in launcher/attention.h.
+// Device-side code is in kernel/attention_launch.cuh +
+// kernel/attention_split_kv.cuh.
 
 #include <kernel/attention_launch.cuh>
+#include <launcher/attention.h>
 #include <launcher/dtype_list.h>
 #include <launcher/entry_utils.h>
 

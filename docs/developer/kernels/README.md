@@ -308,8 +308,8 @@ csrc/
 │   │   ├── gemm.cuh                  #     GEMM orchestrator + launch machinery (no torch; reaches the planner through policy.cuh declarations)
 │   │   ├── gemm_mainloop.cuh         #     stage rings + pipelined mma.sync mainloop (+ dequantized fragment paths)
 │   │   ├── attention_launch.cuh      #     pure-CUDA launch vocabulary: launchers + tile-config maps + dispatch_decode/prefill(_paged) funnels, split-K math
-│   │   ├── attention_decode_split_kv.cuh / _mma.cuh      # decode kernel, scalar / MMA (split-KV)
-│   │   ├── attention_prefill_split_q.cuh / _mma.cuh      # prefill kernel, scalar / MMA (split-Q, GQA head packing)
+│   │   ├── attention_split_kv.cuh    #     decode kernel (split-KV FlashDecoding, GQA head packing) + split-combine
+│   │   ├── attention_split_q.cuh     #     prefill kernel (split-Q, GQA head packing)
 │   │   └── quantize.cuh              #     quantize kernels: vectorized + 64×32-tile transpose (out_layout 0/1/2, Dual as a template param)
 │   ├── memory/                       # data movement with stage semantics
 │   │   ├── load.cuh                  #     gemm operand loaders (typed staged tiles, congruous cp.async + zfill, crosswise direct, trans staging, PrefetchCarry)

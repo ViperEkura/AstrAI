@@ -3,7 +3,7 @@
 // maps, and the four family dispatchers. Pure CUDA, no torch: the standalone
 // harnesses compile the exact code the production dispatch runs, and each
 // production .cu is then exactly one torch-facing function. Kernel bodies
-// live in kernel/attention_{prefill_split_q,decode_split_kv}_mma.cuh.
+// live in kernel/attention_split_{q,kv}.cuh.
 
 #pragma once
 
@@ -13,8 +13,8 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 
-#include <kernel/attention_decode_split_kv_mma.cuh>
-#include <kernel/attention_prefill_split_q_mma.cuh>
+#include <kernel/attention_split_kv.cuh>
+#include <kernel/attention_split_q.cuh>
 #include <memory/layout_policies.cuh>
 #include <utils/attention_common.h>
 #include <utils/launch.cuh>

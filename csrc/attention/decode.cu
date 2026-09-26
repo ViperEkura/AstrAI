@@ -1,8 +1,10 @@
-// GQA decode (split-KV FlashDecoding), contiguous K/V — the torch entry.
-// Device-side code (kernels, launchers, dispatchers) is in
-// kernel/attention_launch.cuh + kernel/attention_decode_split_kv_mma.cuh.
+// GQA decode (split-KV FlashDecoding), contiguous K/V — the implementation
+// of the entry declared in launcher/attention.h (the gated_deltanet_fwd.cu
+// shape). Device-side code (kernels, launchers, dispatchers) is in
+// kernel/attention_launch.cuh + kernel/attention_split_kv.cuh.
 
 #include <kernel/attention_launch.cuh>
+#include <launcher/attention.h>
 #include <launcher/dtype_list.h>
 #include <launcher/entry_utils.h>
 
@@ -54,5 +56,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("layout") = (int64_t)BHLD,
         py::arg("o_part_buf") = py::none(),
         py::arg("ml_part_buf") = py::none(),
-        "GQA decode (tensor-core head-packing on sm_80+, scalar fallback)");
+        "GQA decode (tensor-core head-packing on sm_80+)");
 }

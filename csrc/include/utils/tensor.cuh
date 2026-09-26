@@ -19,6 +19,7 @@
 
 #include <cstdint>
 
+#include <utils/define.cuh>
 #include <utils/swizzle.cuh>
 
 namespace astrai {
@@ -31,7 +32,7 @@ template <typename T>
 struct PtrEngine {
     using Elem = T;
     T* ptr;
-    __device__ __forceinline__ T* base() const { return ptr; }
+    DEVICE_FORCEINLINE T* base() const { return ptr; }
 };
 
 // Register-array storage (cute's Array role — an mma fragment cell IS an
@@ -41,12 +42,12 @@ template <typename T, int N>
 struct ArrayEngine {
     using Elem = T;
     T storage[N];
-    __device__ __forceinline__ T& operator[](int i) { return storage[i]; }
-    __device__ __forceinline__ const T& operator[](int i) const {
+    DEVICE_FORCEINLINE T& operator[](int i) { return storage[i]; }
+    DEVICE_FORCEINLINE const T& operator[](int i) const {
         return storage[i];
     }
-    __device__ __forceinline__ T* base() { return storage; }
-    __device__ __forceinline__ const T* base() const { return storage; }
+    DEVICE_FORCEINLINE T* base() { return storage; }
+    DEVICE_FORCEINLINE const T* base() const { return storage; }
 };
 
 // --- layouts (the tensor's address maps; chunk-grid ops are dtype-blind) -----
@@ -62,7 +63,7 @@ struct RingLayout {
     static constexpr int kStageChunks = StageLay_::kRows * StageLay_::kChunks;
     static constexpr int kStageBytes = kStageChunks * 16;
     static constexpr int kTotalBytes = kSlots * kStageBytes;
-    __device__ __forceinline__ uint32_t operator()(uint32_t slot, uint32_t row,
+    DEVICE_FORCEINLINE uint32_t operator()(uint32_t slot, uint32_t row,
                                                    uint32_t chunk) const {
         return slot * (uint32_t)kStageChunks +
                StageLay_{}(row, chunk);
@@ -74,7 +75,7 @@ struct RingLayout {
 template <int kCols>
 struct CellLayout {
     static constexpr bool kChunkUnit = false;
-    __device__ __forceinline__ uint32_t operator()(uint32_t m,
+    DEVICE_FORCEINLINE uint32_t operator()(uint32_t m,
                                                    uint32_t n) const {
         return m * (uint32_t)kCols + n;
     }
@@ -109,7 +110,7 @@ struct Tensor {
     // regressed W8A8 up to +29%; see docs/developer/cuda_kernels.md).
     template <bool kChunk = LayoutT::kChunkUnit,
               std::enable_if_t<kChunk, int> = 0>
-    __device__ __forceinline__ Elem* operator()(int row, int col) const {
+    DEVICE_FORCEINLINE Elem* operator()(int row, int col) const {
         constexpr int kShift = log2_const<kChunkElems>::value;
         const uint32_t off =
             (uint32_t)row * (uint32_t)(LayoutT::kChunks * kChunkElems) +
@@ -121,7 +122,7 @@ struct Tensor {
     // Chunk-unit 3-coordinate ring view: layout(slot, row, chunk).
     template <bool kChunk = LayoutT::kChunkUnit,
               std::enable_if_t<kChunk, int> = 0>
-    __device__ __forceinline__ Elem* operator()(int slot, int row,
+    DEVICE_FORCEINLINE Elem* operator()(int slot, int row,
                                                 int col) const {
         constexpr int kShift = log2_const<kChunkElems>::value;
         const typename LayoutT::Stage stage{};
@@ -139,7 +140,7 @@ struct Tensor {
     // accumulator rides non-const references through the mainloop/epilogue.
     template <bool kChunk = LayoutT::kChunkUnit,
               std::enable_if_t<!kChunk, int> = 0>
-    __device__ __forceinline__ Elem* operator()(int m, int n) {
+    DEVICE_FORCEINLINE Elem* operator()(int m, int n) {
         return engine.base() + (size_t)layout((uint32_t)m, (uint32_t)n);
     }
 };
@@ -148,7 +149,7 @@ struct Tensor {
 
 // Construct the staged ring tensor over a raw shared-memory carve.
 template <typename ElemT, typename StageLay, int kSlots>
-__device__ __forceinline__ Tensor<PtrEngine<ElemT>,
+DEVICE_FORCEINLINE Tensor<PtrEngine<ElemT>,
                                  RingLayout<StageLay, kSlots>>
 make_ring(char* smem) {
     return {PtrEngine<ElemT>{reinterpret_cast<ElemT*>(smem)}, {}};
@@ -160,7 +161,7 @@ make_ring(char* smem) {
 // points and the TMA barrier placement measure against RingLayout's byte
 // facts.
 template <typename ElemT, typename StageLay, int kSlots>
-__device__ __forceinline__ Tensor<PtrEngine<ElemT>, StageLay>
+DEVICE_FORCEINLINE Tensor<PtrEngine<ElemT>, StageLay>
 stage_of(const Tensor<PtrEngine<ElemT>, RingLayout<StageLay, kSlots>>& ring,
          int64_t tile) {
     return {PtrEngine<ElemT>{

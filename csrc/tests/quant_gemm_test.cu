@@ -19,6 +19,7 @@ nvcc -I csrc/include -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
 #include <type_traits>
 #include <vector>
 
+#include <utils/define.cuh>
 #include <utils/launch.cuh>
 #include <kernel/gemm.cuh>
 #include <launcher/planning.h>
@@ -48,7 +49,7 @@ inline __nv_bfloat16 to_elem<__nv_bfloat16>(float x) {
     return f2bf(x);
 }
 template <typename ElemT>
-__device__ __forceinline__ float elem2f(ElemT x) {
+DEVICE_FORCEINLINE float elem2f(ElemT x) {
     if constexpr (std::is_same_v<ElemT, __nv_bfloat16>)
         return __bfloat162float(x);
     else

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include <utils/define.cuh>
 #include <utils/quantize_common.h>
 #include <utils/launch.cuh>
 #include <arith/reduce.cuh>
@@ -32,10 +33,10 @@ struct quant_in_traits;
 namespace detail {
 
 // Native 2-lane widen: the single per-dtype intrinsic fact.
-__device__ __forceinline__ float2 widen(__nv_bfloat162 v) {
+DEVICE_FORCEINLINE float2 widen(__nv_bfloat162 v) {
     return __bfloat1622float2(v);
 }
-__device__ __forceinline__ float2 widen(__half2 v) {
+DEVICE_FORCEINLINE float2 widen(__half2 v) {
     return __half22float2(v);
 }
 
@@ -44,7 +45,7 @@ __device__ __forceinline__ float2 widen(__half2 v) {
 template <typename InT, typename PairT>
 struct pair_in_traits {
     using native_pair = PairT;
-    static __device__ __forceinline__ void load_pair(const InT* p,
+     static DEVICE_FORCEINLINE void load_pair(const InT* p,
                                                      float* f) {
         const float2 v = widen(*reinterpret_cast<const PairT*>(p));
         f[0] = v.x;
@@ -57,14 +58,14 @@ struct pair_in_traits {
 template <>
 struct quant_in_traits<__nv_bfloat16>
     : detail::pair_in_traits<__nv_bfloat16, __nv_bfloat162> {
-    static __device__ __forceinline__ float to_float(__nv_bfloat16 v) {
+     static DEVICE_FORCEINLINE float to_float(__nv_bfloat16 v) {
         return __bfloat162float(v);
     }
 };
 
 template <>
 struct quant_in_traits<__half> : detail::pair_in_traits<__half, __half2> {
-    static __device__ __forceinline__ float to_float(__half v) {
+     static DEVICE_FORCEINLINE float to_float(__half v) {
         return __half2float(v);
     }
 };
@@ -72,8 +73,8 @@ struct quant_in_traits<__half> : detail::pair_in_traits<__half, __half2> {
 template <>
 struct quant_in_traits<float> {
     using native_pair = float2;
-    static __device__ __forceinline__ float to_float(float v) { return v; }
-    static __device__ __forceinline__ void load_pair(const float* p,
+     static DEVICE_FORCEINLINE float to_float(float v) { return v; }
+     static DEVICE_FORCEINLINE void load_pair(const float* p,
                                                      float* f) {
         f[0] = p[0];
         f[1] = p[1];
@@ -90,7 +91,7 @@ namespace detail {
 // per format.
 template <__nv_fp8_interpretation_t Fmt>
 struct Fp8PackPair {
-    static __device__ __forceinline__ unsigned pack(float a, float b) {
+     static DEVICE_FORCEINLINE unsigned pack(float a, float b) {
         return static_cast<unsigned>(__nv_cvt_float2_to_fp8x2(
             make_float2(a, b), __NV_SATFINITE, Fmt));
     }
@@ -103,14 +104,14 @@ struct fp8_cvt_traits;
 
 template <>
 struct fp8_cvt_traits<__nv_fp8_e4m3> : detail::Fp8PackPair<__NV_E4M3> {
-    static __device__ __forceinline__ uint8_t cvt(float v) {
+     static DEVICE_FORCEINLINE uint8_t cvt(float v) {
         return __nv_fp8_e4m3(v).__x;
     }
 };
 
 template <>
 struct fp8_cvt_traits<__nv_fp8_e5m2> : detail::Fp8PackPair<__NV_E5M2> {
-    static __device__ __forceinline__ uint8_t cvt(float v) {
+     static DEVICE_FORCEINLINE uint8_t cvt(float v) {
         return __nv_fp8_e5m2(v).__x;
     }
 };
@@ -125,9 +126,9 @@ inline constexpr int kQuantWarps = 8;
 // into the history window, publishes the next scale and the round's amax, then
 // re-zeroes for the next launch.
 template <int kWarps>
-__device__ __forceinline__ void publish_amax(const QuantParams& p,
+DEVICE_FORCEINLINE void publish_amax(const QuantParams& p,
                                              float v) {
-    v = warp_reduce_max(v);
+    v = warp_reduce<maximum<float>>(v);
     __shared__ float slots[kWarps];
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
     if ((tid & 31) == 0) slots[tid >> 5] = v;
@@ -190,13 +191,13 @@ template <typename Fp8TA, typename Fp8TB>
 struct dual_cvt {
     static constexpr bool kMixed = !std::is_same_v<Fp8TA, Fp8TB>;
 
-    static __device__ __forceinline__ void store(uint8_t (*q)[2], uint8_t (*q2)[2],
+     static DEVICE_FORCEINLINE void store(uint8_t (*q)[2], uint8_t (*q2)[2],
                                                  int j, int k, float v) {
         q[j][k] = fp8_cvt_traits<Fp8TA>::cvt(v);
         if constexpr (kMixed) q2[j][k] = fp8_cvt_traits<Fp8TB>::cvt(v);
     }
 
-    static __device__ __forceinline__ void zero(uint8_t (*q)[2], uint8_t (*q2)[2],
+     static DEVICE_FORCEINLINE void zero(uint8_t (*q)[2], uint8_t (*q2)[2],
                                                 int j) {
         q[j][0] = 0;
         q[j][1] = 0;
@@ -206,7 +207,7 @@ struct dual_cvt {
         }
     }
 
-    static __device__ __forceinline__ uint8_t pick(const uint8_t (*q)[2],
+     static DEVICE_FORCEINLINE uint8_t pick(const uint8_t (*q)[2],
                                                    const uint8_t (*q2)[2], int j,
                                                    int k) {
         if constexpr (kMixed) return q2[j][k];

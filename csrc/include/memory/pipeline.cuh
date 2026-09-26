@@ -13,6 +13,7 @@
 #include <cstdint>
 
 #include <cuda_runtime.h>
+#include <utils/define.cuh>
 
 namespace astrai {
 
@@ -25,7 +26,7 @@ namespace astrai {
 // its destination without touching the (possibly out-of-range) source.
 // BypassL1 selects .cg (L2 only, default) vs .ca (L1 + L2).
 template <bool BypassL1 = true>
-__device__ __forceinline__ void cp_async_16_raw(unsigned smem_addr,
+DEVICE_FORCEINLINE void cp_async_16_raw(unsigned smem_addr,
                                                 const void* gmem_ptr,
                                                 int src_size) {
     if constexpr (BypassL1) {
@@ -40,7 +41,7 @@ __device__ __forceinline__ void cp_async_16_raw(unsigned smem_addr,
 // Unconditional 16-byte copy to a generic shared pointer.
 // `T` is the smem element type; only the destination pointer's type matters.
 template <typename T, bool BypassL1 = true>
-__device__ __forceinline__ void cp_async_16(T* smem_ptr,
+DEVICE_FORCEINLINE void cp_async_16(T* smem_ptr,
                                             const void* gmem_ptr) {
     cp_async_16_raw<BypassL1>(__cvta_generic_to_shared(smem_ptr), gmem_ptr,
                               16);
@@ -48,7 +49,7 @@ __device__ __forceinline__ void cp_async_16(T* smem_ptr,
 
 // Predicated: full copy when `pred`, zero-fill otherwise.
 template <typename T, bool BypassL1 = true>
-__device__ __forceinline__ void cp_async_16(T* smem_ptr, const void* gmem_ptr,
+DEVICE_FORCEINLINE void cp_async_16(T* smem_ptr, const void* gmem_ptr,
                                             bool pred) {
     cp_async_16_raw<BypassL1>(__cvta_generic_to_shared(smem_ptr), gmem_ptr,
                               pred ? 16 : 0);
@@ -58,7 +59,7 @@ __device__ __forceinline__ void cp_async_16(T* smem_ptr, const void* gmem_ptr,
 // rest — the k-tail / OOB-row predication form (CUTLASS's zfill iterators):
 // boundary chunks ride the same LDGSTS instead of a scalar fallback loop.
 template <typename T, bool BypassL1 = true>
-__device__ __forceinline__ void cp_async_16(T* smem_ptr, const void* gmem_ptr,
+DEVICE_FORCEINLINE void cp_async_16(T* smem_ptr, const void* gmem_ptr,
                                             int src_bytes) {
     cp_async_16_raw<BypassL1>(__cvta_generic_to_shared(smem_ptr), gmem_ptr,
                               src_bytes);
@@ -68,18 +69,18 @@ __device__ __forceinline__ void cp_async_16(T* smem_ptr, const void* gmem_ptr,
 // shared-memory offset (e.g. a loop-carried swizzled stage address), so
 // steady-state prefetch sites issue one LDGSTS straight from the register.
 template <bool BypassL1 = true>
-__device__ __forceinline__ void cp_async_16(unsigned smem_addr,
+DEVICE_FORCEINLINE void cp_async_16(unsigned smem_addr,
                                             const void* gmem_ptr, bool pred) {
     cp_async_16_raw<BypassL1>(smem_addr, gmem_ptr, pred ? 16 : 0);
 }
 
 // Commit all outstanding cp.async ops of this thread as one group.
-__device__ __forceinline__ void cp_async_commit_group() {
+DEVICE_FORCEINLINE void cp_async_commit_group() {
     asm volatile("cp.async.commit_group;");
 }
 
 // Wait for every committed group (pipeline drain).
-__device__ __forceinline__ void cp_async_wait_all() {
+DEVICE_FORCEINLINE void cp_async_wait_all() {
     asm volatile("cp.async.wait_all;");
 }
 
@@ -87,7 +88,7 @@ __device__ __forceinline__ void cp_async_wait_all() {
 // PTX requires an immediate operand; keep it as a template argument so the
 // stage policy stays compile-time configurable.
 template <int KeepGroups>
-__device__ __forceinline__ void cp_async_wait_group() {
+DEVICE_FORCEINLINE void cp_async_wait_group() {
     static_assert(KeepGroups >= 0 && KeepGroups <= 7,
                   "cp.async.wait_group supports immediates in [0, 7]");
     asm volatile("cp.async.wait_group %0;" :: "n"(KeepGroups));
@@ -105,18 +106,18 @@ template <int Stages>
 struct PipelineSync {
     static_assert(Stages >= 1, "a pipeline needs at least one stage");
 
-    __device__ __forceinline__ void producer_commit() const {
+    DEVICE_FORCEINLINE void producer_commit() const {
         cp_async_commit_group();
     }
 
     // Block until stage slots up to (group_of(tile) - (Stages-1)) landed.
-    __device__ __forceinline__ void consumer_wait() const {
+    DEVICE_FORCEINLINE void consumer_wait() const {
         cp_async_wait_group<Stages - 1>();
         __syncthreads();
     }
 
     // Full drain, epilogue-side.
-    __device__ __forceinline__ void drain() const {
+    DEVICE_FORCEINLINE void drain() const {
         cp_async_wait_all();
         __syncthreads();
     }
@@ -132,7 +133,7 @@ struct PipelineSync {
 // offsets per the PTX spec. Declarations stay visible on every pass
 // (only the asm bodies are guarded) so __global__ templates can name
 // them; the stubs must never execute pre-sm_90.
-__device__ __forceinline__ void mbarrier_init(uint64_t* bar, uint32_t count) {
+DEVICE_FORCEINLINE void mbarrier_init(uint64_t* bar, uint32_t count) {
 #if ASTRAI_MBAR_ENABLED
     const uint32_t addr = __cvta_generic_to_shared(bar);
     asm volatile("mbarrier.init.shared.b64 [%0], %1;" ::"r"(addr), "r"(count));
@@ -146,7 +147,7 @@ __device__ __forceinline__ void mbarrier_init(uint64_t* bar, uint32_t count) {
 // consumer-side release — every thread arrives on the stage's empty
 // barrier after its last fragment read, and the producer waits that
 // barrier's phase before overwriting the slot.
-__device__ __forceinline__ void mbarrier_arrive(uint64_t* bar) {
+DEVICE_FORCEINLINE void mbarrier_arrive(uint64_t* bar) {
 #if ASTRAI_MBAR_ENABLED
     const uint32_t addr = __cvta_generic_to_shared(bar);
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(addr));
@@ -160,7 +161,7 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* bar) {
 // arrival itself. The TMA-issuing producer thread calls this once per
 // stage; expect_tx accumulates, so per-operand barriers can be fed
 // separately.
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* bar,
+DEVICE_FORCEINLINE void mbarrier_arrive_expect_tx(uint64_t* bar,
                                                           uint32_t bytes) {
 #if ASTRAI_MBAR_ENABLED
     const uint32_t addr = __cvta_generic_to_shared(bar);
@@ -175,7 +176,7 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* bar,
 // Phase flip wait: blocks while the barrier's phase bit still equals
 // `parity` (0 on first use of the barrier). Returns once the phase has
 // advanced past it, i.e. the awaited trip completed.
-__device__ __forceinline__ void mbarrier_wait_parity(uint64_t* bar,
+DEVICE_FORCEINLINE void mbarrier_wait_parity(uint64_t* bar,
                                                      uint32_t parity) {
 #if ASTRAI_MBAR_ENABLED
     const uint32_t addr = __cvta_generic_to_shared(bar);

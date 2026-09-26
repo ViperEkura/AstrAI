@@ -6,6 +6,7 @@
 // docs/developer/cuda_kernels.md.
 
 #include <memory/pipeline.cuh>
+#include <utils/define.cuh>
 #include <utils/tensor.cuh>
 
 namespace astrai {
@@ -15,7 +16,7 @@ namespace gemm {
 // often as integers, and a numeric conversion would round the bit pattern away
 // — every packed-grid elementwise path reads bytes through here.
 template <typename ElemT>
-__device__ __forceinline__ unsigned raw_byte(const ElemT& e) {
+DEVICE_FORCEINLINE unsigned raw_byte(const ElemT& e) {
     return *reinterpret_cast<const unsigned char*>(&e);
 }
 
@@ -45,7 +46,7 @@ __device__ __forceinline__ unsigned raw_byte(const ElemT& e) {
 // to one immediate XOR per chunk (see the design notes).
 template <typename SmemLayout, typename ElemT,
           int kThreads, bool kTransposed = false, bool kInterior = false>
-__device__ __forceinline__ void
+DEVICE_FORCEINLINE void
 load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                   const ElemT* __restrict__ operand, int64_t rows,
                   int64_t contract, int64_t ld, int tid, int64_t k_base,
@@ -182,7 +183,7 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     int64_t srcStep = 0;            // per-tile source advance (bytes)
     bool active = true;             // false: bus under-subscribed, no chunks
 
-    __device__ __forceinline__ PrefetchCarry(
+     DEVICE_FORCEINLINE PrefetchCarry(
         const RingT& ring, const ElemT* operand,
         int64_t ld, int64_t blockRow, int tid, int firstTile) {
         const int rRaw = tid / kCpr;
@@ -216,14 +217,14 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
     // Emit this thread's chunks for the current tile; pf false (loop tail)
     // zero-fills into the slot compute(i-1) already released. An inactive
     // thread owns no chunks, so it emits nothing at all.
-    __device__ __forceinline__ void emit(bool pf) const {
+     DEVICE_FORCEINLINE void emit(bool pf) const {
         if (!active) return;
 #pragma unroll
         for (int j = 0; j < kCpt; ++j)
             astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
     }
 
-    __device__ __forceinline__ void advance() {
+     DEVICE_FORCEINLINE void advance() {
         wr += (unsigned)RingT::Layout::kStageBytes;
         if (wr == wrEnd) wr = wr0;
         src += srcStep;
@@ -232,11 +233,11 @@ struct PrefetchCarry<true, RingT, kThreads, kTrans> {
 
 template <typename RingT, int kThreads, bool kTrans>
 struct PrefetchCarry<false, RingT, kThreads, kTrans> {
-    __device__ __forceinline__ PrefetchCarry(
+     DEVICE_FORCEINLINE PrefetchCarry(
         const RingT&, const typename RingT::Elem*, int64_t, int64_t, int,
         int) {}
-    __device__ __forceinline__ void emit(bool) const {}
-    __device__ __forceinline__ void advance() {}
+     DEVICE_FORCEINLINE void emit(bool) const {}
+     DEVICE_FORCEINLINE void advance() {}
 };
 
 // The two arms one 16-row crosswise chunk can take, shared by the general
@@ -249,7 +250,7 @@ struct PrefetchCarry<false, RingT, kThreads, kTrans> {
 // tile. Slow arm (row tail / misaligned base): element-granular gather
 // with per-row predication; contract-tail columns zero-fill.
 template <typename TileT>
-__device__ __forceinline__ void crosswise_perm_span(TileT tile, int rg,
+DEVICE_FORCEINLINE void crosswise_perm_span(TileT tile, int rg,
                                                     int span, const uint4* v) {
     const unsigned* bytes = reinterpret_cast<const unsigned*>(v);
 #pragma unroll
@@ -269,7 +270,7 @@ __device__ __forceinline__ void crosswise_perm_span(TileT tile, int rg,
 }
 
 template <typename TileT, typename ElemT>
-__device__ __forceinline__ void crosswise_gather_span(
+DEVICE_FORCEINLINE void crosswise_gather_span(
     TileT tile, const ElemT* __restrict__ operand, int64_t rows,
     int64_t contract, int64_t ld, int64_t k_base, int64_t r0, int rg,
     int span) {
@@ -307,7 +308,7 @@ __device__ __forceinline__ void crosswise_gather_span(
 // below) which load_crosswise_direct selects; this one covers the bus
 // under-subscription case.
 template <typename SmemLayout, typename ElemT, int kThreads>
-__device__ __forceinline__ void
+DEVICE_FORCEINLINE void
 load_crosswise_direct_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                               const ElemT* __restrict__ operand, int64_t rows,
                               int64_t contract, int64_t ld, int tid,
@@ -390,10 +391,10 @@ struct CrosswiseCarry;
 
 template <typename SmemLayout, typename ElemT, int kThreads>
 struct CrosswiseCarry<SmemLayout, ElemT, kThreads, false> {
-    __device__ __forceinline__ void issue(const ElemT*, int64_t, int64_t,
+     DEVICE_FORCEINLINE void issue(const ElemT*, int64_t, int64_t,
                                           int64_t, int, int64_t, int64_t) {}
     template <typename TileT>
-    __device__ __forceinline__ void commit(TileT, const ElemT*, int64_t,
+     DEVICE_FORCEINLINE void commit(TileT, const ElemT*, int64_t,
                                            int64_t, int64_t, int, int64_t,
                                            int64_t) const {}
 };
@@ -415,7 +416,7 @@ struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
     bool active = false;
     bool fast = false;  // interior + aligned: the arm the carry can stage
 
-    __device__ __forceinline__ void issue(const ElemT* __restrict__ operand,
+     DEVICE_FORCEINLINE void issue(const ElemT* __restrict__ operand,
                                           int64_t rows, int64_t contract,
                                           int64_t ld, int tid, int64_t k_base,
                                           int64_t block_row) {
@@ -454,7 +455,7 @@ struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
     // keeps the synchronous gather so the carry never has to hold
     // predicated state.
     template <typename TileT>
-    __device__ __forceinline__ void commit(TileT tile,
+     DEVICE_FORCEINLINE void commit(TileT tile,
                                            const ElemT* __restrict__ operand,
                                            int64_t rows, int64_t contract,
                                            int64_t ld, int tid, int64_t k_base,
@@ -495,7 +496,7 @@ struct CrosswiseCarry<SmemLayout, ElemT, kThreads, true> {
 // bus thinner than the unit count: any geometry, at element resolution, so
 // the fast carry itself stays predication-free.
 template <typename SmemLayout, typename ElemT, int kThreads>
-__device__ __forceinline__ void
+DEVICE_FORCEINLINE void
 pack_crosswise_general(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                        const ElemT* __restrict__ operand, int64_t rows,
                        int64_t contract, int64_t ld, int tid, int64_t k_base,
@@ -529,10 +530,10 @@ struct PairPackCarry;
 
 template <typename SmemLayout, typename ElemT, int kThreads>
 struct PairPackCarry<SmemLayout, ElemT, kThreads, false> {
-    __device__ __forceinline__ void issue(const ElemT*, int64_t, int64_t,
+     DEVICE_FORCEINLINE void issue(const ElemT*, int64_t, int64_t,
                                           int64_t, int, int64_t, int64_t) {}
     template <typename TileT>
-    __device__ __forceinline__ void commit(TileT, const ElemT*, int64_t,
+     DEVICE_FORCEINLINE void commit(TileT, const ElemT*, int64_t,
                                            int64_t, int64_t, int, int64_t,
                                            int64_t) const {}
 };
@@ -552,7 +553,7 @@ struct PairPackCarry<SmemLayout, ElemT, kThreads, true> {
     bool active = false;
     bool fast = false;
 
-    __device__ __forceinline__ void issue(const ElemT* __restrict__ operand,
+     DEVICE_FORCEINLINE void issue(const ElemT* __restrict__ operand,
                                           int64_t rows, int64_t contract,
                                           int64_t ld, int tid, int64_t k_base,
                                           int64_t block_row) {
@@ -590,7 +591,7 @@ struct PairPackCarry<SmemLayout, ElemT, kThreads, true> {
     // out of run words a = 2j and b = 2j+1 — so one byte-perm per word turns
     // the two runs into the packed row's 32 bytes, no exchange needed.
     template <typename TileT>
-    __device__ __forceinline__ void commit(TileT tile,
+     DEVICE_FORCEINLINE void commit(TileT tile,
                                            const ElemT* __restrict__ operand,
                                            int64_t rows, int64_t contract,
                                            int64_t ld, int tid, int64_t k_base,
@@ -642,7 +643,7 @@ struct PairPackCarry<SmemLayout, ElemT, kThreads, true> {
 // The packed-grid route: the two-phase carry when the bus fits it, the
 // elementwise packed grid otherwise.
 template <typename SmemLayout, typename ElemT, int kThreads>
-__device__ __forceinline__ void
+DEVICE_FORCEINLINE void
 load_crosswise_paired(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                       const ElemT* __restrict__ operand, int64_t rows,
                       int64_t contract, int64_t ld, int tid, int64_t k_base,
@@ -655,7 +656,7 @@ load_crosswise_paired(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
 // The 1-byte route the ladders instantiate: the two-phase carry when the bus
 // fits it, the general grid-stride loader otherwise.
 template <typename SmemLayout, typename ElemT, int kThreads>
-__device__ __forceinline__ void
+DEVICE_FORCEINLINE void
 load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
                       const ElemT* __restrict__ operand, int64_t rows,
                       int64_t contract, int64_t ld, int tid, int64_t k_base,

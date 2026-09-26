@@ -33,10 +33,10 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
+#include <utils/define.cuh>
 #include <utils/shape.cuh>
 #include <utils/tensor.cuh>
 
-#define DEVICE_FORCEINLINE static __device__ __forceinline__
 
 namespace astrai {
 
@@ -112,11 +112,11 @@ struct MmaOp<__nv_bfloat16, __nv_bfloat16, Shape<16, 8, 16>> {
     using AFrag = ArrayEngine<unsigned, kARegs>;
     using BFrag = ArrayEngine<unsigned, kBRegs>;
     using CFrag = ArrayEngine<AccT, kCRegs>;
-    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
+     static DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
                                 const CFrag& c) {
         fma(d.storage, a.storage, b.storage, c.storage);
     }
-    DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
+     static DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],
                                        const unsigned b[2], const float c[4]) {
         static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
                       "bf16 mma.sync requires sm_80+");
@@ -150,13 +150,14 @@ struct MmaOp<__nv_bfloat16, __nv_bfloat16, Shape<16, 8, 16>> {
         using BFrag = ArrayEngine<unsigned, kBRegs>;                        \
         using CFrag = ArrayEngine<AccT, kCRegs>;                            \
         template <int Arch = ASTRAI_DEVICE_ARCH>                            \
-        DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a,               \
-                                    const BFrag& b, const CFrag& c) {       \
+         static DEVICE_FORCEINLINE void fma(                                 \
+            CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {     \
             fma<Arch>(d.storage, a.storage, b.storage, c.storage);          \
         }                                                                   \
         template <int Arch = ASTRAI_DEVICE_ARCH>                            \
-        DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],        \
-                                    const unsigned b[2], const float c[4]) {\
+         static DEVICE_FORCEINLINE void fma(                                 \
+            float d[4], const unsigned a[4],                                \
+            const unsigned b[2], const float c[4]) {                        \
             static_assert(Arch == 0 || Arch >= 890,                         \
                           "fp8 mma.sync requires sm_89+");                  \
             asm volatile(                                                   \
@@ -181,12 +182,13 @@ struct MmaOp<int8_t, int8_t, Shape<16, 8, 32>> {
     using AFrag = ArrayEngine<unsigned, kARegs>;
     using BFrag = ArrayEngine<unsigned, kBRegs>;
     using CFrag = ArrayEngine<AccT, kCRegs>;
-    DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b,
-                                const CFrag& c) {
+     static DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a,
+                                       const BFrag& b, const CFrag& c) {
         fma(d.storage, a.storage, b.storage, c.storage);
     }
-    DEVICE_FORCEINLINE void fma(int32_t d[4], const unsigned a[4],
-                                       const unsigned b[2], const int32_t c[4]) {
+     static DEVICE_FORCEINLINE void fma(int32_t d[4], const unsigned a[4],
+                                       const unsigned b[2],
+                                       const int32_t c[4]) {
         static_assert(ASTRAI_DEVICE_ARCH == 0 || ASTRAI_DEVICE_ARCH >= 800,
                       "s8 mma.sync requires sm_80+");
         asm volatile(
@@ -223,13 +225,14 @@ struct MxMmaOp;
         using BFrag = ArrayEngine<unsigned, kBRegs>;                        \
         using CFrag = ArrayEngine<AccT, kCRegs>;                            \
         template <int Family = ASTRAI_ARCH_FAMILY>                          \
-        DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a,               \
-                                    const BFrag& b, const CFrag& c) {       \
+         static DEVICE_FORCEINLINE void fma(                                 \
+            CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {     \
             fma<Family>(d.storage, a.storage, b.storage, c.storage);        \
         }                                                                   \
         template <int Family = ASTRAI_ARCH_FAMILY>                          \
-        DEVICE_FORCEINLINE void fma(float d[4], const unsigned a[4],        \
-                                    const unsigned b[2], const float c[4]) {\
+         static DEVICE_FORCEINLINE void fma(                                 \
+            float d[4], const unsigned a[4],                                \
+            const unsigned b[2], const float c[4]) {                        \
             if constexpr (Family >= 1200) {                                 \
                 constexpr uint32_t sf_one = 0x7f7f7f7fu; /* ue8m0 1.0 x4 */ \
                 const uint16_t sel = 0;                                     \
@@ -269,7 +272,7 @@ struct mma_shape {
 // MmaShapeFor<InT>::kMinArch is a **compile error** — the instruction does
 // not exist there, and a silent no-op would produce wrong results.
 template <typename InT>
-DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
+ static DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
                                  const unsigned b[2],
                                  const float c[4]) {
     static_assert(ASTRAI_DEVICE_ARCH == 0 ||
@@ -312,7 +315,7 @@ DEVICE_FORCEINLINE void mma_sync(float d[4], const unsigned a[4],
 // reads its fragments through it. (ldmatrix is a b16-only instruction:
 // 8-bit crosswise operands keep the PRPT staging + plain loads.)
 template <bool Trans = false>
-DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
+ static DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
                                          unsigned addr) {
     if constexpr (Trans) {
         asm volatile(
@@ -327,7 +330,7 @@ DEVICE_FORCEINLINE void ldmatrix_x2_lane(unsigned r[2],
 }
 
 template <bool Trans = false>
-DEVICE_FORCEINLINE void ldmatrix_x4_lane(unsigned r[4],
+ static DEVICE_FORCEINLINE void ldmatrix_x4_lane(unsigned r[4],
                                          unsigned addr) {
     if constexpr (Trans) {
         asm volatile(
@@ -345,13 +348,13 @@ DEVICE_FORCEINLINE void ldmatrix_x4_lane(unsigned r[4],
 // tensors hand their cells straight to the instruction, no decayed pointers
 // at the seam. Same instructions, forwarding wrappers.
 template <bool Trans = false>
-DEVICE_FORCEINLINE void ldmatrix_x2_lane(ArrayEngine<unsigned, 2>& f,
+ static DEVICE_FORCEINLINE void ldmatrix_x2_lane(ArrayEngine<unsigned, 2>& f,
                                          unsigned addr) {
     ldmatrix_x2_lane<Trans>(f.storage, addr);
 }
 
 template <bool Trans = false>
-DEVICE_FORCEINLINE void ldmatrix_x4_lane(ArrayEngine<unsigned, 4>& f,
+ static DEVICE_FORCEINLINE void ldmatrix_x4_lane(ArrayEngine<unsigned, 4>& f,
                                          unsigned addr) {
     ldmatrix_x4_lane<Trans>(f.storage, addr);
 }
@@ -359,7 +362,7 @@ DEVICE_FORCEINLINE void ldmatrix_x4_lane(ArrayEngine<unsigned, 4>& f,
 // Common-pointer wrapper over the per-lane core (see the matrix layout notes
 // above).
 template <typename T, bool Trans = false>
-DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
+ static DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
     ldmatrix_x2_lane<Trans>(r, __cvta_generic_to_shared(p));
 }
 
@@ -367,4 +370,3 @@ DEVICE_FORCEINLINE void ldmatrix_x2(unsigned r[2], const T* p) {
 
 #undef ASTRAI_MMA_OP_FP8
 #undef ASTRAI_MX_MMA_OP
-#undef DEVICE_FORCEINLINE

@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <utils/attention_common.h>
+#include <utils/define.cuh>
 #include <utils/dtype.cuh>
 
 // ============================================================================
@@ -30,8 +31,6 @@
 // (e.g. the req_pool_indices global read) element-by-element.
 // ============================================================================
 
-#define HOST_FORCEINLINE static __host__ __forceinline__
-#define DEVICE_FORCEINLINE static __device__ __forceinline__
 
 namespace astrai {
 namespace attention {
@@ -45,17 +44,17 @@ namespace attention {
 // ============================================================================
 
 struct DenseQSchedule {
-    HOST_FORCEINLINE int host_q_blocks(
+         static HOST_FORCEINLINE int host_q_blocks(
         const AttentionParams& p, int rows) {
         return (p.q_len + rows - 1) / rows;
     }
 
-    HOST_FORCEINLINE int host_grid_batch(
+         static HOST_FORCEINLINE int host_grid_batch(
         const AttentionParams& p) {
         return p.batch;
     }
 
-    DEVICE_FORCEINLINE void map_block(
+     static DEVICE_FORCEINLINE void map_block(
         const AttentionParams&, int& batch, int& q_tile) {
         batch = blockIdx.z;
         q_tile = blockIdx.x;
@@ -64,40 +63,40 @@ struct DenseQSchedule {
     // GQA-packed prefill mapping: HB q-heads of one kv-head group share a
     // block's K/V stream, each head owning `rows` = BR*WPH consecutive q rows
     // per block.  Dense tensors tile q_len directly, one block per range.
-    HOST_FORCEINLINE int packed_grid_x(
+         static HOST_FORCEINLINE int packed_grid_x(
         const AttentionParams& p, int rows) {
         return (p.q_len + rows - 1) / rows;
     }
 
-    DEVICE_FORCEINLINE void map_packed_block(
+     static DEVICE_FORCEINLINE void map_packed_block(
         const AttentionParams&, int rows, int& batch, int& row_base) {
         batch = blockIdx.z;
         row_base = blockIdx.x * rows;
     }
 
-    DEVICE_FORCEINLINE int q_len(
+     static DEVICE_FORCEINLINE int q_len(
         const AttentionParams& p, int) {
         return p.q_len;
     }
 
-    DEVICE_FORCEINLINE int q_base(
+     static DEVICE_FORCEINLINE int q_base(
         const AttentionParams& p, int batch, int q_head) {
         return batch * p.q_b_stride + q_head * p.q_h_stride;
     }
 };
 
 struct PackedQSchedule {
-    HOST_FORCEINLINE int host_q_blocks(
+         static HOST_FORCEINLINE int host_q_blocks(
         const AttentionParams& p, int) {
         return p.num_q_tiles;
     }
 
-    HOST_FORCEINLINE int host_grid_batch(
+         static HOST_FORCEINLINE int host_grid_batch(
         const AttentionParams&) {
         return 1;
     }
 
-    DEVICE_FORCEINLINE void map_block(
+     static DEVICE_FORCEINLINE void map_block(
         const AttentionParams& p, int& batch, int& q_tile) {
         batch = p.q_tile_to_batch[blockIdx.x];
         q_tile = p.q_tile_to_index[blockIdx.x];
@@ -106,12 +105,12 @@ struct PackedQSchedule {
     // GQA-packed prefill mapping: the host tile maps are built in
     // HOST_Q_TILE_ROWS granularity, so each host tile splits into
     // HOST_Q_TILE_ROWS / rows packed blocks along blockIdx.x.
-    HOST_FORCEINLINE int packed_grid_x(
+         static HOST_FORCEINLINE int packed_grid_x(
         const AttentionParams& p, int rows) {
         return p.num_q_tiles * (HOST_Q_TILE_ROWS / rows);
     }
 
-    DEVICE_FORCEINLINE void map_packed_block(
+     static DEVICE_FORCEINLINE void map_packed_block(
         const AttentionParams& p, int rows, int& batch, int& row_base) {
         const int hb = HOST_Q_TILE_ROWS / rows;
         const int host_tile = blockIdx.x / hb;
@@ -120,12 +119,12 @@ struct PackedQSchedule {
             + (blockIdx.x - host_tile * hb) * rows;
     }
 
-    DEVICE_FORCEINLINE int q_len(
+     static DEVICE_FORCEINLINE int q_len(
         const AttentionParams& p, int batch) {
         return p.qo_indptr[batch + 1] - p.qo_indptr[batch];
     }
 
-    DEVICE_FORCEINLINE int q_base(
+     static DEVICE_FORCEINLINE int q_base(
         const AttentionParams& p, int batch, int q_head) {
         return p.qo_indptr[batch] * p.q_l_stride + q_head * p.q_h_stride;
     }
@@ -162,47 +161,47 @@ struct ContigKV {
     // Typed views of the params' dtype-agnostic pointers. The restrict
     // locals at the deref sites re-state the alias promise the void* -> T*
     // cast drops.
-    DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
+     static DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
         return static_cast<const T*>(p.k_ptr);
     }
-    DEVICE_FORCEINLINE const T* vptr(const AttentionParams& p) {
+     static DEVICE_FORCEINLINE const T* vptr(const AttentionParams& p) {
         return static_cast<const T*>(p.v_ptr);
     }
 
-    HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) {
+         static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) {
         return p.kv_len;
     }
 
     // decode: same offset (q_len == 1, so there is no row stride component)
-    DEVICE_FORCEINLINE int q_decode_base(
+     static DEVICE_FORCEINLINE int q_decode_base(
         const AttentionParams& p, int batch, int q_head) {
         return batch * p.q_b_stride + q_head * p.q_h_stride;
     }
 
-    DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int) {
+     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int) {
         return p.kv_len;
     }
-    DEVICE_FORCEINLINE int causal_offset(
+     static DEVICE_FORCEINLINE int causal_offset(
         const AttentionParams& p, int, int) {
         return p.causal_offset;
     }
     // decode: exclusive bound of the single query's attend range
-    DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int) {
+     static DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int) {
         return (p.kv_len < p.causal_offset + 1) ? p.kv_len : (p.causal_offset + 1);
     }
 
     template <int HEAD_DIM>
-    DEVICE_FORCEINLINE KVContext make_ctx(
+     static DEVICE_FORCEINLINE KVContext make_ctx(
         const AttentionParams& p, int batch, int kv_head) {
         KVContext c = {};
         c.kv_base = batch * p.kv_b_stride + kv_head * p.kv_h_stride;
         return c;
     }
-    DEVICE_FORCEINLINE int resolve_token(
+     static DEVICE_FORCEINLINE int resolve_token(
         const AttentionParams& p, const KVContext& c, int kc, bool valid) {
         return valid ? kc : -1;
     }
-    DEVICE_FORCEINLINE KVAddr kv_addr_from_token(
+     static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(
         const AttentionParams& p, const KVContext& c, int token, int d) {
         const bool valid = token >= 0;
         const int safe_token = valid ? token : 0;
@@ -215,7 +214,7 @@ struct ContigKV {
     }
 
     template <int VEC>
-    DEVICE_FORCEINLINE KVAddr decode_addr(
+     static DEVICE_FORCEINLINE KVAddr decode_addr(
         const AttentionParams& p, const KVContext& c,
         int, int, int kc, int d, bool valid, bool) {
         int token = resolve_token(p, c, kc, valid);
@@ -229,43 +228,43 @@ struct PagedKV {
     using Elem = T;
     static constexpr bool kPaged = true;
 
-    DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
+     static DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
         return static_cast<const T*>(p.k_ptr);
     }
-    DEVICE_FORCEINLINE const T* vptr(const AttentionParams& p) {
+     static DEVICE_FORCEINLINE const T* vptr(const AttentionParams& p) {
         return static_cast<const T*>(p.v_ptr);
     }
-    DEVICE_FORCEINLINE const T* new_kptr(const AttentionParams& p) {
+     static DEVICE_FORCEINLINE const T* new_kptr(const AttentionParams& p) {
         return static_cast<const T*>(p.new_k_ptr);
     }
-    DEVICE_FORCEINLINE const T* new_vptr(const AttentionParams& p) {
+     static DEVICE_FORCEINLINE const T* new_vptr(const AttentionParams& p) {
         return static_cast<const T*>(p.new_v_ptr);
     }
 
-    HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) {
+         static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) {
         return p.max_context_len;
     }
 
     // decode: Q is [batch, q_head, head_dim], so batch is the outer row
-    DEVICE_FORCEINLINE int q_decode_base(
+     static DEVICE_FORCEINLINE int q_decode_base(
         const AttentionParams& p, int batch, int q_head) {
         return batch * p.q_l_stride + q_head * p.q_h_stride;
     }
 
-    DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
+     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
         return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
     }
-    DEVICE_FORCEINLINE int causal_offset(
+     static DEVICE_FORCEINLINE int causal_offset(
         const AttentionParams& p, int batch, int q_len) {
         return kv_len(p, batch) - q_len;
     }
     // decode: the query is the last token, so [0, seq_len) IS its causal range
-    DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int batch) {
+     static DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int batch) {
         return kv_len(p, batch);
     }
 
     template <int HEAD_DIM>
-    DEVICE_FORCEINLINE KVContext make_ctx(
+     static DEVICE_FORCEINLINE KVContext make_ctx(
         const AttentionParams& p, int batch, int kv_head) {
         KVContext c = {};
         c.req_idx = p.req_pool_indices[batch];
@@ -274,11 +273,11 @@ struct PagedKV {
         c.head_off = (int64_t)kv_head * HEAD_DIM;
         return c;
     }
-    DEVICE_FORCEINLINE int resolve_token(
+     static DEVICE_FORCEINLINE int resolve_token(
         const AttentionParams& p, const KVContext& c, int kc, bool valid) {
         return valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : -1;
     }
-    DEVICE_FORCEINLINE KVAddr kv_addr_from_token(
+     static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(
         const AttentionParams& p, const KVContext& c, int slot, int d) {
         const bool valid = slot >= 0;
         const int safe_slot = valid ? slot : 0;
@@ -288,7 +287,7 @@ struct PagedKV {
         return {&k[gmem_off], &v[gmem_off], valid};
     }
 
-    DEVICE_FORCEINLINE KVAddr new_kv_addr(
+     static DEVICE_FORCEINLINE KVAddr new_kv_addr(
         const AttentionParams& p, int batch, int kv_head, int d) {
         const int64_t off = (int64_t)batch * p.new_kv_b_stride
             + (int64_t)kv_head * p.new_kv_h_stride + d;
@@ -297,7 +296,7 @@ struct PagedKV {
         return {&nk[off], &nv[off], true};
     }
 
-    DEVICE_FORCEINLINE void store_new_kv(
+     static DEVICE_FORCEINLINE void store_new_kv(
         const AttentionParams& p, const KVContext& c,
         int seq_len, int d, const KVAddr& src) {
         int slot = resolve_token(p, c, seq_len - 1, true);
@@ -309,7 +308,7 @@ struct PagedKV {
     }
 
     template <int VEC>
-    DEVICE_FORCEINLINE KVAddr decode_addr(
+     static DEVICE_FORCEINLINE KVAddr decode_addr(
         const AttentionParams& p, const KVContext& c,
         int batch, int kv_head, int kc, int d, bool valid, bool persist) {
         if (p.new_k_ptr && valid && kc == kv_len(p, batch) - 1) {
@@ -332,7 +331,7 @@ struct PagedKV {
 // linear (unswizzled) shared memory, zero-filling invalid slots.  AddrFn
 // maps (kc, d) -> KVAddr; tid/stride carry the caller's thread mapping.
 template <typename T, typename AddrFn>
-DEVICE_FORCEINLINE void fill_kv_smem(
+ static DEVICE_FORCEINLINE void fill_kv_smem(
     T* k_smem, T* v_smem, int elems, int head_dim,
     int kv_base, int tid, int stride, const AddrFn& addr)
 {

@@ -5,6 +5,7 @@
 
 #include <memory/pipeline.cuh>
 #include <mma/mma.cuh>
+#include <utils/define.cuh>
 #include <utils/dtype.cuh>
 #include <arith/softmax.cuh>
 
@@ -64,7 +65,7 @@ struct KernelTraits {
 
 // pack two floats into one 16-bit-pair register as .b32 (mma A/B operand cell)
 template <typename T>
-__device__ __forceinline__ unsigned pk2(float a, float b) {
+DEVICE_FORCEINLINE unsigned pk2(float a, float b) {
     return ElemTrait<T>::pack2(a, b);
 }
 
@@ -73,7 +74,7 @@ __device__ __forceinline__ unsigned pk2(float a, float b) {
 // the K/V fragments with the exact register layout mma expects.
 
 // XOR swizzle for shared-memory column at 8-element chunk granularity.
-__device__ __forceinline__ int swiz_col(int d, int r, int mask = 7) {
+DEVICE_FORCEINLINE int swiz_col(int d, int r, int mask = 7) {
     return ((d >> 3) ^ (r & mask)) << 3 | (d & 7);
 }
 

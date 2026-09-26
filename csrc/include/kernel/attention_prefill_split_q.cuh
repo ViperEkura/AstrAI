@@ -15,7 +15,7 @@ namespace attention {
 // Unified across contiguous and paged (SGLang flat-pool) K/V via KV, and
 // across precisions via KV::Elem.
 // Templated on <HEAD_DIM, QSchedule, KV, G, ROWS, P_BC, IsCausal, HasMask>.
-// group_reduce_sum<G> lives in common/reduce.cuh (astrai::).
+// group_reduce<G> lives in arith/reduce.cuh (astrai::).
 
 template <int HEAD_DIM, typename QSchedule, typename KV, int G, int ROWS, int P_BC,
           bool IsCausal, bool HasMask>
@@ -103,7 +103,7 @@ __global__ void attn_prefill_split_q_kernel_t(AttentionParams p) {
                 for (int j = 0; j < 8; j++)
                     part = fmaf(qreg[i + j], k8[j], part);
             }
-            float dot = group_reduce_sum<G>(part, gmask) * p.scale;
+            float dot = group_reduce<G>(part, gmask) * p.scale;
 
             int kv_idx = kv0 + s;
             if constexpr (HasMask) {

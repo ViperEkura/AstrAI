@@ -23,6 +23,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <utils/define.cuh>
 
 namespace astrai {
 
@@ -40,19 +41,19 @@ struct ElemTrait<bf16> {
     static constexpr int kBytes = 2;
     static constexpr int kPerCell = 2;  // elements per 32-bit cell
 
-    static __device__ __forceinline__ float to_float(bf16 x) {
+          static DEVICE_FORCEINLINE float to_float(bf16 x) {
         return __bfloat162float(x);
     }
-    static __device__ __forceinline__ bf16 from_float(float x) {
+          static DEVICE_FORCEINLINE bf16 from_float(float x) {
         return __float2bfloat16(x);
     }
     // Two elements into one 32-bit cell, element 0 in the low half — the mma
     // A/B operand order and the packed-store layout.
-    static __device__ __forceinline__ unsigned pack2(float lo, float hi) {
+          static DEVICE_FORCEINLINE unsigned pack2(float lo, float hi) {
         __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
         return *reinterpret_cast<unsigned*>(&v);
     }
-    static __device__ __forceinline__ float2 unpack2(unsigned cell) {
+          static DEVICE_FORCEINLINE float2 unpack2(unsigned cell) {
         __nv_bfloat162 v = *reinterpret_cast<__nv_bfloat162*>(&cell);
         return __bfloat1622float2(v);
     }
@@ -63,17 +64,17 @@ struct ElemTrait<fp16> {
     static constexpr int kBytes = 2;
     static constexpr int kPerCell = 2;
 
-    static __device__ __forceinline__ float to_float(fp16 x) {
+          static DEVICE_FORCEINLINE float to_float(fp16 x) {
         return __half2float(x);
     }
-    static __device__ __forceinline__ fp16 from_float(float x) {
+          static DEVICE_FORCEINLINE fp16 from_float(float x) {
         return __float2half(x);
     }
-    static __device__ __forceinline__ unsigned pack2(float lo, float hi) {
+          static DEVICE_FORCEINLINE unsigned pack2(float lo, float hi) {
         __half2 v = __floats2half2_rn(lo, hi);
         return *reinterpret_cast<unsigned*>(&v);
     }
-    static __device__ __forceinline__ float2 unpack2(unsigned cell) {
+          static DEVICE_FORCEINLINE float2 unpack2(unsigned cell) {
         __half2 v = *reinterpret_cast<__half2*>(&cell);
         return __half22float2(v);
     }
@@ -89,8 +90,8 @@ template <>
 struct ElemTrait<float> {
     static constexpr int kBytes = 4;
 
-    static __device__ __forceinline__ float to_float(float x) { return x; }
-    static __device__ __forceinline__ float from_float(float x) { return x; }
+          static DEVICE_FORCEINLINE float to_float(float x) { return x; }
+          static DEVICE_FORCEINLINE float from_float(float x) { return x; }
 };
 
 // ---------------------------------------------------------------------------
@@ -100,7 +101,7 @@ struct ElemTrait<float> {
 // Eight elements (one 16-byte chunk) as floats. src must be 16-byte aligned —
 // every 16-bit row of a contiguous tile is.
 template <typename T>
-__device__ __forceinline__ void load8(const T* src, float* out) {
+DEVICE_FORCEINLINE void load8(const T* src, float* out) {
     static_assert(ElemTrait<T>::kBytes == 2,
                   "load8 is a 16-bit-element helper (8 elements = 16 bytes)");
     uint4 raw = *reinterpret_cast<const uint4*>(src);
@@ -115,7 +116,7 @@ __device__ __forceinline__ void load8(const T* src, float* out) {
 // Two elements as one packed 32-bit cell at dst (4-byte aligned, as every
 // element pair at an even index of a contiguous row is).
 template <typename T>
-__device__ __forceinline__ void store2(T* dst, float e0, float e1) {
+DEVICE_FORCEINLINE void store2(T* dst, float e0, float e1) {
     static_assert(ElemTrait<T>::kBytes == 2,
                   "store2 is a 16-bit-element helper (one cell = two elements)");
     *reinterpret_cast<unsigned*>(dst) = ElemTrait<T>::pack2(e0, e1);

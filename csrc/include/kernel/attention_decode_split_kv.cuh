@@ -91,7 +91,7 @@ __global__ void attn_decode_split_kv_kernel(AttentionParams p) {
                 for (int i = 0; i < hd_per_thread; i++)
                     partial += q_reg[i] * ElemTrait<T>::to_float(
                         k_smem[s * p.head_dim + lane * hd_per_thread + i]);
-                partial = warp_reduce_sum(partial) * p.scale;
+                partial = warp_reduce(partial) * p.scale;
 
                 int kv_idx = chunk_start + s;
                 if constexpr (HasMask) {

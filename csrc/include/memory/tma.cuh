@@ -36,6 +36,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <utils/define.cuh>
 #include <utils/swizzle.cuh>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -57,7 +58,7 @@ namespace astrai {
 // transaction bytes. Coordinates are in the map's element units — the
 // host encodes byte-granular dims for operand tiles, so x is a byte
 // offset along K.
-__device__ __forceinline__ void tma_load_2d(const void* map, uint64_t* bar,
+DEVICE_FORCEINLINE void tma_load_2d(const void* map, uint64_t* bar,
                                             void* smem_dst, int x, int y) {
 #if ASTRAI_TMA_ENABLED
     const unsigned dst = __cvta_generic_to_shared(smem_dst);
@@ -74,7 +75,7 @@ __device__ __forceinline__ void tma_load_2d(const void* map, uint64_t* bar,
 
 // 3D form: the batch is the outer map dimension (stride-0 broadcast
 // operands encode as 2D and keep the 2D emitter).
-__device__ __forceinline__ void tma_load_3d(const void* map, uint64_t* bar,
+DEVICE_FORCEINLINE void tma_load_3d(const void* map, uint64_t* bar,
                                             void* smem_dst, int x, int y,
                                             int z) {
 #if ASTRAI_TMA_ENABLED
@@ -94,7 +95,7 @@ __device__ __forceinline__ void tma_load_3d(const void* map, uint64_t* bar,
 // compile-time branch instead of a runtime flag. `z` is dead in the rank-2
 // form (broadcast operands share one 2D map's coordinates across grid.z).
 template <bool kRank3>
-__device__ __forceinline__ void tma_load(const void* map, uint64_t* bar,
+DEVICE_FORCEINLINE void tma_load(const void* map, uint64_t* bar,
                                          void* smem_dst, int x, int y, int z) {
     if constexpr (kRank3)
         tma_load_3d(map, bar, smem_dst, x, y, z);

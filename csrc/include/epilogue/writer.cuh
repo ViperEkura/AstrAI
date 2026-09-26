@@ -4,6 +4,7 @@
 // coalesced copy-out. The staging swizzle is one instance of the unified
 // family (common/swizzle.cuh) shared with the operand staging in load.cuh.
 
+#include <utils/define.cuh>
 #include <utils/swizzle.cuh>
 #include <utils/tensor.cuh>
 #include <utils/gemm_common.h>
@@ -24,10 +25,10 @@ struct OutElem<__nv_bfloat16> {
     using T2 = __nv_bfloat162;
     static constexpr int kChunkElems = 8;  // per 16B chunk
     static constexpr int kChunkShift = 3;
-    static __device__ __forceinline__ __nv_bfloat162 pack2(float a, float b) {
+     static DEVICE_FORCEINLINE __nv_bfloat162 pack2(float a, float b) {
         return __floats2bfloat162_rn(a, b);
     }
-    static __device__ __forceinline__ __nv_bfloat16 cvt(float a) {
+     static DEVICE_FORCEINLINE __nv_bfloat16 cvt(float a) {
         return __float2bfloat16_rn(a);
     }
 };
@@ -37,10 +38,10 @@ struct OutElem<float> {
     using T2 = float2;
     static constexpr int kChunkElems = 4;
     static constexpr int kChunkShift = 2;
-    static __device__ __forceinline__ float2 pack2(float a, float b) {
+     static DEVICE_FORCEINLINE float2 pack2(float a, float b) {
         return make_float2(a, b);
     }
-    static __device__ __forceinline__ float cvt(float a) { return a; }
+     static DEVICE_FORCEINLINE float cvt(float a) { return a; }
 };
 
 template <typename Policy>
@@ -108,10 +109,10 @@ struct GemmCollectiveEpilogue {
     // kBlockM rows of kBlockN elems; out-transposed (swap dispatch): rows
     // and row length trade places. Both row-chunk counts are powers of
     // two, keeping the XOR swizzle well-defined.
-    __device__ __forceinline__ OutT* out_chunk(int r, int c) const {
+     DEVICE_FORCEINLINE OutT* out_chunk(int r, int c) const {
         return out_tile(r, c << OE::kChunkShift);
     }
-    __device__ __forceinline__ OutT* out_elem(int r, int v) const {
+     DEVICE_FORCEINLINE OutT* out_elem(int r, int v) const {
         return out_tile(r, v);
     }
 
@@ -121,7 +122,7 @@ struct GemmCollectiveEpilogue {
     // tile coherent, then the whole CTA copies it out in fully-coalesced
     // 16B chunks. The 16B-chunk XOR swizzle keeps both the scatter and the
     // gather conflict-free.
-    __device__ __forceinline__ void stage(AccTensor& acc) const {
+     DEVICE_FORCEINLINE void stage(AccTensor& acc) const {
         // Fused bias: added to the fp32 accumulator before the single bf16
         // rounding. The per-lane loads are L1 broadcasts; rows past the
         // edge skip the load (their smem slots never copy out). Under
@@ -192,7 +193,7 @@ struct GemmCollectiveEpilogue {
     // a row so each global transaction covers a full 128B line. Under the
     // swap the staged rows are D-rows counted from block_n's stripe while
     // the row length is kernel m', so row/stride flip to the swapped dims.
-    __device__ __forceinline__ void store(OutT* out) const {
+     DEVICE_FORCEINLINE void store(OutT* out) const {
         constexpr int kTotalChunks =
             kBlockM * (kBlockN / OE::kChunkElems);  // == kBlockN * (kBlockM/chunk)
         const int64_t row0_global = block_m * kBlockM;
@@ -239,7 +240,7 @@ struct GemmCollectiveEpilogue {
         }
     }
 
-    __device__ __forceinline__ void run(AccTensor& acc, OutT* out) {
+     DEVICE_FORCEINLINE void run(AccTensor& acc, OutT* out) {
         stage(acc);
         __syncthreads();
         store(out);
@@ -252,13 +253,13 @@ struct GemmCollectiveEpilogue {
     // b_scale D-cols and a_scale D-rows in BOTH orientations. The load
     // flavors stay as they always were — b_scale/bias keep the L1-friendly
     // plain loads (broadcast cols), a_scale the streaming __ldcg (per-row).
-    __device__ __forceinline__ float bias_at(int64_t i, int64_t ext) const {
+     DEVICE_FORCEINLINE float bias_at(int64_t i, int64_t ext) const {
         return bias && i < ext ? __bfloat162float(bias[i]) : 0.0f;
     }
-    __device__ __forceinline__ float col_factor(int64_t i, int64_t ext) const {
+     DEVICE_FORCEINLINE float col_factor(int64_t i, int64_t ext) const {
         return b_scale && i < ext ? b_scale[i] : 1.0f;
     }
-    __device__ __forceinline__ float row_factor(int64_t i, int64_t ext) const {
+     DEVICE_FORCEINLINE float row_factor(int64_t i, int64_t ext) const {
         return a_scale && i < ext ? __ldcg(a_scale + i) : 1.0f;
     }
 };

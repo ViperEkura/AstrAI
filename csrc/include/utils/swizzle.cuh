@@ -19,6 +19,7 @@
 
 #include <cstdint>
 
+#include <utils/define.cuh>
 #include <utils/shape.cuh>
 
 namespace astrai {
@@ -31,7 +32,7 @@ struct Swizzle {
     static constexpr int kShift = Shift;
     static constexpr uint32_t kMask = (uint32_t(1) << Bits) - 1;
     static constexpr bool kTmaMode = Shift == 3 && Bits >= 1 && Bits <= 3;
-    __device__ __forceinline__ uint32_t operator()(uint32_t linear) const {
+    DEVICE_FORCEINLINE uint32_t operator()(uint32_t linear) const {
         return linear ^ ((linear >> Shift) & kMask);
     }
 };
@@ -50,7 +51,7 @@ struct Layout<Shape<Rows, Chunks>, Stride<RowStride, ColStride>> {
                   "staged chunk grids are row-major packed");
     static constexpr int kRows = Rows;
     static constexpr int kChunks = Chunks;
-    __device__ __forceinline__ uint32_t operator()(uint32_t row,
+    DEVICE_FORCEINLINE uint32_t operator()(uint32_t row,
                                                    uint32_t chunk) const {
         return row * Chunks + chunk;
     }
@@ -81,12 +82,12 @@ struct ComposedLayout {
     // Swizzled chunk coordinate alone; the row term stays out so the tensor
     // scales the two terms separately in 32-bit (the address chain never
     // widens to 64-bit).
-    __device__ __forceinline__ uint32_t chunk_of(uint32_t row,
+    DEVICE_FORCEINLINE uint32_t chunk_of(uint32_t row,
                                                  uint32_t chunk) const {
         const uint32_t swz = (row >> kRowShift) & kMask;
         return (chunk & ~kMask) | ((chunk ^ swz) & kMask);
     }
-    __device__ __forceinline__ uint32_t operator()(uint32_t row,
+    DEVICE_FORCEINLINE uint32_t operator()(uint32_t row,
                                                    uint32_t chunk) const {
         return row * (uint32_t)kChunks + chunk_of(row, chunk);
     }

@@ -10,6 +10,7 @@
 #include <mma/mma.cuh>
 #include <memory/pipeline.cuh>
 #include <memory/tma.cuh>
+#include <utils/define.cuh>
 #include <utils/tensor.cuh>
 #include <utils/gemm_common.h>
 #include <memory/load.cuh>
@@ -36,10 +37,10 @@ struct GemmTmaContext {
     int depth = 0;       // ring slots (kStages + 1): 2*depth barriers
     int z = 0;           // batch coordinate (rank-3 descriptors)
 
-    __device__ __forceinline__ uint64_t* full(int slot) const {
+     DEVICE_FORCEINLINE uint64_t* full(int slot) const {
         return bars + slot;
     }
-    __device__ __forceinline__ uint64_t* empty(int slot) const {
+     DEVICE_FORCEINLINE uint64_t* empty(int slot) const {
         return bars + depth + slot;
     }
 };
@@ -252,7 +253,7 @@ struct GemmCollectiveMainloop {
     // loads (kInterior applies, and in the generic loop they run after the
     // MMA phase alongside the commit).
     template <bool kInterior = false, bool kSyncPhase = false>
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     load_stage(TileA a_tile, TileB b_tile,
                int64_t k_base) const {
         if constexpr (kSyncPhase) {
@@ -289,7 +290,7 @@ struct GemmCollectiveMainloop {
     // (typed loads: each operand's rank rides its context type).
     // Elected-thread only.
     template <bool kRank3A, bool kRank3B>
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     tma_issue_stage(const GemmTmaContext<kRank3A, kRank3B>& tma,
                     int tile) const {
         const int slot = tile % kARing;
@@ -319,7 +320,7 @@ struct GemmCollectiveMainloop {
     // expect_tx barrier with no transaction never trips, so short-K tiles
     // skip their slots' barriers entirely (and are never waited on).
     template <bool kRank3A = false, bool kRank3B = false>
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     prologue(const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         if constexpr (kUseTma) {
             if (tid == 0) {
@@ -360,7 +361,7 @@ struct GemmCollectiveMainloop {
     // tile i-1 before tile i+kStages's boxes overwrite its slot).
     template <bool kInterior, bool kTma = false, bool kRank3A = false,
               bool kRank3B = false>
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     run_loop(AccTensor& acc,
              const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         const astrai::PipelineSync<kStages> pipe;
@@ -571,7 +572,7 @@ struct GemmCollectiveMainloop {
     }
 
     template <bool kRank3A = false, bool kRank3B = false>
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     accumulate(AccTensor& acc,
                const GemmTmaContext<kRank3A, kRank3B>& tma = {}) const {
         if constexpr (kUseTma) {
@@ -591,7 +592,7 @@ struct GemmCollectiveMainloop {
     // pointer arithmetic at the fma seam. (Not "half": nvcc reserves
     // that name for the fp16 type.)
     struct BFragPair : ArrayEngine<unsigned, 4> {
-        __device__ __forceinline__ typename MmaOp::BFrag cell(int i) const {
+         DEVICE_FORCEINLINE typename MmaOp::BFrag cell(int i) const {
             return {storage[2 * i + 0], storage[2 * i + 1]};
         }
     };
@@ -613,7 +614,7 @@ struct GemmCollectiveMainloop {
     // halves, B uses the +8-row bit as its chunk half — see the notes on
     // each wrapper).
     template <typename SmemLayoutT, typename ElemT>
-    static __device__ __forceinline__ unsigned
+     static DEVICE_FORCEINLINE unsigned
     canonical_lane_off(int64_t row, int chunk_half, int lane) {
         constexpr int kChunkShift = log2_const<16 / sizeof(ElemT)>::value;
         const unsigned lswz = static_cast<unsigned>(
@@ -634,7 +635,7 @@ struct GemmCollectiveMainloop {
     // the chunk field, not an add; kTransSeg*: one mma k-segment = kMmaK
     // k rows.
     template <typename SmemLayoutT, typename ElemT>
-    static __device__ __forceinline__ unsigned
+     static DEVICE_FORCEINLINE unsigned
     trans_lane_off(int krow, int col, int block_extent) {
         const unsigned lswz = static_cast<unsigned>(
             (krow >> SmemLayoutT::kRowShift) & SmemLayoutT::kMask);
@@ -645,13 +646,13 @@ struct GemmCollectiveMainloop {
 
     static constexpr int kChunkElems = 16 / sizeof(ElemA);
     static constexpr int kChunkShift = log2_const<kChunkElems>::value;
-    __device__ __forceinline__ unsigned a_lane_off(int lane) const {
+     DEVICE_FORCEINLINE unsigned a_lane_off(int lane) const {
         // Stage-relative, loop-invariant per-lane base; A's fragment row
         // carries the +8-row (rh8) and +1-chunk (rh16) halves.
         return canonical_lane_off<SmemLayoutA, ElemA>(
             a_row0 + ((lane >> 3) & 1) * 8 + (lane & 7), lane >> 4, lane);
     }
-    __device__ __forceinline__ unsigned b_lane_off(int lane) const {
+     DEVICE_FORCEINLINE unsigned b_lane_off(int lane) const {
         // ldmatrix (non-dequant) B addressing: byte offsets in ElemB units.
         return canonical_lane_off<SmemLayoutB, ElemB>(
             b_row0 + (lane & 7), (lane >> 3) & 1, lane);
@@ -677,7 +678,7 @@ struct GemmCollectiveMainloop {
     static_assert(!kPairB || !kTransB,
                   "2-byte crosswise B never pairs (chunk budget)");
     static constexpr unsigned kPairStep = 16u * kK * sizeof(ElemB);  // nt-pair row step
-    __device__ __forceinline__ unsigned b4_lane_off(int lane) const {
+     DEVICE_FORCEINLINE unsigned b4_lane_off(int lane) const {
         return b_lane_off(lane) + (lane >> 4) * kPairStep / 2;
     }
 
@@ -685,7 +686,7 @@ struct GemmCollectiveMainloop {
     static constexpr unsigned kNtXor = 16u;  // n8 = 1 chunk
     static constexpr unsigned kTransSegA = (unsigned)Traits::kMmaK * kBlockM * sizeof(ElemA);
     static constexpr unsigned kTransSegB = (unsigned)Traits::kMmaK * kBlockN * sizeof(ElemB);
-    __device__ __forceinline__ unsigned a_trans_lane_off(int lane) const {
+     DEVICE_FORCEINLINE unsigned a_trans_lane_off(int lane) const {
         // x4 matrix order must match the mma's A-register order (m+8 rides
         // reg1, k+8 reg2): lanes 8-15 step the m+8 chunk, lanes 16-31 the
         // k+8 row half.
@@ -693,7 +694,7 @@ struct GemmCollectiveMainloop {
             (lane & 7) + ((lane >> 4) << 3),
             a_row0 + (((lane >> 3) & 1) << 3), kBlockM);
     }
-    __device__ __forceinline__ unsigned b_trans_lane_off(int lane) const {
+     DEVICE_FORCEINLINE unsigned b_trans_lane_off(int lane) const {
         // nt windows step by kNtXor at call sites (col stays at b_row0).
         return trans_lane_off<SmemLayoutBTrans, ElemB>(
             (lane & 7) + (((lane >> 3) & 1) << 3), b_row0, kBlockN);
@@ -704,12 +705,12 @@ struct GemmCollectiveMainloop {
     // kBlockM/kBlockN UNITS and every address scales by the unit width. The
     // lane contract, the m/n-tile XOR steps and the per-k-segment ADD are the
     // trans reader's: 16 packed rows carry exactly one mma k-segment.
-    __device__ __forceinline__ unsigned a_pack_lane_off(int lane) const {
+     DEVICE_FORCEINLINE unsigned a_pack_lane_off(int lane) const {
         return trans_lane_off<SmemLayoutAPack, unsigned short>(
             (lane & 7) + ((lane >> 4) << 3),
             a_row0 + (((lane >> 3) & 1) << 3), kBlockM);
     }
-    __device__ __forceinline__ unsigned b_pack_lane_off(int lane) const {
+     DEVICE_FORCEINLINE unsigned b_pack_lane_off(int lane) const {
         return trans_lane_off<SmemLayoutBPack, unsigned short>(
             (lane & 7) + (((lane >> 3) & 1) << 3), b_row0, kBlockN);
     }
@@ -718,7 +719,7 @@ struct GemmCollectiveMainloop {
     // double-buffer's next-seg fill. frag2/frag4 are one b_frag /
     // b_frag4 buffer (the unused one is never touched) — typed cells, so
     // every load addresses a whole fragment.
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     load_b_frags(typename MmaOp::BFrag (&frag2)[kNt],
                  BFragPair (&frag4)[kNt / 2],
                  unsigned seg_base) const {
@@ -750,7 +751,7 @@ struct GemmCollectiveMainloop {
     // as two packed pairs — both u16 reads land inside one 16B swizzle
     // chunk, so plain staged-tile addressing works. The LOP3 expansion
     // (dequant.cuh) is exact for the int8 range.
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     load_b_frags_at(typename MmaOp::BFrag (&frag2)[kNt],
                     BFragPair (&frag4)[kNt / 2],
                     TileB stage, int k_seg, unsigned seg_base,
@@ -776,7 +777,7 @@ struct GemmCollectiveMainloop {
     // order (m, m+8, k+8, m+8&k+8), matching the ldmatrix x4 matrix order
     // the non-dequant path produces (see a_trans_lane_off's note). Both
     // u16 reads of one row stay inside one swizzle chunk (c2 <= 6).
-    __device__ __forceinline__ void
+     DEVICE_FORCEINLINE void
     load_a_frags_at(typename MmaOp::AFrag& frag, TileA stage, int k_seg,
                     int mt, int lane) const {
         const int q = lane >> 2, c2 = (lane & 3) * 2;

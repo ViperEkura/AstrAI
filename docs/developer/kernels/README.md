@@ -284,14 +284,6 @@ the -0.56% instruction delta and -1..-2 registers).
 
 ## Benchmarks
 
-**Reference box: NVIDIA L20 (sm_89, 46 GB), CUDA 12.8, driver 570.86** — the
-numbers in this file and in the operator docs were measured there. This
-workspace's box is a *different machine* (8x RTX 5090, sm_120a, 170 SM,
-~1.79 TB/s): per-machine figures do not transfer, so re-measure locally
-before quoting any of them (the workspace `AGENTS.md` carries the
-measurement discipline — production dispatch path, interleaved A/B rounds,
-median, one fact one home).
-
 Reproduce (decode + prefill in `attn_test.cu`, paged in `attn_paged_test.cu`):
 ```bash
 nvcc -I csrc/include -arch=sm_120 -O3 --use_fast_math \
@@ -301,12 +293,9 @@ nvcc -I csrc/include -arch=sm_120 -O3 --use_fast_math \
 
 ## Known Optimization Targets
 
-All three are L20 reference-box readings (see Benchmarks above) — re-measure
-locally before acting on them.
-
 - **Decode D=256**: spill eliminated (BC=16 + STAGES=2), but still 248 regs — further tiling could help.
-- **Prefill single-batch**: bandwidth low (22 GB/s at q=kv=2048) — compute-bound at ~94 TFLOP/s (near L20 bf16 ceiling ~193 TFLOP/s for non-causal).
-- **Decode single-batch**: bandwidth low (113 GB/s at kv=512, 13% of 864 GB/s theoretical) — small kv underutilizes SMs despite split-KV; scales to 757 GB/s (88%) at B=16+.
+- **Prefill single-batch**: bandwidth low at q=kv=2048 — compute-bound near the bf16 ceiling for non-causal.
+- **Decode single-batch**: bandwidth low at kv=512 — small kv underutilizes SMs despite split-KV; scales well at B=16+.
 
 ## File Layout
 
@@ -336,10 +325,11 @@ csrc/
 │   │   └── writer.cuh                #     gemm fused bias + scale folding + bf16/fp32 smem scatter + copy-out
 │   ├── arith/                        # value transforms on register fragments
 │   │   ├── softmax.cuh               #     shared online-softmax recurrence (scalar kernels, MMA tile, split-KV combine)
-│   │   └── reduce.cuh                #     warp_reduce_max, atomic_max_float
+│   │   └── reduce.cuh                #     plus/maximum functors, warp_reduce/group_reduce, atomic_max_float
 │   ├── datatype/                     # dtype traits and dequant primitives (stage-agnostic)
 │   │   └── dequant.cuh               #     in-register dequant functors (DequantPair<SrcT, MmaT>: exact int8→bf16)
 │   ├── utils/                        # stage-agnostic vocabulary — the sink of the include graph
+│   │   ├── define.cuh                #     HOST/DEVICE_FORCEINLINE — the shared function-qualifier macros
 │   │   ├── device.cuh                #     DeviceFacts geometry query (sms / smem opt-in / L2)
 │   │   ├── dtype.cuh                 #     element-type words (aliases + ElemTrait, torch at::ScalarType naming)
 │   │   ├── launch.cuh                #     launch-and-check macros, pure C

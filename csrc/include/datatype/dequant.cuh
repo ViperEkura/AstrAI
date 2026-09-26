@@ -20,12 +20,13 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 #include <type_traits>
+#include <utils/define.cuh>
 
 namespace astrai {
 namespace quant {
 
 // (a & mask) | base as one SASS LOP3 (truth table 0xEA).
-__device__ __forceinline__ unsigned lop3_and_or(unsigned a, unsigned mask,
+DEVICE_FORCEINLINE unsigned lop3_and_or(unsigned a, unsigned mask,
                                                 unsigned base) {
     unsigned r;
     asm("lop3.b32 %0, %1, %2, %3, 0xea;"
@@ -35,7 +36,7 @@ __device__ __forceinline__ unsigned lop3_and_or(unsigned a, unsigned mask,
 }
 
 // __hsub2 over bit-cast words (bf16x2 lanes).
-__device__ __forceinline__ unsigned hsub2_words(unsigned a, unsigned b) {
+DEVICE_FORCEINLINE unsigned hsub2_words(unsigned a, unsigned b) {
     const __nv_bfloat162 x = *reinterpret_cast<const __nv_bfloat162*>(&a);
     const __nv_bfloat162 y = *reinterpret_cast<const __nv_bfloat162*>(&b);
     const __nv_bfloat162 d = __hsub2(x, y);
@@ -55,7 +56,7 @@ struct DequantPair<int8_t, __nv_bfloat16> {
     static constexpr unsigned kSignMask = 0x00800080u;  // sign bit
 
     // Two expand steps: magnitude word (128+u7) and sign word (128/256).
-    static __device__ __forceinline__ unsigned expand(unsigned lanes,
+     static DEVICE_FORCEINLINE unsigned expand(unsigned lanes,
                                                       unsigned sign) {
         return hsub2_words(lop3_and_or(lanes, kMagMask, kBase),
                            lop3_and_or(sign, kSignMask, kBase));
@@ -67,7 +68,7 @@ struct DequantPair<int8_t, __nv_bfloat16> {
     // 4 SASS instructions. (A future humming-style offline byte interleave
     // could fold the spread into storage and drop the PRMT; the layout
     // derivation lives in docs/developer/cuda_kernels.md.)
-    static __device__ __forceinline__ unsigned pair(unsigned short v) {
+     static DEVICE_FORCEINLINE unsigned pair(unsigned short v) {
         const unsigned spread =
             __byte_perm((unsigned)v, 0, 0x4140u);  // (e0, 0, e1, 0)
         return expand(spread, spread);

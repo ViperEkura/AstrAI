@@ -55,13 +55,13 @@ STAGES = ("arith", "datatype", "epilogue", "kernel", "memory", "mma", "utils")
 HOST_DIRS = ("launcher",)
 
 # Device->host edges that still exist. Each entry is (includer, include
-# target), both include-root-relative. The plan is to empty this set by
-# splitting gemm.cuh's host planning half out; the assertions below fail on
-# BOTH an unlisted new edge and a listed edge that has since been split, so
-# the set cannot rot.
-PENDING_HOST_EDGES = {
-    ("kernel/gemm.cuh", "launcher/plan_table.h"),
-}
+# target), both include-root-relative. The assertions below fail on BOTH an
+# unlisted new edge and a listed edge that has since been split, so the set
+# cannot rot. Empty since the gemm planning split: the kernel-side TUs reach
+# the planner through policy.cuh's declarations, and planning.h is included
+# by exactly one TU per binary (enforced by link-time multiple-definition
+# on its non-inline plan_dispatch).
+PENDING_HOST_EDGES: set[tuple[str, str]] = set()
 
 # Harness-local headers: outside the include root, spelled quoted and found
 # beside the harness (in csrc/tests, or through the bench harness's extra
@@ -164,6 +164,36 @@ def test_stage_directories_are_the_closed_set() -> None:
     assert found == sorted(STAGES + HOST_DIRS), (
         "csrc/include/ child directories changed; update STAGES/HOST_DIRS and "
         "docs/developer/kernels/README.md together"
+    )
+
+
+def test_planning_and_plan_table_include_sites() -> None:
+    """The single-inclusion discipline, made structural.
+
+    launcher/planning.h defines plan_dispatch non-inline: exactly one TU per
+    binary may include it — the gemm module's gemm.cu, or a standalone
+    harness. launcher/plan_table.h carries the row tables and the config
+    state; its includers are planning.h, the gemm binding (parse_planner_mode
+    only), and the harnesses. A per-dtype kernel TU or any other module
+    pulling either one re-opens the compile-seven-times cost this seam closed.
+    """
+    planning_ok = {CSRC / "gemm" / "gemm.cu"}
+    table_ok = {INCLUDE / "launcher" / "planning.h", CSRC / "gemm" / "bindings.cu"}
+    planning_bad, table_bad = [], []
+    for path, name in project_includes():
+        rel = path.relative_to(CSRC)
+        if name == "launcher/planning.h" and path not in planning_ok:
+            if rel.parts[0] not in ("tests", "bench"):
+                planning_bad.append(str(rel))
+        if name == "launcher/plan_table.h" and path not in table_ok:
+            if rel.parts[0] not in ("tests", "bench"):
+                table_bad.append(str(rel))
+    assert not planning_bad and not table_bad, (
+        "launcher/planning.h is single-inclusion (gemm/gemm.cu or a harness); "
+        "launcher/plan_table.h belongs to planning.h, the gemm binding and "
+        "the harnesses — any other includer drags the row tables back "
+        "through nvcc:\n"
+        f"  planning.h: {planning_bad}\n  plan_table.h: {table_bad}"
     )
 
 

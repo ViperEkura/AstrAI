@@ -21,6 +21,7 @@
 #include <kernel/gemm.cuh>
 #include <launcher/api.h>
 #include <launcher/checks.h>
+#include <launcher/planning.h>
 
 using namespace astrai;
 using namespace astrai::quant;

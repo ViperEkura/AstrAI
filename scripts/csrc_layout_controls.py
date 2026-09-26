@@ -75,10 +75,24 @@ def inject(dest: Path, name: str) -> None:
             '#include "shape.cuh"',
         )
     elif name == "stale_pending_edge":
+        # The set is empty since the planning split; an entry that names no
+        # real edge must fail the two-sided assertion.
         edit(
             "tests/extension/test_csrc_layout.py",
-            '("kernel/gemm.cuh", "launcher/plan_table.h"),',
-            '("kernel/gemm.cuh", "launcher/plan_table.h"),\n    ("kernel/quantize.cuh", "launcher/api.h"),',
+            "PENDING_HOST_EDGES: set[tuple[str, str]] = set()",
+            'PENDING_HOST_EDGES: set[tuple[str, str]] = {\n    ("kernel/gemm.cuh", "launcher/plan_table.h"),\n}',
+        )
+    elif name == "per_dtype_tu_includes_planning":
+        edit(
+            "csrc/gemm/gemm_bf16_bf16.cu",
+            "#include <kernel/gemm.cuh>",
+            "#include <kernel/gemm.cuh>\n#include <launcher/planning.h>",
+        )
+    elif name == "stage_header_includes_planning":
+        edit(
+            "csrc/include/kernel/gemm.cuh",
+            "#include <policy.cuh>",
+            "#include <policy.cuh>\n#include <launcher/planning.h>",
         )
     elif name == "quoted_stage_prefix":
         edit(
@@ -92,6 +106,8 @@ def inject(dest: Path, name: str) -> None:
 
 CONTROLS = [
     "stage_includes_launcher",
+    "stage_header_includes_planning",
+    "per_dtype_tu_includes_planning",
     "stage_touches_torch",
     "harness_touches_torch",
     "new_toplevel_dir",

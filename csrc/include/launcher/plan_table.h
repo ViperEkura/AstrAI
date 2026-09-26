@@ -43,9 +43,8 @@ static constexpr int kRowFieldsKband = 12;
 static constexpr int kRowFieldsWave = 13;
 static constexpr int kRowFieldsWavePermille = 14;
 
-// Upper bound of the perf_class field. The GemmPerfClass ids live in gemm.cuh,
-// which includes this header, so the enum cannot be named here: this mirrors
-// its last enumerator (kF8A8).
+// Upper bound of the perf_class field, mirroring GemmPerfClass's last
+// enumerator (kF8A8, policy.cuh — where the enum now lives).
 static constexpr int kMaxPerfClass = 3;
 
 // The k-tile depths the manifests actually carry as tiles. A row naming any
@@ -110,38 +109,9 @@ inline constexpr void plan_row_geometry(TileClass cta, int& bm, int& bn) {
     bn = kTileClassCta[(int)cta][1];
 }
 
-// Everything one plan decision is priced against, assembled once per launch
-// and passed as one value: the problem's shape, the class it keys the table
-// on, the operand widths the ring and the load path depend on, and the
-// device. A struct because these facts used to travel as eight positional
-// arguments, each planner entry in its own order, with GemmParams and loose
-// scalars carrying the same numbers — a call site read
-// `plan_row_for(rows, count, m, n, perf, crosswise, k, ba, bb, dev, batch)`
-// and nothing at the call site said which argument was which. The device is
-// the queried DeviceFacts rather than a planner-private view: a bare SM count
-// cannot carry a wave bound (a wave is sms * resident, and resident is the
-// minimum of three per-SM resource limits), and a second device type with
-// most of the same fields only invited the two to drift.
-struct PlanQuery {
-    int64_t m = 0;
-    int64_t n = 0;
-    int64_t k = 0;
-    int64_t batch = 1;
-    int perf_class = -1;  // GemmPerfClass id; -1 matches any
-    int crosswise = 0;    // direct-load operand count, see gemm_dispatch
-    int ba = 2;           // operand element bytes
-    int bb = 2;
-    int out_elem_bytes = 2;  // output element bytes the model cost's output
-                             // term prices; 2 = the bf16 fused-linear
-                             // default (plan_query's OutT parameter — an
-                             // fp32-out caller is priced at 4, not 2)
-    bool tma = true;  // the staging this launch will take (plan_query fills
-                      // it from launch_plan_impl's predicate): the planner
-                      // prices residency per variant — the sign flips with
-                      // staging (TMA shares bandwidth, cp.async's software
-                      // ring IS the latency hiding)
-    DeviceFacts dev{};
-};
+// Everything a plan decision is priced against is PlanQuery — now policy.cuh
+// (the kernel-side vocabulary), so this header compiles against types the
+// launchers already see.
 
 // CTAs of one plan's tile that fit on an SM, or 0 when the plan cannot be
 // priced (no device facts) or its ring cannot be launched at all (the same
@@ -419,23 +389,6 @@ inline RowSource& plan_table_injected_source() {
 }
 
 
-// Runtime configuration: the backing state of the runtime plan API
-// (astrai.extension.ops.gemm's set_* functions and the gemm ``configure``
-// binding). One knob per launch-time switch, each a tri-state atomic —
-// -1 means "unset, the one-time env seed decides", any other value is
-// explicit and wins. The environment is consulted exactly once per
-// process (a migration seed; the vars are documented as deprecated),
-// never per call: sweeps toggle this state through the binding instead,
-// which is the same one-set-per-launch cadence the env file supported
-// without paying getenv on the hot path.
-struct GemmConfig {
-    std::atomic<int> planner{-1};      // 0 table-only, 1 hybrid (table -> model), 2 model-only
-    std::atomic<int> log{-1};          // [gemm-plan] stderr log on/off
-    std::atomic<int> tma_disabled{-1};  // cp.async staging forced everywhere
-    std::atomic<int> mx_disabled{-1};   // sm_120a block-scale cell knocked out
-    std::atomic<int> table_off{-1};    // 1 = "-" (no override, no injected, no builtin rows)
-};
-
 // The planner-rank vocabulary, one place: the strings configure() takes
 // and config_state() returns for GemmConfig::planner.
 inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid",
@@ -448,11 +401,6 @@ inline bool parse_planner_mode(const std::string& name, int& out) {
             return true;
         }
     return false;
-}
-
-inline GemmConfig& gemm_config() {
-    static GemmConfig cfg;
-    return cfg;
 }
 
 // The migration seed: legacy ASTR_GEMM_* variables read once, on the first
@@ -486,22 +434,14 @@ inline void gemm_config_seed_once() {
 }
 
 // Resolved views (unset falls to the default, never to a later env read).
+// gemm_planner_mode and gemm_table_off are table-side: only the planner
+// chain (planning.h) and the row tiers read them. The three launch-side
+// knobs' resolved views are policy.cuh's — the kernel TUs call them without
+// this header.
 inline int gemm_planner_mode() {
     gemm_config_seed_once();
     const int v = gemm_config().planner.load(std::memory_order_relaxed);
     return v < 0 ? 1 : v;  // default: hybrid (model fills what no row owns)
-}
-inline bool gemm_plan_log_enabled() {
-    gemm_config_seed_once();
-    return gemm_config().log.load(std::memory_order_relaxed) > 0;
-}
-inline bool gemm_tma_staging_disabled() {
-    gemm_config_seed_once();
-    return gemm_config().tma_disabled.load(std::memory_order_relaxed) > 0;
-}
-inline bool gemm_mx_cell_disabled() {
-    gemm_config_seed_once();
-    return gemm_config().mx_disabled.load(std::memory_order_relaxed) > 0;
 }
 inline bool gemm_table_off() {
     gemm_config_seed_once();

@@ -59,6 +59,7 @@ that computes the wrong thing is not a win.
 
 #include <utils/device.cuh>
 #include <kernel/gemm.cuh>
+#include <launcher/planning.h>
 
 using namespace astrai;
 using namespace astrai::gemm;

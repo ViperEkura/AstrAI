@@ -4,11 +4,14 @@
 // layout tags + scheduling knobs). Dtype-generic via gemm_elem_traits.
 
 #include <cuda_fp8.h>
+#include <atomic>
+#include <cstdint>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 
 #include <mma/mma.cuh>
+#include <utils/device.cuh>
 #include <utils/tensor.cuh>
 #include <utils/gemm_common.h>
 
@@ -455,6 +458,109 @@ struct GemmPolicy {
     static constexpr int kMinCtas = Smem::kMinCtas;
     static constexpr int kSmemBytes = Smem::kBytes + kTmaExtra;
 };
+
+// ---------------------------------------------------------------------------
+// Runtime planning vocabulary. The kernel-side headers (gemm.cuh and below)
+// plan a launch through these value types, the launch-side runtime knobs and
+// one planner-entry declaration whose definition lives in
+// launcher/planning.h — the single host-side unit that compiles the planner
+// chain and the row tables. Keeping the vocabulary here means the heavy
+// per-dtype kernel TUs reference the planner through declarations only
+// (plan_table.h stops being compiled once per dtype pair), while the launch
+// side still sees the same types the planner decides on.
+// ---------------------------------------------------------------------------
+
+// Launch-side runtime configuration: the backing state of the runtime plan
+// API (astrai.extension.ops.gemm's set_* functions and the gemm
+// ``configure`` binding). One knob per launch-time switch, each a tri-state
+// atomic — -1 means "unset, the one-time env seed decides" (seeded in
+// plan_table.h, next to the row sources it also seeds), any other value is
+// explicit and wins. Lives here rather than plan_table.h so the three
+// launch-side knobs below are defined where their callers compile.
+struct GemmConfig {
+    std::atomic<int> planner{-1};      // 0 table-only, 1 hybrid (table -> model), 2 model-only
+    std::atomic<int> log{-1};          // [gemm-plan] stderr log on/off
+    std::atomic<int> tma_disabled{-1};  // cp.async staging forced everywhere
+    std::atomic<int> mx_disabled{-1};  // sm_120a block-scale cell knocked out
+    std::atomic<int> table_off{-1};    // 1 = "-" (no override, no injected, no builtin rows)
+};
+
+inline GemmConfig& gemm_config() {
+    static GemmConfig cfg;
+    return cfg;
+}
+
+void gemm_config_seed_once();  // defined in plan_table.h (env migration seed)
+
+// Dtype-class ids the plan-table rows key on.
+enum class GemmPerfClass : int { kW16A16 = 0, kW8A16, kW8A8, kF8A8 };
+
+// One launchable tile configuration, runtime form. The manifest types are
+// the compiled truth; every consumer — row tables, the analytical model,
+// the launchers, the tile_vocabulary binding — names tiles through this.
+struct GemmRecipe {
+    int cta;      // TileClass ordinal — the row-file serialization key
+    int stages;   // ring depth
+    int kk;       // k-tile depth (the kK twins are separate recipes)
+    int bm, bn;   // CTA geometry
+    int wm, wn;   // warp tiling (the recipe name's W<x>x<y>)
+    int threads;  // the manifest entry's warp tiling (first match wins)
+    int smem;     // ring bytes at this staging pair's operand widths
+};
+
+// Everything one plan decision is priced against (shape, the table key it
+// derives from, operand widths, the queried device). Assembled once per
+// launch by plan_query and passed as one value.
+struct PlanQuery {
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int64_t batch = 1;
+    int perf_class = -1;  // GemmPerfClass id; -1 matches any
+    int crosswise = 0;    // direct-load operand count, see gemm_dispatch
+    int ba = 2;           // operand element bytes
+    int bb = 2;
+    int out_elem_bytes = 2;  // output element bytes the model cost's output
+                             // term prices; 2 = the bf16 fused-linear
+                             // default (plan_query's OutT parameter — an
+                             // fp32-out caller is priced at 4, not 2)
+    bool tma = true;  // the staging this launch will take (plan_query fills
+                      // it from launch_plan_impl's predicate): the planner
+                      // prices residency per variant — the sign flips with
+                      // staging (TMA shares bandwidth, cp.async's software
+                      // ring IS the latency hiding)
+    DeviceFacts dev{};
+};
+
+// One dispatch decision: the recipe, the resolved raster (a row's literal,
+// or plan_raster at the recipe's geometry), and the planner that made it.
+// source is that planner's own name — the log line and the probe dict
+// report it verbatim.
+struct PlanDecision {
+    GemmRecipe recipe;
+    int raster;
+    const char* source;
+};
+
+// The planner entry and the three launch-side knobs. The knobs are inline
+// here (their callers are the kernel TUs, which must not reach plan_table.h);
+// plan_dispatch is defined non-inline in launcher/planning.h — the
+// single-inclusion unit that compiles the planner chain. A TU that includes
+// planning.h twice over is a multiple-definition link error, which is the
+// enforcement.
+PlanDecision plan_dispatch(const PlanQuery& q);
+inline bool gemm_plan_log_enabled() {
+    gemm_config_seed_once();
+    return gemm_config().log.load(std::memory_order_relaxed) > 0;
+}
+inline bool gemm_tma_staging_disabled() {
+    gemm_config_seed_once();
+    return gemm_config().tma_disabled.load(std::memory_order_relaxed) > 0;
+}
+inline bool gemm_mx_cell_disabled() {
+    gemm_config_seed_once();
+    return gemm_config().mx_disabled.load(std::memory_order_relaxed) > 0;
+}
 
 }  // namespace gemm
 }  // namespace astrai

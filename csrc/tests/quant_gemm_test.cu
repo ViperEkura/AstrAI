@@ -21,6 +21,7 @@ nvcc -I csrc/include -arch=sm_89 -std=c++17 -O3 csrc/tests/quant_gemm_test.cu \
 
 #include <utils/launch.cuh>
 #include <kernel/gemm.cuh>
+#include <launcher/planning.h>
 
 using namespace astrai::quant;
 using namespace astrai::gemm;

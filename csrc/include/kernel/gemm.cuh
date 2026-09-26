@@ -7,14 +7,10 @@
 // binding and the C tests. Layout tags and the NN swap semantics live in
 // utils/gemm_common.h and docs/developer/cuda_kernels.md.
 
-#include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdio>
-#include <cstdlib>
-#include <functional>
-#include <optional>
 #include <tuple>
 #include <utility>
 #include <type_traits>

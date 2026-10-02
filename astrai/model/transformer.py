@@ -16,11 +16,30 @@ from astrai.model.kv_cache import KVCache
 
 def process_attention_mask(
     input_mask: Optional[Tensor],
+    *,
+    causal: bool = False,
 ) -> Optional[Tensor]:
+    """Expand masks, optionally adding causality to a 2-D key-padding mask.
+
+    Explicit 3-D/4-D masks already define which query/key pairs may attend.
+    """
     if input_mask is None:
         return None
     if input_mask.dim() == 2:
-        return input_mask[:, None, None, :]
+        mask = input_mask[:, None, None, :]
+        if causal:
+            seq_len = input_mask.size(-1)
+            causal_mask = torch.ones(
+                seq_len, seq_len, dtype=torch.bool, device=input_mask.device
+            ).tril()
+            if input_mask.dtype == torch.bool:
+                mask = mask & causal_mask
+            else:
+                # Preserve additive attention biases on allowed keys.
+                mask = mask.expand(-1, 1, seq_len, -1).masked_fill(
+                    ~causal_mask, float("-inf")
+                )
+        return mask
     if input_mask.dim() == 3:
         return input_mask[:, None, :, :]
     return input_mask
@@ -124,7 +143,11 @@ class AutoRegressiveLM(AutoModel):
 
         x = self.embed_tokens(input_ids)
         rotary_emb = self.rotary_embedding(x, position_ids)
-        attn_mask = process_attention_mask(input_mask)
+        # GDN supplies causality through its recurrence and needs the compact
+        # key-padding mask; softmax attention needs both constraints combined.
+        attn_mask = process_attention_mask(
+            input_mask, causal=self.config.attn_type != "gdn"
+        )
         use_sdpa_causal_mask = attn_mask is None
 
         aux_losses = []

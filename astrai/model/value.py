@@ -43,7 +43,9 @@ class ValueModel(AutoRegressiveLM):
             raise ValueError("critic input_ids must be [batch, seq_len]")
         x = self.embed_tokens(input_ids)
         rotary_emb = self.rotary_embedding(x, position_ids)
-        attn_mask = process_attention_mask(input_mask)
+        attn_mask = process_attention_mask(
+            input_mask, causal=self.config.attn_type != "gdn"
+        )
         use_sdpa_causal_mask = attn_mask is None
 
         for layer in self.layers:

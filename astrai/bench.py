@@ -189,10 +189,8 @@ def causal_sequence_logits(
     """Causally masked forward over a batch of token rows.
 
     The single owner of the causal mask for every log-likelihood metric.
-    Callers must not build masks themselves: a 2-D ``input_mask`` is read as
-    key-padding only and switches causality off in
-    ``astrai/model/transformer.py``, which lets a scored position attend to
-    the very token it is scoring (see ``loglikelihood_batched``).
+    Callers delegate mask construction here so padding, document boundaries,
+    and causality are applied consistently across metrics.
     Per query/key pair the mask is ``real key & same document & key index
     <= query index``.
 

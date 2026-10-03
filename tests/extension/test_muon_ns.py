@@ -42,7 +42,18 @@ def test_muon_ns_accepts_float_input_and_returns_bf16():
     assert torch.isfinite(result).all()
 
 
-@pytest.mark.parametrize("shape", [(64, 128), (256, 1024), (512, 1024), (1024, 1024)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (64, 128),
+        (256, 1024),
+        (512, 1024),
+        (1024, 1024),
+        (1024, 2048),
+        (2048, 1024),
+        (1536, 1536),
+    ],
+)
 @pytest.mark.parametrize("ns_steps", [1, 5])
 @pytest.mark.parametrize("coefficients", [(3.4445, -4.7750, 2.0315), (2.0, -1.0, 0.5)])
 @skip_no_muon_ns

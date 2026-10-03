@@ -191,7 +191,7 @@ foreach(entry IN LISTS KERNEL_MODULES)
 
     target_link_libraries(${name} PRIVATE ${TORCH_LIBS})
     if(name STREQUAL "muon_ns")
-        target_link_libraries(${name} PRIVATE CUDA::cublas)
+        target_link_libraries(${name} PRIVATE CUDA::cublas CUDA::cublasLt)
     endif()
     target_link_options(${name} PRIVATE "-Wl,-rpath,${TORCH_LIB_DIR}")
 

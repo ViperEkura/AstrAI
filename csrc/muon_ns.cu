@@ -2,6 +2,7 @@
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -85,6 +87,67 @@ __global__ void fused_gram_polynomial_32_kernel(
     }
 }
 
+// cuBLASLt accepts distinct residual (C) and result (D) pointers. ATen's
+// addmm_out copies C into D before GEMM when beta is nonzero; keeping them
+// separate removes two full-matrix copies from every NS iteration.
+struct LtMatrix {
+    cublasLtMatrixLayout_t layout = nullptr;
+
+    LtMatrix(int64_t rows, int64_t cols, int64_t stride0, int64_t stride1) {
+        const bool column_major = stride0 == 1;
+        const auto order = column_major ? CUBLASLT_ORDER_COL : CUBLASLT_ORDER_ROW;
+        const int64_t ld = column_major ? stride1 : stride0;
+        TORCH_CUDABLAS_CHECK(cublasLtMatrixLayoutCreate(&layout, CUDA_R_16BF, rows, cols, ld));
+        TORCH_CUDABLAS_CHECK(cublasLtMatrixLayoutSetAttribute(layout, CUBLASLT_MATRIX_LAYOUT_ORDER,
+                                                              &order, sizeof(order)));
+    }
+
+    ~LtMatrix() {
+        if (layout != nullptr) {
+            cublasLtMatrixLayoutDestroy(layout);
+        }
+    }
+
+    LtMatrix(const LtMatrix&) = delete;
+    LtMatrix& operator=(const LtMatrix&) = delete;
+};
+
+struct LtMatmul {
+    cublasLtMatmulDesc_t desc = nullptr;
+
+    LtMatmul() {
+        TORCH_CUDABLAS_CHECK(cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+    }
+
+    ~LtMatmul() {
+        if (desc != nullptr) {
+            cublasLtMatmulDescDestroy(desc);
+        }
+    }
+
+    LtMatmul(const LtMatmul&) = delete;
+    LtMatmul& operator=(const LtMatmul&) = delete;
+};
+
+void lt_addmm(const LtMatmul& operation,
+              const torch::Tensor& lhs,
+              const LtMatrix& lhs_layout,
+              const torch::Tensor& rhs,
+              const LtMatrix& rhs_layout,
+              const torch::Tensor& residual,
+              const LtMatrix& residual_layout,
+              torch::Tensor& result,
+              const LtMatrix& result_layout,
+              float alpha,
+              float beta,
+              cudaStream_t stream) {
+    TORCH_CUDABLAS_CHECK(cublasLtMatmul(
+        at::cuda::getCurrentCUDABlasLtHandle(), operation.desc, &alpha,
+        lhs.data_ptr<at::BFloat16>(), lhs_layout.layout, rhs.data_ptr<at::BFloat16>(),
+        rhs_layout.layout, &beta, residual.data_ptr<at::BFloat16>(), residual_layout.layout,
+        result.data_ptr<at::BFloat16>(), result_layout.layout, nullptr, nullptr, 0, stream));
+}
+
 torch::Tensor muon_ns_impl(torch::Tensor grad,
                            const std::vector<double>& coefficients,
                            int64_t ns_steps,
@@ -119,6 +182,16 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
     const bool use_wmma = fused_polynomial && at::cuda::getCurrentDeviceProperties()->major == 12;
     const bool use_fused_polynomial_16 = use_wmma && m >= 16 && m <= 256 && m % 16 == 0;
     const bool use_fused_polynomial_32 = use_wmma && m >= 288 && m <= 512 && m % 32 == 0;
+    const bool use_lt = fused_polynomial && at::cuda::getCurrentDeviceProperties()->major == 12 &&
+                        m > 512 && m % 16 == 0 && x.size(1) % 16 == 0;
+    std::optional<LtMatmul> lt_operation;
+    std::optional<LtMatrix> lt_gram;
+    std::optional<LtMatrix> lt_x;
+    if (use_lt) {
+        lt_operation.emplace();
+        lt_gram.emplace(m, m, gram.stride(0), gram.stride(1));
+        lt_x.emplace(x.size(0), x.size(1), x.stride(0), x.stride(1));
+    }
     const auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     for (int64_t step = 0; step < ns_steps; ++step) {
@@ -137,10 +210,18 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
                 reinterpret_cast<__nv_bfloat16*>(gram_update.data_ptr<at::BFloat16>()),
                 static_cast<int>(m), static_cast<float>(b), static_cast<float>(c));
             C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else if (use_lt) {
+            lt_addmm(*lt_operation, gram, *lt_gram, gram, *lt_gram, gram, *lt_gram, gram_update,
+                     *lt_gram, static_cast<float>(c), static_cast<float>(b), stream);
         } else {
             at::addmm_out(gram_update, gram, gram, gram, b, c);
         }
-        at::addmm_out(next_x, x, gram_update, x, a, 1.0);
+        if (use_lt) {
+            lt_addmm(*lt_operation, gram_update, *lt_gram, x, *lt_x, x, *lt_x, next_x, *lt_x, 1.0f,
+                     static_cast<float>(a), stream);
+        } else {
+            at::addmm_out(next_x, x, gram_update, x, a, 1.0);
+        }
         std::swap(x, next_x);
     }
 

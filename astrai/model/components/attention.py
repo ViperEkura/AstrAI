@@ -82,8 +82,12 @@ class GQA(nn.Module):
 
         q, k = apply_rotary_emb(q, rotary_emb), apply_rotary_emb(k, rotary_emb)
 
+        # The layer index only addresses KV-cache storage. Keeping the
+        # cache-free training call constant lets Dynamo reuse one graph
+        # across decoder layers instead of specializing on every layer_id.
+        cache_layer_id = self.layer_id if kv_cache is not None else 0
         sdqa_out = attention(
-            q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
+            q, k, v, kv_cache, cache_layer_id, attn_mask, is_causal, fwd
         ).reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
         if self.use_gated_attention:

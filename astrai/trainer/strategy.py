@@ -24,6 +24,8 @@ from torch import Tensor
 from torch.optim import Optimizer
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from astrai.extension.kernel.cross_entropy import cross_entropy as cuda_cross_entropy
+from astrai.extension.kernel.cross_entropy import is_available as has_cross_entropy
 from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
 from astrai.parallel.cp import LossReduction, TokenLoss
@@ -48,7 +50,7 @@ class ForwardResult:
     """Model forward over the (possibly sequence-sharded) batch.
 
     ``logits`` keeps the model dtype; :meth:`BaseStrategy.reduce_loss`
-    upcasts at the loss input.  The MoE extras ride along so the loss
+    uses FP32 loss arithmetic.  The MoE extras ride along so the loss
     assembly can attach aux-loss and router diagnostics.
     """
 
@@ -881,12 +883,31 @@ class StrategyFactory(BaseFactory["BaseStrategy"]):
 # All strategies are registered at class definition time using the decorator
 
 
+def _cross_entropy_sum(logits, targets, label_smoothing, fused):
+    """Keep token-sum semantics for accumulation and context parallelism."""
+    logits = logits.flatten(0, 1)
+    targets = targets.flatten()
+    if (
+        fused
+        and label_smoothing == 0.0
+        and logits.is_cuda
+        and logits.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and has_cross_entropy()
+    ):
+        return cuda_cross_entropy(logits, targets, reduction="sum")
+    return F.cross_entropy(
+        logits.float(), targets, label_smoothing=label_smoothing, reduction="sum"
+    )
+
+
 @StrategyFactory.register("seq")
 class SEQStrategy(BaseStrategy):
     """Standard next-token prediction training strategy.
 
     Computes cross-entropy loss for next token prediction.
     Optionally adds MoE load balancing auxiliary loss.
+    ``fused_cross_entropy=True`` opts into CUDA loss forward/backward without
+    full FP32 logits storage; smoothing and unavailable kernels use Torch.
     """
 
     loss_reduction = LossReduction.TOKEN_MEAN
@@ -896,10 +917,12 @@ class SEQStrategy(BaseStrategy):
         model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
         device: str,
         label_smoothing: float = 0.0,
+        fused_cross_entropy: bool = False,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
         self.label_smoothing = label_smoothing
+        self.fused_cross_entropy = fused_cross_entropy
 
     def prepare_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
         batch = super().prepare_batch(batch)
@@ -933,11 +956,8 @@ class SEQStrategy(BaseStrategy):
         self, forward: ForwardResult, batch: Dict[str, Tensor]
     ) -> TokenLoss:
         target_ids = batch["target_ids"]
-        loss_sum = F.cross_entropy(
-            input=forward.logits.flatten(0, 1).float(),
-            target=target_ids.flatten(),
-            label_smoothing=self.label_smoothing,
-            reduction="sum",
+        loss_sum = _cross_entropy_sum(
+            forward.logits, target_ids, self.label_smoothing, self.fused_cross_entropy
         )
         token_count = torch.tensor(
             target_ids.numel(), dtype=torch.float32, device=target_ids.device
@@ -951,6 +971,8 @@ class SFTStrategy(BaseStrategy):
 
     Applies cross-entropy loss only to tokens where loss_mask is True.
     Optionally adds MoE load balancing auxiliary loss.
+    ``fused_cross_entropy=True`` uses CUDA loss with the same masked token-sum
+    contract. It remains opt-in because floating-point reduction order differs.
     """
 
     loss_reduction = LossReduction.TOKEN_MEAN
@@ -960,10 +982,12 @@ class SFTStrategy(BaseStrategy):
         model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
         device: str,
         label_smoothing: float = 0.0,
+        fused_cross_entropy: bool = False,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
         self.label_smoothing = label_smoothing
+        self.fused_cross_entropy = fused_cross_entropy
 
     def shard_spec(self, batch: Dict[str, Tensor]) -> Tuple[List[Tensor], List[int]]:
         if _is_packed(batch["position_ids"]):
@@ -1005,12 +1029,8 @@ class SFTStrategy(BaseStrategy):
     ) -> TokenLoss:
         ignore_index = -100
         target_ids = batch["target_ids"].masked_fill(~batch["loss_mask"], ignore_index)
-        loss_sum = F.cross_entropy(
-            input=forward.logits.flatten(0, 1).float(),
-            target=target_ids.flatten(),
-            ignore_index=ignore_index,
-            label_smoothing=self.label_smoothing,
-            reduction="sum",
+        loss_sum = _cross_entropy_sum(
+            forward.logits, target_ids, self.label_smoothing, self.fused_cross_entropy
         )
         token_count = (target_ids != ignore_index).sum().to(dtype=torch.float32)
         return TokenLoss(loss_sum, token_count)

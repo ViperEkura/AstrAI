@@ -77,6 +77,8 @@ from astrai.extension.kernel import (
     attn_paged_decode,
     attn_paged_prefill,
     attn_prefill,
+    cross_entropy,
+    muon_ns,
 )
 from astrai.extension.kernel.gemm import (
     facts,
@@ -139,6 +141,8 @@ __all__ = [
     "attn_paged_decode",
     "attn_prefill",
     "attn_paged_prefill",
+    "muon_ns",
+    "cross_entropy",
     "is_available",
     "KERNEL_NAMES",
     "apply_rotary_emb",

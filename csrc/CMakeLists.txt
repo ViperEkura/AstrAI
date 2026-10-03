@@ -123,6 +123,8 @@ set(KERNEL_MODULES
          attention/paged_prefill.cu
          attention/bindings.cu"
     "rotary_emb|rotary_emb.cu"
+    "muon_ns|muon_ns.cu"
+    "cross_entropy|cross_entropy.cu"
     "gated_deltanet|gated_deltanet/gated_deltanet_fwd.cu
          gated_deltanet/gated_deltanet_bwd.cu
          gated_deltanet/bindings.cu"
@@ -189,6 +191,9 @@ foreach(entry IN LISTS KERNEL_MODULES)
         "${PYTHON_INCLUDE_DIR}")
 
     target_link_libraries(${name} PRIVATE ${TORCH_LIBS})
+    if(name STREQUAL "muon_ns")
+        target_link_libraries(${name} PRIVATE CUDA::cublas CUDA::cublasLt)
+    endif()
     target_link_options(${name} PRIVATE "-Wl,-rpath,${TORCH_LIB_DIR}")
 
     target_compile_options(${name} PRIVATE

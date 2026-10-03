@@ -567,10 +567,14 @@ def _run_stats(args, torch):
 
 
 def _run_muon(args, torch):
-    """Measure single-stream Muon and optionally compare NS buffer reuse."""
+    """Measure Muon variants with matched inputs and symmetric run order."""
+    from astrai.extension.kernel.muon_ns import is_available
     from astrai.model import AutoRegressiveLM
     from astrai.optim.muon_adamw import MuonAdamW
 
+    kernel_available = is_available()
+    if args.muon_fused_ns and not kernel_available:
+        raise RuntimeError("--muon-fused-ns requires the muon_ns CUDA extension")
     result = {
         "model_path": str(args.model_path),
         "optimizer": "MuonAdamW",
@@ -579,17 +583,33 @@ def _run_muon(args, torch):
         "gradient_seed": 17,
         "warmup_steps": 3,
         "measured_steps": args.steps,
+        "parity_after_steps": 3 + args.steps,
+        "muon_ns_available": kernel_available,
     }
-    variants = [("reference", False)]
+    variants = [("reference", False, False)]
     if args.muon_reuse_ns_buffers:
-        variants.append(("reuse_ns_buffers", True))
+        variants.append(("reuse_ns_buffers", True, False))
+    if args.muon_fused_ns:
+        variants.append(("fused_ns", False, True))
+    # Symmetric order reduces sensitivity to the GPU clock drifting during a run.
+    run_order = variants + list(reversed(variants)) if len(variants) > 1 else variants
+    result["runs_per_variant"] = 2 if len(variants) > 1 else 1
+    result["run_order"] = [name for name, _, _ in run_order]
+    measurements = {name: [] for name, _, _ in variants}
+    peak_allocated = {name: 0.0 for name, _, _ in variants}
+    peak_reserved = {name: 0.0 for name, _, _ in variants}
+    parity = {}
     expected = None
-    for name, reuse in variants:
+    for name, reuse, fused in run_order:
         torch.manual_seed(7)
         model = AutoRegressiveLM.from_pretrained(args.model_path).to(
             device="cuda", dtype=torch.bfloat16
         )
-        kwargs = {"reuse_ns_buffers": True} if reuse else {}
+        kwargs = {}
+        if reuse:
+            kwargs["reuse_ns_buffers"] = True
+        if fused:
+            kwargs["fused_ns"] = True
         optimizer = MuonAdamW(model, lr=1e-5, ns_steps=5, **kwargs)
         torch.manual_seed(17)
         for param in model.parameters():
@@ -597,12 +617,25 @@ def _run_muon(args, torch):
         for _ in range(3):
             optimizer.step()
         torch.cuda.synchronize()
-        if name == "reference" and args.muon_reuse_ns_buffers:
+        torch.cuda.reset_peak_memory_stats()
+        for _ in range(args.steps):
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            optimizer.step()
+            torch.cuda.synchronize()
+            measurements[name].append((time.perf_counter() - start) * 1000)
+        peak_allocated[name] = max(
+            peak_allocated[name], torch.cuda.max_memory_allocated() / 2**20
+        )
+        peak_reserved[name] = max(
+            peak_reserved[name], torch.cuda.max_memory_reserved() / 2**20
+        )
+        if name == "reference" and expected is None and len(variants) > 1:
             expected = {
                 key: param.detach().cpu().clone()
                 for key, param in model.named_parameters()
             }
-        elif reuse:
+        elif expected is not None:
             max_abs = 0.0
             different_elements = 0
             for key, param in model.named_parameters():
@@ -611,27 +644,29 @@ def _run_muon(args, torch):
                     difference = current.float() - expected[key].float()
                     max_abs = max(max_abs, difference.abs().max().item())
                     different_elements += torch.count_nonzero(difference).item()
-            result["update_equivalence"] = {
-                "max_abs": max_abs,
-                "different_elements": different_elements,
+            previous = parity.get(name, {"max_abs": 0.0, "different_elements": 0})
+            parity[name] = {
+                "max_abs": max(max_abs, previous["max_abs"]),
+                "different_elements": max(
+                    different_elements, previous["different_elements"]
+                ),
             }
-            torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        samples = []
-        for _ in range(args.steps):
-            start = time.perf_counter()
-            optimizer.step()
-            torch.cuda.synchronize()
-            samples.append((time.perf_counter() - start) * 1000)
-        result[name] = {
-            "optimizer_step": _summary(samples),
-            "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 2),
-            "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 2),
-        }
         result["parameter_count"] = sum(p.numel() for p in model.parameters())
         del model, optimizer
         gc.collect()
         torch.cuda.empty_cache()
+    for name, _, _ in variants:
+        result[name] = {
+            "optimizer_step": _summary(measurements[name]),
+            "sample_count": len(measurements[name]),
+            "peak_allocated_mib": round(peak_allocated[name], 2),
+            "peak_reserved_mib": round(peak_reserved[name], 2),
+        }
+        if name in parity:
+            result[name]["parameter_parity"] = {
+                **parity[name],
+                "passed": parity[name]["different_elements"] == 0,
+            }
     return result
 
 
@@ -651,6 +686,11 @@ def main():
         "--muon-reuse-ns-buffers",
         action="store_true",
         help="muon mode: compare optional NS scratch-buffer reuse",
+    )
+    parser.add_argument(
+        "--muon-fused-ns",
+        action="store_true",
+        help="muon mode: compare the fused CUDA NS operator",
     )
     parser.add_argument(
         "--config", type=Path, help="optional JSON case matrix for train mode"
@@ -703,6 +743,7 @@ def main():
                 dry_run.update(
                     model_path=str(args.model_path),
                     muon_reuse_ns_buffers=args.muon_reuse_ns_buffers,
+                    muon_fused_ns=args.muon_fused_ns,
                     steps=args.steps,
                 )
             else:

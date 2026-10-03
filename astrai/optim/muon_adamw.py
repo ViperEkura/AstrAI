@@ -12,6 +12,7 @@ from torch.optim._muon import (
     _zeropower_via_newtonschulz,
 )
 
+from astrai.extension.kernel.muon_ns import is_available, muon_ns
 from astrai.optim.composite import (
     OptimizerFactory,
     composite_state_dict,
@@ -62,6 +63,7 @@ def _single_tensor_muon_reuse_buffers(
     eps: float,
     adjust_lr_fn: str | None,
     has_complex: bool,
+    fused_ns: bool = False,
 ) -> None:
     if has_complex:
         raise ValueError("Complex parameters are not supported")
@@ -71,13 +73,18 @@ def _single_tensor_muon_reuse_buffers(
             raise ValueError("Param gradient must be a 2D matrix")
         buf.lerp_(grad, 1 - momentum)
         update = grad.lerp(buf, momentum) if nesterov else buf
-        update = _zeropower_reuse_buffers(update, ns_coefficients, ns_steps, eps)
+        if fused_ns:
+            update = muon_ns(update, ns_coefficients, ns_steps, eps)
+        else:
+            update = _zeropower_reuse_buffers(update, ns_coefficients, ns_steps, eps)
         adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
         param.mul_(1 - lr * weight_decay)
         param.add_(update, alpha=-adjusted_lr)
 
 
-def _sharded_orthogonalize(update: Tensor, group: Mapping) -> Tensor:
+def _sharded_orthogonalize(
+    update: Tensor, group: Mapping, *, fused_ns: bool = False
+) -> Tensor:
     """Newton-Schulz for a sharded DTensor momentum update.
 
     NS needs global matmuls, so gather the update to the full matrix,
@@ -86,9 +93,12 @@ def _sharded_orthogonalize(update: Tensor, group: Mapping) -> Tensor:
     every rank, so the scatter is a uniform collective.
     """
     full = update.full_tensor()
-    ortho = _zeropower_via_newtonschulz(
-        full, group["ns_coefficients"], group["ns_steps"], group["eps"]
-    )
+    if fused_ns:
+        ortho = muon_ns(full, group["ns_coefficients"], group["ns_steps"], group["eps"])
+    else:
+        ortho = _zeropower_via_newtonschulz(
+            full, group["ns_coefficients"], group["ns_steps"], group["eps"]
+        )
     return distribute_tensor(ortho, update.device_mesh, update.placements)
 
 
@@ -110,9 +120,17 @@ class _ShardedMuon(optim.Muon):
     are DTensor-safe and run directly on the shards.
     """
 
-    def __init__(self, params, *, reuse_ns_buffers: bool = False, **kwargs):
+    def __init__(
+        self,
+        params,
+        *,
+        reuse_ns_buffers: bool = False,
+        fused_ns: bool = False,
+        **kwargs,
+    ):
         super().__init__(params, **kwargs)
         self.reuse_ns_buffers = reuse_ns_buffers
+        self.fused_ns = fused_ns
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -135,26 +153,48 @@ class _ShardedMuon(optim.Muon):
 
             if plain:
                 pp, gg, bb = (list(t) for t in zip(*plain))
-                step_plain = (
-                    _single_tensor_muon_reuse_buffers
-                    if self.reuse_ns_buffers
-                    else _single_tensor_muon
+                use_fused_ns = (
+                    self.fused_ns
+                    and all(grad.is_cuda for grad in gg)
+                    and is_available()
                 )
-                step_plain(
-                    pp,
-                    gg,
-                    bb,
-                    lr=group["lr"],
-                    weight_decay=group["weight_decay"],
-                    momentum=group["momentum"],
-                    nesterov=group["nesterov"],
-                    ns_coefficients=group["ns_coefficients"],
-                    ns_steps=group["ns_steps"],
-                    eps=group["eps"],
-                    adjust_lr_fn=group["adjust_lr_fn"],
-                    has_complex=False,
-                )
+                if use_fused_ns or self.reuse_ns_buffers:
+                    _single_tensor_muon_reuse_buffers(
+                        pp,
+                        gg,
+                        bb,
+                        lr=group["lr"],
+                        weight_decay=group["weight_decay"],
+                        momentum=group["momentum"],
+                        nesterov=group["nesterov"],
+                        ns_coefficients=group["ns_coefficients"],
+                        ns_steps=group["ns_steps"],
+                        eps=group["eps"],
+                        adjust_lr_fn=group["adjust_lr_fn"],
+                        has_complex=False,
+                        fused_ns=use_fused_ns,
+                    )
+                else:
+                    _single_tensor_muon(
+                        pp,
+                        gg,
+                        bb,
+                        lr=group["lr"],
+                        weight_decay=group["weight_decay"],
+                        momentum=group["momentum"],
+                        nesterov=group["nesterov"],
+                        ns_coefficients=group["ns_coefficients"],
+                        ns_steps=group["ns_steps"],
+                        eps=group["eps"],
+                        adjust_lr_fn=group["adjust_lr_fn"],
+                        has_complex=False,
+                    )
 
+            use_fused_ns = (
+                self.fused_ns
+                and all(grad.device.type == "cuda" for _, grad, _ in sharded)
+                and is_available()
+            )
             lr = _scalar_lr(group["lr"])
             for param, grad, buf in sharded:
                 buf.lerp_(grad, 1 - group["momentum"])
@@ -162,7 +202,10 @@ class _ShardedMuon(optim.Muon):
 
                 adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], param.shape)
                 param.mul_(1 - lr * group["weight_decay"])
-                param.add_(_sharded_orthogonalize(update, group), alpha=-adjusted_lr)
+                param.add_(
+                    _sharded_orthogonalize(update, group, fused_ns=use_fused_ns),
+                    alpha=-adjusted_lr,
+                )
         return loss
 
 
@@ -182,6 +225,7 @@ class MuonAdamW(optim.Optimizer):
         ns_steps: int = 5,
         adjust_lr_fn: str = "match_rms_adamw",
         reuse_ns_buffers: bool = False,
+        fused_ns: bool = False,
     ):
         defaults = {
             "lr": lr,
@@ -219,6 +263,7 @@ class MuonAdamW(optim.Optimizer):
             ns_steps=ns_steps,
             adjust_lr_fn=adjust_lr_fn,
             reuse_ns_buffers=reuse_ns_buffers,
+            fused_ns=fused_ns,
         )
         self.adamw = optim.AdamW(
             [{"params": other_params, "weight_decay": 0.0}],

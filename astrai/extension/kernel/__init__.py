@@ -7,6 +7,7 @@ from astrai.extension.kernel.attention import (
     attn_paged_prefill,
     attn_prefill,
 )
+from astrai.extension.kernel.muon_ns import muon_ns
 from astrai.extension.kernel.rotary import rotary_emb
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "attn_paged_decode",
     "attn_paged_prefill",
     "attn_prefill",
+    "muon_ns",
     "rotary_emb",
 ]

@@ -3,6 +3,8 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <mma.h>
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -15,10 +17,79 @@ namespace muon_ns {
 
 namespace {
 
+// One warp owns an output tile. The BF16 product stays in FP32 until the
+// polynomial epilogue, so the Gram matrix is read only for MMA and the
+// residual, and the rounded polynomial is written once.
+__global__ void fused_gram_polynomial_kernel(
+    const __nv_bfloat16* gram, __nv_bfloat16* polynomial, int dim, float b, float c) {
+    using namespace nvcuda;
+    constexpr int kTile = 16;
+    const int row = blockIdx.y * kTile;
+    const int col = blockIdx.x * kTile;
+    wmma::fragment<wmma::matrix_a, kTile, kTile, kTile, __nv_bfloat16, wmma::row_major> lhs;
+    wmma::fragment<wmma::matrix_b, kTile, kTile, kTile, __nv_bfloat16, wmma::row_major> rhs;
+    wmma::fragment<wmma::accumulator, kTile, kTile, kTile, float> product;
+    wmma::fill_fragment(product, 0.0f);
+    for (int k = 0; k < dim; k += kTile) {
+        wmma::load_matrix_sync(lhs, gram + row * dim + k, dim);
+        wmma::load_matrix_sync(rhs, gram + k * dim + col, dim);
+        wmma::mma_sync(product, lhs, rhs, product);
+    }
+    __shared__ float tile[kTile * kTile];
+    wmma::store_matrix_sync(tile, product, kTile, wmma::mem_row_major);
+    __syncwarp();
+    for (int index = threadIdx.x; index < kTile * kTile; index += warpSize) {
+        const int offset = (row + index / kTile) * dim + col + index % kTile;
+        const float residual = __bfloat162float(gram[offset]);
+        polynomial[offset] = __float2bfloat16_rn(fmaf(c, tile[index], b * residual));
+    }
+}
+
+// Four output MMA tiles share the same input fragments in each K iteration.
+// This reduces redundant Gram loads once the matrix is too large for the
+// one-MMA-tile variant.
+__global__ void fused_gram_polynomial_32_kernel(
+    const __nv_bfloat16* gram, __nv_bfloat16* polynomial, int dim, float b, float c) {
+    using namespace nvcuda;
+    constexpr int kMma = 16;
+    constexpr int kTile = 32;
+    const int row = blockIdx.y * kTile;
+    const int col = blockIdx.x * kTile;
+    wmma::fragment<wmma::matrix_a, kMma, kMma, kMma, __nv_bfloat16, wmma::row_major> a0, a1;
+    wmma::fragment<wmma::matrix_b, kMma, kMma, kMma, __nv_bfloat16, wmma::row_major> b0, b1;
+    wmma::fragment<wmma::accumulator, kMma, kMma, kMma, float> p00, p01, p10, p11;
+    wmma::fill_fragment(p00, 0.0f);
+    wmma::fill_fragment(p01, 0.0f);
+    wmma::fill_fragment(p10, 0.0f);
+    wmma::fill_fragment(p11, 0.0f);
+    for (int k = 0; k < dim; k += kMma) {
+        wmma::load_matrix_sync(a0, gram + row * dim + k, dim);
+        wmma::load_matrix_sync(a1, gram + (row + kMma) * dim + k, dim);
+        wmma::load_matrix_sync(b0, gram + k * dim + col, dim);
+        wmma::load_matrix_sync(b1, gram + k * dim + col + kMma, dim);
+        wmma::mma_sync(p00, a0, b0, p00);
+        wmma::mma_sync(p01, a0, b1, p01);
+        wmma::mma_sync(p10, a1, b0, p10);
+        wmma::mma_sync(p11, a1, b1, p11);
+    }
+    __shared__ float tile[kTile * kTile];
+    wmma::store_matrix_sync(tile, p00, kTile, wmma::mem_row_major);
+    wmma::store_matrix_sync(tile + kMma, p01, kTile, wmma::mem_row_major);
+    wmma::store_matrix_sync(tile + kMma * kTile, p10, kTile, wmma::mem_row_major);
+    wmma::store_matrix_sync(tile + kMma * kTile + kMma, p11, kTile, wmma::mem_row_major);
+    __syncwarp();
+    for (int index = threadIdx.x; index < kTile * kTile; index += warpSize) {
+        const int offset = (row + index / kTile) * dim + col + index % kTile;
+        const float residual = __bfloat162float(gram[offset]);
+        polynomial[offset] = __float2bfloat16_rn(fmaf(c, tile[index], b * residual));
+    }
+}
+
 torch::Tensor muon_ns_impl(torch::Tensor grad,
                            const std::vector<double>& coefficients,
                            int64_t ns_steps,
-                           double eps) {
+                           double eps,
+                           bool fused_polynomial) {
     TORCH_CHECK(grad.is_cuda(), "grad must be a CUDA tensor");
     TORCH_CHECK(grad.dim() == 2, "grad must be a 2D matrix");
     TORCH_CHECK(grad.is_floating_point(), "grad must have a floating-point dtype");
@@ -43,10 +114,32 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
     auto gram = torch::empty({m, m}, x.options());
     auto gram_update = torch::empty_like(gram);
     auto next_x = torch::empty_like(x);
+    // The size gates were measured on RTX 5090. Keep the ATen GEMM path on
+    // other architectures until their crossover points are profiled.
+    const bool use_wmma = fused_polynomial && at::cuda::getCurrentDeviceProperties()->major == 12;
+    const bool use_fused_polynomial_16 = use_wmma && m >= 16 && m <= 256 && m % 16 == 0;
+    const bool use_fused_polynomial_32 = use_wmma && m >= 288 && m <= 512 && m % 32 == 0;
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     for (int64_t step = 0; step < ns_steps; ++step) {
         at::mm_out(gram, x, x.transpose(0, 1));
-        at::addmm_out(gram_update, gram, gram, gram, b, c);
+        if (use_fused_polynomial_16) {
+            const int tiles = static_cast<int>(m / 16);
+            fused_gram_polynomial_kernel<<<dim3(tiles, tiles), 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(gram.data_ptr<at::BFloat16>()),
+                reinterpret_cast<__nv_bfloat16*>(gram_update.data_ptr<at::BFloat16>()),
+                static_cast<int>(m), static_cast<float>(b), static_cast<float>(c));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else if (use_fused_polynomial_32) {
+            const int tiles = static_cast<int>(m / 32);
+            fused_gram_polynomial_32_kernel<<<dim3(tiles, tiles), 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(gram.data_ptr<at::BFloat16>()),
+                reinterpret_cast<__nv_bfloat16*>(gram_update.data_ptr<at::BFloat16>()),
+                static_cast<int>(m), static_cast<float>(b), static_cast<float>(c));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else {
+            at::addmm_out(gram_update, gram, gram, gram, b, c);
+        }
         at::addmm_out(next_x, x, gram_update, x, a, 1.0);
         std::swap(x, next_x);
     }
@@ -352,6 +445,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ns_update_", &ns_update_, "Apply one BF16 local Muon NS update");
     m.def("finish_", &finish_, "Fuse local Muon decay and parameter update");
     m.def("muon_ns", &astrai::muon_ns::muon_ns_impl, py::arg("grad"), py::arg("ns_coefficients"),
-          py::arg("ns_steps"), py::arg("eps"),
+          py::arg("ns_steps"), py::arg("eps"), py::arg("fused_polynomial") = true,
           "Run Muon's Newton-Schulz orthogonalization in one extension call");
 }

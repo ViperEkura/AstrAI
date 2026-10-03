@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from astrai.extension.kernel.muon_ns import is_available, muon_ns
+from astrai.extension.loader import get_module
 from astrai.optim.muon_adamw import _zeropower_reuse_buffers
 
 CUDA_AVAIL = torch.cuda.is_available()
@@ -39,6 +40,22 @@ def test_muon_ns_accepts_float_input_and_returns_bf16():
     assert result.dtype == torch.bfloat16
     assert result.shape == grad.shape
     assert torch.isfinite(result).all()
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (256, 1024), (512, 1024), (1024, 1024)])
+@pytest.mark.parametrize("ns_steps", [1, 5])
+@pytest.mark.parametrize("coefficients", [(3.4445, -4.7750, 2.0315), (2.0, -1.0, 0.5)])
+@skip_no_muon_ns
+def test_fused_polynomial_matches_aten_gemm(shape, ns_steps, coefficients):
+    torch.manual_seed(31)
+    grad = torch.randn(shape, device="cuda", dtype=torch.float32)
+    module = get_module("muon_ns")
+    expected = module.muon_ns(grad.clone(), coefficients, ns_steps, 1e-7, False)
+    actual = module.muon_ns(grad.clone(), coefficients, ns_steps, 1e-7, True)
+    assert torch.equal(actual, expected), (
+        f"shape={shape}, ns_steps={ns_steps}, "
+        f"max_abs={(actual.float() - expected.float()).abs().max().item()}"
+    )
 
 
 @pytest.mark.parametrize("coefficients", [(3.4445, -4.7750, 2.0315), (2.0, -1.0, 0.5)])

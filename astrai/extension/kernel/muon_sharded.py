@@ -138,7 +138,7 @@ def _step_bucket_(
         )
         prepared.append((local_param, update, partial_squares, adjusted_lr))
 
-    norm_squared = torch.stack([entry[2].sum() for entry in prepared])
+    norm_squared = module.reduce_partials([entry[2] for entry in prepared])
     process_group = items[0][0].device_mesh.get_group(0)
     dist.all_reduce(norm_squared, group=process_group)
 
@@ -160,7 +160,9 @@ def _step_bucket_(
                 adjusted_lr,
                 x,
                 gram,
-                torch.empty_like(gram),
+                torch.empty(
+                    (small_dim, small_dim), device=x.device, dtype=torch.bfloat16
+                ),
                 torch.empty_like(x),
             ]
         )
@@ -169,12 +171,11 @@ def _step_bucket_(
     for _ in range(ns_steps):
         for state in states:
             x, gram = state[2], state[3]
-            torch.mm(x, x.T, out=gram)
+            module.gram_(x, gram)
         dist.all_reduce(gram_bucket, group=process_group)
         for state in states:
-            x, gram, gram_update, next_x = state[2:]
-            torch.addmm(gram, gram, gram, beta=b, alpha=c, out=gram_update)
-            torch.addmm(x, gram_update, x, beta=a, out=next_x)
+            x, gram, polynomial, next_x = state[2:]
+            module.ns_update_(x, gram, polynomial, next_x, a, b, c)
             state[2], state[5] = next_x, x
 
     for local_param, adjusted_lr, x, _, _, _ in states:

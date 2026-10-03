@@ -1,9 +1,12 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cublas_v2.h>
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <limits>
 #include <tuple>
 #include <vector>
 
@@ -67,6 +70,7 @@ __global__ void prepare_kernel(const scalar_t* grad,
                                float* partial_squares,
                                int64_t count,
                                float momentum,
+                               float momentum_weight,
                                bool nesterov) {
     __shared__ float sums[kThreads];
     float local_sum = 0.0f;
@@ -75,7 +79,7 @@ __global__ void prepare_kernel(const scalar_t* grad,
         const float g = static_cast<float>(grad[index]);
         const float old_buffer = static_cast<float>(momentum_buffer[index]);
         const scalar_t new_buffer =
-            static_cast<scalar_t>(old_buffer + (g - old_buffer) * (1.0f - momentum));
+            static_cast<scalar_t>(old_buffer + (g - old_buffer) * momentum_weight);
         momentum_buffer[index] = new_buffer;
         const float value = nesterov ? g + (static_cast<float>(new_buffer) - g) * momentum
                                      : static_cast<float>(new_buffer);
@@ -100,12 +104,50 @@ __global__ void prepare_kernel(const scalar_t* grad,
 }
 
 __global__ void
+sum_partials_kernel(const float* partials, float* totals, int64_t count, int index) {
+    __shared__ float sums[kThreads];
+    float value = 0.0f;
+    for (int64_t offset = threadIdx.x; offset < count; offset += kThreads) {
+        value += partials[offset];
+    }
+    sums[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sums[threadIdx.x] += sums[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        totals[index] = sums[0];
+    }
+}
+
+__global__ void
 normalize_kernel(at::BFloat16* update, const float* norm_squared, int64_t count, float eps) {
     const at::BFloat16 rounded_norm = static_cast<at::BFloat16>(sqrtf(norm_squared[0]));
     const float divisor = fmaxf(static_cast<float>(rounded_norm), eps);
     for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
          index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
         update[index] = static_cast<at::BFloat16>(static_cast<float>(update[index]) / divisor);
+    }
+}
+
+__global__ void copy_residuals_kernel(const at::BFloat16* gram,
+                                      at::BFloat16* polynomial,
+                                      int64_t gram_count,
+                                      const at::BFloat16* x,
+                                      at::BFloat16* next_x,
+                                      int64_t x_count) {
+    const int64_t count = gram_count > x_count ? gram_count : x_count;
+    for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        if (index < gram_count) {
+            polynomial[index] = gram[index];
+        }
+        if (index < x_count) {
+            next_x[index] = x[index];
+        }
     }
 }
 
@@ -155,15 +197,37 @@ prepare(const torch::Tensor& grad, torch::Tensor momentum_buffer, double momentu
         prepare_kernel<<<blocks, kThreads, 0, stream>>>(
             grad.data_ptr<at::BFloat16>(), momentum_buffer.data_ptr<at::BFloat16>(),
             update.data_ptr<at::BFloat16>(), partials.data_ptr<float>(), grad.numel(),
-            static_cast<float>(momentum), nesterov);
+            static_cast<float>(momentum), static_cast<float>(1.0 - momentum), nesterov);
     } else {
         prepare_kernel<<<blocks, kThreads, 0, stream>>>(
             grad.data_ptr<float>(), momentum_buffer.data_ptr<float>(),
             update.data_ptr<at::BFloat16>(), partials.data_ptr<float>(), grad.numel(),
-            static_cast<float>(momentum), nesterov);
+            static_cast<float>(momentum), static_cast<float>(1.0 - momentum), nesterov);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {update, partials};
+}
+
+torch::Tensor reduce_partials(const std::vector<torch::Tensor>& partials) {
+    TORCH_CHECK(!partials.empty(), "partials must contain at least one tensor");
+    const auto& first = partials.front();
+    TORCH_CHECK(first.is_cuda() && first.scalar_type() == at::kFloat,
+                "partials must be CUDA FP32 tensors");
+    const at::cuda::OptionalCUDAGuard guard(device_of(first));
+    auto totals = torch::empty({static_cast<int64_t>(partials.size())}, first.options());
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    for (size_t index = 0; index < partials.size(); ++index) {
+        const auto& part = partials[index];
+        TORCH_CHECK(part.is_cuda() && part.device() == first.device() &&
+                        part.scalar_type() == at::kFloat && part.is_contiguous() &&
+                        part.dim() == 1 && part.numel() > 0,
+                    "each partial tensor must be a nonempty contiguous CUDA FP32 vector");
+        sum_partials_kernel<<<1, kThreads, 0, stream>>>(part.data_ptr<float>(),
+                                                        totals.data_ptr<float>(), part.numel(),
+                                                        static_cast<int>(index));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return totals;
 }
 
 void normalize_(torch::Tensor update, const torch::Tensor& norm_squared, double eps) {
@@ -179,6 +243,76 @@ void normalize_(torch::Tensor update, const torch::Tensor& norm_squared, double 
         update.data_ptr<at::BFloat16>(), norm_squared.data_ptr<float>(), update.numel(),
         static_cast<float>(eps));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void check_ns_x(const torch::Tensor& x) {
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.scalar_type() == at::kBFloat16 &&
+                    x.stride(0) == 1 && x.stride(1) == x.size(0),
+                "x must be a transposed contiguous CUDA BF16 matrix");
+    TORCH_CHECK(x.size(0) > 0 && x.size(1) > 0 && x.size(0) <= std::numeric_limits<int>::max() &&
+                    x.size(1) <= std::numeric_limits<int>::max(),
+                "x dimensions exceed cuBLAS limits");
+}
+
+void gram_(const torch::Tensor& x, torch::Tensor gram) {
+    check_ns_x(x);
+    const int small = static_cast<int>(x.size(0));
+    const int local_rows = static_cast<int>(x.size(1));
+    TORCH_CHECK(gram.is_cuda() && gram.device() == x.device() && gram.is_contiguous() &&
+                    gram.scalar_type() == at::kBFloat16 &&
+                    gram.sizes() == at::IntArrayRef({small, small}),
+                "gram must be a matching contiguous CUDA BF16 matrix");
+    const at::cuda::OptionalCUDAGuard guard(device_of(x));
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    TORCH_CUDABLAS_CHECK(cublasGemmEx(
+        at::cuda::getCurrentCUDABlasHandle(), CUBLAS_OP_N, CUBLAS_OP_T, small, small, local_rows,
+        &one, x.data_ptr<at::BFloat16>(), CUDA_R_16BF, small, x.data_ptr<at::BFloat16>(),
+        CUDA_R_16BF, small, &zero, gram.data_ptr<at::BFloat16>(), CUDA_R_16BF, small,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
+void ns_update_(const torch::Tensor& x,
+                const torch::Tensor& gram,
+                torch::Tensor polynomial,
+                torch::Tensor next_x,
+                double a,
+                double b,
+                double c) {
+    check_ns_x(x);
+    check_ns_x(next_x);
+    const int small = static_cast<int>(x.size(0));
+    const int local_rows = static_cast<int>(x.size(1));
+    TORCH_CHECK(next_x.sizes() == x.sizes() && next_x.device() == x.device(),
+                "next_x must match x");
+    for (const auto& tensor : {gram, polynomial}) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.device() == x.device() && tensor.is_contiguous() &&
+                        tensor.scalar_type() == at::kBFloat16 &&
+                        tensor.sizes() == at::IntArrayRef({small, small}),
+                    "Gram scratch must be a matching contiguous CUDA BF16 matrix");
+    }
+    const at::cuda::OptionalCUDAGuard guard(device_of(x));
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    copy_residuals_kernel<<<blocks_for(std::max(gram.numel(), x.numel())), kThreads, 0, stream>>>(
+        gram.data_ptr<at::BFloat16>(), polynomial.data_ptr<at::BFloat16>(), gram.numel(),
+        x.data_ptr<at::BFloat16>(), next_x.data_ptr<at::BFloat16>(), x.numel());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const float b_value = static_cast<float>(b);
+    const float c_value = static_cast<float>(c);
+    const auto handle = at::cuda::getCurrentCUDABlasHandle();
+    TORCH_CUDABLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, small, small, small,
+                                      &c_value, gram.data_ptr<at::BFloat16>(), CUDA_R_16BF, small,
+                                      gram.data_ptr<at::BFloat16>(), CUDA_R_16BF, small, &b_value,
+                                      polynomial.data_ptr<at::BFloat16>(), CUDA_R_16BF, small,
+                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    const float one = 1.0f;
+    const float a_value = static_cast<float>(a);
+    TORCH_CUDABLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, small, local_rows, small,
+                                      &one, polynomial.data_ptr<at::BFloat16>(), CUDA_R_16BF, small,
+                                      x.data_ptr<at::BFloat16>(), CUDA_R_16BF, small, &a_value,
+                                      next_x.data_ptr<at::BFloat16>(), CUDA_R_16BF, small,
+                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 void finish_(torch::Tensor param,
@@ -212,7 +346,10 @@ void finish_(torch::Tensor param,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("prepare", &prepare, "Fuse local Muon momentum and NS input preparation");
+    m.def("reduce_partials", &reduce_partials, "Reduce local Muon norm partials");
     m.def("normalize_", &normalize_, "Normalize a local Muon BF16 shard");
+    m.def("gram_", &gram_, "Compute a local BF16 Muon Gram matrix with cuBLAS");
+    m.def("ns_update_", &ns_update_, "Apply one BF16 local Muon NS update");
     m.def("finish_", &finish_, "Fuse local Muon decay and parameter update");
     m.def("muon_ns", &astrai::muon_ns::muon_ns_impl, py::arg("grad"), py::arg("ns_coefficients"),
           py::arg("ns_steps"), py::arg("eps"),

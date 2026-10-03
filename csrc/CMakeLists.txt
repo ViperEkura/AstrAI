@@ -190,6 +190,9 @@ foreach(entry IN LISTS KERNEL_MODULES)
         "${PYTHON_INCLUDE_DIR}")
 
     target_link_libraries(${name} PRIVATE ${TORCH_LIBS})
+    if(name STREQUAL "muon_ns")
+        target_link_libraries(${name} PRIVATE CUDA::cublas)
+    endif()
     target_link_options(${name} PRIVATE "-Wl,-rpath,${TORCH_LIB_DIR}")
 
     target_compile_options(${name} PRIVATE

@@ -26,6 +26,7 @@ from astrai.optim.composite import (
     composite_zero_grad,
     refresh_param_groups,
 )
+from astrai.optim.muon_replicated import ReplicatedMuon
 
 
 def _scalar_lr(lr: Any) -> float:
@@ -116,8 +117,15 @@ def _muon_step_group(
     *,
     reuse_ns_buffers: bool,
     fused_ns: bool,
+    replicated_muon=None,
 ) -> None:
     """One optimizer entry for local Tensor and sharded DTensor Muon updates."""
+    if (
+        fused_ns
+        and replicated_muon is not None
+        and replicated_muon.step(params, grads, bufs, group)
+    ):
+        return
     plain, sharded = [], []
     for param, grad, buf in zip(params, grads, bufs):
         (sharded if isinstance(param, DTensor) else plain).append((param, grad, buf))
@@ -217,11 +225,15 @@ class _ShardedMuon(optim.Muon):
         *,
         reuse_ns_buffers: bool = False,
         fused_ns: bool = False,
+        process_group=None,
         **kwargs,
     ):
         super().__init__(params, **kwargs)
         self.reuse_ns_buffers = reuse_ns_buffers
         self.fused_ns = fused_ns
+        self.replicated_muon = (
+            ReplicatedMuon(process_group) if process_group is not None else None
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -243,13 +255,21 @@ class _ShardedMuon(optim.Muon):
                 group,
                 reuse_ns_buffers=self.reuse_ns_buffers,
                 fused_ns=self.fused_ns,
+                replicated_muon=self.replicated_muon,
             )
         return loss
 
 
 @OptimizerFactory.register("muon_adamw")
 class MuonAdamW(optim.Optimizer):
-    """Combined Muon (matrix) + AdamW (non-matrix) optimizer."""
+    """Combined Muon (matrix) + AdamW (non-matrix) optimizer.
+
+    ``fused_ns`` opts into the CUDA NS path. For a DDP model, its process
+    group also distributes whole-matrix NS work across replicas. An explicit
+    ``muon_process_group`` may supply that context when passing the unwrapped
+    module; it must contain replicas with synchronized full gradients. Never
+    pass a tensor-parallel or FSDP sharding group as replica context.
+    """
 
     optimizer_name = "muon_adamw"
 
@@ -264,7 +284,13 @@ class MuonAdamW(optim.Optimizer):
         adjust_lr_fn: str = "match_rms_adamw",
         reuse_ns_buffers: bool = False,
         fused_ns: bool = False,
+        muon_process_group=None,
     ):
+        if fused_ns and muon_process_group is None:
+            # torch.compile(DDP(...)) retains the DDP wrapper as _orig_mod.
+            ddp_model = getattr(model, "_orig_mod", model)
+            if isinstance(ddp_model, nn.parallel.DistributedDataParallel):
+                muon_process_group = ddp_model.process_group
         defaults = {
             "lr": lr,
             "weight_decay": weight_decay,
@@ -302,6 +328,7 @@ class MuonAdamW(optim.Optimizer):
             adjust_lr_fn=adjust_lr_fn,
             reuse_ns_buffers=reuse_ns_buffers,
             fused_ns=fused_ns,
+            process_group=muon_process_group,
         )
         self.adamw = optim.AdamW(
             [{"params": other_params, "weight_decay": 0.0}],

@@ -124,6 +124,7 @@ set(KERNEL_MODULES
          attention/bindings.cu"
     "rotary_emb|rotary_emb.cu"
     "muon_ns|muon_ns.cu"
+    "cross_entropy|cross_entropy.cu"
     "gated_deltanet|gated_deltanet/gated_deltanet_fwd.cu
          gated_deltanet/gated_deltanet_bwd.cu
          gated_deltanet/bindings.cu"

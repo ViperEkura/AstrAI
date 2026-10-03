@@ -13,6 +13,12 @@ from torch.optim._muon import (
 )
 
 from astrai.extension.kernel.muon_ns import is_available, muon_ns
+from astrai.extension.kernel.muon_sharded import (
+    steps_ as sharded_muon_steps_,
+)
+from astrai.extension.kernel.muon_sharded import (
+    supports as supports_sharded_muon,
+)
 from astrai.optim.composite import (
     OptimizerFactory,
     composite_state_dict,
@@ -102,13 +108,98 @@ def _sharded_orthogonalize(
     return distribute_tensor(ortho, update.device_mesh, update.placements)
 
 
-class _ShardedMuon(optim.Muon):
-    """Muon that materializes sharded DTensor params around Newton-Schulz.
+def _muon_step_group(
+    params: list[Tensor],
+    grads: list[Tensor],
+    bufs: list[Tensor],
+    group: Mapping,
+    *,
+    reuse_ns_buffers: bool,
+    fused_ns: bool,
+) -> None:
+    """One optimizer entry for local Tensor and sharded DTensor Muon updates."""
+    plain, sharded = [], []
+    for param, grad, buf in zip(params, grads, bufs):
+        (sharded if isinstance(param, DTensor) else plain).append((param, grad, buf))
 
-    FSDP2 hands this optimizer dim-0 sharded DTensor parameters. The NS
-    iteration needs global matmuls: run it on the gathered full matrix,
-    then scatter the orthogonalized update back onto the parameter's
-    sharded layout so momentum buffers and weight decay stay sharded.
+    if plain:
+        pp, gg, bb = (list(t) for t in zip(*plain))
+        use_fused_ns = fused_ns and all(grad.is_cuda for grad in gg) and is_available()
+        if use_fused_ns or reuse_ns_buffers:
+            _single_tensor_muon_reuse_buffers(
+                pp,
+                gg,
+                bb,
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                momentum=group["momentum"],
+                nesterov=group["nesterov"],
+                ns_coefficients=group["ns_coefficients"],
+                ns_steps=group["ns_steps"],
+                eps=group["eps"],
+                adjust_lr_fn=group["adjust_lr_fn"],
+                has_complex=False,
+                fused_ns=use_fused_ns,
+            )
+        else:
+            _single_tensor_muon(
+                pp,
+                gg,
+                bb,
+                lr=group["lr"],
+                weight_decay=group["weight_decay"],
+                momentum=group["momentum"],
+                nesterov=group["nesterov"],
+                ns_coefficients=group["ns_coefficients"],
+                ns_steps=group["ns_steps"],
+                eps=group["eps"],
+                adjust_lr_fn=group["adjust_lr_fn"],
+                has_complex=False,
+            )
+
+    use_fused_ns = (
+        fused_ns
+        and all(grad.device.type == "cuda" for _, grad, _ in sharded)
+        and is_available()
+    )
+    lr = _scalar_lr(group["lr"])
+    fused_items = []
+    if fused_ns:
+        for param, grad, buf in sharded:
+            if supports_sharded_muon(param, grad, buf):
+                adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], param.shape)
+                fused_items.append((param, grad, buf, adjusted_lr))
+        sharded_muon_steps_(
+            fused_items,
+            lr=lr,
+            weight_decay=group["weight_decay"],
+            momentum=group["momentum"],
+            nesterov=group["nesterov"],
+            ns_coefficients=group["ns_coefficients"],
+            ns_steps=group["ns_steps"],
+            eps=group["eps"],
+        )
+    fused_param_ids = {id(param) for param, _, _, _ in fused_items}
+    for param, grad, buf in sharded:
+        if id(param) in fused_param_ids:
+            continue
+        adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], param.shape)
+        buf.lerp_(grad, 1 - group["momentum"])
+        update = grad.lerp(buf, group["momentum"]) if group["nesterov"] else buf
+
+        param.mul_(1 - lr * group["weight_decay"])
+        param.add_(
+            _sharded_orthogonalize(update, group, fused_ns=use_fused_ns),
+            alpha=-adjusted_lr,
+        )
+
+
+class _ShardedMuon(optim.Muon):
+    """Muon with one step entry for Tensor and sharded DTensor parameters.
+
+    The default DTensor path gathers the update for global Newton-Schulz,
+    then scatters its result. With fused_ns enabled, supported tall dim-0
+    shards use local CUDA kernels and reduced Gram matrices instead.
     Without this, ``og @ og.T`` produces ``Partial(sum)`` DTensors that
     downstream ``addmm`` calls consume without completing the reduction,
     silently corrupting every update (measured 2e-4-9e-4 relative error
@@ -145,67 +236,14 @@ class _ShardedMuon(optim.Muon):
             bufs: list[Tensor] = []
             self._init_group(group, params, grads, bufs)
 
-            plain, sharded = [], []
-            for param, grad, buf in zip(params, grads, bufs):
-                (sharded if isinstance(param, DTensor) else plain).append(
-                    (param, grad, buf)
-                )
-
-            if plain:
-                pp, gg, bb = (list(t) for t in zip(*plain))
-                use_fused_ns = (
-                    self.fused_ns
-                    and all(grad.is_cuda for grad in gg)
-                    and is_available()
-                )
-                if use_fused_ns or self.reuse_ns_buffers:
-                    _single_tensor_muon_reuse_buffers(
-                        pp,
-                        gg,
-                        bb,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        momentum=group["momentum"],
-                        nesterov=group["nesterov"],
-                        ns_coefficients=group["ns_coefficients"],
-                        ns_steps=group["ns_steps"],
-                        eps=group["eps"],
-                        adjust_lr_fn=group["adjust_lr_fn"],
-                        has_complex=False,
-                        fused_ns=use_fused_ns,
-                    )
-                else:
-                    _single_tensor_muon(
-                        pp,
-                        gg,
-                        bb,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        momentum=group["momentum"],
-                        nesterov=group["nesterov"],
-                        ns_coefficients=group["ns_coefficients"],
-                        ns_steps=group["ns_steps"],
-                        eps=group["eps"],
-                        adjust_lr_fn=group["adjust_lr_fn"],
-                        has_complex=False,
-                    )
-
-            use_fused_ns = (
-                self.fused_ns
-                and all(grad.device.type == "cuda" for _, grad, _ in sharded)
-                and is_available()
+            _muon_step_group(
+                params,
+                grads,
+                bufs,
+                group,
+                reuse_ns_buffers=self.reuse_ns_buffers,
+                fused_ns=self.fused_ns,
             )
-            lr = _scalar_lr(group["lr"])
-            for param, grad, buf in sharded:
-                buf.lerp_(grad, 1 - group["momentum"])
-                update = grad.lerp(buf, group["momentum"]) if group["nesterov"] else buf
-
-                adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], param.shape)
-                param.mul_(1 - lr * group["weight_decay"])
-                param.add_(
-                    _sharded_orthogonalize(update, group, fused_ns=use_fused_ns),
-                    alpha=-adjusted_lr,
-                )
         return loss
 
 

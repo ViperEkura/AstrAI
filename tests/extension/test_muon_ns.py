@@ -94,3 +94,47 @@ def test_muon_ns_accepts_noncontiguous_input():
 def test_muon_ns_rejects_cpu_input():
     with pytest.raises(ValueError, match="CUDA"):
         muon_ns(torch.ones((2, 2)), (3.4445, -4.775, 2.0315), 5, 1e-7)
+
+
+@pytest.mark.parametrize("shape", [(512, 2048), (1536, 6144), (6144, 1536)])
+@pytest.mark.parametrize("seed", [23, 31])
+@pytest.mark.parametrize("ns_steps", [1, 5])
+@skip_no_muon_ns
+def test_direct_gram_preserves_wide_reduction_order(shape, seed, ns_steps):
+    # A different Gram GEMM algorithm can change a few BF16 rounding decisions,
+    # which later NS iterations amplify. Exercise both layouts and multiple seeds.
+    torch.manual_seed(seed)
+    grad = torch.randn(shape, device="cuda", dtype=torch.float32)
+    module = get_module("muon_ns")
+    expected = module.muon_ns(grad, (3.4445, -4.775, 2.0315), ns_steps, 1e-7, False)
+    actual = module.muon_ns(grad, (3.4445, -4.775, 2.0315), ns_steps, 1e-7, True)
+    assert torch.equal(actual, expected), (
+        f"shape={shape}, seed={seed}, ns_steps={ns_steps}, "
+        f"max_abs={(actual.float() - expected.float()).abs().max().item()}"
+    )
+
+
+@pytest.mark.parametrize("eps", [1e-7, 0.1001])
+@pytest.mark.parametrize("scale", [0.0, 1e-5, 1.0])
+@skip_no_muon_ns
+def test_fused_normalization_preserves_bf16_clamp_rounding(eps, scale):
+    torch.manual_seed(7)
+    grad = torch.randn((64, 128), device="cuda", dtype=torch.bfloat16) * scale
+    module = get_module("muon_ns")
+    expected = module.muon_ns(grad.clone(), (3.4445, -4.775, 2.0315), 5, eps, False)
+    actual = module.muon_ns(grad.clone(), (3.4445, -4.775, 2.0315), 5, eps, True)
+    assert torch.equal(actual, expected)
+
+
+@skip_no_muon_ns
+def test_muon_ns_respects_disabled_bf16_reduced_precision():
+    previous = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    try:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        torch.manual_seed(23)
+        grad = torch.randn((1024, 2048), device="cuda")
+        expected = _zeropower_reuse_buffers(grad, (3.4445, -4.775, 2.0315), 5, 1e-7)
+        actual = muon_ns(grad, (3.4445, -4.775, 2.0315), 5, 1e-7)
+        assert torch.equal(actual, expected)
+    finally:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = previous

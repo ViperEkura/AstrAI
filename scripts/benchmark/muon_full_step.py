@@ -2,7 +2,9 @@
 
 import argparse
 import gc
+import importlib.util
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -10,7 +12,9 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from astrai.extension.loader import get_module
 from astrai.model import AutoRegressiveLM
+from astrai.optim import muon_adamw as muon_impl
 from astrai.optim.muon_adamw import MuonAdamW
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -19,6 +23,11 @@ parser.add_argument("--seq-len", type=int, default=256)
 parser.add_argument("--warmup", type=int, default=3)
 parser.add_argument("--steps", type=int, default=10)
 parser.add_argument("--memory-fraction", type=float, default=0.5)
+parser.add_argument(
+    "--baseline-extension",
+    type=Path,
+    help="compare a saved muon_ns shared library against the current fused extension",
+)
 parser.add_argument(
     "--json-out", type=Path, default=Path("results/muon-full-step.json")
 )
@@ -31,6 +40,23 @@ if min(args.seq_len, args.warmup, args.steps) < 1 or not 0 < args.memory_fractio
 WARMUP = args.warmup
 MEASURED = args.steps
 SEQ = args.seq_len
+current_muon_ns = muon_impl.muon_ns
+baseline_module = None
+current_module = None
+if args.baseline_extension is not None:
+    spec = importlib.util.spec_from_file_location(
+        "baseline.muon_ns", args.baseline_extension.resolve()
+    )
+    if spec is None or spec.loader is None:
+        parser.error("baseline-extension must be a loadable muon_ns shared library")
+    baseline_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(baseline_module)
+    current_module = get_module("muon_ns")
+
+
+def benchmark_muon_ns(grad, coefficients, ns_steps, eps):
+    # Give both shared libraries exactly the same Python adapter overhead.
+    return benchmark_module.muon_ns(grad.contiguous(), coefficients, ns_steps, eps)
 
 
 def summarize(samples):
@@ -38,7 +64,7 @@ def summarize(samples):
     return {
         "median_ms": round(statistics.median(samples), 3),
         "mean_ms": round(statistics.mean(samples), 3),
-        "p95_ms": round(samples[-1], 3),
+        "p95_ms": round(samples[math.ceil(0.95 * len(samples)) - 1], 3),
     }
 
 
@@ -66,13 +92,22 @@ blocks = []
 peaks = {"reference": 0.0, "fused_ns": 0.0}
 
 for variant in ("reference", "fused_ns", "fused_ns", "reference"):
+    benchmark_module = baseline_module if variant == "reference" else current_module
+    muon_impl.muon_ns = (
+        benchmark_muon_ns if baseline_module is not None else current_muon_ns
+    )
     torch.manual_seed(7)
     model = (
         AutoRegressiveLM.from_pretrained(args.model_path)
         .to(device="cuda", dtype=torch.bfloat16)
         .train()
     )
-    optimizer = MuonAdamW(model, lr=1e-5, ns_steps=5, fused_ns=variant == "fused_ns")
+    optimizer = MuonAdamW(
+        model,
+        lr=1e-5,
+        ns_steps=5,
+        fused_ns=variant == "fused_ns" or baseline_module is not None,
+    )
     for _ in range(WARMUP):
         step(model, optimizer, inputs, targets)
     torch.cuda.synchronize()
@@ -122,7 +157,11 @@ for variant in ("reference", "fused_ns", "fused_ns", "reference"):
     gc.collect()
     torch.cuda.empty_cache()
 
+muon_impl.muon_ns = current_muon_ns
 result = {
+    "baseline": str(args.baseline_extension)
+    if baseline_module is not None
+    else "torch",
     "gpu": torch.cuda.get_device_name(),
     "model": args.model_path,
     "dtype": "bfloat16",

@@ -1,3 +1,4 @@
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAException.h>
@@ -18,6 +19,21 @@ namespace astrai {
 namespace muon_ns {
 
 namespace {
+
+// Match BF16 clamp_min followed by division, including rounding eps to the
+// tensor dtype before comparison. Keep the norm reduction order unchanged.
+__global__ void
+normalize_bf16_kernel(at::BFloat16* x, const at::BFloat16* norm, int64_t count, at::BFloat16 eps) {
+    float divisor = static_cast<float>(norm[0]);
+    const float floor = static_cast<float>(eps);
+    if (divisor < floor) {
+        divisor = floor;
+    }
+    for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        x[index] = static_cast<at::BFloat16>(__fdiv_rn(static_cast<float>(x[index]), divisor));
+    }
+}
 
 // One warp owns an output tile. The BF16 product stays in FP32 until the
 // polynomial epilogue, so the Gram matrix is read only for MMA and the
@@ -148,6 +164,22 @@ void lt_addmm(const LtMatmul& operation,
         result.data_ptr<at::BFloat16>(), result_layout.layout, nullptr, nullptr, 0, stream));
 }
 
+void direct_gram(const torch::Tensor& x, torch::Tensor& gram) {
+    const int m = static_cast<int>(x.size(0));
+    const int n = static_cast<int>(x.size(1));
+    const bool column_major = x.stride(0) == 1;
+    const int ld = column_major ? m : n;
+    const auto lhs_op = column_major ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const auto rhs_op = column_major ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    TORCH_CUDABLAS_CHECK(cublasGemmEx(at::cuda::getCurrentCUDABlasHandle(), lhs_op, rhs_op, m, m, n,
+                                      &one, x.data_ptr<at::BFloat16>(), CUDA_R_16BF, ld,
+                                      x.data_ptr<at::BFloat16>(), CUDA_R_16BF, ld, &zero,
+                                      gram.data_ptr<at::BFloat16>(), CUDA_R_16BF, m,
+                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+
 torch::Tensor muon_ns_impl(torch::Tensor grad,
                            const std::vector<double>& coefficients,
                            int64_t ns_steps,
@@ -171,7 +203,17 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
         x = x.transpose(0, 1);
     }
 
-    x.div_(x.norm().clamp_min(eps));
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
+    if (fused_polynomial && x.is_non_overlapping_and_dense() && x.numel() > 0) {
+        auto norm = x.norm();
+        const int blocks = static_cast<int>(std::min<int64_t>((x.numel() + 255) / 256, 4096));
+        normalize_bf16_kernel<<<blocks, 256, 0, stream>>>(x.data_ptr<at::BFloat16>(),
+                                                          norm.data_ptr<at::BFloat16>(), x.numel(),
+                                                          static_cast<at::BFloat16>(eps));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+        x.div_(x.norm().clamp_min(eps));
+    }
 
     const auto m = x.size(0);
     auto gram = torch::empty({m, m}, x.options());
@@ -179,11 +221,18 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
     auto next_x = torch::empty_like(x);
     // The size gates were measured on RTX 5090. Keep the ATen GEMM path on
     // other architectures until their crossover points are profiled.
-    const bool use_wmma = fused_polynomial && at::cuda::getCurrentDeviceProperties()->major == 12;
+    const bool default_reduction = at::globalContext().allowBF16ReductionCuBLAS() ==
+                                   at::CuBLASReductionOption::AllowReducedPrecisionWithSplitK;
+    const bool use_wmma = fused_polynomial && default_reduction &&
+                          !at::globalContext().deterministicAlgorithms() &&
+                          at::cuda::getCurrentDeviceProperties()->major == 12;
     const bool use_fused_polynomial_16 = use_wmma && m >= 16 && m <= 256 && m % 16 == 0;
     const bool use_fused_polynomial_32 = use_wmma && m >= 288 && m <= 512 && m % 32 == 0;
-    const bool use_lt = fused_polynomial && at::cuda::getCurrentDeviceProperties()->major == 12 &&
-                        m > 512 && m % 16 == 0 && x.size(1) % 16 == 0;
+    const bool dense_matrix =
+        (x.stride(1) == 1 && x.stride(0) == x.size(1)) || (x.stride(0) == 1 && x.stride(1) == m);
+    const bool use_lt = use_wmma && dense_matrix && m >= 16 && m % 16 == 0 && x.size(1) % 16 == 0 &&
+                        m <= std::numeric_limits<int>::max() &&
+                        x.size(1) <= std::numeric_limits<int>::max();
     std::optional<LtMatmul> lt_operation;
     std::optional<LtMatrix> lt_gram;
     std::optional<LtMatrix> lt_x;
@@ -192,10 +241,12 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
         lt_gram.emplace(m, m, gram.stride(0), gram.stride(1));
         lt_x.emplace(x.size(0), x.size(1), x.stride(0), x.stride(1));
     }
-    const auto stream = at::cuda::getCurrentCUDAStream().stream();
-
     for (int64_t step = 0; step < ns_steps; ++step) {
-        at::mm_out(gram, x, x.transpose(0, 1));
+        if (use_lt) {
+            direct_gram(x, gram);
+        } else {
+            at::mm_out(gram, x, x.transpose(0, 1));
+        }
         if (use_fused_polynomial_16) {
             const int tiles = static_cast<int>(m / 16);
             fused_gram_polynomial_kernel<<<dim3(tiles, tiles), 32, 0, stream>>>(

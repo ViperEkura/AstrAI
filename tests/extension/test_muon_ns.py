@@ -100,17 +100,56 @@ def test_muon_ns_rejects_cpu_input():
 @pytest.mark.parametrize("seed", [23, 31])
 @pytest.mark.parametrize("ns_steps", [1, 5])
 @skip_no_muon_ns
-def test_direct_gram_preserves_wide_reduction_order(shape, seed, ns_steps):
-    # A different Gram GEMM algorithm can change a few BF16 rounding decisions,
-    # which later NS iterations amplify. Exercise both layouts and multiple seeds.
+def test_direct_gram_preserves_wide_reduction_order(
+    shape, seed, ns_steps, record_property
+):
+    # The SM120 SYRK uses a different BF16 reduction order for large, wide
+    # matrices. Other layouts retain the bitwise-identical cuBLAS path.
     torch.manual_seed(seed)
     grad = torch.randn(shape, device="cuda", dtype=torch.float32)
     module = get_module("muon_ns")
     expected = module.muon_ns(grad, (3.4445, -4.775, 2.0315), ns_steps, 1e-7, False)
     actual = module.muon_ns(grad, (3.4445, -4.775, 2.0315), ns_steps, 1e-7, True)
-    assert torch.equal(actual, expected), (
-        f"shape={shape}, seed={seed}, ns_steps={ns_steps}, "
-        f"max_abs={(actual.float() - expected.float()).abs().max().item()}"
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    different = torch.count_nonzero(actual != expected).item()
+    record_property("max_abs", max_abs)
+    record_property("different_elements", different)
+
+    uses_syrk = (
+        torch.cuda.get_device_capability()[0] == 12
+        and shape == (1536, 6144)
+        and torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        and not torch.are_deterministic_algorithms_enabled()
+    )
+    if uses_syrk:
+        assert max_abs <= 0.002, (
+            f"shape={shape}, seed={seed}, ns_steps={ns_steps}, "
+            f"max_abs={max_abs}, different_elements={different}"
+        )
+    else:
+        assert torch.equal(actual, expected), (
+            f"shape={shape}, seed={seed}, ns_steps={ns_steps}, max_abs={max_abs}"
+        )
+
+
+@pytest.mark.parametrize("coefficients", [(3.4445, -4.775, 2.0315), (2.0, -1.0, 0.5)])
+@pytest.mark.parametrize("eps", [1e-7, 0.3])
+@skip_no_muon_ns
+def test_syrk_wide_bf16_coefficients_and_eps(coefficients, eps, record_property):
+    torch.manual_seed(47)
+    grad = torch.randn((1536, 2048), device="cuda", dtype=torch.bfloat16) * 1e-4
+    module = get_module("muon_ns")
+    # BF16 inputs are normalized in place; each path needs the original input.
+    expected = module.muon_ns(grad.clone(), coefficients, 3, eps, False)
+    actual = module.muon_ns(grad.clone(), coefficients, 3, eps, True)
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    different = torch.count_nonzero(actual != expected).item()
+    record_property("max_abs", max_abs)
+    record_property("different_elements", different)
+    assert torch.isfinite(actual).all()
+    assert max_abs <= 0.002, (
+        f"coefficients={coefficients}, eps={eps}, "
+        f"max_abs={max_abs}, different_elements={different}"
     )
 
 

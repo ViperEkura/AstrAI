@@ -9,6 +9,8 @@
 #include <mma.h>
 #include <torch/extension.h>
 
+#include "muon_syrk.cuh"
+
 #include <algorithm>
 #include <limits>
 #include <optional>
@@ -233,6 +235,10 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
     const bool use_lt = use_wmma && dense_matrix && m >= 16 && m % 16 == 0 && x.size(1) % 16 == 0 &&
                         m <= std::numeric_limits<int>::max() &&
                         x.size(1) <= std::numeric_limits<int>::max();
+    // The 64x64 SYRK wins for contiguous wide matrices from m >= 1536.
+    // Keep cuBLASLt for tall layouts and smaller Gram matrices.
+    const bool use_syrk =
+        use_lt && x.stride(1) == 1 && m >= 1536 && m % 64 == 0 && x.size(1) % 64 == 0;
     std::optional<LtMatmul> lt_operation;
     std::optional<LtMatrix> lt_gram;
     std::optional<LtMatrix> lt_x;
@@ -242,7 +248,13 @@ torch::Tensor muon_ns_impl(torch::Tensor grad,
         lt_x.emplace(x.size(0), x.size(1), x.stride(0), x.stride(1));
     }
     for (int64_t step = 0; step < ns_steps; ++step) {
-        if (use_lt) {
+        if (use_syrk) {
+            syrk::launch(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                         reinterpret_cast<__nv_bfloat16*>(gram.data_ptr<at::BFloat16>()),
+                         static_cast<int>(m), static_cast<int>(x.size(1)), x.stride(0), x.stride(1),
+                         stream);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else if (use_lt) {
             direct_gram(x, gram);
         } else {
             at::mm_out(gram, x, x.transpose(0, 1));

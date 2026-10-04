@@ -3,17 +3,13 @@
 from typing import Any, Dict, Mapping, Optional
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
-from torch.distributed.tensor import DTensor
 
 from astrai.config.model_config import AutoRegressiveLMConfig
-from astrai.extension.kernel.cross_entropy import is_available as ce_available
-from astrai.extension.kernel.cross_entropy import linear_cross_entropy
 from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.linear import Linear
 from astrai.model.kv_cache import KVCache
-from astrai.model.transformer_model import TransformerModel, init_module_weights
+from astrai.model.transformer import TransformerModel, init_module_weights
 
 
 @ModelFactory.register("autoregressive_lm")
@@ -68,9 +64,7 @@ class AutoRegressiveLM(AutoModel):
         fwd: Optional[str] = None,
         logits_positions: Optional[Tensor] = None,
         skip_lm_head: bool = False,
-        loss_targets: Optional[Tensor] = None,
-        loss_chunk_size: int = 512,
-        label_smoothing: float = 0.0,
+        return_lm_head_weight: bool = False,
     ) -> Dict[str, Tensor]:
         if fwd is None:
             if input_ids.ndim != 2:
@@ -85,10 +79,8 @@ class AutoRegressiveLM(AutoModel):
         else:
             raise ValueError(f"unsupported forward mode: {fwd}")
 
-        if loss_targets is not None and (
-            fwd is not None or skip_lm_head or logits_positions is not None
-        ):
-            raise ValueError("loss_targets requires a full training forward")
+        if return_lm_head_weight and not skip_lm_head:
+            raise ValueError("return_lm_head_weight requires skip_lm_head")
         output = self.model(
             input_ids,
             input_mask=input_mask,
@@ -97,35 +89,6 @@ class AutoRegressiveLM(AutoModel):
             fwd=fwd,
             logits_positions=logits_positions,
         )
-        if loss_targets is not None:
-            hidden = output["hidden_states"]
-            if loss_targets.shape != hidden.shape[:-1]:
-                raise ValueError("loss_targets must match the training token shape")
-            # Keep the head in this forward's autograd graph: DDP/FSDP must
-            # observe its use before installing their backward bookkeeping.
-            if (
-                hidden.is_cuda
-                and not isinstance(self.lm_head.weight, DTensor)
-                and self.lm_head.bias is None
-                and ce_available()
-            ):
-                output["loss_sum"] = linear_cross_entropy(
-                    hidden.flatten(0, 1),
-                    self.lm_head.weight,
-                    loss_targets.flatten(),
-                    label_smoothing=label_smoothing,
-                    chunk_size=loss_chunk_size,
-                )
-            else:
-                logits = self.lm_head(hidden)
-                output["loss_sum"] = F.cross_entropy(
-                    logits.flatten(0, 1).float(),
-                    loss_targets.flatten(),
-                    label_smoothing=label_smoothing,
-                    reduction="sum",
-                )
-            output["logits"] = None
-            return output
         # skip_lm_head returns post-norm hidden states only, with logits
         # set to None: no-grad consumers compute per-token log-probs from
         # hidden @ lm_head.T in row chunks instead of materializing the
@@ -133,4 +96,11 @@ class AutoRegressiveLM(AutoModel):
         output["logits"] = (
             None if skip_lm_head else self.lm_head(output["hidden_states"])
         )
+        if return_lm_head_weight:
+            # A view keeps the head reachable from DDP's forward outputs when
+            # a training strategy applies the projection outside this module.
+            output["lm_head_weight"] = self.lm_head.weight.view_as(self.lm_head.weight)
+            if self.lm_head.bias is not None:
+                output["lm_head_bias"] = self.lm_head.bias.view_as(self.lm_head.bias)
+
         return output

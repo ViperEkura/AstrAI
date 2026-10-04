@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from astrai.extension.kernel.cross_entropy import cross_entropy
+from astrai.extension.kernel.cross_entropy import cross_entropy, linear_cross_entropy
 from astrai.extension.kernel.cross_entropy import is_available as ce_available
 from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
@@ -50,9 +50,9 @@ class LogprobsOutput(TypedDict):
 class ForwardResult:
     """Model forward over the (possibly sequence-sharded) batch.
 
-    ``logits`` keeps the model dtype. Fused linear CE instead supplies
-    ``loss_sum`` and leaves logits unset. MoE extras ride along so loss
-    assembly can attach aux-loss and router diagnostics.
+    ``logits`` keeps the model dtype. The training strategy's fused linear CE
+    supplies ``loss_sum`` and leaves logits unset. MoE extras ride along so
+    loss assembly can attach aux-loss and router diagnostics.
     """
 
     logits: Optional[Tensor]
@@ -910,17 +910,57 @@ class _CEStrategy(BaseStrategy):
         self.loss_backend = loss_backend
         self.loss_chunk_size = loss_chunk_size
 
-    def _loss_kwargs(
-        self, targets: Tensor, loss_mask: Optional[Tensor] = None
-    ) -> Dict[str, Any]:
+    def _forward_ce(self, targets: Tensor, **model_kwargs) -> ForwardResult:
         if self.loss_backend != "cuda_linear_ce":
-            return {}
-        if loss_mask is not None:
-            targets = targets.masked_fill(~loss_mask, -100)
-        return dict(
-            loss_targets=targets,
-            loss_chunk_size=self.loss_chunk_size,
-            label_smoothing=self.label_smoothing,
+            outputs = self.model(**model_kwargs)
+            return ForwardResult(
+                outputs["logits"],
+                outputs.get("aux_loss"),
+                outputs.get("router_stats"),
+            )
+
+        outputs = self.model(
+            **model_kwargs, skip_lm_head=True, return_lm_head_weight=True
+        )
+        hidden = outputs["hidden_states"]
+        if targets.shape != hidden.shape[:-1]:
+            raise ValueError("targets must match the training token shape")
+        weight = outputs["lm_head_weight"]
+        bias = outputs.get("lm_head_bias")
+        if (
+            hidden.is_cuda
+            and not isinstance(weight, DTensor)
+            and bias is None
+            and ce_available()
+        ):
+            loss_sum = linear_cross_entropy(
+                hidden.flatten(0, 1),
+                weight,
+                targets.flatten(),
+                label_smoothing=self.label_smoothing,
+                chunk_size=self.loss_chunk_size,
+            )
+        else:
+            # FSDP's head owns its all-gather; use its forward for DTensors.
+            head = self.model
+            while hasattr(head, "_orig_mod") or hasattr(head, "module"):
+                head = getattr(head, "_orig_mod", None) or head.module
+            logits = (
+                head.lm_head(hidden)
+                if isinstance(weight, DTensor)
+                else F.linear(hidden, weight, bias)
+            )
+            loss_sum = F.cross_entropy(
+                logits.flatten(0, 1).float(),
+                targets.flatten(),
+                label_smoothing=self.label_smoothing,
+                reduction="sum",
+            )
+        return ForwardResult(
+            None,
+            outputs.get("aux_loss"),
+            outputs.get("router_stats"),
+            loss_sum,
         )
 
     def _ce_sum(self, forward: ForwardResult, targets: Tensor) -> Tensor:
@@ -974,16 +1014,10 @@ class SEQStrategy(_CEStrategy):
         )
 
     def forward_tokens(self, batch: Dict[str, Tensor]) -> ForwardResult:
-        outputs = self.model(
+        return self._forward_ce(
+            batch["target_ids"],
             input_ids=batch["input_ids"],
             position_ids=batch["position_ids"],
-            **self._loss_kwargs(batch["target_ids"]),
-        )
-        return ForwardResult(
-            outputs["logits"],
-            outputs.get("aux_loss"),
-            outputs.get("router_stats"),
-            outputs.get("loss_sum"),
         )
 
     def reduce_loss(
@@ -1033,17 +1067,14 @@ class SFTStrategy(_CEStrategy):
         input_mask = (
             make_doc_boundary_mask(position_ids) if _is_packed(position_ids) else None
         )
-        outputs = self.model(
+        targets = batch["target_ids"]
+        if self.loss_backend == "cuda_linear_ce":
+            targets = targets.masked_fill(~batch["loss_mask"], -100)
+        return self._forward_ce(
+            targets,
             input_ids=batch["input_ids"],
             position_ids=position_ids,
             input_mask=input_mask,
-            **self._loss_kwargs(batch["target_ids"], batch["loss_mask"]),
-        )
-        return ForwardResult(
-            outputs["logits"],
-            outputs.get("aux_loss"),
-            outputs.get("router_stats"),
-            outputs.get("loss_sum"),
         )
 
     def reduce_loss(

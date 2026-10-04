@@ -8,7 +8,7 @@ from torch import Tensor
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.linear import Linear
-from astrai.model.transformer_model import TransformerModel, init_module_weights
+from astrai.model.transformer import TransformerModel, init_module_weights
 
 
 @ModelFactory.register("value_model")

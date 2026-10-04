@@ -4,7 +4,7 @@ import torch
 from astrai.config.model_config import AutoRegressiveLMConfig, EncoderConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.encoder import EmbeddingEncoder
-from astrai.model.transformer_model import process_attention_mask
+from astrai.model.transformer import process_attention_mask
 from astrai.model.value import ValueModel
 from tests.helpers import TINY_CONFIG
 

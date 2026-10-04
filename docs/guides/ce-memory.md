@@ -20,10 +20,12 @@ strategy_kwargs:
   loss_chunk_size: 512
 ```
 
-This computes the head and CE inside the model forward, so DDP sees the head
-parameter in the returned loss graph. Forward generates logits one row chunk
-at a time and saves only per-row normalization statistics. Backward recomputes
-vocabulary tiles, replaces each private tile with scaled logits gradients, and
+The strategy computes the head and CE from the model's hidden states and an
+LM-head weight view returned by the model. The view keeps the head visible to
+DDP's forward-output traversal, including `find_unused_parameters=True`, while
+the model remains independent of targets and loss configuration. Forward
+generates logits one row chunk at a time and saves only per-row normalization
+statistics. Backward recomputes vocabulary tiles, replaces each private tile with scaled logits gradients, and
 reduces all tokens in one GEMM per weight-gradient tile. This avoids a full
 FP32 head-gradient buffer and repeated BF16 accumulation across token chunks.
 The smaller hidden-gradient buffer accumulates across vocabulary tiles in FP32.
@@ -49,9 +51,10 @@ no Liger, Triton or CUTLASS runtime dependency.
   the Torch computation; these kernels do not operate on local vocabulary
   shards. DDP and sequence context parallelism retain their collective and
   normalization boundaries.
-- Inference remains unchanged and returns logits. An explicit training
-  `loss_targets` argument to `AutoRegressiveLM.forward` returns `loss_sum` and
-  sets `logits=None`. The chunked strategy requires this model interface.
+- Inference remains unchanged and returns logits. The chunked strategy asks
+  the model for hidden states and an LM-head parameter view, then returns
+  `loss_sum` with `logits=None` from the strategy. The model does not receive
+  labels or loss configuration.
 - Chunked mode falls back to full Torch linear+CE on CPU, with a biased head,
   or without the compiled extension. It does not silently choose another
   chunk size or backend based on benchmark results.

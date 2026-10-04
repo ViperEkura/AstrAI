@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.distributed.fsdp import fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from astrai.config.model_config import AutoRegressiveLMConfig
@@ -104,12 +105,21 @@ def test_cpu_fallback_and_mask(backend):
 @skip_no_ce
 def test_missing_kernel_fallback(monkeypatch):
     monkeypatch.setattr("astrai.trainer.strategy.ce_available", lambda: False)
-    monkeypatch.setattr("astrai.model.autoregressive_lm.ce_available", lambda: False)
     m, data = model("cuda"), batch("cuda")
     ref = SEQStrategy(m, "cuda").compute_loss(data)
     for backend in ("cuda_ce", "cuda_linear_ce"):
         loss = SEQStrategy(m, "cuda", loss_backend=backend).compute_loss(data)
         torch.testing.assert_close(loss, ref, rtol=0, atol=0)
+
+
+def test_model_has_no_loss_api():
+    m = model("cpu")
+    data = batch("cpu")
+    with pytest.raises(TypeError, match="loss_targets"):
+        m(data["input_ids"], loss_targets=data["target_ids"])
+    outputs = m(data["input_ids"], skip_lm_head=True, return_lm_head_weight=True)
+    assert outputs["logits"] is None
+    assert outputs["lm_head_weight"].shape == m.lm_head.weight.shape
 
 
 def _ddp_worker(rank, init_file):
@@ -186,3 +196,33 @@ def _ddp_worker(rank, init_file):
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
 def test_ddp_global_count(tmp_path):
     mp.spawn(_ddp_worker, args=(os.fspath(tmp_path / "init"),), nprocs=2, join=True)
+
+
+def _fsdp_worker(rank, init_file):
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method="file://" + init_file, rank=rank, world_size=2
+    )
+    try:
+        torch.manual_seed(50)
+        sharded = model("cuda:" + str(rank))
+        reference = copy.deepcopy(sharded)
+        fully_shard(sharded.lm_head, reshard_after_forward=False)
+        data = batch("cuda:" + str(rank))
+        actual = SEQStrategy(
+            sharded, "cuda:" + str(rank), loss_backend="cuda_linear_ce"
+        ).compute_loss(data)
+        expected = SEQStrategy(reference, "cuda:" + str(rank)).compute_loss(data)
+        torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+        actual.backward()
+        assert sharded.lm_head.weight.grad is not None
+    finally:
+        dist.destroy_process_group()
+
+
+@skip_no_ce
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_fsdp_head_fallback(tmp_path):
+    mp.spawn(
+        _fsdp_worker, args=(os.fspath(tmp_path / "init_fsdp"),), nprocs=2, join=True
+    )

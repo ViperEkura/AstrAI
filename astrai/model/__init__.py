@@ -13,7 +13,7 @@ from astrai.model.components.lora import (
 from astrai.model.components.mlp import MLP, DeepSeekMoE
 from astrai.model.components.norm import RMSNorm
 from astrai.model.encoder import EmbeddingEncoder
-from astrai.model.transformer_model import TransformerModel
+from astrai.model.transformer import TransformerModel
 from astrai.model.value import ValueModel
 
 __all__ = [

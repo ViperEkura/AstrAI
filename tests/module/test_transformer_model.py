@@ -2,7 +2,7 @@ import torch
 
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
-from astrai.model.transformer_model import TransformerModel
+from astrai.model.transformer import TransformerModel
 from astrai.model.value import ValueModel
 from tests.helpers import TINY_CONFIG
 

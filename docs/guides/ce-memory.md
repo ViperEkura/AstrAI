@@ -90,3 +90,20 @@ For a separate numerical audit, pass `--deterministic`. It sets
 This can select slower model kernels; do not mix its timings with the default
 performance runs. Repeated ordinary Torch runs also report their parameter
 differences against the first Torch run to expose baseline nondeterminism.
+
+For the maximum micro-batch at a fixed sequence length, use a separate capacity
+probe. It completes forward, backward and optimizer steps (including state
+allocation), records the allocated/reserved peaks, and stops each backend at its
+first CUDA OOM. A passed short probe is not a long-run stability guarantee.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
+  --mode capacity --variants torch cuda_ce linear512 \
+  --batch-sizes 3 4 5 6 7 8 --seq-len 2048 --warmup 2 --steps 3 \
+  --memory-fraction 0.95 --out results/ce-capacity.json
+```
+
+The default 0.95 memory fraction leaves allocator headroom. Use 1.0 for a
+separate limit probe on an idle GPU. The limit is micro-batch per device, not
+the effective batch after gradient accumulation; changing sequence length,
+optimizer, dtype, checkpointing or model changes the result.

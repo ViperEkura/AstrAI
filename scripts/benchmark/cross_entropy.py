@@ -65,15 +65,89 @@ def parity(model, reference):
     )
 
 
+def capacity(args, config):
+    """Find the largest completed micro-batch, including optimizer state."""
+    records = []
+
+    def attempt(batch_size, variant):
+        torch.manual_seed(7)
+        model = (
+            AutoRegressiveLM.from_pretrained(args.model_path)
+            .to(device="cuda", dtype=torch.bfloat16)
+            .train()
+        )
+        optimizer = MuonAdamW(model, lr=1e-5, ns_steps=5)
+        chunk = int(variant[6:]) if variant.startswith("linear") else 512
+        backend = "cuda_linear_ce" if variant.startswith("linear") else variant
+        strategy = SEQStrategy(
+            model, "cuda", loss_backend=backend, loss_chunk_size=chunk
+        )
+        data = dict(
+            input_ids=torch.randint(
+                config["vocab_size"], (batch_size, args.seq_len), device="cuda"
+            ),
+            target_ids=torch.randint(
+                config["vocab_size"], (batch_size, args.seq_len), device="cuda"
+            ),
+        )
+        torch.cuda.reset_peak_memory_stats()
+        for _ in range(args.warmup + args.steps):
+            optimizer.zero_grad(set_to_none=True)
+            loss = strategy.compute_loss(data)
+            loss.backward()
+            optimizer.step()
+            del loss
+        torch.cuda.synchronize()
+        return dict(
+            peak_allocated_MiB=torch.cuda.max_memory_allocated() / 2**20,
+            peak_reserved_MiB=torch.cuda.max_memory_reserved() / 2**20,
+        )
+
+    for variant in args.variants:
+        for batch_size in sorted(set(args.batch_sizes)):
+            gc.collect()
+            torch.cuda.empty_cache()
+            record = dict(variant=variant, batch=batch_size)
+            try:
+                record.update(attempt(batch_size, variant))
+                record["completed"] = True
+            except torch.cuda.OutOfMemoryError as error:
+                record.update(completed=False, error=str(error))
+            records.append(record)
+            print(json.dumps(record), flush=True)
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(
+                json.dumps(
+                    dict(
+                        mode="capacity",
+                        gpu=torch.cuda.get_device_name(),
+                        seq_len=args.seq_len,
+                        dtype="bfloat16",
+                        memory_fraction=args.memory_fraction,
+                        steps=args.warmup + args.steps,
+                        model=args.model_path,
+                        records=records,
+                    ),
+                    indent=2,
+                )
+                + "\n"
+            )
+            if not record["completed"]:
+                break
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["head", "train"], default="train")
+    parser.add_argument(
+        "--mode", choices=["head", "train", "capacity"], default="train"
+    )
     parser.add_argument("--model-path", default="models/AstrAI-V1-base")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2])
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--memory-fraction", type=float, default=0.95)
     parser.add_argument(
         "--deterministic",
         action="store_true",
@@ -111,9 +185,14 @@ def main():
         raise RuntimeError(
             "build cross_entropy before benchmarking; fallback is not a measurement"
         )
-    torch.cuda.set_per_process_memory_fraction(0.95)
+    if not 0 < args.memory_fraction <= 1:
+        parser.error("memory-fraction must be in (0, 1]")
+    torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     torch.manual_seed(7)
     config = json.loads((Path(args.model_path) / "config.json").read_text())
+    if args.mode == "capacity":
+        capacity(args, config)
+        return
     records = []
     report = dict(
         args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},

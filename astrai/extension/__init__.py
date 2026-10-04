@@ -77,6 +77,8 @@ from astrai.extension.kernel import (
     attn_paged_decode,
     attn_paged_prefill,
     attn_prefill,
+    cross_entropy,
+    linear_cross_entropy,
 )
 from astrai.extension.kernel.gemm import (
     facts,
@@ -125,6 +127,8 @@ def quantize_act_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 __all__ = [
+    "cross_entropy",
+    "linear_cross_entropy",
     "ATTN_BACKEND",
     "AttentionBackend",
     "AttentionBackendFactory",

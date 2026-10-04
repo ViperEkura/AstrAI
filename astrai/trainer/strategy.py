@@ -21,9 +21,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from astrai.extension.kernel.cross_entropy import cross_entropy
+from astrai.extension.kernel.cross_entropy import is_available as ce_available
 from astrai.factory import BaseFactory
 from astrai.model.components.mlp import RouterStats
 from astrai.parallel.cp import LossReduction, TokenLoss
@@ -47,14 +50,15 @@ class LogprobsOutput(TypedDict):
 class ForwardResult:
     """Model forward over the (possibly sequence-sharded) batch.
 
-    ``logits`` keeps the model dtype; :meth:`BaseStrategy.reduce_loss`
-    upcasts at the loss input.  The MoE extras ride along so the loss
+    ``logits`` keeps the model dtype. Fused linear CE instead supplies
+    ``loss_sum`` and leaves logits unset. MoE extras ride along so loss
     assembly can attach aux-loss and router diagnostics.
     """
 
-    logits: Tensor
+    logits: Optional[Tensor]
     aux_loss: Optional[Tensor] = None
     router_stats: Optional[List[RouterStats]] = None
+    loss_sum: Optional[Tensor] = None
 
 
 def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
@@ -881,8 +885,66 @@ class StrategyFactory(BaseFactory["BaseStrategy"]):
 # All strategies are registered at class definition time using the decorator
 
 
+class _CEStrategy(BaseStrategy):
+    """Shared explicit CE selection; torch remains the default."""
+
+    def __init__(
+        self,
+        model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
+        device: str,
+        label_smoothing: float = 0.0,
+        loss_backend: str = "torch",
+        loss_chunk_size: int = 512,
+        **kwargs,
+    ):
+        super().__init__(model, device, **kwargs)
+        if loss_backend not in ("torch", "cuda_ce", "cuda_linear_ce"):
+            raise ValueError("loss_backend must be torch, cuda_ce, or cuda_linear_ce")
+        if (
+            isinstance(loss_chunk_size, bool)
+            or not isinstance(loss_chunk_size, int)
+            or loss_chunk_size <= 0
+        ):
+            raise ValueError("loss_chunk_size must be a positive integer")
+        self.label_smoothing = label_smoothing
+        self.loss_backend = loss_backend
+        self.loss_chunk_size = loss_chunk_size
+
+    def _loss_kwargs(
+        self, targets: Tensor, loss_mask: Optional[Tensor] = None
+    ) -> Dict[str, Any]:
+        if self.loss_backend != "cuda_linear_ce":
+            return {}
+        if loss_mask is not None:
+            targets = targets.masked_fill(~loss_mask, -100)
+        return dict(
+            loss_targets=targets,
+            loss_chunk_size=self.loss_chunk_size,
+            label_smoothing=self.label_smoothing,
+        )
+
+    def _ce_sum(self, forward: ForwardResult, targets: Tensor) -> Tensor:
+        if forward.loss_sum is not None:
+            return forward.loss_sum
+        logits = forward.logits.flatten(0, 1)
+        targets = targets.flatten()
+        if (
+            self.loss_backend == "cuda_ce"
+            and logits.is_cuda
+            and not isinstance(logits, DTensor)
+            and ce_available()
+        ):
+            return cross_entropy(logits, targets, label_smoothing=self.label_smoothing)
+        return F.cross_entropy(
+            logits.float(),
+            targets,
+            label_smoothing=self.label_smoothing,
+            reduction="sum",
+        )
+
+
 @StrategyFactory.register("seq")
-class SEQStrategy(BaseStrategy):
+class SEQStrategy(_CEStrategy):
     """Standard next-token prediction training strategy.
 
     Computes cross-entropy loss for next token prediction.
@@ -890,16 +952,6 @@ class SEQStrategy(BaseStrategy):
     """
 
     loss_reduction = LossReduction.TOKEN_MEAN
-
-    def __init__(
-        self,
-        model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
-        device: str,
-        label_smoothing: float = 0.0,
-        **kwargs,
-    ):
-        super().__init__(model, device, **kwargs)
-        self.label_smoothing = label_smoothing
 
     def prepare_batch(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
         batch = super().prepare_batch(batch)
@@ -923,22 +975,22 @@ class SEQStrategy(BaseStrategy):
 
     def forward_tokens(self, batch: Dict[str, Tensor]) -> ForwardResult:
         outputs = self.model(
-            input_ids=batch["input_ids"], position_ids=batch["position_ids"]
+            input_ids=batch["input_ids"],
+            position_ids=batch["position_ids"],
+            **self._loss_kwargs(batch["target_ids"]),
         )
         return ForwardResult(
-            outputs["logits"], outputs.get("aux_loss"), outputs.get("router_stats")
+            outputs["logits"],
+            outputs.get("aux_loss"),
+            outputs.get("router_stats"),
+            outputs.get("loss_sum"),
         )
 
     def reduce_loss(
         self, forward: ForwardResult, batch: Dict[str, Tensor]
     ) -> TokenLoss:
         target_ids = batch["target_ids"]
-        loss_sum = F.cross_entropy(
-            input=forward.logits.flatten(0, 1).float(),
-            target=target_ids.flatten(),
-            label_smoothing=self.label_smoothing,
-            reduction="sum",
-        )
+        loss_sum = self._ce_sum(forward, target_ids)
         token_count = torch.tensor(
             target_ids.numel(), dtype=torch.float32, device=target_ids.device
         )
@@ -946,7 +998,7 @@ class SEQStrategy(BaseStrategy):
 
 
 @StrategyFactory.register("sft")
-class SFTStrategy(BaseStrategy):
+class SFTStrategy(_CEStrategy):
     """Supervised Fine-tuning strategy with loss masking.
 
     Applies cross-entropy loss only to tokens where loss_mask is True.
@@ -954,16 +1006,6 @@ class SFTStrategy(BaseStrategy):
     """
 
     loss_reduction = LossReduction.TOKEN_MEAN
-
-    def __init__(
-        self,
-        model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
-        device: str,
-        label_smoothing: float = 0.0,
-        **kwargs,
-    ):
-        super().__init__(model, device, **kwargs)
-        self.label_smoothing = label_smoothing
 
     def shard_spec(self, batch: Dict[str, Tensor]) -> Tuple[List[Tensor], List[int]]:
         if _is_packed(batch["position_ids"]):
@@ -995,9 +1037,13 @@ class SFTStrategy(BaseStrategy):
             input_ids=batch["input_ids"],
             position_ids=position_ids,
             input_mask=input_mask,
+            **self._loss_kwargs(batch["target_ids"], batch["loss_mask"]),
         )
         return ForwardResult(
-            outputs["logits"], outputs.get("aux_loss"), outputs.get("router_stats")
+            outputs["logits"],
+            outputs.get("aux_loss"),
+            outputs.get("router_stats"),
+            outputs.get("loss_sum"),
         )
 
     def reduce_loss(
@@ -1005,13 +1051,7 @@ class SFTStrategy(BaseStrategy):
     ) -> TokenLoss:
         ignore_index = -100
         target_ids = batch["target_ids"].masked_fill(~batch["loss_mask"], ignore_index)
-        loss_sum = F.cross_entropy(
-            input=forward.logits.flatten(0, 1).float(),
-            target=target_ids.flatten(),
-            ignore_index=ignore_index,
-            label_smoothing=self.label_smoothing,
-            reduction="sum",
-        )
+        loss_sum = self._ce_sum(forward, target_ids)
         token_count = (target_ids != ignore_index).sum().to(dtype=torch.float32)
         return TokenLoss(loss_sum, token_count)
 

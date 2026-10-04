@@ -7,9 +7,12 @@ from astrai.extension.kernel.attention import (
     attn_paged_prefill,
     attn_prefill,
 )
+from astrai.extension.kernel.cross_entropy import cross_entropy, linear_cross_entropy
 from astrai.extension.kernel.rotary import rotary_emb
 
 __all__ = [
+    "cross_entropy",
+    "linear_cross_entropy",
     "TensorLayout",
     "attn_decode",
     "attn_paged_decode",

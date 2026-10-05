@@ -20,7 +20,7 @@
  * Host side: cuTensorMapEncodeTiled per (pointer, geometry, box) — a few
  * microseconds — cached exact-match so steady-state serving loops (same
  * activation buffer, same weight) pay it once. The driver symbol is
- * dlsym'd, so neither the CMake link line nor the standalone C tests
+ * looked up at runtime, so neither the CMake link line nor the standalone C tests
  * need -lcuda.
  *
  * All includes live at file scope OUTSIDE namespace astrai: standard
@@ -31,13 +31,13 @@
 #pragma once
 
 #include <cstdint>
-#include <dlfcn.h>
 #include <mutex>
 #include <optional>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <system/cuda_driver_loader.cuh>
 #include <utils/define.cuh>
 #include <utils/swizzle.cuh>
 
@@ -117,8 +117,8 @@ tma_load(const void* map, uint64_t* bar, void* smem_dst, int x, int y, int z) {
 }
 
 /*
- * Host: tensor-map encode (driver API via dlsym) + exact-match cache.
- * Unconditional (both passes parse host functions; the dlsym'd symbol
+ * Host: tensor-map encode (driver API via runtime lookup) + exact-match cache.
+ * Unconditional (both passes parse host functions; symbol lookup
  * only ever runs on the host).
  */
 
@@ -205,13 +205,8 @@ using TmaEncodeFn = CUresult (*)(CUtensorMap*,
                                  CUtensorMapFloatOOBfill);
 
 inline TmaEncodeFn tma_encode_fn() {
-    static TmaEncodeFn fn = [] {
-        void* handle = dlopen("libcuda.so.1", RTLD_LAZY);
-        if (handle == nullptr)
-            handle = dlopen("libcuda.so", RTLD_LAZY);
-        return handle ? reinterpret_cast<TmaEncodeFn>(dlsym(handle, "cuTensorMapEncodeTiled"))
-                      : nullptr;
-    }();
+    static TmaEncodeFn fn =
+        astrai::system::resolve_cuda_driver_symbol<TmaEncodeFn>("cuTensorMapEncodeTiled");
     return fn;
 }
 

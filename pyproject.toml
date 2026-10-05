@@ -39,7 +39,7 @@ where = ["."]
 include = ["astrai*"]
 
 [tool.setuptools.package-data]
-"astrai.extension" = ["_C_*.so"]
+"astrai.extension" = ["_C_*.so", "_C_*.pyd"]
 
 [tool.setuptools.dynamic]
 version = { attr = "astrai.__version__" }

@@ -1,103 +1,252 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform wheel jobs to run
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - linux
+          - windows
+  pull_request:
+    paths:
+      - "setup.py"
+      - "pyproject.toml"
+      - "csrc/**"
+      - "astrai/**"
+      - "tests/extension/**"
   push:
     tags:
       - "v*"
 
 jobs:
-  build-pure:
-    name: Build pure-Python wheel
+  build-cuda-linux:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.platform == 'all' ||
+      inputs.platform == 'linux'
+    name: Build complete wheel (Linux, CUDA 13.0)
     runs-on: ubuntu-latest
+    env:
+      CSRC_KERNELS: "true"
+      ASTRAI_CUDA_ARCH: "80;89;90;100;120a"
+      BUILD_PARALLEL: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Build wheel (no CUDA)
+      - name: Install build tools and CUDA-enabled PyTorch
         run: |
-          pip wheel . --no-deps -w dist/
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
+      - name: Set up CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: "13.0.0"
+
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
+
+      - name: Diagnose Linux runner resources after a build failure
+        if: failure()
+        run: |
+          echo "=== memory ==="
+          free -h
+          echo "=== cgroup memory events ==="
+          cat /sys/fs/cgroup/memory.events || true
+          echo "=== filesystem ==="
+          df -h /
+          echo "=== kernel log ==="
+          sudo dmesg -T | tail -40 || true
+
+      - name: Verify wheel tag and CUDA modules
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+          from pathlib import Path
+          from packaging.tags import sys_tags
+          from packaging.utils import parse_wheel_filename
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          tags = parse_wheel_filename(Path(wheels[0]).name)[3]
+          assert tags & set(sys_tags()), (wheels[0], tags)
+          assert all(tag.platform != "any" for tag in tags), tags
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              modules = [name for name in wheel.namelist()
+                         if name.startswith("astrai/extension/_C_") and name.endswith(".so")]
+          assert len(modules) == 6, modules
+          print(Path(wheels[0]).name)
+          print(*modules, sep="\n")
+          PY
+
+      - name: Install and verify native modules load
+        run: |
+          python -m pip install --no-deps --target "$RUNNER_TEMP/wheel-install" dist/*.whl
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$RUNNER_TEMP/wheel-install" python - "$RUNNER_TEMP/wheel-install" <<'PY'
+          import sys
+          import types
+          from pathlib import Path
+
+          root = Path(sys.argv[1]) / "astrai"
+          package = types.ModuleType("astrai")
+          package.__path__ = [str(root)]
+          sys.modules["astrai"] = package
+          extension = types.ModuleType("astrai.extension")
+          extension.__path__ = [str(root / "extension")]
+          sys.modules["astrai.extension"] = extension
+
+          from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
+
+          print(KERNEL_NAMES)
+          assert len(KERNEL_NAMES) == 6, KERNEL_NAMES
+          assert all(is_available(name) for name in KERNEL_NAMES)
+          PY
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pure-wheel
+          name: astrai-linux-cu130
           path: dist/*.whl
           if-no-files-found: error
 
-  build-cuda-linux:
-    name: Build CUDA wheel (Linux, ${{ matrix.cuda_tag }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - cuda_tag: "cu128"
-            cuda_ver: "12.8.0"
-          - cuda_tag: "cu130"
-            cuda_ver: "13.0.0"
+  build-cuda-windows:
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.platform == 'all' ||
+      inputs.platform == 'windows'
+    name: Build complete wheel (Windows, CUDA 13.0)
+    runs-on: windows-2022
+    env:
+      CMAKE_GENERATOR: "Ninja"
+      CSRC_KERNELS: "true"
+      ASTRAI_CUDA_ARCH: "80;89;90;100;120a"
+      BUILD_PARALLEL: "2"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install torch (${{ matrix.cuda_tag }})
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/${{ matrix.cuda_tag }}
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
 
-      - name: Setup CUDA (${{ matrix.cuda_ver }})
+      - name: Set up CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: "${{ matrix.cuda_ver }}"
+          cuda: "13.0.0"
 
-      - name: Build wheel (with CUDA kernels)
+      - name: Install build tools and CUDA-enabled PyTorch
         run: |
-          CSRC_KERNELS=true pip wheel . --no-deps --no-build-isolation -w dist/
-          for f in dist/*.whl; do
-            mv "$f" "dist/$(basename "$f" .whl)+${{ matrix.cuda_tag }}.whl"
-          done
+          python -m pip install --upgrade pip setuptools wheel ninja
+          python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
+      - name: Build wheel
+        run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
+
+      - name: Verify wheel tag and CUDA modules
+        shell: pwsh
+        run: |
+          @'
+          import glob
+          import zipfile
+          from pathlib import Path
+          from packaging.tags import sys_tags
+          from packaging.utils import parse_wheel_filename
+
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          tags = parse_wheel_filename(Path(wheels[0]).name)[3]
+          assert tags & set(sys_tags()), (wheels[0], tags)
+          assert all(tag.platform != "any" for tag in tags), tags
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              modules = [
+                  name for name in wheel.namelist()
+                  if name.startswith("astrai/extension/_C_") and name.endswith(".pyd")
+              ]
+          print(Path(wheels[0]).name)
+          print(*modules, sep="\n")
+          assert len(modules) == 6, modules
+          '@ | python -
+
+      - name: Install and verify native modules load
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist/*.whl).FullName
+          $install = Join-Path $env:RUNNER_TEMP "wheel-install"
+          python -m pip install --no-deps --target $install $wheel
+          Set-Location $env:RUNNER_TEMP
+          $env:PYTHONPATH = $install
+          @'
+          import sys
+          import types
+          from pathlib import Path
+
+          root = Path(sys.argv[1]) / "astrai"
+          package = types.ModuleType("astrai")
+          package.__path__ = [str(root)]
+          sys.modules["astrai"] = package
+          extension = types.ModuleType("astrai.extension")
+          extension.__path__ = [str(root / "extension")]
+          sys.modules["astrai.extension"] = extension
+
+          from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
+
+          print(KERNEL_NAMES)
+          assert len(KERNEL_NAMES) == 6, KERNEL_NAMES
+          assert all(is_available(name) for name in KERNEL_NAMES)
+          '@ | python - $install
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cuda-wheel-linux-${{ matrix.cuda_tag }}
+          name: astrai-windows-cu130
           path: dist/*.whl
           if-no-files-found: error
 
   release:
-    name: Attach wheels to release
-    needs: [build-pure, build-cuda-linux]
+    name: Attach Linux and Windows wheels to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-cuda-linux, build-cuda-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download pure-Python wheel
+      - name: Download Linux wheel
         uses: actions/download-artifact@v4
         with:
-          name: pure-wheel
-          path: release-assets/pure
+          name: astrai-linux-cu130
+          path: release-assets/linux
 
-      - name: Download CUDA wheels (all variants)
+      - name: Download Windows wheel
         uses: actions/download-artifact@v4
         with:
-          pattern: cuda-wheel-linux-*
-          merge-multiple: true
-          path: release-assets/cuda
+          name: astrai-windows-cu130
+          path: release-assets/windows
 
-      - name: Verify release assets
+      - name: Verify platform wheel files exist
         shell: bash
         run: |
           set -euo pipefail
-          pure_wheels=(release-assets/pure/*.whl)
-          cuda_wheels=(release-assets/cuda/*.whl)
-          test "${#pure_wheels[@]}" -eq 1
-          test "${#cuda_wheels[@]}" -ge 1
+          linux_wheels=(release-assets/linux/*.whl)
+          windows_wheels=(release-assets/windows/*.whl)
+          test "${#linux_wheels[@]}" -eq 1
+          test "${#windows_wheels[@]}" -eq 1
 
-      - name: Create release & upload assets
+      - name: Create release and upload wheels
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/pure/*.whl
-            release-assets/cuda/*.whl
+            release-assets/linux/*.whl
+            release-assets/windows/*.whl
           tag_name: ${{ github.ref_name }}
           generate_release_notes: true

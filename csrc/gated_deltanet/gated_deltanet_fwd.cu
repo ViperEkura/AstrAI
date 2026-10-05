@@ -22,6 +22,9 @@ constexpr int kQuarters = 4;  // norm reduction is split kQuarters ways
  * keep the stores scalar to avoid bank conflicts.
  */
 constexpr int kPitch = kTile + 2;
+constexpr int kQkvSharedBytes =
+    3 * kHeadDim * kPitch * sizeof(__nv_bfloat16) +
+    (2 * kQuarters * kTile + 2 * kTile) * sizeof(float);
 
 // One block per (b, h, token tile).
 __global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ q,
@@ -36,13 +39,14 @@ __global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ 
                                               int seq,
                                               int heads,
                                               float eps) {
-    __shared__ __nv_bfloat16 q_s[kHeadDim * kPitch];
-    __shared__ __nv_bfloat16 k_s[kHeadDim * kPitch];
-    __shared__ __nv_bfloat16 v_s[kHeadDim * kPitch];
-    __shared__ float partial_q[kQuarters][kTile];
-    __shared__ float partial_k[kQuarters][kTile];
-    __shared__ float scale_q[kTile];
-    __shared__ float scale_k[kTile];
+    extern __shared__ unsigned char smem[];
+    auto* q_s = reinterpret_cast<__nv_bfloat16*>(smem);
+    auto* k_s = q_s + kHeadDim * kPitch;
+    auto* v_s = k_s + kHeadDim * kPitch;
+    auto* partial_q = reinterpret_cast<float*>(v_s + kHeadDim * kPitch);
+    auto* partial_k = partial_q + kQuarters * kTile;
+    auto* scale_q = partial_k + kQuarters * kTile;
+    auto* scale_k = scale_q + kTile;
 
     const int tid = threadIdx.x;
     const int tiles = (seq + kTile - 1) / kTile;
@@ -104,16 +108,16 @@ __global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ 
         q_sum = fmaf(qv, qv, q_sum);
         k_sum = fmaf(kv, kv, k_sum);
     }
-    partial_q[quarter][col] = q_sum;
-    partial_k[quarter][col] = k_sum;
+    partial_q[quarter * kTile + col] = q_sum;
+    partial_k[quarter * kTile + col] = k_sum;
     __syncthreads();
     if (tid < kTile) {
         float qs = 0.0f;
         float ks = 0.0f;
 #pragma unroll
         for (int r = 0; r < kQuarters; ++r) {
-            qs += partial_q[r][tid];
-            ks += partial_k[r][tid];
+            qs += partial_q[r * kTile + tid];
+            ks += partial_k[r * kTile + tid];
         }
         scale_q[tid] = rsqrtf(qs + eps);
         scale_k[tid] = rsqrtf(ks + eps);
@@ -238,7 +242,16 @@ std::vector<torch::Tensor> gated_deltanet_fwd(torch::Tensor q,
     auto beta_out = torch::empty({batch, heads, seq}, beta.options());
 
     const int tiles = (seq + kTile - 1) / kTile;
-    gated_deltanet_fwd_qkv_kernel<<<batch * heads * tiles, kThreads, 0, stream>>>(
+    static bool configured = false;
+    if (!configured) {
+        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(
+            gated_deltanet_fwd_qkv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kQkvSharedBytes));
+        configured = true;
+    }
+
+    gated_deltanet_fwd_qkv_kernel<<<batch * heads * tiles, kThreads, kQkvSharedBytes,
+                                      stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),

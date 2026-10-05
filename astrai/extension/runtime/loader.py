@@ -17,11 +17,11 @@ _LIB_DIR = os.path.dirname(os.path.dirname(__file__))
 
 
 def _discover_kernel_names() -> List[str]:
-    """Return the module names of the compiled kernel ``.so`` files in lib/."""
+    """Return the module names of compiled kernel extension files in lib/."""
     names: List[str] = []
-    for path in glob.glob(os.path.join(_LIB_DIR, "_C_*.so")):
-        # strip the "<soabi>.so" suffix, e.g. attn_decode.cpython-312-...so
-        names.append(os.path.basename(path).split(".", 1)[0].removeprefix("_C_"))
+    for suffix in (".so", ".pyd"):
+        for path in glob.glob(os.path.join(_LIB_DIR, f"_C_*{suffix}")):
+            names.append(os.path.basename(path).split(".", 1)[0].removeprefix("_C_"))
     return sorted(names)
 
 
@@ -35,7 +35,7 @@ def _try_load(name: str) -> object:
     """Import and cache the ``name`` kernel module (lazy, one attempt).
 
     Returns the module, or ``None`` if it is unavailable. Cached so each
-    ``.so`` is imported at most once per process; a successful first import
+    native extension is imported at most once per process; a successful first import
     invalidates the dispatch record caches, whose availability predicates
     consult ``is_available`` (the only availability change that can happen
     without a re-registration).

@@ -19,14 +19,11 @@ endif()
 set(ASTRAI_KERNEL_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../astrai/extension"
     CACHE PATH "Directory for compiled AstrAI extension modules")
 set(TORCH_LIB_DIR "${TORCH_HOME}/lib")
-set(TORCH_LIBS
-    "${TORCH_LIB_DIR}/libtorch_python.so"
-    "${TORCH_LIB_DIR}/libtorch_cuda.so"
-    "${TORCH_LIB_DIR}/libc10_cuda.so"
-    "${TORCH_LIB_DIR}/libtorch_cpu.so"
-    "${TORCH_LIB_DIR}/libtorch.so"
-    "${TORCH_LIB_DIR}/libc10.so"
-    CUDA::cudart)
+if(WIN32)
+    include(cmake/windows.cmake)
+else()
+    include(cmake/linux.cmake)
+endif()
 
 function(astrai_compile_target target)
     set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -37,8 +34,8 @@ function(astrai_compile_target target)
         "${TORCH_HOME}/include/torch/csrc/api/include"
         "${PYTHON_INCLUDE_DIR}")
     target_link_libraries(${target} PRIVATE ${TORCH_LIBS})
+    astrai_platform_compile_options(${target})
     target_compile_options(${target} PRIVATE
-        "$<$<COMPILE_LANGUAGE:CXX>:-O3;-funroll-loops>"
         "$<$<COMPILE_LANGUAGE:CUDA>:-O3>"
         "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>"
         "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>"
@@ -76,13 +73,14 @@ foreach(entry IN LISTS KERNEL_MODULES)
     astrai_compile_target(${name})
     astrai_target_arches(${name} ${ASTRAI_CUDA_ARCH_LIST})
     target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=_C_${name})
-    target_link_options(${name} PRIVATE "-Wl,-rpath,${TORCH_LIB_DIR}")
+    astrai_platform_link_options(${name})
     if(name STREQUAL "cross_entropy")
         target_link_libraries(${name} PRIVATE CUDA::cublas)
     endif()
     set_target_properties(${name} PROPERTIES PREFIX "" OUTPUT_NAME "_C_${name}"
-        SUFFIX ".${PY_SOABI}.so"
-        LIBRARY_OUTPUT_DIRECTORY "${ASTRAI_KERNEL_OUTPUT_DIRECTORY}")
+        SUFFIX ".${PY_SOABI}${ASTRAI_EXTENSION_SUFFIX}"
+        LIBRARY_OUTPUT_DIRECTORY "${ASTRAI_KERNEL_OUTPUT_DIRECTORY}"
+        RUNTIME_OUTPUT_DIRECTORY "${ASTRAI_KERNEL_OUTPUT_DIRECTORY}")
 endforeach()
 
 set(GEMM_BASE_SOURCES

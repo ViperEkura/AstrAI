@@ -48,8 +48,11 @@ def _python_include():
 def _python_soabi():
     import sysconfig
 
-    ext = sysconfig.get_config_var("EXT_SUFFIX").lstrip(".")
-    return ext[: -len(".so")]
+    ext = sysconfig.get_config_var("EXT_SUFFIX") or ""
+    for suffix in (".so", ".pyd"):
+        if ext.endswith(suffix):
+            return ext[1 : -len(suffix)]
+    return ext.lstrip(".")
 
 
 class _CMakeBuildExt(_build_ext):
@@ -94,6 +97,7 @@ class _CMakeBuildExt(_build_ext):
             f"-DTORCH_HOME={torch_home}",
             f"-DPYTHON_INCLUDE_DIR={_python_include()}",
             f"-DPY_SOABI={_python_soabi()}",
+            f"-DCMAKE_BUILD_TYPE={os.environ.get('CMAKE_BUILD_TYPE', 'Release')}",
         ]
         arch = os.environ.get("ASTRAI_CUDA_ARCH")
         max_arch = None
@@ -151,8 +155,11 @@ class _CMakeBuildExt(_build_ext):
         )
         if max_arch is not None and max_arch >= 80:
             required += ("quantize", "gemm")
+        module_suffix = ".pyd" if os.name == "nt" else ".so"
         missing = [
-            name for name in required if not any(lib_dir.glob(f"_C_{name}.*.so"))
+            name
+            for name in required
+            if not any(lib_dir.glob(f"_C_{name}.*{module_suffix}"))
         ]
         if missing:
             raise RuntimeError(
@@ -227,8 +234,9 @@ def _torch_cuda_version():
 
 class _BinaryDistribution(_Distribution):
     def has_ext_modules(self):
+        module_suffix = ".pyd" if os.name == "nt" else ".so"
         return _should_build() or any(
-            Path(__file__).parent.glob("astrai/extension/_C_*.so")
+            Path(__file__).parent.glob(f"astrai/extension/_C_*{module_suffix}")
         )
 
 

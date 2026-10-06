@@ -10,37 +10,12 @@ from astrai.model.components.embedding import Embedding
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
 from astrai.model.kv_cache import KVCache
-
-
-def process_attention_mask(
-    input_mask: Optional[Tensor],
-    *,
-    causal: bool = False,
-) -> Optional[Tensor]:
-    """Expand masks, optionally adding causality to a 2-D key-padding mask.
-
-    Explicit 3-D/4-D masks already define which query/key pairs may attend.
-    """
-    if input_mask is None:
-        return None
-    if input_mask.dim() == 2:
-        mask = input_mask[:, None, None, :]
-        if causal:
-            seq_len = input_mask.size(-1)
-            causal_mask = torch.ones(
-                seq_len, seq_len, dtype=torch.bool, device=input_mask.device
-            ).tril()
-            if input_mask.dtype == torch.bool:
-                mask = mask & causal_mask
-            else:
-                # Preserve additive attention biases on allowed keys.
-                mask = mask.expand(-1, 1, seq_len, -1).masked_fill(
-                    ~causal_mask, float("-inf")
-                )
-        return mask
-    if input_mask.dim() == 3:
-        return input_mask[:, None, :, :]
-    return input_mask
+from astrai.model.masking import (
+    prepare_decoder_masks,
+)
+from astrai.model.masking import (
+    process_attention_mask as process_attention_mask,
+)
 
 
 def init_module_weights(module: nn.Module):
@@ -63,17 +38,31 @@ class TransformerModel(nn.Module):
     def __init__(self, config: AutoRegressiveLMConfig):
         super().__init__()
         self.config = config
-        rope_dim = (
-            config.qk_rope_head_dim
-            if config.attn_type == "mla"
-            else config.hidden_size // config.num_attention_heads
+        attention = config.attention
+        self.layer_types = tuple(
+            attention.type_for_layer(layer_id)
+            for layer_id in range(config.num_hidden_layers)
         )
+        rope_dims = {}
+        if "gqa" in self.layer_types:
+            rope_dims["gqa"] = (
+                attention.gqa.rotary_dim
+                or attention.gqa.head_dim
+                or config.hidden_size // attention.num_heads
+            )
+        if "mla" in self.layer_types:
+            rope_dims["mla"] = attention.mla.qk_rope_head_dim
         rope_base = config.rope_theta if config.rope_theta is not None else 10000
-        self.rotary_embedding = RotaryEmbedding(
-            rope_dim,
-            config.max_position_embeddings,
-            rope_base,
-            rope_scaling=config.rope_scaling,
+        self.rotary_embeddings = nn.ModuleDict(
+            {
+                kind: RotaryEmbedding(
+                    dim,
+                    config.max_position_embeddings,
+                    rope_base,
+                    rope_scaling=config.rope_scaling,
+                )
+                for kind, dim in rope_dims.items()
+            }
         )
         self.embed_tokens = Embedding(
             config.vocab_size,
@@ -83,7 +72,11 @@ class TransformerModel(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                DecoderBlock(config, layer_id)
+                DecoderBlock(
+                    config,
+                    layer_id,
+                    attention_type=self.layer_types[layer_id],
+                )
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
@@ -100,23 +93,22 @@ class TransformerModel(nn.Module):
         logits_positions: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         x = self.embed_tokens(input_ids)
-        rotary_emb = self.rotary_embedding(x, position_ids)
-        # GDN supplies causality through its recurrence and needs the compact
-        # key-padding mask; softmax attention needs both constraints combined.
-        attn_mask = process_attention_mask(
-            input_mask, causal=self.config.attn_type != "gdn"
-        )
-        use_sdpa_causal_mask = attn_mask is None
+        rotary_by_type = {
+            kind: embedding(x, position_ids)
+            for kind, embedding in self.rotary_embeddings.items()
+        }
+        masks = prepare_decoder_masks(input_mask, self.layer_types)
 
         aux_losses = []
         router_stats_list = []
-        for layer in self.layers:
+        for layer, kind in zip(self.layers, self.layer_types):
+            mask = masks[kind]
             layer_output = layer(
                 x,
-                rotary_emb,
-                attn_mask,
+                rotary_by_type.get(kind),
+                mask.tensor,
                 kv_cache,
-                use_sdpa_causal_mask,
+                mask.is_causal,
                 fwd,
             )
             x = layer_output["hidden_states"]

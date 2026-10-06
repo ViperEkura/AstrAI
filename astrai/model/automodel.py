@@ -11,9 +11,9 @@ import torch.nn as nn
 from astrai.config.model_config import BaseModelConfig, ConfigFactory
 from astrai.factory import BaseFactory
 from astrai.serialization import (
-    HF_MODEL_TYPES,
     adapt_config,
     convert_hf_weights,
+    load_hf_mapping,
     load_model_config,
     load_model_weights,
     looks_like_hf_state_dict,
@@ -75,9 +75,9 @@ class AutoModel(nn.Module):
             disable_random_init: Replace parameter initializers with no-ops
                 while building the model.
             strict: Passed to ``load_state_dict``.
-            weights_format: ``"auto"`` detects HuggingFace checkpoints
-                (LLaMA-style keys and ``model_type``) and converts them;
-                ``"astrai"`` skips conversion; ``"hf"`` forces it.
+            weights_format: ``"auto"`` reads a model-directory mapping and
+                detects compatible HF weight keys; ``"astrai"`` skips conversion;
+                ``"hf"`` requires a mapping and forces weight conversion.
         """
         if weights_format not in ("auto", "astrai", "hf"):
             raise ValueError(
@@ -92,11 +92,18 @@ class AutoModel(nn.Module):
             raise FileNotFoundError(f"Config file not found: {config_path}")
 
         raw = load_model_config(str(model_path))
-        is_hf_config = weights_format == "hf" or (
-            weights_format == "auto" and raw.get("model_type") in HF_MODEL_TYPES
-        )
+        mapping = load_hf_mapping(model_path)
+        is_hf_config = mapping is not None
+        if weights_format == "hf" and mapping is None:
+            raise FileNotFoundError(
+                f"HF config mapping not found: {model_path / 'hf_mapping.json'}"
+            )
         if is_hf_config:
-            raw = adapt_config(raw)
+            raw = adapt_config(raw, str(model_path))
+        elif raw.get("model_type") not in (None, "autoregressive_lm"):
+            raise FileNotFoundError(
+                f"HF config mapping not found: {model_path / 'hf_mapping.json'}"
+            )
 
         config = ConfigFactory.load(raw)
         model_type = config.model_type or "autoregressive_lm"
@@ -110,11 +117,11 @@ class AutoModel(nn.Module):
         index_path = model_path / "model.safetensors.index.json"
         if weights_path.exists() or index_path.exists():
             state_dict = load_model_weights(str(model_path))
-            is_hf_weights = is_hf_config or (
+            is_hf_weights = weights_format == "hf" or (
                 weights_format == "auto" and looks_like_hf_state_dict(state_dict)
             )
             if is_hf_weights:
-                state_dict = convert_hf_weights(state_dict, config)
+                state_dict = convert_hf_weights(state_dict, config, mapping=mapping)
             model.load_state_dict(state_dict, strict=strict)
 
         return model

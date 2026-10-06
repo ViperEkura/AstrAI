@@ -98,22 +98,43 @@ blocks.
 
 ## Gated DeltaNet reference path
 
-`attn_type: "gdn"` selects the differentiable recurrent Gated DeltaNet
-reference module, not an SDPA backend. A minimal autoregressive config is:
+Set `attention.default_type` to `"gdn"` for a model whose layers all use
+the differentiable Gated DeltaNet reference module. A minimal autoregressive
+attention section is:
 
 ```json
 {
-  "attn_type": "gated_deltanet",
-  "gated_deltanet_num_key_heads": 16,
-  "gated_deltanet_num_value_heads": 32,
-  "gated_deltanet_key_head_dim": 128,
-  "gated_deltanet_value_head_dim": 128,
-  "gated_deltanet_conv_kernel_size": 4
+  "attention": {
+    "default_type": "gdn",
+    "num_heads": 16,
+    "num_kv_heads": 4,
+    "gdn": {
+      "num_key_heads": 16,
+      "num_value_heads": 32,
+      "key_head_dim": 128,
+      "value_head_dim": 128,
+      "conv_kernel_size": 4
+    }
+  }
 }
 ```
 
-The head counts and dimensions default to `num_attention_heads` and
-`hidden_size / num_attention_heads` when omitted. Key heads are repeated across
+For a hybrid decoder, `attention.layers` lists the type for each layer using
+`"gdn"` or `"gqa"`. Its length must equal `num_hidden_layers`.
+
+During training, an unpacked batch without padding passes no mask. GQA uses
+the causal backend path and GDN's recurrence is causal by construction.
+A boolean right-padding mask is passed as `[batch, seq]`. The model prepares
+one mask per attention type: a causal query/key mask for GQA or MLA, and the
+original two-dimensional padding mask for GDN. The same mask is reused by
+layers of that type. Packed batches use a four-dimensional document-boundary
+mask for softmax attention. GDN cannot use that mask: its recurrent and
+convolution states would need a reset at every document boundary. Until
+boundary resets are implemented, train any model containing GDN on unpacked
+sequences; the model rejects packed document masks before entering the blocks.
+
+The GDN head counts and dimensions default to `attention.num_heads` and
+`hidden_size / attention.num_heads` when omitted. Key heads are repeated across
 value heads and must divide the value-head count. The module applies causal
 depthwise local convolution and L2-normalizes query/key vectors without RoPE,
 then updates a per-batch, per-value-head state with decay followed by the
@@ -158,8 +179,9 @@ Interface contract:
   does not depend on the number of steps, so decode memory is constant in the
   history length.
 - All math is float32 internally; outputs are cast back to the input dtype.
-- Padded rows carry `beta = 0` and `g = 0`, so right padding neither writes to
-  nor decays the state and the returned state matches an unpadded run.
+- Training accepts right padding because no later valid token can observe a
+  padded update; outputs at padded positions are zeroed. Prefill does not
+  accept padding when returning a state for continued decoding.
 
 `GDN.prefill` and `GDN.decode_step` carry a `GatedDeltaNetState` (convolution window plus
 recurrent matrix) and are validated to reproduce the training forward token for

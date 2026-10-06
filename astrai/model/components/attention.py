@@ -32,12 +32,18 @@ class GQA(nn.Module):
         use_gated_attention: bool,
         layer_id: int,
         n_layers: int = 1,
+        head_dim: Optional[int] = None,
+        rotary_dim: Optional[int] = None,
+        **kwargs,
     ):
         super().__init__()
-        assert dim % n_heads == 0
+        assert (head_dim or dim // n_heads) > 0
         assert n_heads % n_kv_heads == 0
 
-        self.head_dim = dim // n_heads
+        self.head_dim = head_dim or dim // n_heads
+        self.rotary_dim = rotary_dim or self.head_dim
+        if self.rotary_dim > self.head_dim or self.rotary_dim % 2:
+            raise ValueError("rotary_dim must be even and no larger than head_dim")
         self.layer_id = layer_id
         self.dim = dim
         self.n_heads = n_heads
@@ -49,14 +55,16 @@ class GQA(nn.Module):
         self.q_proj = Linear(dim, n_heads * self.head_dim)
         self.k_proj = Linear(dim, n_kv_heads * self.head_dim)
         self.v_proj = Linear(dim, n_kv_heads * self.head_dim)
-        self.o_proj = Linear(dim, dim, init_std=0.02 / (2 * n_layers) ** 0.5)
+        self.o_proj = Linear(
+            n_heads * self.head_dim, dim, init_std=0.02 / (2 * n_layers) ** 0.5
+        )
 
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, norm_eps)
             self.k_norm = RMSNorm(self.head_dim, norm_eps)
 
         if self.use_gated_attention:
-            self.gate = Linear(dim, dim)
+            self.gate = Linear(dim, n_heads * self.head_dim)
 
     def _split_heads(self, x: Tensor, n_heads) -> Tensor:
         return x.reshape(*x.shape[:-1], n_heads, self.head_dim)
@@ -74,13 +82,19 @@ class GQA(nn.Module):
         k = self._split_heads(self.k_proj(x), self.n_kv_heads)
         v = self._split_heads(self.v_proj(x), self.n_kv_heads)
 
-        # Match the HuggingFace convention (Qwen2/Gemma): normalize Q/K
-        # before RoPE. RMSNorm's per-channel gain does not commute with
-        # the rotation, so the order changes numerics.
+        # Match the HuggingFace convention (Qwen2/Gemma): normalize Q/K before RoPE.
+        # RMSNorm's per-channel gain does not commute with the rotation, so the order changes numerics.
         if self.use_qk_norm:
             q, k = self.q_norm(q), self.k_norm(k)
 
-        q, k = apply_rotary_emb(q, rotary_emb), apply_rotary_emb(k, rotary_emb)
+        if self.rotary_dim < self.head_dim:
+            q_rot = apply_rotary_emb(q[..., : self.rotary_dim], rotary_emb)
+            k_rot = apply_rotary_emb(k[..., : self.rotary_dim], rotary_emb)
+            q = torch.cat((q_rot, q[..., self.rotary_dim :]), dim=-1)
+            k = torch.cat((k_rot, k[..., self.rotary_dim :]), dim=-1)
+        else:
+            q = apply_rotary_emb(q, rotary_emb)
+            k = apply_rotary_emb(k, rotary_emb)
 
         sdqa_out = attention(
             q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
@@ -264,12 +278,12 @@ class GDN(nn.Module):
         return history[:, -self.conv_width :].contiguous()
 
     def _padding_mask(self, x: Tensor, attn_mask: Optional[Tensor]):
-        """Unwrap the 2-D padding mask to ``[B, T]`` bool, or None."""
+        """Validate the recurrent layer's 2-D boolean right-padding mask."""
         if attn_mask is None:
             return None
-        if attn_mask.ndim != 4 or attn_mask.shape[1:3] != (1, 1):
-            raise ValueError("Gated DeltaNet supports only a 2D padding mask")
-        valid = attn_mask[:, 0, 0, :].to(dtype=torch.bool)
+        if attn_mask.ndim != 2 or attn_mask.dtype != torch.bool:
+            raise ValueError("Gated DeltaNet requires a boolean 2D padding mask")
+        valid = attn_mask
         if valid.shape != x.shape[:2]:
             raise ValueError(
                 "Gated DeltaNet padding mask must match batch and sequence dimensions"
@@ -301,9 +315,8 @@ class GDN(nn.Module):
         valid = self._padding_mask(x, attn_mask)
         q, k, v = self._project_qkv(x)
         log_decay, beta = self._gates(x)
-        # Right padding is safe without touching the state: padded rows carry
-        # beta = 0 and g = 0, so they write nothing and never decay, and
-        # causality keeps them out of the preceding outputs.
+        # Right padding has no later valid tokens, so updates on padded rows
+        # cannot affect valid outputs. Zero padded outputs for the caller.
         core, _ = chunk_gated_delta_rule(q, k, v, log_decay, beta)
         if valid is not None:
             core = core * valid[:, :, None, None].to(core.dtype)

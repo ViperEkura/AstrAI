@@ -41,6 +41,41 @@ LLAMA_RAW = {
     "head_dim": 4,
 }
 
+TEST_MAPPING = {
+    "version": 1,
+    "required": [
+        "vocab_size",
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+    ],
+    "fields": {
+        "vocab_size": "vocab_size",
+        "hidden_size": "hidden_size",
+        "num_hidden_layers": "num_hidden_layers",
+        "intermediate_size": "intermediate_size",
+        "rms_norm_eps": "rms_norm_eps",
+        "tie_word_embeddings": "tie_word_embeddings",
+        "max_position_embeddings": "max_position_embeddings",
+        "rope_theta": "rope_theta",
+        "attention.num_heads": "num_attention_heads",
+        "attention.num_kv_heads": "num_key_value_heads",
+        "attention.gqa.head_dim": "head_dim",
+        "n_routed_experts": "num_local_experts",
+        "n_activated_experts": "num_experts_per_tok",
+        "n_shared_experts": "n_shared_experts",
+        "moe_intermediate_size": "intermediate_size",
+        "decoder_sparse_step": "decoder_sparse_step",
+        "mlp_only_layers": "mlp_only_layers",
+    },
+    "defaults": {"attention.num_kv_heads": "num_attention_heads"},
+}
+
+
+def _write_mapping(model_dir, mapping=TEST_MAPPING):
+    (model_dir / "hf_mapping.json").write_text(json.dumps(mapping))
+
+
 MOE_RAW = {
     **LLAMA_RAW,
     "model_type": "mixtral",
@@ -149,6 +184,12 @@ def _assert_hf_directory_load(tmp_path, cfg, raw_config):
         state_dict=_hf_keyed_state_dict(model, cfg),
         save_directory=str(tmp_path),
     )
+    mapping = (
+        {**TEST_MAPPING, "constants": {"ffn_type": "moe"}}
+        if raw_config.get("num_local_experts")
+        else TEST_MAPPING
+    )
+    _write_mapping(tmp_path, mapping)
     loaded = AutoModel.from_pretrained(tmp_path).eval()
     input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
     with torch.no_grad():
@@ -157,47 +198,69 @@ def _assert_hf_directory_load(tmp_path, cfg, raw_config):
         )
 
 
-def test_convert_hf_config_llama():
-    cfg = convert_hf_config(LLAMA_RAW)
+def test_convert_hf_config_with_explicit_mapping():
+    cfg = convert_hf_config(LLAMA_RAW, TEST_MAPPING)
     assert cfg["model_type"] == "autoregressive_lm"
     assert cfg["hidden_size"] == 8
-    assert cfg["num_key_value_heads"] == 1
+    assert cfg["attention"]["num_kv_heads"] == 1
     loaded = ConfigFactory.load(cfg)
     assert loaded.num_attention_heads == 2
-    assert loaded.ffn_type == "mlp"
 
 
 def test_convert_hf_config_defaults_kv_heads():
     raw = {k: v for k, v in LLAMA_RAW.items() if k != "num_key_value_heads"}
-    cfg = ConfigFactory.load(convert_hf_config(raw))
+    cfg = ConfigFactory.load(convert_hf_config(raw, TEST_MAPPING))
     assert cfg.num_key_value_heads == 2
 
 
-def test_convert_hf_config_mixtral_moe():
-    cfg = convert_hf_config(MOE_RAW)
-    assert cfg["ffn_type"] == "moe"
-    assert cfg["n_routed_experts"] == 2
-    assert cfg["n_activated_experts"] == 1
-    assert cfg["n_shared_experts"] == 1
-    assert cfg["moe_intermediate_size"] == 16
-    loaded = ConfigFactory.load(cfg)
-    assert loaded.ffn_type == "moe"
-
-
-def test_convert_hf_config_mixtral_without_shared_experts():
-    raw = {k: v for k, v in MOE_RAW.items() if k != "n_shared_experts"}
-    cfg = ConfigFactory.load(convert_hf_config(raw))
-    assert cfg.n_shared_experts == 0
+def test_convert_hf_config_requires_declared_fields():
+    raw = {k: v for k, v in LLAMA_RAW.items() if k != "hidden_size"}
+    with pytest.raises(ValueError, match="missing hidden_size"):
+        convert_hf_config(raw, TEST_MAPPING)
 
 
 def test_convert_hf_config_rejects_bias():
     with pytest.raises(NotImplementedError):
-        convert_hf_config({**LLAMA_RAW, "attention_bias": True})
+        convert_hf_config({**LLAMA_RAW, "attention_bias": True}, TEST_MAPPING)
 
 
-def test_convert_hf_config_rejects_mismatched_head_dim():
-    with pytest.raises(NotImplementedError):
-        convert_hf_config({**LLAMA_RAW, "head_dim": 8})
+def test_convert_hf_config_nested_source_and_operations():
+    raw = {
+        "model_type": "test_wrapper",
+        "text_config": {
+            **LLAMA_RAW,
+            "layer_types": ["full_attention", "linear_attention"],
+            "rope_parameters": {"partial_rotary_factor": 0.5},
+        },
+    }
+    mapping = {
+        **TEST_MAPPING,
+        "source": "text_config",
+        "operations": [
+            {
+                "op": "map_values",
+                "source": "layer_types",
+                "target": "attention.layers",
+                "values": {"full_attention": "gqa", "linear_attention": "gdn"},
+            },
+            {
+                "op": "multiply",
+                "sources": ["head_dim", "rope_parameters.partial_rotary_factor"],
+                "target": "attention.gqa.rotary_dim",
+            },
+        ],
+    }
+    cfg = convert_hf_config(raw, mapping)
+    assert cfg["attention"]["layers"] == ["gqa", "gdn"]
+    assert cfg["attention"]["gqa"]["rotary_dim"] == 2
+
+
+def test_convert_hf_config_rejects_unknown_operation():
+    with pytest.raises(ValueError, match="unknown HF mapping operation"):
+        convert_hf_config(
+            LLAMA_RAW,
+            {**TEST_MAPPING, "operations": [{"op": "python", "target": "hidden_size"}]},
+        )
 
 
 def test_looks_like_hf_state_dict():
@@ -214,13 +277,30 @@ def test_adapt_config_passthrough():
     assert adapt_config(raw) is raw
 
 
+def test_adapt_config_uses_model_directory(tmp_path):
+    _write_mapping(tmp_path)
+    assert adapt_config(LLAMA_RAW, str(tmp_path))["hidden_size"] == 8
+
+
+def test_adapt_config_without_mapping_is_unchanged(tmp_path):
+    assert adapt_config(LLAMA_RAW, str(tmp_path)) is LLAMA_RAW
+
+
+def test_load_mapping_rejects_unsupported_version(tmp_path):
+    _write_mapping(tmp_path, {"version": 2})
+    with pytest.raises(ValueError, match="version 1"):
+        adapt_config(LLAMA_RAW, str(tmp_path))
+
+
 def test_convert_hf_weights_dense_roundtrip():
     _assert_hf_roundtrip(make_tiny_config())
 
 
 def test_convert_hf_weights_moe_roundtrip():
     cfg = make_tiny_config(**MOE_KWARGS)
-    hf_raw = convert_hf_config(MOE_RAW)
+    hf_raw = convert_hf_config(
+        MOE_RAW, {**TEST_MAPPING, "constants": {"ffn_type": "moe"}}
+    )
     hf_cfg = ConfigFactory.load(hf_raw)
     _assert_hf_roundtrip(cfg, convert_cfg=hf_cfg)
 
@@ -247,25 +327,17 @@ def test_convert_hf_weights_rejects_mla():
         convert_hf_weights(sd, cfg)
 
 
-def test_convert_hf_config_qwen2_moe_preserves_sparse_fields():
+def test_convert_hf_config_preserves_sparse_fields():
     raw = {
-        **LLAMA_RAW,
-        "model_type": "qwen2_moe",
-        "num_local_experts": 2,
-        "num_experts_per_tok": 1,
-        "n_shared_experts": 1,
+        **MOE_RAW,
         "decoder_sparse_step": 2,
         "mlp_only_layers": [0],
     }
-    cfg = ConfigFactory.load(convert_hf_config(raw))
+    cfg = ConfigFactory.load(
+        convert_hf_config(raw, {**TEST_MAPPING, "constants": {"ffn_type": "moe"}})
+    )
     assert cfg.decoder_sparse_step == 2
     assert cfg.mlp_only_layers == [0]
-
-
-def test_convert_hf_config_gemma_enables_qk_norm():
-    raw = {**LLAMA_RAW, "model_type": "gemma"}
-    cfg = ConfigFactory.load(convert_hf_config(raw))
-    assert cfg.use_qk_norm is True
 
 
 def test_convert_hf_weights_moe_with_dense_layers_roundtrip():
@@ -305,6 +377,19 @@ def test_from_pretrained_astrai_directory(tmp_path):
     assert_state_dicts_equal(loaded.state_dict(), model.state_dict())
 
 
+def test_from_pretrained_hf_config_with_astrai_weights(tmp_path):
+    cfg = make_tiny_config()
+    model = AutoRegressiveLM(cfg)
+    save_model(
+        config=LLAMA_RAW,
+        state_dict=model.state_dict(),
+        save_directory=str(tmp_path),
+    )
+    _write_mapping(tmp_path)
+    loaded = AutoModel.from_pretrained(tmp_path, weights_format="astrai")
+    assert_state_dicts_equal(loaded.state_dict(), model.state_dict())
+
+
 def test_from_pretrained_weights_format_hf_on_astrai_dir(tmp_path):
     cfg = make_tiny_config()
     model = AutoRegressiveLM(cfg)
@@ -313,10 +398,10 @@ def test_from_pretrained_weights_format_hf_on_astrai_dir(tmp_path):
         state_dict=model.state_dict(),
         save_directory=str(tmp_path),
     )
-    loaded = AutoModel.from_pretrained(
-        tmp_path, disable_random_init=False, weights_format="hf"
-    )
-    assert_state_dicts_equal(loaded.state_dict(), model.state_dict())
+    with pytest.raises(FileNotFoundError, match="hf_mapping.json"):
+        AutoModel.from_pretrained(
+            tmp_path, disable_random_init=False, weights_format="hf"
+        )
 
 
 def test_from_pretrained_weights_format_astrai_rejects_hf(tmp_path):
@@ -327,7 +412,7 @@ def test_from_pretrained_weights_format_astrai_rejects_hf(tmp_path):
         state_dict=_hf_keyed_state_dict(model, cfg),
         save_directory=str(tmp_path),
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(FileNotFoundError, match="hf_mapping.json"):
         AutoModel.from_pretrained(tmp_path, weights_format="astrai")
 
 
@@ -366,6 +451,7 @@ def test_from_pretrained_hf_directory_sharded(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
     (tmp_path / "config.json").write_text(json.dumps(LLAMA_RAW))
 
+    _write_mapping(tmp_path)
     loaded = AutoModel.from_pretrained(tmp_path).eval()
     input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
     with torch.no_grad():
@@ -494,3 +580,138 @@ def test_hf_import_qk_norm_matches_norm_before_rope_reference():
 
 def test_from_pretrained_hf_directory_with_moe(tmp_path):
     _assert_hf_directory_load(tmp_path, make_tiny_config(**MOE_KWARGS), MOE_RAW)
+
+
+def test_hybrid_weight_layout_converts_fused_gates_and_gdn_parameters():
+    cfg = ConfigFactory.load(
+        {
+            "model_type": "autoregressive_lm",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "max_position_embeddings": 64,
+            "rms_norm_eps": 1e-6,
+            "attention": {
+                "layers": ["gdn", "gqa"],
+                "num_heads": 2,
+                "num_kv_heads": 1,
+                "qk_norm": True,
+                "output_gate": True,
+                "gqa": {"head_dim": 8, "rotary_dim": 4},
+                "gdn": {
+                    "num_key_heads": 1,
+                    "num_value_heads": 2,
+                    "key_head_dim": 4,
+                    "value_head_dim": 4,
+                },
+            },
+        }
+    )
+    fused_q_gate = torch.arange(2 * 2 * 8 * 16).reshape(32, 16).float()
+    qkv = torch.arange(16 * 16).reshape(16, 16).float()
+    source = {
+        "model.language_model.layers.1.self_attn.q_proj.weight": fused_q_gate,
+        "model.language_model.layers.1.self_attn.q_norm.weight": torch.arange(
+            8
+        ).float(),
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": qkv,
+        "model.language_model.layers.0.linear_attn.A_log": torch.ones(2),
+        "model.language_model.layers.0.linear_attn.dt_bias": torch.ones(2),
+        "model.language_model.layers.0.linear_attn.norm.weight": torch.full((4,), 0.5),
+        "model.language_model.layers.0.input_layernorm.weight": torch.zeros(16),
+        "model.visual.dummy.weight": torch.ones(1),
+        "mtp.layers.0.dummy.weight": torch.ones(1),
+    }
+    mapping = {
+        "weights": {
+            "norm_weight_offset": 1,
+            "skip_prefixes": ["model.visual.", "mtp."],
+        }
+    }
+    converted = convert_hf_weights(source, cfg, mapping)
+    paired = fused_q_gate.reshape(2, 2, 8, 16)
+    perm = torch.tensor([0, 2, 1, 3, 4, 5, 6, 7])
+    expected_q = paired[:, 0].index_select(1, perm).reshape(16, 16)
+    torch.testing.assert_close(
+        converted["model.layers.1.attention.q_proj.weight"], expected_q
+    )
+    torch.testing.assert_close(
+        converted["model.layers.1.attention.gate.weight"],
+        paired[:, 1].reshape(16, 16),
+    )
+    torch.testing.assert_close(
+        converted["model.layers.1.attention.q_norm.weight"],
+        torch.arange(8).float().index_select(0, perm) + 1,
+    )
+    for name, chunk in zip(("q", "k", "v"), qkv.split((4, 4, 8))):
+        torch.testing.assert_close(
+            converted[f"model.layers.0.attention.{name}_proj.weight"], chunk
+        )
+    assert converted["model.layers.0.attention.A_log"].shape == (2,)
+    assert converted["model.layers.0.attention.dt_bias"].shape == (2,)
+    torch.testing.assert_close(
+        converted["model.layers.0.attention.g_norm.weight"], torch.full((4,), 0.5)
+    )
+    torch.testing.assert_close(
+        converted["model.layers.0.input_norm.weight"], torch.ones(16)
+    )
+    assert len(converted) == 10
+
+
+def test_from_pretrained_gated_zero_centered_hf_directory(tmp_path):
+    cfg = make_tiny_config(use_gated_attention=True, use_qk_norm=True)
+    reference = AutoRegressiveLM(cfg).eval()
+    hf_state = to_hf_keys(reference.state_dict(), head_dim=4)
+    for layer_id in range(cfg.num_hidden_layers):
+        root = f"model.layers.{layer_id}.self_attn."
+        q = hf_state.pop(root + "q_proj.weight").reshape(2, 4, 8)
+        gate = hf_state.pop(root + "gate.weight").reshape(2, 4, 8)
+        hf_state[root + "q_proj.weight"] = torch.stack((q, gate), dim=1).reshape(16, 8)
+    centered_norms = (
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "q_norm.weight",
+        "k_norm.weight",
+    )
+    for key in tuple(hf_state):
+        if key == "model.norm.weight" or key.endswith(centered_norms):
+            hf_state[key] = hf_state[key] - 1
+    hf_state = {
+        key.replace("model.", "model.language_model.", 1): value.contiguous()
+        for key, value in hf_state.items()
+    }
+    hf_state["model.visual.dummy.weight"] = torch.ones(1)
+    hf_state["mtp.layers.0.dummy.weight"] = torch.ones(1)
+    save_model(LLAMA_RAW, hf_state, str(tmp_path))
+    mapping = {
+        **TEST_MAPPING,
+        "constants": {"attention.qk_norm": True, "attention.output_gate": True},
+        "weights": {
+            "norm_weight_offset": 1,
+            "skip_prefixes": ["model.visual.", "mtp."],
+        },
+    }
+    _write_mapping(tmp_path, mapping)
+    loaded = AutoModel.from_pretrained(tmp_path, strict=True).eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    with torch.no_grad():
+        torch.testing.assert_close(
+            loaded(input_ids)["logits"], reference(input_ids)["logits"]
+        )
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {"norm_weight_offset": True},
+        {"norm_weight_offset": "one"},
+        {"skip_prefixes": "mtp."},
+        {"skip_prefixes": [""]},
+        {"unknown": 1},
+    ],
+)
+def test_load_mapping_rejects_invalid_weight_options(tmp_path, weights):
+    _write_mapping(tmp_path, {**TEST_MAPPING, "weights": weights})
+    with pytest.raises(ValueError):
+        adapt_config(LLAMA_RAW, str(tmp_path))

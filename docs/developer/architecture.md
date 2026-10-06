@@ -36,14 +36,8 @@ classDiagram
             +Optional[dict] rope_scaling
             +Optional[int] max_position_embeddings
             +Optional[float] rope_theta
-            +str attn_type
-            +Optional[int] num_attention_heads
-            +Optional[int] num_key_value_heads
-            +Optional[bool] use_qk_norm
-            +Optional[bool] use_gated_attention
-            +Optional[int] kv_lora_rank
-            +Optional[int] qk_nope_head_dim
-            +Optional[int] qk_rope_head_dim
+            +AttentionConfig attention
+            +Optional[str] source_model_type
             +str ffn_type
             +Optional[int] n_routed_experts
             +Optional[int] n_shared_experts
@@ -54,6 +48,35 @@ classDiagram
             +bool norm_topk_prob
             +int decoder_sparse_step
             +Optional[List[int]] mlp_only_layers
+        }
+
+        class AttentionConfig {
+            +str default_type
+            +Optional[List[str]] layers
+            +Optional[int] num_heads
+            +Optional[int] num_kv_heads
+            +GQAConfig gqa
+            +GDNConfig gdn
+            +MLAConfig mla
+        }
+
+        class GQAConfig {
+            +Optional[int] head_dim
+            +Optional[int] rotary_dim
+        }
+
+        class GDNConfig {
+            +Optional[int] num_key_heads
+            +Optional[int] num_value_heads
+            +Optional[int] key_head_dim
+            +Optional[int] value_head_dim
+            +int conv_kernel_size
+        }
+
+        class MLAConfig {
+            +Optional[int] kv_lora_rank
+            +Optional[int] qk_nope_head_dim
+            +Optional[int] qk_rope_head_dim
         }
 
         class EncoderConfig {
@@ -1213,6 +1236,10 @@ classDiagram
     BaseConfig <|-- OutputConfig
     BaseConfig <|-- PipelineConfig
     BaseModelConfig <|-- AutoRegressiveLMConfig
+    AutoRegressiveLMConfig *-- AttentionConfig
+    AttentionConfig *-- GQAConfig
+    AttentionConfig *-- GDNConfig
+    AttentionConfig *-- MLAConfig
     BaseModelConfig <|-- EncoderConfig
     BaseFactory <|-- ModelFactory
     BaseFactory <|-- AttnFactory
@@ -1383,7 +1410,7 @@ classDiagram
 
 | Module | Components | Description |
 |--------|------------|-------------|
-| **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
+| **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, AttentionConfig, GQAConfig, GDNConfig, MLAConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
 | **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, MaskBuilderFactory, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, PackingStrategy, PackingStrategyFactory, SimplePacking, BFDPacking, BFDSplitPacking, PositionIdStrategy, PositionIdStrategyFactory, NoPositionId, DocResetPositionId, ContinuousPositionId, StoreWriter, StoreWriterFactory, BinWriter | Declarative JSON-driven data preprocessing |
 | **astrai.dataset** | BaseDataset, SEQDataset, SFTDataset, DPODataset, GRPODataset, Store, Streamable, Recordable, MmapStore, JsonlSource, JsonlStore, StoreFactory, RDSampler, DatasetFactory | Dataset loading and management |
 | **astrai.serialization** | Checkpoint | Model serialization |

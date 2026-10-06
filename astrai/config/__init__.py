@@ -7,10 +7,14 @@ from astrai.config.cli import (
     opt,
 )
 from astrai.config.model_config import (
+    AttentionConfig,
     AutoRegressiveLMConfig,
     BaseModelConfig,
     ConfigFactory,
     EncoderConfig,
+    GDNConfig,
+    GQAConfig,
+    MLAConfig,
 )
 from astrai.config.preprocess_config import (
     InputConfig,
@@ -23,6 +27,10 @@ from astrai.config.train_config import TrainConfig
 __all__ = [
     "BaseModelConfig",
     "AutoRegressiveLMConfig",
+    "AttentionConfig",
+    "GQAConfig",
+    "GDNConfig",
+    "MLAConfig",
     "EncoderConfig",
     "ConfigFactory",
     "TrainConfig",

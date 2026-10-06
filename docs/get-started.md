@@ -66,13 +66,16 @@ The model directory contains:
 - `model.safetensors` — model weights
 - `tokenizer.json` + `tokenizer_config.json` — tokenizer files (including chat template)
 
-External HuggingFace checkpoints of the LLaMA layout (e.g. `meta-llama/...`,
-`mistralai/...`, `Qwen/Qwen2-...`) can be loaded directly: `AutoModel.from_pretrained`
-auto-detects HF `model_type` / key names (`input_layernorm`, `gate_proj`, MoE
-`experts.<j>` ...) and converts config and weights in place. Dense and MoE
-(Mixtral / DeepSeek-V3 layout) FFNs are supported; MLA attention
-(DeepSeek-V2/V3) and biased projections (`attention_bias`) are not. Pass
-`weights_format="astrai"` to skip conversion, or `"hf"` to force it.
+External Hugging Face checkpoints need an `hf_mapping.json` beside
+`config.json` in the model directory. The mapping declares how to construct
+AstrAI's model config; see [HF config mapping](developer/hf-config-specs.md).
+`AutoModel.from_pretrained` then detects compatible HF weight keys and
+converts them. An unsupported checkpoint layout may need additional tensor
+conversion. Pass `weights_format="astrai"` for native weights, or `"hf"`
+to require a mapping and force HF weight conversion.
+
+The imported config stores attention settings under `attention`. Older
+flat AstrAI attention fields are accepted when reading a config.
 
 ## 3. Run Inference
 

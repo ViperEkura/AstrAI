@@ -17,19 +17,28 @@ class DecoderOutput(TypedDict):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, config, layer_id: int):
+    def __init__(self, config, layer_id: int, attention_type: Optional[str] = None):
         super().__init__()
         cfg = asdict(config)
+        attention_config = getattr(config, "attention", None)
+        if attention_config is None:
+            cfg.update(
+                n_heads=config.num_attention_heads,
+                n_kv_heads=config.num_key_value_heads,
+            )
+            attn_type = attention_type or config.attn_type
+        else:
+            cfg.update(attention_config.module_kwargs())
+            attn_type = attention_type or attention_config.type_for_layer(layer_id)
         cfg.update(
             dim=config.hidden_size,
             dim_ffn=config.intermediate_size,
             n_layers=config.num_hidden_layers,
-            n_heads=config.num_attention_heads,
-            n_kv_heads=config.num_key_value_heads,
             norm_eps=config.rms_norm_eps,
             down_init_std=0.02 / (2 * config.num_hidden_layers) ** 0.5,
         )
-        self.attention = AttnFactory.create(config.attn_type, **cfg, layer_id=layer_id)
+        self.attention_type = attn_type
+        self.attention = AttnFactory.create(attn_type, **cfg, layer_id=layer_id)
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         ffn_type = self._resolve_ffn_type(config, layer_id)
@@ -50,7 +59,7 @@ class DecoderBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        rotary_emb: Tensor,
+        rotary_emb: Optional[Tensor],
         attention_mask: Optional[Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,

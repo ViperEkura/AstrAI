@@ -4,7 +4,7 @@ import torch
 from astrai.config.model_config import AutoRegressiveLMConfig, EncoderConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.encoder import EmbeddingEncoder
-from astrai.model.transformer import process_attention_mask
+from astrai.model.masking import prepare_decoder_masks, process_attention_mask
 from astrai.model.value import ValueModel
 from tests.helpers import TINY_CONFIG
 
@@ -75,6 +75,57 @@ def test_explicit_attention_masks_keep_their_existing_layout(shape):
     actual = process_attention_mask(mask, causal=True)
     expected = mask[:, None] if mask.ndim == 3 else mask
     torch.testing.assert_close(actual, expected)
+
+
+def test_hybrid_decoder_uses_layer_specific_padding_masks(device):
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        layer_types=["gqa", "gdn"],
+    )
+    model = AutoRegressiveLM(config).to(device).eval()
+    ids = torch.tensor([[1, 2, 3, 4]], device=device)
+    mask = torch.tensor([[True, True, True, False]], device=device)
+    with torch.no_grad():
+        output = model(ids, input_mask=mask)
+    assert torch.isfinite(output["logits"]).all()
+
+
+def test_hybrid_decoder_rejects_additive_mask_for_gdn(device):
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        layer_types=["gqa", "gdn"],
+    )
+    model = AutoRegressiveLM(config).to(device)
+    ids = torch.tensor([[1, 2, 3, 4]], device=device)
+    mask = torch.tensor([[0.0, 0.0, 0.0, float("-inf")]], device=device)
+    with pytest.raises(ValueError, match="boolean 2D right-padding mask"):
+        model(ids, input_mask=mask)
+
+
+def test_hybrid_mask_plan_keeps_recurrent_padding_2d(device):
+    padding = torch.tensor([[True, True, False]], device=device)
+    masks = prepare_decoder_masks(padding, ("gqa", "gdn", "mla"))
+    assert masks["gdn"].tensor is padding
+    assert masks["gdn"].is_causal
+    assert masks["gqa"] is masks["mla"]
+    assert masks["gqa"].tensor.shape == (1, 1, 3, 3)
+    assert not masks["gqa"].is_causal
+
+
+def test_hybrid_gqa_mla_use_their_own_rope_dimensions(device):
+    config = AutoRegressiveLMConfig(
+        **TINY_CONFIG,
+        layer_types=["gqa", "mla"],
+        kv_lora_rank=4,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=2,
+    )
+    model = AutoRegressiveLM(config).to(device).eval()
+    assert model.model.rotary_embeddings["gqa"].dim == 4
+    assert model.model.rotary_embeddings["mla"].dim == 2
+    with torch.no_grad():
+        output = model(torch.tensor([[1, 2, 3, 4]], device=device))
+    assert torch.isfinite(output["logits"]).all()
 
 
 def test_encoder_2d_padding_mask_remains_bidirectional(device):

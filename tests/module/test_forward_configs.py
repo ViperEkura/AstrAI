@@ -206,6 +206,17 @@ def test_gated_deltanet_forward_backward_and_causal_prefix():
     torch.testing.assert_close(original_logits[:, :2], changed_logits[:, :2])
 
 
+def test_gated_deltanet_rejects_packed_document_mask():
+    from astrai.config.model_config import AutoRegressiveLMConfig
+
+    config = AutoRegressiveLMConfig(**TINY_CONFIG, attn_type="gdn")
+    model = AutoRegressiveLM(config)
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    mask = torch.ones(1, 1, 4, 4, dtype=torch.bool).tril()
+    with pytest.raises(ValueError, match="Packed document masks need GDN state resets"):
+        model(input_ids, input_mask=mask)
+
+
 def test_gated_deltanet_rejects_inference_cache():
     from astrai.config.model_config import AutoRegressiveLMConfig
 

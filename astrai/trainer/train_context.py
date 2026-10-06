@@ -236,11 +236,15 @@ class TrainContextBuilder:
         if self._param_path:
             config_path = Path(self._param_path) / "config.json"
             if config_path.exists():
-                state.model_config = adapt_config(load_json(config_path))
+                state.model_config = adapt_config(
+                    load_json(config_path), self._param_path
+                )
             checkpoint = Checkpoint.load_any(self._param_path)
             if checkpoint is not None:
                 if checkpoint.config:
-                    checkpoint.config = adapt_config(checkpoint.config)
+                    checkpoint.config = adapt_config(
+                        checkpoint.config, self._param_path
+                    )
                 if checkpoint.state_dict and looks_like_hf_state_dict(
                     checkpoint.state_dict
                 ):

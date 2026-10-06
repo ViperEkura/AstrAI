@@ -1,22 +1,7 @@
-"""HuggingFace checkpoint adaptation for LLaMA-style decoder models.
+"""Translate compatible Hugging Face decoder checkpoint weight keys.
 
-AstrAI stores trunk weights under the same ``model.*`` hierarchy HF uses
-(``model.layers.<i>.input_norm`` / ``model.layers.<i>.mlp.gate``), while
-HuggingFace decoder-only checkpoints name the components differently
-(``self_attn``, ``input_layernorm``, ``gate_proj``).  This module translates
-HF configs and state dicts so external checkpoints can be loaded directly.
-
-Supported families (LLaMA layout, dense and MoE):
-- dense FFN: llama, mistral, qwen2, gemma, gemma2, phi3
-- MoE FFN (Mixtral / Qwen2-MoE / DeepSeek-V3 layout): router
-  ``mlp.gate``, routed experts ``mlp.experts.<j>``, shared experts
-  ``mlp.shared_experts.<j>``
-
-Not supported:
-- MLA attention (DeepSeek-V2/V3 ``kv_a_proj_with_mqa``) uses a different
-  KV factorization and cannot be converted numerically.
-- Attention/MLP bias (``attention_bias`` / ``mlp_bias``) — AstrAI
-  projections are bias-free.
+HF configuration fields are mapped by hf_mapping.json in each model
+directory. Tensor conversion here handles layouts supported by AstrAI.
 """
 
 import logging
@@ -26,22 +11,9 @@ from typing import Any, Dict, Mapping
 import torch
 
 from astrai.config.base import BaseConfig
+from astrai.serialization.hf_config import convert_hf_config, load_hf_mapping
 
 logger = logging.getLogger(__name__)
-
-HF_MODEL_TYPES = frozenset(
-    {
-        "llama",
-        "mistral",
-        "mixtral",
-        "qwen2",
-        "qwen2_moe",
-        "qwen3",
-        "gemma",
-        "gemma2",
-        "phi3",
-    }
-)
 
 _EMBED = re.compile(r"^model\.embed_tokens\.weight$")
 _ATTN = re.compile(r"^model\.layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.(weight|bias)$")
@@ -115,108 +87,16 @@ def _is_dense_mlp_layer(config: BaseConfig, layer_id: int) -> bool:
     return step > 1 and (layer_id + 1) % step != 0
 
 
-def adapt_config(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Translate *raw* for AstrAI if it looks like an HF model config."""
-    if raw.get("model_type") in HF_MODEL_TYPES:
-        return convert_hf_config(raw)
-    return raw
-
-
-def convert_hf_config(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert an HF LLaMA-style config dict to AstrAI field names."""
-    if raw.get("attention_bias") or raw.get("mlp_bias"):
-        raise NotImplementedError(
-            "attention_bias / mlp_bias checkpoints are not supported; "
-            "AstrAI projections are bias-free"
-        )
-
-    cfg: Dict[str, Any] = {}
-    for key in (
-        "vocab_size",
-        "hidden_size",
-        "num_hidden_layers",
-        "intermediate_size",
-        "rms_norm_eps",
-        "tie_word_embeddings",
-        "max_position_embeddings",
-        "rope_theta",
-        "rope_scaling",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "use_qk_norm",
-        "use_gated_attention",
-        "kv_lora_rank",
-        "qk_nope_head_dim",
-        "qk_rope_head_dim",
-        "moe_intermediate_size",
-        "shared_expert_intermediate_size",
-        "topk_method",
-        "norm_topk_prob",
-        "moe_aux_loss_coef",
-        "decoder_sparse_step",
-        "mlp_only_layers",
-        "neftune_alpha",
-    ):
-        if key in raw:
-            cfg[key] = raw[key]
-
-    if "qk_norm" in raw and "use_qk_norm" not in cfg:
-        cfg["use_qk_norm"] = raw["qk_norm"]
-    if (
-        raw.get("model_type") in ("gemma", "gemma2")
-        and "use_qk_norm" not in cfg
-        and "qk_norm" not in raw
-    ):
-        # Gemma/Gemma2 always apply RMSNorm to Q and K before attention.
-        cfg["use_qk_norm"] = True
-
-    n_heads = raw.get("num_attention_heads")
-    if cfg.get("num_key_value_heads") is None and n_heads is not None:
-        cfg["num_key_value_heads"] = n_heads
-
-    if raw.get("head_dim") is not None and n_heads and raw.get("hidden_size"):
-        expected = raw["hidden_size"] // n_heads
-        if raw["head_dim"] != expected:
-            raise NotImplementedError(
-                f"HF head_dim={raw['head_dim']} differs from the computed "
-                f"head dim {expected}; AstrAI derives head_dim from "
-                "hidden_size / num_attention_heads"
-            )
-
-    if "kv_lora_rank" in raw:
-        cfg["attn_type"] = "mla"
-
-    n_experts = raw.get("num_local_experts") or raw.get("n_routed_experts")
-    if n_experts:
-        cfg["ffn_type"] = "moe"
-        cfg["n_routed_experts"] = n_experts
-        if "num_experts_per_tok" in raw:
-            cfg["n_activated_experts"] = raw["num_experts_per_tok"]
-        if "n_activated_experts" in raw:
-            cfg["n_activated_experts"] = raw["n_activated_experts"]
-        if "n_shared_experts" in raw:
-            cfg["n_shared_experts"] = raw["n_shared_experts"]
-        elif raw.get("shared_expert_intermediate_size"):
-            # Qwen2-MoE exposes a single un-indexed shared expert.
-            cfg["n_shared_experts"] = 1
-        else:
-            # Mixtral has no shared experts.
-            cfg["n_shared_experts"] = 0
-        if cfg.get("moe_intermediate_size") is None and "intermediate_size" in raw:
-            # MoE configs store the per-expert FFN size in intermediate_size.
-            cfg["moe_intermediate_size"] = raw["intermediate_size"]
-        first_k_dense = raw.get("first_k_dense_replace")
-        if isinstance(first_k_dense, int) and first_k_dense > 0:
-            cfg["mlp_only_layers"] = list(range(first_k_dense))
-            cfg["decoder_sparse_step"] = 1
-
-    cfg["model_type"] = "autoregressive_lm"
-    return cfg
+def adapt_config(raw: Dict[str, Any], model_dir: str | None = None) -> Dict[str, Any]:
+    """Import an HF config when its model directory provides a mapping."""
+    mapping = load_hf_mapping(model_dir) if model_dir is not None else None
+    return convert_hf_config(raw, mapping) if mapping is not None else raw
 
 
 def convert_hf_weights(
     state_dict: Mapping[str, Any],
     config: BaseConfig,
+    mapping: Mapping[str, Any] | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Rename HF state dict keys to AstrAI names.
 
@@ -231,6 +111,9 @@ def convert_hf_weights(
                 "different KV factorization and cannot be converted"
             )
 
+    weight_options = mapping.get("weights", {}) if mapping is not None else {}
+    norm_offset = weight_options.get("norm_weight_offset", 0)
+    skip_prefixes = tuple(weight_options.get("skip_prefixes", []))
     ffn_type = getattr(config, "ffn_type", "mlp")
     permute_rope = getattr(config, "attn_type", "gqa") != "mla"
     head_dim = None
@@ -242,9 +125,53 @@ def convert_hf_weights(
             )
     converted: Dict[str, torch.Tensor] = {}
     skipped: list[str] = []
-    for key, tensor in state_dict.items():
+    for source_key, tensor in state_dict.items():
+        if source_key.startswith(skip_prefixes):
+            continue
+        key = source_key
+        for prefix in ("model.language_model.", "language_model."):
+            if key.startswith(prefix):
+                key = "model." + key[len(prefix) :]
+                break
         new_key = None
-        if ffn_type == "moe":
+        linear = re.match(
+            r"^model\.layers\.(\d+)\.linear_attn\."
+            r"(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|conv1d|norm|A_log|dt_bias|out_proj)"
+            r"(?:\.(weight|bias))?$",
+            key,
+        )
+        if linear:
+            layer, name, suffix = linear.groups()
+            root = f"model.layers.{layer}.attention."
+            if name == "in_proj_qkv" and suffix == "weight":
+                q_size = config.gdn_num_key_heads * config.gdn_key_head_dim
+                v_size = config.gdn_num_value_heads * config.gdn_value_head_dim
+                q, k, v = tensor.split((q_size, q_size, v_size), dim=0)
+                converted[root + "q_proj.weight"] = q
+                converted[root + "k_proj.weight"] = k
+                converted[root + "v_proj.weight"] = v
+                continue
+            names = {
+                "in_proj_z": "z_proj",
+                "in_proj_a": "gate_proj",
+                "in_proj_b": "beta_proj",
+                "conv1d": "conv",
+                "norm": "g_norm",
+                "A_log": "A_log",
+                "dt_bias": "dt_bias",
+                "out_proj": "o_proj",
+            }
+            target = names[name]
+            if name == "conv1d":
+                new_key = root + "conv.weight"
+            elif name == "norm":
+                new_key = root + "g_norm.weight"
+            elif name in ("A_log", "dt_bias"):
+                new_key = root + name
+            else:
+                new_key = root + target + "." + (suffix or "weight")
+
+        if new_key is None and ffn_type == "moe":
             m = _MOE_ROUTER.match(key)
             if m:
                 new_key = f"model.layers.{m.group(1)}.mlp.router.weight"
@@ -267,7 +194,7 @@ def convert_hf_weights(
                 m = _DENSE_MLP.match(key)
                 if m and _is_dense_mlp_layer(config, int(m.group(1))):
                     new_key = f"model.layers.{m.group(1)}.mlp.{m.group(2)}.{m.group(3)}"
-        else:
+        elif new_key is None:
             m = _DENSE_MLP.match(key)
             if m:
                 new_key = f"model.layers.{m.group(1)}.mlp.{m.group(2)}.{m.group(3)}"
@@ -275,35 +202,59 @@ def convert_hf_weights(
         if new_key is None:
             m = _ATTN.match(key)
             if m:
-                new_key = (
-                    f"model.layers.{m.group(1)}.attention."
-                    f"{m.group(2)}_proj.{m.group(3)}"
+                layer, projection, suffix = m.groups()
+                root = f"model.layers.{layer}.attention."
+                hd = getattr(config, "head_dim", None) or (
+                    config.hidden_size // config.num_attention_heads
+                    if permute_rope
+                    else None
                 )
-                if permute_rope and m.group(2) in ("q", "k"):
-                    rows = tensor.shape[0]
-                    if rows % head_dim != 0:
-                        raise ValueError(
-                            f"{key}: {rows} output rows not divisible by "
-                            f"head_dim={head_dim}"
+                rd = getattr(config, "rotary_dim", None) or hd
+                new_key = root + f"{projection}_proj.{suffix}"
+                if projection == "q" and getattr(config, "use_gated_attention", False):
+                    expected = config.num_attention_heads * hd
+                    if tensor.shape[0] == 2 * expected:
+                        if suffix != "weight":
+                            raise ValueError(f"{key}: gated Q bias is not supported")
+                        # HF stores [query, gate] for each attention head.
+                        paired = tensor.reshape(config.num_attention_heads, 2, hd, -1)
+                        converted[root + "gate.weight"] = (
+                            paired[:, 1].reshape(expected, -1).contiguous()
                         )
-                    base = _half_to_interleaved(head_dim).to(tensor.device)
-                    blocks = (
-                        torch.arange(rows // head_dim, device=tensor.device) * head_dim
+                        tensor = paired[:, 0].reshape(expected, -1).contiguous()
+                    elif tensor.shape[0] != expected:
+                        raise ValueError(
+                            f"{key}: expected {expected} or {2 * expected} rows"
+                        )
+                if permute_rope and projection in ("q", "k"):
+                    rows = tensor.shape[0]
+                    if rows % hd != 0:
+                        raise ValueError(
+                            f"{key}: {rows} rows not divisible by head_dim={hd}"
+                        )
+                    base = _half_to_interleaved(rd).to(tensor.device)
+                    blocks = torch.arange(rows // hd, device=tensor.device) * hd
+                    indices = (
+                        torch.arange(rows, device=tensor.device).reshape(-1, hd).clone()
                     )
-                    perm = (blocks[:, None] + base[None, :]).flatten()
-                    tensor = tensor.index_select(0, perm)
+                    indices[:, :rd] = blocks[:, None] + base[None, :]
+                    tensor = tensor.index_select(0, indices.flatten())
             elif (m := _Q_NORM.match(key)) is not None:
                 new_key = f"model.layers.{m.group(1)}.attention.q_norm.weight"
-                if permute_rope and tensor.shape[0] == head_dim:
-                    tensor = tensor.index_select(
-                        0, _half_to_interleaved(head_dim).to(tensor.device)
-                    )
+                hd = getattr(config, "head_dim", None) or head_dim
+                rd = getattr(config, "rotary_dim", None) or hd
+                if permute_rope and tensor.shape[0] == hd:
+                    indices = torch.arange(hd, device=tensor.device)
+                    indices[:rd] = _half_to_interleaved(rd).to(tensor.device)
+                    tensor = tensor.index_select(0, indices)
             elif (m := _K_NORM.match(key)) is not None:
                 new_key = f"model.layers.{m.group(1)}.attention.k_norm.weight"
-                if permute_rope and tensor.shape[0] == head_dim:
-                    tensor = tensor.index_select(
-                        0, _half_to_interleaved(head_dim).to(tensor.device)
-                    )
+                hd = getattr(config, "head_dim", None) or head_dim
+                rd = getattr(config, "rotary_dim", None) or hd
+                if permute_rope and tensor.shape[0] == hd:
+                    indices = torch.arange(hd, device=tensor.device)
+                    indices[:rd] = _half_to_interleaved(rd).to(tensor.device)
+                    tensor = tensor.index_select(0, indices)
             elif (m := _INPUT_NORM.match(key)) is not None:
                 new_key = f"model.layers.{m.group(1)}.input_norm.weight"
             elif (m := _POST_NORM.match(key)) is not None:
@@ -324,6 +275,14 @@ def convert_hf_weights(
                 skipped.append(key)
             continue
         else:
+            if norm_offset and (
+                new_key.endswith(".input_norm.weight")
+                or new_key.endswith(".post_attention_norm.weight")
+                or new_key.endswith(".q_norm.weight")
+                or new_key.endswith(".k_norm.weight")
+                or new_key == "model.norm.weight"
+            ):
+                tensor = tensor + norm_offset
             converted[new_key] = tensor
 
     if skipped:

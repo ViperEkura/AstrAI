@@ -10,7 +10,7 @@ from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
-from astrai.model.transformer import process_attention_mask
+from astrai.model.masking import process_attention_mask
 
 
 @ModelFactory.register("embedding")

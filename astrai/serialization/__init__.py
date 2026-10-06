@@ -23,16 +23,17 @@ from astrai.serialization.dataset import (
     save_bin,
 )
 from astrai.serialization.hf_adapter import (
-    HF_MODEL_TYPES,
     adapt_config,
     convert_hf_config,
     convert_hf_weights,
     looks_like_hf_state_dict,
 )
+from astrai.serialization.hf_config import HF_MAPPING_FILENAME, load_hf_mapping
 
 __all__ = [
     "Checkpoint",
-    "HF_MODEL_TYPES",
+    "HF_MAPPING_FILENAME",
+    "load_hf_mapping",
     "adapt_config",
     "convert_hf_config",
     "convert_hf_weights",

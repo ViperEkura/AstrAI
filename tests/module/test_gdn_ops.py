@@ -253,8 +253,8 @@ def test_layer_state_is_fixed_size_after_long_decode(device):
 def test_layer_forward_rejects_non_right_padding(device):
     layer = make_layer(device)
     x = torch.randn(2, 8, LAYER_DIM, device=device)
-    mask = torch.ones(2, 1, 1, 8, dtype=torch.bool, device=device)
-    mask[0, 0, 0, 0] = False
+    mask = torch.ones(2, 8, dtype=torch.bool, device=device)
+    mask[0, 0] = False
     with pytest.raises(ValueError, match="right padding only"):
         layer(x, attn_mask=mask)
 

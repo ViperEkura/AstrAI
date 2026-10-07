@@ -351,25 +351,33 @@ class AsyncRoundCoordinator:
         if self._closed:
             return
         self._closed = True
-        if not force:
-            for index, process in enumerate(self._processes):
+        weights_closed = False
+        try:
+            if not force:
+                for index, process in enumerate(self._processes):
+                    if process.is_alive():
+                        try:
+                            self._send_command(index, MessageKind.STOP)
+                        except (BrokenPipeError, EOFError, OSError, RuntimeError):
+                            pass
+                # NCCL shutdown involves every rank. Join only after the
+                # learner has entered shutdown alongside the workers.
+                self.weights.close()
+                weights_closed = True
+                deadline = time.monotonic() + 5.0
+                for process in self._processes:
+                    process.join(max(0.0, deadline - time.monotonic()))
+        finally:
+            for process in self._processes:
                 if process.is_alive():
-                    try:
-                        self._send_command(index, MessageKind.STOP)
-                    except (BrokenPipeError, EOFError, OSError, RuntimeError):
-                        pass
+                    process.terminate()
             deadline = time.monotonic() + 5.0
             for process in self._processes:
                 process.join(max(0.0, deadline - time.monotonic()))
-        for process in self._processes:
-            if process.is_alive():
-                process.terminate()
-        deadline = time.monotonic() + 5.0
-        for process in self._processes:
-            process.join(max(0.0, deadline - time.monotonic()))
-            if process.is_alive():
-                process.kill()
-                process.join(1.0)
-        for conn in self._pipes:
-            conn.close()
-        self.weights.close(force=force)
+                if process.is_alive():
+                    process.kill()
+                    process.join(1.0)
+            for conn in self._pipes:
+                conn.close()
+            if not weights_closed:
+                self.weights.close(force=True)

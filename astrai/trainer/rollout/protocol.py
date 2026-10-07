@@ -1,21 +1,22 @@
 """Control-plane messages for the local online rollout worker processes.
 
 Each worker has one ordered, duplex pipe and at most one outstanding command.
-Large policy tensors live in shared memory; only metadata and CPU rollout
-results are serialized through these messages.
+Policy tensors travel through NCCL; only metadata and CPU rollout results are
+serialized through these messages.
 """
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from multiprocessing.connection import Connection
-from typing import Any
+from typing import Any, Optional
 
 from astrai.trainer.rollout.types import RawRollout
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
-class MessageKind(StrEnum):
+class MessageKind(str, Enum):
+    MODEL_READY = "model_ready"
     READY = "ready"
     WEIGHT_SYNC = "weight_sync"
     WEIGHT_SYNC_ACK = "weight_sync_ack"
@@ -33,8 +34,8 @@ class RolloutProtocolError(RuntimeError):
 class RolloutMessage:
     kind: MessageKind
     request_id: int
-    round_id: int | None = None
-    policy_version: int | None = None
+    round_id: Optional[int] = None
+    policy_version: Optional[int] = None
     payload: Any = None
     protocol_version: int = PROTOCOL_VERSION
 
@@ -43,8 +44,8 @@ class RolloutMessage:
         kind: MessageKind,
         request_id: int,
         *,
-        round_id: int | None = None,
-        policy_version: int | None = None,
+        round_id: Optional[int] = None,
+        policy_version: Optional[int] = None,
     ) -> None:
         """Validate a reply against its one outstanding worker command."""
         if self.kind != kind:
@@ -55,9 +56,9 @@ class RolloutMessage:
             raise RolloutProtocolError("stale round ID")
         if policy_version is not None and self.policy_version != policy_version:
             raise RolloutProtocolError("wrong policy version")
-        if kind == MessageKind.WEIGHT_SYNC_ACK:
+        if kind in (MessageKind.MODEL_READY, MessageKind.WEIGHT_SYNC_ACK):
             if self.payload is not None:
-                raise RolloutProtocolError("weight ACK must not carry a payload")
+                raise RolloutProtocolError(f"{kind} must not carry a payload")
             return
         expected_payload = {
             MessageKind.READY: WorkerReady,
@@ -71,7 +72,6 @@ class RolloutMessage:
 class WorkerReady:
     cuda_graph_enabled: bool
     peak_gpu_memory: int
-    shared_memory_pinned: bool
 
 
 @dataclass(frozen=True, slots=True)

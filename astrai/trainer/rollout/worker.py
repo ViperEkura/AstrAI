@@ -3,14 +3,15 @@
 import time
 import traceback
 from dataclasses import dataclass
-from multiprocessing.shared_memory import SharedMemory
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import torch
 
+from astrai.tokenize import AutoTokenizer
 from astrai.trainer.backend import ReplicaBackend
 from astrai.trainer.rollout.batching import merge_rollouts, slice_batch
 from astrai.trainer.rollout.generator import RolloutGenerator
+from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
 from astrai.trainer.rollout.protocol import (
     GenerationResult,
     MessageKind,
@@ -21,12 +22,6 @@ from astrai.trainer.rollout.protocol import (
     send_message,
 )
 from astrai.trainer.rollout.types import SamplingParams
-from astrai.trainer.rollout.weight_transport import (
-    _copy_shared_weights,
-    _register_shared,
-    _shared_views,
-    _unregister_shared,
-)
 
 
 @dataclass(frozen=True)
@@ -39,41 +34,60 @@ class RolloutWorkerSpec:
     max_seq_len: Optional[int]
     policy_version: int
     model_dtype: str
-    shm_name: str
-    layout: list
+    rank: int
+    world_size: int
+    rendezvous_port: int
+    nccl_timeout_s: float
+    layout: List[Tuple[str, Tuple[int, ...], str]]
     max_prompts_per_worker: int
 
 
 def run_rollout_worker(conn, spec: RolloutWorkerSpec):
-    shm = None
-    registered = False
-    views = None
+    channel = None
+    failed = False
     request_id = 0
     device = spec.device
     try:
         torch.cuda.set_device(device)
-        from astrai.tokenize import AutoTokenizer
-
-        shm = SharedMemory(name=spec.shm_name)
-        registered = _register_shared(shm, device)
-        views = _shared_views(shm, spec.layout)
         model = spec.model_fn().to(
             device=device, dtype=getattr(torch, spec.model_dtype)
         )
         model.requires_grad_(False)
         model.eval()
-        target = dict(model.state_dict(keep_vars=True))
-        pinned = (
-            None
-            if registered
-            else {
-                name: torch.empty(
-                    shape, dtype=getattr(torch, dtype_name), pin_memory=True
-                )
-                for name, shape, dtype_name, _, _ in spec.layout
-            }
+        channel = NCCLWeightChannel(
+            model, spec.policy_version, expected_layout=spec.layout
         )
-        _copy_shared_weights(views, spec.layout, target, pinned, device)
+        send_message(
+            conn,
+            RolloutMessage(
+                MessageKind.MODEL_READY,
+                request_id=0,
+                policy_version=spec.policy_version,
+            ),
+        )
+        initial = recv_message(conn)
+        request_id = initial.request_id
+        if (
+            initial.kind != MessageKind.WEIGHT_SYNC
+            or initial.policy_version != spec.policy_version
+            or initial.payload is not None
+        ):
+            raise RolloutProtocolError("initial weight sync command is invalid")
+        channel.connect(
+            rank=spec.rank,
+            world_size=spec.world_size,
+            port=spec.rendezvous_port,
+            timeout_s=spec.nccl_timeout_s,
+        )
+        channel.broadcast()
+        send_message(
+            conn,
+            RolloutMessage(
+                MessageKind.WEIGHT_SYNC_ACK,
+                request_id=request_id,
+                policy_version=spec.policy_version,
+            ),
+        )
         tokenizer = AutoTokenizer.from_pretrained(spec.param_path)
         backend = ReplicaBackend(
             model=model,
@@ -99,7 +113,6 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
                 payload=WorkerReady(
                     backend.scheduler.cuda_graph_enabled,
                     torch.cuda.max_memory_allocated(device),
-                    registered,
                 ),
             ),
         )
@@ -115,12 +128,9 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
                 if version <= backend.policy_version:
                     raise RuntimeError("weight version must advance")
 
-                def copy_weights(_version):
-                    return _copy_shared_weights(
-                        views, spec.layout, target, pinned, device
-                    )
-
-                backend.apply_weight_update(version, copy_weights)
+                backend.apply_weight_update(
+                    version, lambda _version: channel.broadcast()
+                )
                 send_message(
                     conn,
                     RolloutMessage(
@@ -177,6 +187,7 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
                     f"unexpected rollout command: {command.kind}"
                 )
     except BaseException:
+        failed = True
         try:
             send_message(
                 conn,
@@ -190,9 +201,5 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
             pass
     finally:
         conn.close()
-        if shm is not None:
-            if views is not None:
-                views.clear()
-            if registered:
-                _unregister_shared(shm, device)
-            shm.close()
+        if channel is not None:
+            channel.close(force=failed)

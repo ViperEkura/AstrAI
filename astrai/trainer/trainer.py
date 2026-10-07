@@ -14,7 +14,6 @@ from astrai.trainer.callbacks import (
     CallbackFactory,
     TrainCallback,
 )
-from astrai.trainer.rollout.async_round import WeightSnapshotError
 from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.rollout.types import RolloutVersionError
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
@@ -126,24 +125,19 @@ class Trainer:
             context.metrics = weighted_metrics
             self._call_callbacks("before_optimizer_step", context)
             context.checkpoint_safe = False
+            version_before = coordinator.policy_version
             try:
                 context.strategy.optimizer_step(context.optimizer)
-            except WeightSnapshotError:
-                # The learner already changed. Finish the committed round's
-                # accounting before on_error is allowed to save a checkpoint.
-                context.optimizer.zero_grad()
-                if context.scheduler:
-                    context.scheduler.step()
-                context.consumed_samples += total
-                context.optimizer_steps_completed += 1
-                context.checkpoint_safe = True
-                raise
-            context.optimizer.zero_grad()
-            if context.scheduler:
-                context.scheduler.step()
-            context.consumed_samples += total
-            context.optimizer_steps_completed += 1
-            context.checkpoint_safe = True
+            finally:
+                # A version advance is the commit marker. Complete accounting
+                # even if the subsequent NCCL channel state update fails.
+                if coordinator.policy_version > version_before:
+                    context.optimizer.zero_grad()
+                    if context.scheduler:
+                        context.scheduler.step()
+                    context.consumed_samples += total
+                    context.optimizer_steps_completed += 1
+                    context.checkpoint_safe = True
             self._call_callbacks("after_optimizer_step", context)
             self._call_callbacks("on_batch_end", context)
             batch, handle = next_batch, next_handle

@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from astrai.trainer.rollout.batching import merge_rollouts, slice_batch
+from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
 from astrai.trainer.rollout.protocol import (
     MessageKind,
     RolloutMessage,
@@ -24,12 +25,7 @@ from astrai.trainer.rollout.types import (
     RolloutVersionError,
     SamplingParams,
 )
-from astrai.trainer.rollout.weight_transport import SharedWeightBuffer
 from astrai.trainer.rollout.worker import RolloutWorkerSpec, run_rollout_worker
-
-
-class WeightSnapshotError(RuntimeError):
-    """The learner step committed, but staging its new weights failed."""
 
 
 @dataclass
@@ -61,6 +57,7 @@ class AsyncRoundCoordinator:
         max_prompts_per_worker: int = 1,
         worker_timeout_s: float = 600.0,
         worker_target=None,
+        weight_channel=None,
     ):
         try:
             pickle.dumps(model_fn)
@@ -80,8 +77,8 @@ class AsyncRoundCoordinator:
         self.learner_wait_seconds = 0.0
         self.peak_gpu_memory = {}
         self.worker_cuda_graph_enabled = {}
-        self.worker_shared_memory_pinned = {}
-        self.weights = SharedWeightBuffer(source)
+        self.weights = weight_channel or NCCLWeightChannel(source, policy_version)
+        self._nccl_timeout_s = min(30.0, max(5.0, worker_timeout_s))
         self._ctx = mp.get_context("spawn")
         self._processes = []
         self._pipes = []
@@ -90,8 +87,10 @@ class AsyncRoundCoordinator:
         self._worker_target = worker_target or run_rollout_worker
         try:
             startup_deadline = time.monotonic() + 300.0
-            self.weights.snapshot(policy_version)
-            for device in devices:
+            self._rendezvous_port = self.weights.prepare_rendezvous(
+                len(devices) + 1, 300.0
+            )
+            for index, device in enumerate(devices):
                 parent, child = self._ctx.Pipe(duplex=True)
                 spec = RolloutWorkerSpec(
                     device=device,
@@ -102,7 +101,10 @@ class AsyncRoundCoordinator:
                     max_seq_len=max_seq_len,
                     policy_version=policy_version,
                     model_dtype=str(model_dtype).split(".")[-1],
-                    shm_name=self.weights.name,
+                    rank=index + 1,
+                    world_size=len(devices) + 1,
+                    rendezvous_port=self._rendezvous_port,
+                    nccl_timeout_s=self._nccl_timeout_s,
                     layout=self.weights.layout,
                     max_prompts_per_worker=max_prompts_per_worker,
                 )
@@ -120,6 +122,14 @@ class AsyncRoundCoordinator:
                 self._pipes.append(parent)
                 self._processes.append(process)
                 self._worker_versions.append(None)
+            self._collect_replies(
+                list(range(len(devices))),
+                MessageKind.MODEL_READY,
+                startup_deadline,
+                request_ids={index: 0 for index in range(len(devices))},
+                version=policy_version,
+            )
+            self._sync_weights(policy_version)
             ready = self._collect_replies(
                 list(range(len(devices))),
                 MessageKind.READY,
@@ -134,9 +144,6 @@ class AsyncRoundCoordinator:
                     payload.cuda_graph_enabled
                 )
                 self.peak_gpu_memory[devices[index]] = payload.peak_gpu_memory
-                self.worker_shared_memory_pinned[devices[index]] = (
-                    payload.shared_memory_pinned
-                )
         except BaseException:
             self.close(force=True)
             raise
@@ -203,20 +210,31 @@ class AsyncRoundCoordinator:
         )
         return request_id
 
-    def _sync_weights(self, indices, version):
+    def _sync_weights(self, version):
         missing = [
-            index for index in indices if self._worker_versions[index] != version
+            index
+            for index in range(len(self._processes))
+            if self._worker_versions[index] != version
         ]
         if not missing:
             return
+        if len(missing) != len(self._processes):
+            raise RuntimeError("NCCL weight broadcast requires all workers")
         if self.weights.version != version:
-            raise RuntimeError("learner weights were not staged for requested version")
+            raise RuntimeError("learner weights have not committed requested version")
         self.weights.begin_fanout(missing)
         started = time.perf_counter()
         request_ids = {
             index: self._send_command(index, MessageKind.WEIGHT_SYNC, version=version)
             for index in missing
         }
+        self.weights.connect(
+            rank=0,
+            world_size=len(self._processes) + 1,
+            port=self._rendezvous_port,
+            timeout_s=self._nccl_timeout_s,
+        )
+        self.weights.broadcast()
         acks = self._collect_replies(
             missing,
             MessageKind.WEIGHT_SYNC_ACK,
@@ -235,12 +253,7 @@ class AsyncRoundCoordinator:
             raise ValueError("policy_version must advance")
         result = update(target)
         self._policy_version = target
-        try:
-            self.weights.snapshot(target)
-        except BaseException as exc:
-            raise WeightSnapshotError(
-                f"optimizer committed policy version {target}, but weight staging failed"
-            ) from exc
+        self.weights.mark_committed(target)
         return result
 
     def step(self):
@@ -260,7 +273,7 @@ class AsyncRoundCoordinator:
             for index in range(min(total, len(self._processes)))
         }
         try:
-            self._sync_weights(list(jobs), version)
+            self._sync_weights(version)
             self._round_id += 1
             request_ids = {}
             for index, indices in jobs.items():
@@ -359,4 +372,4 @@ class AsyncRoundCoordinator:
                 process.join(1.0)
         for conn in self._pipes:
             conn.close()
-        self.weights.close()
+        self.weights.close(force=force)

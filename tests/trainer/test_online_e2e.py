@@ -16,10 +16,9 @@ from astrai.trainer import train_context
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.rollout.async_round import (
     AsyncRoundCoordinator,
-    WeightSnapshotError,
 )
+from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
 from astrai.trainer.rollout.setup import configure_rollout
-from astrai.trainer.rollout.weight_transport import SharedWeightBuffer
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
 from tests.helpers import CHAT_TEMPLATE
@@ -369,7 +368,7 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
 
 @pytest.mark.integration
 @pytest.mark.skipif(torch.cuda.device_count() < 5, reason="five CUDA devices required")
-def test_async_round_snapshot_failure_checkpoint_resumes_once(
+def test_async_round_version_commit_failure_checkpoint_resumes_once(
     base_test_env, monkeypatch
 ):
     test_dir = base_test_env["test_dir"]
@@ -398,15 +397,15 @@ def test_async_round_snapshot_failure_checkpoint_resumes_once(
         reward_model_fn=LengthRewardModel,
         collate_fn=instruction_collate_fn,
     )
-    original_snapshot = SharedWeightBuffer.snapshot
+    original_publication = NCCLWeightChannel.mark_committed
 
     def fail_after_commit(self, version):
         if version == 1:
-            raise RuntimeError("injected staging failure")
-        return original_snapshot(self, version)
+            raise RuntimeError("injected version commit failure")
+        return original_publication(self, version)
 
-    monkeypatch.setattr(SharedWeightBuffer, "snapshot", fail_after_commit)
-    with pytest.raises(WeightSnapshotError, match="optimizer committed"):
+    monkeypatch.setattr(NCCLWeightChannel, "mark_committed", fail_after_commit)
+    with pytest.raises(RuntimeError, match="injected version commit failure"):
         Trainer(config).train(param_path=test_dir)
     checkpoint_path = os.path.join(test_dir, "ckpt", "epoch_0_step_1")
     checkpoint = Checkpoint.load(checkpoint_path)
@@ -414,7 +413,7 @@ def test_async_round_snapshot_failure_checkpoint_resumes_once(
     assert checkpoint.meta["optimizer_step"] == 1
     assert checkpoint.consumed_samples == 4
 
-    monkeypatch.setattr(SharedWeightBuffer, "snapshot", original_snapshot)
+    monkeypatch.setattr(NCCLWeightChannel, "mark_committed", original_publication)
     Trainer(config).train(param_path=checkpoint_path, resume=True)
     resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_2"))
     assert resumed.meta["policy_version"] == 2

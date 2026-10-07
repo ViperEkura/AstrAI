@@ -215,34 +215,40 @@ model factory.
 
 ### Rollout backends and validation sampling
 
-For one-learner online GRPO, `TrainConfig(rollout_mode="async_round",
-rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
-rollout_interval=1, rollout_max_policy_lag=1, batch_per_device=4)`
-uses GPU0 for the trainable policy, optimizer and frozen KL reference, and
-GPU1–4 for four frozen generation processes. Each worker receives one prompt
-per four-prompt round by default. The learner accumulates prompt microbatches
+For one-learner online GRPO, set `TrainConfig(rollout_mode="async_round",
+rollout_devices=worker_devices, rollout_interval=1,
+rollout_max_policy_lag=1)`, where `worker_devices` contains distinct CUDA
+devices separate from the learner device. The learner holds the trainable
+policy, optimizer and frozen KL reference; each listed device hosts one frozen
+generation process. Each worker receives one prompt per round by default.
+The learner accumulates prompt microbatches
 (`async_train_microbatch_prompts=1`) and steps the optimizer once per round.
 The next round generates while the current round trains, with at most one
 optimizer-version lag; a stale or failed round is never partially trained.
 
 The process control plane uses one ordered duplex `multiprocessing.Pipe` per
 worker. Messages have an explicit kind, request ID, round ID and policy version:
-`READY`, `GENERATE`/`RESULT`, `WEIGHT_SYNC`/`WEIGHT_SYNC_ACK`, `ERROR`, and `STOP`.
+`MODEL_READY`, `READY`, `GENERATE`/`RESULT`, `WEIGHT_SYNC`/`WEIGHT_SYNC_ACK`,
+`ERROR`, and `STOP`.
 The coordinator accepts a reply only when its request ID, round and version
 match the pending command. `RESULT` carries CPU rollout tensors, while
-`WEIGHT_SYNC` carries only a version notification; policy bytes use shared memory.
+`WEIGHT_SYNC` carries only a version notification; policy tensors are broadcast
+from the learner through an NCCL group containing the learner and all workers.
 Worker process sentinels and finite deadlines are polled alongside the pipes,
 so a crash or hang aborts the entire round. This is a local one-to-one
 protocol; no network broker or cross-worker traffic is required.
 
-On the 5090 host, peer access is unavailable. After each learner update the
-coordinator copies the new weights once into shared host memory. Each worker
-registers that mapping as CUDA pinned memory and copies it to its GPU at the
-next idle boundary; the coordinator waits for all transfer ACKs before reusing
-the mapping. If CUDA host registration is unavailable, pinned local staging
-buffers provide the same synchronization boundary. Token IDs, masks, aligned
+Each worker first allocates its replica, joins the NCCL group, and receives the
+initial learner weights before
+constructing its inference backend and capturing CUDA Graphs. After each
+optimizer step, the learner advances its policy version. At the next idle
+round boundary it broadcasts the live weights once through NCCL; every worker
+synchronizes its CUDA device before returning `WEIGHT_SYNC_ACK`. All workers
+participate in each broadcast, even when a short final round has fewer prompts
+than workers. The application does not allocate a shared-memory weight buffer;
+NCCL selects its own transport. Token IDs, masks, aligned
 behaviour log-probabilities and CPU rewards are assembled on the host before
-the learner moves them to GPU0; KV cache and full logits remain on the
+the learner moves them to its device; KV cache and full logits remain on the
 generation devices. The async mode is programmatic-only, supports
 `online_grpo` with one CUDA learner and dense models, and does not yet support
 validation. Each worker owns its Scheduler and CUDA Graph state in its own
@@ -256,18 +262,16 @@ The existing synchronous backend remains the default.
 Where generation physically runs is a *backend* choice
 (`astrai/trainer/backend.py`): by default the scheduler wraps the training
 model object in-process (`ColocatedBackend`, weight updates are free).
-`--rollout_device cuda:1` instead builds a frozen replica on that device
+Setting `--rollout_device` builds a frozen replica on the selected device
 with its own scheduler and KV pool; a `P2PCopyPublisher` copies the
 training weights into the replica inside the policy-version lock on every
 optimizer step, so the replica's generations stay version-attributable. The
-copy is a full state transfer (~2GB/step for a 1B bf16 policy) — pay it only
-when backend isolation is worth it.
+copy transfers the full model state at every optimizer step.
 
 The scheduler's KV pool is sized from the model's full
 `max_position_embeddings` by default; `--rollout_pool_seq_len` right-sizes it
 to the true rollout horizon (it must cover the longest prompt plus
-`rollout_max_tokens`). For the 1B policy the default 32768 window allocates
-~3.2 GB of KV against ~400 MB at 4096 — requests beyond the budget are
+`rollout_max_tokens`). Requests beyond the budget are
 rejected (`prompt_too_long`) rather than silently truncated.
 
 `--rollout_val_device` gives *validation* its own replica, so evaluation

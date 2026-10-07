@@ -2,7 +2,6 @@
 
 import time
 from functools import partial
-from multiprocessing.shared_memory import SharedMemory
 from threading import Thread
 from types import SimpleNamespace
 
@@ -10,10 +9,7 @@ import pytest
 import torch
 
 from astrai.trainer.callbacks.checkpoint import CheckpointCallback
-from astrai.trainer.rollout.async_round import (
-    AsyncRoundCoordinator,
-    WeightSnapshotError,
-)
+from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 from astrai.trainer.rollout.protocol import (
     GenerationResult,
     MessageKind,
@@ -29,16 +25,33 @@ from astrai.trainer.rollout.types import RawRollout, RolloutVersionError, Sampli
 def _fake_worker(conn, spec):
     device = spec.device
     policy_version = spec.policy_version
-    shm = SharedMemory(name=spec.shm_name)
     generated = 0
     try:
+        send_message(
+            conn,
+            RolloutMessage(
+                MessageKind.MODEL_READY,
+                request_id=0,
+                policy_version=policy_version,
+            ),
+        )
+        initial = recv_message(conn)
+        assert initial.kind == MessageKind.WEIGHT_SYNC
+        send_message(
+            conn,
+            RolloutMessage(
+                MessageKind.WEIGHT_SYNC_ACK,
+                request_id=initial.request_id,
+                policy_version=policy_version,
+            ),
+        )
         send_message(
             conn,
             RolloutMessage(
                 MessageKind.READY,
                 request_id=0,
                 policy_version=policy_version,
-                payload=WorkerReady(False, 0, False),
+                payload=WorkerReady(False, 0),
             ),
         )
         while True:
@@ -104,7 +117,41 @@ def _fake_worker(conn, spec):
             generated += 1
     finally:
         conn.close()
-        shm.close()
+
+
+class _FakeWeightChannel:
+    def __init__(self, source, version):
+        self.layout = [
+            (name, tuple(tensor.shape), str(tensor.dtype).split(".")[-1])
+            for name, tensor in source.state_dict().items()
+        ]
+        self.version = version
+        self._pending = set()
+        self.fanout_seconds = 0.0
+        self.broadcast_calls = 0
+
+    def prepare_rendezvous(self, _world_size, _timeout_s):
+        return 0
+
+    def connect(self, **_kwargs):
+        pass
+
+    def broadcast(self):
+        self.broadcast_calls += 1
+
+    def mark_committed(self, version):
+        if self._pending:
+            raise RuntimeError("previous weight broadcast has not been acknowledged")
+        self.version = version
+
+    def begin_fanout(self, indices):
+        self._pending = set(indices)
+
+    def acknowledge(self, index):
+        self._pending.remove(index)
+
+    def close(self, force=False):
+        pass
 
 
 class _Reward:
@@ -128,6 +175,7 @@ def _coordinator(devices=None, timeout=3.0, max_prompts_per_worker=1):
         worker_timeout_s=timeout,
         max_prompts_per_worker=max_prompts_per_worker,
         worker_target=_fake_worker,
+        weight_channel=_FakeWeightChannel(source, 0),
     )
 
 
@@ -137,7 +185,7 @@ def _collect(coordinator, values):
     )
 
 
-def test_four_processes_generate_ordered_round_and_receive_one_snapshot():
+def test_four_processes_generate_ordered_round_and_receive_one_broadcast():
     source, coordinator = _coordinator()
     try:
         started = time.perf_counter()
@@ -147,6 +195,7 @@ def test_four_processes_generate_ordered_round_and_receive_one_snapshot():
         assert result.responses[:, 0, 0].tolist() == [1, 2, 3, 4]
         torch.testing.assert_close(result.logprobs_old, -result.responses.float() / 100)
         assert result.policy_version == 0
+        assert coordinator.weights.broadcast_calls == 1
 
         def update(_version):
             with torch.no_grad():
@@ -156,6 +205,7 @@ def test_four_processes_generate_ordered_round_and_receive_one_snapshot():
         assert coordinator.policy_version == 1
         assert _collect(coordinator, range(4, 8)).policy_version == 1
         assert coordinator._worker_versions == [1] * 4
+        assert coordinator.weights.broadcast_calls == 2
         assert not coordinator.weights._pending
     finally:
         coordinator.close()
@@ -245,7 +295,7 @@ def test_timeout_kills_all_workers():
     assert all(not process.is_alive() for process in coordinator._processes)
 
 
-def test_shared_snapshot_cannot_be_reused_before_ack():
+def test_committed_version_cannot_advance_before_ack():
     source, coordinator = _coordinator(devices=["slow_ack", "b", "c", "d"])
     try:
         coordinator.apply_weight_update(
@@ -266,7 +316,7 @@ def test_shared_snapshot_cannot_be_reused_before_ack():
             time.sleep(0.01)
         assert coordinator.weights._pending
         with pytest.raises(RuntimeError, match="not been acknowledged"):
-            coordinator.weights.snapshot(2)
+            coordinator.weights.mark_committed(2)
         thread.join(timeout=3)
         assert not thread.is_alive() and not errors
         assert coordinator.weights.version == 1
@@ -287,16 +337,16 @@ def test_weight_publication_during_generation_keeps_round_version():
         coordinator.close()
 
 
-def test_snapshot_failure_marks_optimizer_commit():
+def test_version_commit_failure_marks_optimizer_commit():
     source, coordinator = _coordinator()
     try:
 
-        def fail_snapshot(_version):
-            raise RuntimeError("staging failed")
+        def fail_version_commit(_version):
+            raise RuntimeError("version commit failed")
 
-        coordinator.weights.snapshot = fail_snapshot
+        coordinator.weights.mark_committed = fail_version_commit
         before = source.weight.detach().clone()
-        with pytest.raises(WeightSnapshotError, match="optimizer committed"):
+        with pytest.raises(RuntimeError, match="version commit failed"):
             coordinator.apply_weight_update(
                 None, lambda _version: source.weight.data.add_(1)
             )

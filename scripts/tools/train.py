@@ -153,6 +153,13 @@ _SPECS = [
         help="Reuse Muon NS scratch buffers within each matrix update.",
     ),
     OptSpec(
+        "muon_ns_kernels",
+        "Optimizer",
+        type=bool,
+        default=False,
+        help="Use optional symmetric kernels for eligible Muon NS matrices.",
+    ),
+    OptSpec(
         "muon_adjust_lr",
         "Optimizer",
         choices=["original", "match_rms_adamw"],
@@ -713,6 +720,7 @@ def train(
         "nesterov": kwargs.pop("muon_nesterov", True),
         "ns_steps": kwargs.pop("muon_ns_steps", 5),
         "reuse_ns_buffers": kwargs.pop("muon_reuse_ns_buffers", False),
+        "use_ns_kernels": kwargs.pop("muon_ns_kernels", False),
         "adjust_lr_fn": kwargs.pop("muon_adjust_lr", "match_rms_adamw"),
         "mano_momentum": kwargs.pop("mano_momentum", 0.95),
         "mano_nesterov": kwargs.pop("mano_nesterov", True),
@@ -755,6 +763,7 @@ def train(
                 "nesterov",
                 "ns_steps",
                 "reuse_ns_buffers",
+                "use_ns_kernels",
                 "adjust_lr_fn",
             )
         }

@@ -11,7 +11,9 @@ from astrai.extension.backend.attention import (
     attn_backend,
     get_backend,
 )
+from astrai.extension.backend.newton_schulz import newton_schulz
 from astrai.extension.backend.rotary import apply_rotary_emb
+from astrai.extension.backend.symmetric import symm_out, syrk_out
 
 __all__ = [
     "ATTN_BACKEND",
@@ -21,6 +23,9 @@ __all__ = [
     "FlashAttnBackend",
     "TorchNativeBackend",
     "apply_rotary_emb",
+    "newton_schulz",
+    "symm_out",
+    "syrk_out",
     "attention",
     "attn_backend",
     "get_backend",

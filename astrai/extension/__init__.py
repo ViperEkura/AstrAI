@@ -16,6 +16,9 @@ from astrai.extension.backend import (
     attention,
     attn_backend,
     get_backend,
+    newton_schulz,
+    symm_out,
+    syrk_out,
 )
 from astrai.extension.kernel import (
     TensorLayout,
@@ -95,6 +98,9 @@ __all__ = [
     "is_available",
     "KERNEL_NAMES",
     "apply_rotary_emb",
+    "newton_schulz",
+    "symm_out",
+    "syrk_out",
     "FP8Recipe",
     "fp8_autocast",
     "fp8_format_pair",

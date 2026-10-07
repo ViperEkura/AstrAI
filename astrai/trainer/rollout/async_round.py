@@ -17,6 +17,16 @@ from torch import Tensor, nn
 from astrai.parallel.executor import strip_compile_prefix
 from astrai.trainer.backend import ReplicaBackend
 from astrai.trainer.rollout.generator import RolloutGenerator
+from astrai.trainer.rollout.protocol import (
+    GenerationResult,
+    MessageKind,
+    RolloutMessage,
+    RolloutProtocolError,
+    WeightAck,
+    WorkerReady,
+    recv_message,
+    send_message,
+)
 from astrai.trainer.rollout.runner import _score_rewards
 from astrai.trainer.rollout.types import (
     RawRollout,
@@ -266,6 +276,7 @@ def _rollout_worker_main(
     shm = None
     registered = False
     views = None
+    request_id = 0
     try:
         torch.cuda.set_device(device)
         from astrai.tokenize import AutoTokenizer
@@ -301,22 +312,28 @@ def _rollout_worker_main(
         generator = RolloutGenerator(
             backend=backend, tokenizer=tokenizer, params=params, output_device="cpu"
         )
-        conn.send(
-            (
-                "ready",
-                policy_version,
-                backend.scheduler.cuda_graph_enabled,
-                torch.cuda.max_memory_allocated(device),
-                registered,
-            )
+        send_message(
+            conn,
+            RolloutMessage(
+                MessageKind.READY,
+                request_id=0,
+                policy_version=policy_version,
+                payload=WorkerReady(
+                    backend.scheduler.cuda_graph_enabled,
+                    torch.cuda.max_memory_allocated(device),
+                    registered,
+                ),
+            ),
         )
         while True:
-            command = conn.recv()
-            kind = command[0]
-            if kind == "stop":
+            command = recv_message(conn)
+            request_id = command.request_id
+            if command.kind == MessageKind.STOP:
                 break
-            if kind == "weight":
-                version = command[1]
+            if command.kind == MessageKind.WEIGHT:
+                version = command.policy_version
+                if version is None:
+                    raise RolloutProtocolError("weight command is missing a version")
                 if version <= backend.policy_version:
                     raise RuntimeError("weight version must advance")
 
@@ -324,16 +341,25 @@ def _rollout_worker_main(
                     return _copy_shared_weights(views, layout, target, pinned, device)
 
                 duration = backend.apply_weight_update(version, copy_weights)
-                conn.send(
-                    (
-                        "weight_ack",
-                        version,
-                        duration,
-                        torch.cuda.max_memory_allocated(device),
-                    )
+                send_message(
+                    conn,
+                    RolloutMessage(
+                        MessageKind.WEIGHT_ACK,
+                        request_id=request_id,
+                        policy_version=version,
+                        payload=WeightAck(
+                            duration, torch.cuda.max_memory_allocated(device)
+                        ),
+                    ),
                 )
-            elif kind == "generate":
-                _, round_id, version, chunk = command
+            elif command.kind == MessageKind.GENERATE:
+                round_id, version, chunk = (
+                    command.round_id,
+                    command.policy_version,
+                    command.payload,
+                )
+                if round_id is None or version is None or not isinstance(chunk, dict):
+                    raise RolloutProtocolError("generate command is incomplete")
                 if backend.policy_version != version:
                     raise RuntimeError(
                         "rollout worker did not receive requested version"
@@ -352,21 +378,34 @@ def _rollout_worker_main(
                         )
                     )
                 raw = _merge_rollouts(pieces, total)
-                conn.send(
-                    (
-                        "result",
-                        round_id,
-                        version,
-                        raw,
-                        time.perf_counter() - started,
-                        torch.cuda.max_memory_allocated(device),
-                    )
+                send_message(
+                    conn,
+                    RolloutMessage(
+                        MessageKind.RESULT,
+                        request_id=request_id,
+                        round_id=round_id,
+                        policy_version=version,
+                        payload=GenerationResult(
+                            raw,
+                            time.perf_counter() - started,
+                            torch.cuda.max_memory_allocated(device),
+                        ),
+                    ),
                 )
             else:
-                raise RuntimeError(f"unknown rollout command: {kind}")
+                raise RolloutProtocolError(
+                    f"unexpected rollout command: {command.kind}"
+                )
     except BaseException:
         try:
-            conn.send(("error", traceback.format_exc()))
+            send_message(
+                conn,
+                RolloutMessage(
+                    MessageKind.ERROR,
+                    request_id=request_id,
+                    payload=traceback.format_exc(),
+                ),
+            )
         except (BrokenPipeError, EOFError, OSError):
             pass
     finally:
@@ -386,6 +425,7 @@ class RoundHandle:
     version: int
     round_id: int
     started: float
+    request_ids: Dict[int, int]
 
 
 class AsyncRoundCoordinator:
@@ -419,6 +459,7 @@ class AsyncRoundCoordinator:
         self.worker_timeout_s = worker_timeout_s
         self._devices = list(devices)
         self._round_id = 0
+        self._request_id = 0
         self._closed = False
         self.generated_tokens = 0
         self.generation_seconds = 0.0
@@ -465,12 +506,23 @@ class AsyncRoundCoordinator:
                 self._pipes.append(parent)
                 self._processes.append(process)
                 self._worker_versions.append(None)
-            ready = self._wait_for(list(range(len(devices))), "ready", startup_deadline)
+            ready = self._wait_for(
+                list(range(len(devices))),
+                MessageKind.READY,
+                startup_deadline,
+                request_ids={index: 0 for index in range(len(devices))},
+                version=policy_version,
+            )
             for index, message in ready.items():
-                self._worker_versions[index] = message[1]
-                self.worker_cuda_graph_enabled[devices[index]] = message[2]
-                self.peak_gpu_memory[devices[index]] = message[3]
-                self.worker_shared_memory_pinned[devices[index]] = message[4]
+                payload = message.payload
+                self._worker_versions[index] = message.policy_version
+                self.worker_cuda_graph_enabled[devices[index]] = (
+                    payload.cuda_graph_enabled
+                )
+                self.peak_gpu_memory[devices[index]] = payload.peak_gpu_memory
+                self.worker_shared_memory_pinned[devices[index]] = (
+                    payload.shared_memory_pinned
+                )
         except BaseException:
             self.close(force=True)
             raise
@@ -479,7 +531,9 @@ class AsyncRoundCoordinator:
     def policy_version(self) -> int:
         return self._policy_version
 
-    def _wait_for(self, indices, kind, deadline, round_id=None, version=None):
+    def _wait_for(
+        self, indices, kind, deadline, request_ids, round_id=None, version=None
+    ):
         pending = set(indices)
         messages = {}
         while pending:
@@ -497,24 +551,39 @@ class AsyncRoundCoordinator:
                 conn = self._pipes[index]
                 if conn in ready:
                     try:
-                        message = conn.recv()
+                        message = recv_message(conn)
                     except (EOFError, OSError) as exc:
                         raise RuntimeError(
                             f"async rollout worker {index} exited"
                         ) from exc
-                    if message[0] == "error":
+                    if message.kind == MessageKind.ERROR:
                         raise RuntimeError(
-                            f"async rollout worker {index} failed:\n{message[1]}"
+                            f"async rollout worker {index} failed:\n{message.payload}"
                         )
-                    if message[0] != kind:
+                    if message.kind != kind:
                         raise RuntimeError(
-                            f"async rollout worker {index} sent unexpected {message[0]}"
+                            f"async rollout worker {index} sent unexpected {message.kind}"
                         )
-                    if kind == "result" and message[1] != round_id:
-                        raise RuntimeError("async rollout worker sent stale round ID")
-                    if kind == "weight_ack" and message[1] != version:
-                        raise RuntimeError(
-                            "async rollout worker acknowledged wrong version"
+                    if message.request_id != request_ids[index]:
+                        raise RolloutProtocolError(
+                            f"async rollout worker {index} sent wrong request ID"
+                        )
+                    if round_id is not None and message.round_id != round_id:
+                        raise RolloutProtocolError(
+                            f"async rollout worker {index} sent stale round ID"
+                        )
+                    if version is not None and message.policy_version != version:
+                        raise RolloutProtocolError(
+                            f"async rollout worker {index} sent wrong policy version"
+                        )
+                    expected_payload = {
+                        MessageKind.READY: WorkerReady,
+                        MessageKind.WEIGHT_ACK: WeightAck,
+                        MessageKind.RESULT: GenerationResult,
+                    }[kind]
+                    if not isinstance(message.payload, expected_payload):
+                        raise RolloutProtocolError(
+                            f"async rollout worker {index} sent invalid payload"
                         )
                     messages[index] = message
                     pending.remove(index)
@@ -523,10 +592,16 @@ class AsyncRoundCoordinator:
                     raise RuntimeError(f"async rollout worker {index} exited")
         return messages
 
-    def _send(self, index, message):
+    def _send(self, index, kind, *, round_id=None, version=None, payload=None):
         if not self._processes[index].is_alive():
             raise RuntimeError(f"async rollout worker {index} exited")
-        self._pipes[index].send(message)
+        self._request_id += 1
+        request_id = self._request_id
+        send_message(
+            self._pipes[index],
+            RolloutMessage(kind, request_id, round_id, version, payload),
+        )
+        return request_id
 
     def _load_version(self, indices, version):
         missing = [
@@ -538,12 +613,15 @@ class AsyncRoundCoordinator:
             raise RuntimeError("learner weights were not staged for requested version")
         self.publisher.begin_fanout(missing)
         started = time.perf_counter()
-        for index in missing:
-            self._send(index, ("weight", version))
+        request_ids = {
+            index: self._send(index, MessageKind.WEIGHT, version=version)
+            for index in missing
+        }
         acks = self._wait_for(
             missing,
-            "weight_ack",
+            MessageKind.WEIGHT_ACK,
             time.monotonic() + self.worker_timeout_s,
+            request_ids,
             version=version,
         )
         for index, message in acks.items():
@@ -551,7 +629,7 @@ class AsyncRoundCoordinator:
             self._worker_versions[index] = version
             device = str(self._devices[index])
             self.peak_gpu_memory[device] = max(
-                self.peak_gpu_memory.get(device, 0), message[3]
+                self.peak_gpu_memory.get(device, 0), message.payload.peak_gpu_memory
             )
         self.publisher.fanout_seconds += time.perf_counter() - started
 
@@ -589,17 +667,18 @@ class AsyncRoundCoordinator:
         try:
             self._load_version([index for index, _ in jobs], version)
             self._round_id += 1
+            request_ids = {}
             for index, indices in jobs:
-                self._send(
+                request_ids[index] = self._send(
                     index,
-                    (
-                        "generate",
-                        self._round_id,
-                        version,
-                        _slice_batch(batch, indices, total),
-                    ),
+                    MessageKind.GENERATE,
+                    round_id=self._round_id,
+                    version=version,
+                    payload=_slice_batch(batch, indices, total),
                 )
-            handle = RoundHandle(batch, jobs, version, self._round_id, time.monotonic())
+            handle = RoundHandle(
+                batch, jobs, version, self._round_id, time.monotonic(), request_ids
+            )
             self._active_round = handle
             return handle
         except BaseException:
@@ -613,9 +692,11 @@ class AsyncRoundCoordinator:
         try:
             messages = self._wait_for(
                 [index for index, _ in handle.jobs],
-                "result",
+                MessageKind.RESULT,
                 handle.started + self.worker_timeout_s,
+                handle.request_ids,
                 round_id=handle.round_id,
+                version=handle.version,
             )
         except BaseException:
             self.close(force=True)
@@ -627,16 +708,14 @@ class AsyncRoundCoordinator:
         durations = []
         for index, indices in handle.jobs:
             message = messages[index]
-            if (
-                message[2] != handle.version
-                or message[3].policy_version != handle.version
-            ):
+            payload = message.payload
+            if payload.rollout.policy_version != handle.version:
                 raise RolloutVersionError("mixed rollout versions")
-            parts.append((indices, message[3]))
-            durations.append(message[4])
+            parts.append((indices, payload.rollout))
+            durations.append(payload.generation_seconds)
             device = str(self._devices[index])
             self.peak_gpu_memory[device] = max(
-                self.peak_gpu_memory.get(device, 0), message[5]
+                self.peak_gpu_memory.get(device, 0), payload.peak_gpu_memory
             )
         lag = self._policy_version - handle.version
         if lag < 0 or lag > self.max_policy_lag:
@@ -668,8 +747,8 @@ class AsyncRoundCoordinator:
             for index, process in enumerate(self._processes):
                 if process.is_alive():
                     try:
-                        self._pipes[index].send(("stop",))
-                    except (BrokenPipeError, EOFError, OSError):
+                        self._send(index, MessageKind.STOP)
+                    except (BrokenPipeError, EOFError, OSError, RuntimeError):
                         pass
             deadline = time.monotonic() + 5.0
             for process in self._processes:

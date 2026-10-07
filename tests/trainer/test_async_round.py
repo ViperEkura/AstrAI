@@ -14,6 +14,16 @@ from astrai.trainer.rollout.async_round import (
     AsyncRoundCoordinator,
     WeightSnapshotError,
 )
+from astrai.trainer.rollout.protocol import (
+    GenerationResult,
+    MessageKind,
+    RolloutMessage,
+    RolloutProtocolError,
+    WeightAck,
+    WorkerReady,
+    recv_message,
+    send_message,
+)
 from astrai.trainer.rollout.types import RawRollout, RolloutVersionError, SamplingParams
 
 
@@ -34,22 +44,49 @@ def _fake_worker(
     shm = SharedMemory(name=shm_name)
     generated = 0
     try:
-        conn.send(("ready", policy_version, False, 0, False))
+        send_message(
+            conn,
+            RolloutMessage(
+                MessageKind.READY,
+                request_id=0,
+                policy_version=policy_version,
+                payload=WorkerReady(False, 0, False),
+            ),
+        )
         while True:
-            message = conn.recv()
-            if message[0] == "stop":
+            message = recv_message(conn)
+            if message.kind == MessageKind.STOP:
                 return
-            if message[0] == "weight":
+            if message.kind == MessageKind.WEIGHT:
                 if device == "slow_ack":
                     time.sleep(0.3)
-                policy_version = message[1]
-                conn.send(("weight_ack", policy_version, 0.0, 0))
+                policy_version = message.policy_version
+                send_message(
+                    conn,
+                    RolloutMessage(
+                        MessageKind.WEIGHT_ACK,
+                        request_id=message.request_id,
+                        policy_version=policy_version,
+                        payload=WeightAck(0.0, 0),
+                    ),
+                )
                 continue
-            _, round_id, version, chunk = message
+            round_id, version, chunk = (
+                message.round_id,
+                message.policy_version,
+                message.payload,
+            )
             if device == "hang":
                 time.sleep(999)
             if device == "fail":
-                conn.send(("error", "worker failed"))
+                send_message(
+                    conn,
+                    RolloutMessage(
+                        MessageKind.ERROR,
+                        request_id=message.request_id,
+                        payload="worker failed",
+                    ),
+                )
                 return
             time.sleep(0.15)
             prompt_ids = [int(value) for value in chunk["instruction"]]
@@ -67,7 +104,16 @@ def _fake_worker(
                 response_texts=[[str(value + 1)] for value in prompt_ids],
                 finish_reasons=[["stop"] for _ in prompt_ids],
             )
-            conn.send(("result", round_id, version, raw, 0.15, 0))
+            send_message(
+                conn,
+                RolloutMessage(
+                    MessageKind.RESULT,
+                    request_id=message.request_id + (device == "wrong_request"),
+                    round_id=round_id + (device == "wrong_round"),
+                    policy_version=version + (device == "wrong_version"),
+                    payload=GenerationResult(raw, 0.15, 0),
+                ),
+            )
             generated += 1
     finally:
         conn.close()
@@ -163,6 +209,21 @@ def test_stale_or_mixed_round_is_rejected_before_training():
             _collect(coordinator, range(4))
     finally:
         coordinator.close()
+
+
+@pytest.mark.parametrize(
+    ("bad_worker", "reason"),
+    [
+        ("wrong_request", "wrong request ID"),
+        ("wrong_round", "stale round ID"),
+        ("wrong_version", "wrong policy version"),
+    ],
+)
+def test_protocol_rejects_mismatched_response_envelope(bad_worker, reason):
+    _, coordinator = _coordinator(devices=[bad_worker, "b", "c", "d"])
+    with pytest.raises(RolloutProtocolError, match=reason):
+        _collect(coordinator, range(4))
+    assert all(not process.is_alive() for process in coordinator._processes)
 
 
 def test_failed_worker_wakes_collector_and_kills_hung_peer():

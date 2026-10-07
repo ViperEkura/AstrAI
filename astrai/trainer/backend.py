@@ -34,10 +34,9 @@ T = TypeVar("T")
 def _device_context(device):
     """Pin CUDA work to ``device``; a no-op on CPU.
 
-    CUDA graph capture/replay binds to the calling thread's current
-    device (``CUDAGraphRunner`` uses a bare ``torch.cuda.CUDAGraph()``),
-    so a scheduler living on a non-current device must be constructed
-    and driven under ``torch.cuda.device``.
+    CUDA graph replay and scheduler work use the calling thread's current
+    device, so a scheduler living on another GPU must be constructed and
+    driven under ``torch.cuda.device``.
     """
     if isinstance(device, torch.device) and device.type == "cuda":
         return torch.cuda.device(device)
@@ -155,6 +154,10 @@ class ReplicaBackend:
     def generate(self, prompt_ids_list: List[List[int]], **kwargs):
         with _device_context(self.device):
             return self.scheduler.run_batch(prompt_ids_list, **kwargs)
+
+    def freeze_cuda_graph_captures(self) -> None:
+        """Keep concurrent rollout threads from starting new captures."""
+        self.scheduler._executor._graph_ctx.freeze_captures()
 
     def update_weights(self, policy_version: int) -> int:
         return self.scheduler.update_weights(policy_version)

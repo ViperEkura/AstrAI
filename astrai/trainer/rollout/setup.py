@@ -123,9 +123,9 @@ def configure_rollout(
             )
         if any(device.index == train_index for device in devices):
             raise ValueError("rollout_devices must exclude the learner device")
-        # Multi-device graph capture can silently produce an empty graph on
-        # this host. Use live forward for all async replicas; the complete
-        # per-worker prompt shard runs as one inference batch.
+        # Construct replicas sequentially: CUDA permits only one capture in
+        # a process at a time. Each graph runner owns a capture stream on its
+        # device; freeze new shapes before the generator threads start.
         prompts_per_worker = max(1, ceil(cfg.batch_per_device / len(devices)))
         worker_capacity = group_size * prompts_per_worker
         params = SamplingParams(
@@ -136,9 +136,11 @@ def configure_rollout(
             top_p=cfg.rollout_top_p,
         )
         backends = [
-            _replica(str(device), worker_capacity, enable_cuda_graph=False)
+            _replica(str(device), worker_capacity, enable_cuda_graph=True)
             for device in devices
         ]
+        for backend in backends:
+            backend.freeze_cuda_graph_captures()
         generators = [
             RolloutGenerator(
                 backend=backend,

@@ -37,8 +37,9 @@ class CUDAGraphRunner:
 
     The first call at a given key runs *without* capture (warmup).  The
     second call captures the graph.  Subsequent calls replay the captured
-    graph.  A ``torch.cuda.synchronize()`` before capture drains in-flight
-    work so the graph trace is clean.
+    graph.  Capture uses an explicit stream on the input tensor's device:
+    PyTorch's implicit graph stream can remain bound to the first GPU used
+    by a process, leaving later GPUs with an empty graph.
     """
 
     def __init__(self, enabled: bool = False):
@@ -46,6 +47,8 @@ class CUDAGraphRunner:
         self._graphs: dict[tuple, torch.cuda.CUDAGraph] = {}
         self._outputs: dict[tuple, dict[str, Tensor]] = {}
         self._warmed: set[tuple] = set()
+        self._capture_stream: torch.cuda.Stream | None = None
+        self._captures_frozen = False
 
     @property
     def enabled(self) -> bool:
@@ -65,6 +68,17 @@ class CUDAGraphRunner:
             self._graphs.clear()
             self._outputs.clear()
             self._warmed.clear()
+            self._capture_stream = None
+            self._captures_frozen = False
+
+    def freeze_captures(self):
+        """Use eager forward for uncaptured shapes after startup warmup.
+
+        A process can only capture one CUDA graph at a time.  Multi-GPU
+        rollout workers may replay concurrently, but must never initiate a
+        new capture while another worker is generating.
+        """
+        self._captures_frozen = True
 
     def forward(self, model, *, key, **kwargs) -> dict[str, Tensor]:
         """Run ``model(**kwargs)`` via graph replay or live forward.
@@ -85,11 +99,18 @@ class CUDAGraphRunner:
 
         if key in self._graphs:
             self._graphs[key].replay()
+        elif self._captures_frozen:
+            return model(**kwargs)
         elif key in self._warmed:
             cap_output = model(**kwargs)
-            torch.cuda.synchronize()
+            device = next(
+                value.device for value in kwargs.values() if isinstance(value, Tensor)
+            )
+            torch.cuda.synchronize(device)
+            if self._capture_stream is None:
+                self._capture_stream = torch.cuda.Stream(device=device)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=self._capture_stream):
                 self._outputs[key] = model(**kwargs)
             self._graphs[key] = graph
             self._warmed.discard(key)

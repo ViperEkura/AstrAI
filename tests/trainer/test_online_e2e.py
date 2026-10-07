@@ -269,10 +269,16 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
     original_init = ReplicaBackend.__init__
 
     def tracked_init(self, *args, **kwargs):
-        assert kwargs["enable_cuda_graph"] is False
-        return original_init(self, *args, **kwargs)
+        assert kwargs["enable_cuda_graph"] is True
+        result = original_init(self, *args, **kwargs)
+        runner = self.scheduler._executor
+        if runner._graph_supported:
+            assert runner.cuda_graph_enabled
+            assert runner._graph_ctx.has_graph((2,))
+        return result
 
     def tracked_generate(self, prompt_ids_list, **kwargs):
+        assert self.scheduler._executor._graph_ctx._captures_frozen
         if self.policy_version == 0:
             simultaneous.wait(timeout=30)
         result = original_generate(self, prompt_ids_list, **kwargs)

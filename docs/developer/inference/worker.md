@@ -96,6 +96,11 @@ CUDA decode path, not every fallback and sampling combination.
 addresses owned by `InferenceWorkspace`, and capture must not race outstanding
 work on those buffers. Sampling remains outside the captured forward. An
 in-place weight update does not by itself change parameter addresses.
+Each runner captures on an explicit stream bound to its input device. Async
+rollout constructs replicas sequentially and freezes new captures before
+generator threads start; an unseen batch size runs eager. PyTorch allows only
+one capture at a time per process, and its implicit graph stream may produce
+an empty graph on later GPUs in a single-process multi-GPU setup.
 
 ## Prefill and future mixed execution
 

@@ -3,7 +3,9 @@
 import math
 from numbers import Real
 from typing import (
+    Any,
     Dict,
+    Iterator,
     Optional,
 )
 
@@ -14,6 +16,7 @@ from torch.optim import Optimizer
 
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
+from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.strategy.base import BaseStrategy
 from astrai.trainer.strategy.factory import StrategyFactory
 from astrai.trainer.strategy.ops import (
@@ -282,6 +285,44 @@ class GRPOStrategy(BaseStrategy):
 
     def supports_online(self) -> bool:
         return True
+
+    def training_updates(
+        self, batch: Any, microbatch_prompts: Optional[int] = None
+    ) -> Iterator[Iterator[LossOutput]]:
+        if not isinstance(batch, RolloutResult):
+            yield from super().training_updates(batch, microbatch_prompts)
+            return
+
+        self._on_rollout_refresh()
+        prepared = self.prepare_from_rollout(batch)
+        total = prepared["prompts"].shape[0]
+        masks = prepared["masks"]
+        denominator = self._response_count(masks)
+        if denominator == 0:
+            raise RuntimeError("async GRPO round has no valid response tokens")
+
+        def microbatches() -> Iterator[LossOutput]:
+            size = microbatch_prompts or total
+            for begin in range(0, total, size):
+                indices = list(range(begin, min(begin + size, total)))
+                chunk = slice_batch(prepared, indices, total)
+                count = self._response_count(chunk["masks"])
+                if count == 0:
+                    continue
+                weight = count / denominator
+                output = self.compute_loss_output(chunk)
+                metrics = {}
+                for name, value in output["metrics"].items():
+                    metric = value.detach() if isinstance(value, Tensor) else value
+                    metrics[name] = float(metric) * weight
+                yield {"loss": output["loss"] * weight, "metrics": metrics}
+
+        yield microbatches()
+
+    def _response_count(self, masks: Tensor) -> int:
+        if self.loss_aggregation == "sequence":
+            return int(masks.any(dim=-1).sum().item())
+        return int(masks.sum().item())
 
     def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
         return {

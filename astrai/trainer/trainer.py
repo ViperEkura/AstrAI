@@ -2,7 +2,6 @@ import logging
 from typing import List, Optional
 
 import torch.distributed as dist
-from torch import Tensor
 
 from astrai.config import TrainConfig
 from astrai.parallel.setup import spawn_parallel_fn
@@ -14,8 +13,6 @@ from astrai.trainer.callbacks import (
     CallbackFactory,
     TrainCallback,
 )
-from astrai.trainer.rollout.batching import slice_batch
-from astrai.trainer.rollout.types import RolloutVersionError
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 
 logger = logging.getLogger(__name__)
@@ -62,85 +59,79 @@ class Trainer:
             if method:
                 method(context)
 
-    def _train_async_epoch(self, context: TrainContext) -> None:
-        """Keep one rollout round ahead of a single GRPO optimizer update."""
+    def _commit_update(self, context: TrainContext, batch) -> None:
+        self._call_callbacks("before_optimizer_step", context)
         coordinator = context.async_rollout
-        batches = iter(context.dataloader)
-        batch = next(batches, None)
-        if batch is None:
-            return
-        handle = coordinator.submit_round(batch)
-        while batch is not None and not context.stop_requested:
-            try:
-                rollout = coordinator.collect_round(handle)
-            except RolloutVersionError:
-                # Discard the entire old round. No optimizer step has run.
-                handle = coordinator.submit_round(batch)
-                rollout = coordinator.collect_round(handle)
-
-            next_batch = next(batches, None)
-            next_handle = (
-                coordinator.submit_round(next_batch) if next_batch is not None else None
-            )
-
-            self._call_callbacks("on_batch_begin", context)
-            context.strategy._on_rollout_refresh()
-            prepared = context.strategy.prepare_from_rollout(rollout)
-            total = prepared["prompts"].shape[0]
-            masks = prepared["masks"]
-            if context.strategy.loss_aggregation == "sequence":
-                denominator = int(masks.any(dim=-1).sum().item())
-            else:
-                denominator = int(masks.sum().item())
-            if denominator == 0:
-                raise RuntimeError("async GRPO round has no valid response tokens")
-            weighted_loss = None
-            weighted_metrics = {}
-            size = context.config.async_train_microbatch_prompts
-            for begin in range(0, total, size):
-                indices = list(range(begin, min(begin + size, total)))
-                chunk = slice_batch(prepared, indices, total)
-                chunk_masks = chunk["masks"]
-                if context.strategy.loss_aggregation == "sequence":
-                    count = int(chunk_masks.any(dim=-1).sum().item())
-                else:
-                    count = int(chunk_masks.sum().item())
-                if count == 0:
-                    continue
-                weight = count / denominator
-                output = context.strategy.compute_loss_output(chunk)
-                loss = output["loss"] * weight
-                context.executor.backward(loss)
-                detached = loss.detach()
-                weighted_loss = (
-                    detached if weighted_loss is None else weighted_loss + detached
-                )
-                for name, value in output["metrics"].items():
-                    metric = value.detach() if isinstance(value, Tensor) else value
-                    weighted_metrics[name] = weighted_metrics.get(name, 0.0) + (
-                        float(metric) * weight
-                    )
-
-            context.loss = float(weighted_loss.item())
-            context.metrics = weighted_metrics
-            self._call_callbacks("before_optimizer_step", context)
+        if coordinator is None:
+            context.strategy.optimizer_step(context.optimizer)
+            context.optimizer.zero_grad()
+            if context.scheduler:
+                context.scheduler.step()
+        else:
             context.checkpoint_safe = False
             version_before = coordinator.policy_version
             try:
                 context.strategy.optimizer_step(context.optimizer)
             finally:
-                # A version advance is the commit marker. Complete accounting
-                # even if the subsequent NCCL channel state update fails.
+                # A version advance marks a committed step, even if later
+                # publication fails and an error checkpoint is needed.
                 if coordinator.policy_version > version_before:
                     context.optimizer.zero_grad()
                     if context.scheduler:
                         context.scheduler.step()
-                    context.consumed_samples += total
+                    context.consumed_samples += batch.prompts.shape[0]
                     context.optimizer_steps_completed += 1
                     context.checkpoint_safe = True
-            self._call_callbacks("after_optimizer_step", context)
+        self._call_callbacks("after_optimizer_step", context)
+
+    def _train_batch(self, context: TrainContext, batch) -> None:
+        executor = context.executor
+        with executor.accumulate(context.model):
+            self._call_callbacks("on_batch_begin", context)
+            microbatch_prompts = (
+                context.config.async_train_microbatch_prompts
+                if context.async_rollout is not None
+                else None
+            )
+            for update in context.strategy.training_updates(batch, microbatch_prompts):
+                update_loss = None
+                update_metrics = {}
+                for output in update:
+                    loss = output["loss"]
+                    executor.backward(loss / executor.grad_accum_steps)
+                    detached = loss.detach()
+                    update_loss = (
+                        detached if update_loss is None else update_loss + detached
+                    )
+                    for name, value in output["metrics"].items():
+                        update_metrics[name] = update_metrics.get(name, 0.0) + float(
+                            value
+                        )
+                if update_loss is None:
+                    raise RuntimeError("training update has no valid loss")
+                context.loss = float(update_loss.item())
+                context.metrics = update_metrics
+                if executor.sync_gradients:
+                    self._commit_update(context, batch)
+            if context.async_rollout is None:
+                context.consumed_samples += (
+                    context.config.batch_per_device * context.dp_size
+                )
             self._call_callbacks("on_batch_end", context)
-            batch, handle = next_batch, next_handle
+
+    def _train_epoch(self, context: TrainContext, epoch: int) -> None:
+        context.epoch = epoch
+        self._call_callbacks("on_epoch_begin", context)
+        batches = context.dataloader
+        if context.async_rollout is not None:
+            batches = context.async_rollout.iter_rounds(
+                batches, lambda: context.stop_requested
+            )
+        for batch in batches:
+            if context.stop_requested:
+                break
+            self._train_batch(context, batch)
+        self._call_callbacks("on_epoch_end", context)
 
     def _trainer_loop(self, param_path: Optional[str] = None, resume: bool = False):
         context = (
@@ -158,47 +149,7 @@ class Trainer:
             for epoch in range(context.epoch, context.config.n_epoch):
                 if context.stop_requested:
                     break
-                context.epoch = epoch
-                self._call_callbacks("on_epoch_begin", context)
-
-                if context.async_rollout is not None:
-                    self._train_async_epoch(context)
-                    self._call_callbacks("on_epoch_end", context)
-                    continue
-
-                for batch in context.dataloader:
-                    if context.stop_requested:
-                        break
-                    with executor.accumulate(context.model):
-                        self._call_callbacks("on_batch_begin", context)
-                        # One batch may expand into several learner updates
-                        # (online RL: one rollout round -> minibatches x
-                        # update epochs); each yielded step gets its own
-                        # backward and, when the accumulation window syncs,
-                        # its own optimizer step.
-                        last_output = None
-                        for loss_output in context.strategy.training_steps(batch):
-                            last_output = loss_output
-                            stand_loss = loss_output["loss"] / executor.grad_accum_steps
-                            executor.backward(stand_loss)
-
-                            if executor.sync_gradients:
-                                self._call_callbacks("before_optimizer_step", context)
-                                context.strategy.optimizer_step(context.optimizer)
-                                context.optimizer.zero_grad()
-
-                                if context.scheduler:
-                                    context.scheduler.step()
-
-                                self._call_callbacks("after_optimizer_step", context)
-                        context.loss = last_output["loss"].item()
-                        context.metrics = last_output["metrics"]
-                        context.consumed_samples += (
-                            context.config.batch_per_device * context.dp_size
-                        )
-                        self._call_callbacks("on_batch_end", context)
-
-                self._call_callbacks("on_epoch_end", context)
+                self._train_epoch(context, epoch)
 
             if context.stop_requested:
                 logger.warning(

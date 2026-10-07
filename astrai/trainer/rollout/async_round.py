@@ -5,7 +5,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import wait
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -39,7 +39,7 @@ class PendingRound:
 
 
 class AsyncRoundCoordinator:
-    """Bounded one-round lookahead with four killable rollout processes."""
+    """Bounded one-round lookahead with killable rollout processes."""
 
     def __init__(
         self,
@@ -258,6 +258,30 @@ class AsyncRoundCoordinator:
 
     def step(self):
         """Compatibility with BaseStrategy.optimizer_step."""
+
+    def iter_rounds(
+        self, batches, stop_requested: Callable[[], bool]
+    ) -> Iterator[RolloutResult]:
+        """Generate one round ahead while the learner consumes the current one."""
+        batches = iter(batches)
+        batch = next(batches, None)
+        if batch is None:
+            return
+        handle = self.submit_round(batch)
+        while batch is not None and not stop_requested():
+            try:
+                rollout = self.collect_round(handle)
+            except RolloutVersionError:
+                # A stale round contributes no gradient or sample accounting.
+                handle = self.submit_round(batch)
+                rollout = self.collect_round(handle)
+
+            next_batch = next(batches, None)
+            next_handle = (
+                self.submit_round(next_batch) if next_batch is not None else None
+            )
+            yield rollout
+            batch, handle = next_batch, next_handle
 
     def submit_round(self, batch: Dict) -> PendingRound:
         if self._closed:

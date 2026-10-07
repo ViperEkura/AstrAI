@@ -3,10 +3,19 @@
 import pytest
 import torch
 
-from astrai.extension.backend.symmetric import symm_out, syrk_out
+from astrai.extension.backend import symmetric as backend
+from astrai.extension.backend.symmetric import select, symm_out, syrk_out
 from astrai.extension.kernel.symmetric import is_available, tiles
 from astrai.extension.policy import symmetric as plan
-from astrai.extension.runtime.dispatch import ExplicitSelectionError, op_backend
+from astrai.extension.runtime.dispatch import (
+    ExplicitSelectionError,
+    ImplRecord,
+    Spec,
+    op_backend,
+    register_impl,
+    set_op,
+    unregister_impl,
+)
 
 CUDA_AVAILABLE = torch.cuda.is_available() and is_available()
 
@@ -68,15 +77,35 @@ def test_plan_configuration_is_atomic_and_scoped():
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
 @pytest.mark.parametrize("operation", ["syrk", "symm"])
-def test_every_tile_on_nonproduction_geometry_and_graph(operation):
+@pytest.mark.parametrize("input_layout", ["row", "column"])
+@pytest.mark.parametrize("output_layout", ["row", "column"])
+def test_every_tile_on_nonproduction_geometry_and_graph(
+    operation, input_layout, output_layout
+):
     torch.manual_seed(29)
-    x = torch.randn((192, 320), device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(
+        (192, 320) if input_layout == "row" else (320, 192),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if input_layout == "column":
+        x = x.T
     x.div_(x.norm())
     symmetric = torch.randn((192, 192), device="cuda", dtype=x.dtype)
     symmetric = (symmetric + symmetric.T) / 2
     symmetric.div_(symmetric.norm())
-    output = torch.empty_like(symmetric if operation == "syrk" else x)
-    addend = torch.randn_like(output)
+    shape = symmetric.shape if operation == "syrk" else x.shape
+    output = torch.empty(
+        shape if output_layout == "row" else shape[::-1], device=x.device, dtype=x.dtype
+    )
+    if output_layout == "column":
+        output = output.T
+    # The addend is independently laid out, exercising both stride dimensions.
+    addend = torch.randn(
+        shape[::-1] if output_layout == "row" else shape, device=x.device, dtype=x.dtype
+    )
+    if output_layout == "row":
+        addend = addend.T
     if operation == "syrk":
         addend = (addend + addend.T) / 2
     addend.div_(addend.norm())
@@ -89,6 +118,12 @@ def test_every_tile_on_nonproduction_geometry_and_graph(operation):
         beta=beta,
     )
     for tile in tiles(operation):
+        if (
+            input_layout not in tile["input_layouts"]
+            or tile["shared_memory"]
+            > torch.cuda.get_device_properties(x.device).shared_memory_per_block_optin
+        ):
+            continue
         options = dict(
             alpha=alpha, beta=beta, addend=addend, backend="cuda", tile=tile["name"]
         )
@@ -177,3 +212,97 @@ def test_zero_beta_does_not_read_addend(device):
         backend="cuda" if device == "cuda" else "torch",
     )
     torch.testing.assert_close(output, x @ x.T, atol=0.0001, rtol=0.02)
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
+def test_layout_plans_and_nondense_fallback():
+    x = torch.randn(320, 192, device="cuda", dtype=torch.bfloat16).T
+    output = torch.empty_like(x)
+    cc = sum(a * b for a, b in zip(torch.cuda.get_device_capability(), (10, 1)))
+    row = dict(
+        operation="symm",
+        cc=cc,
+        rows=192,
+        cols=320,
+        input_layout="column",
+        output_layout="column",
+        backend="cuda",
+        tile="64x64x32_W16x32_S2",
+    )
+    with plan.override([row]):
+        assert plan.probe("symm", x, output=output).backend == "cuda"
+        assert plan.probe("symm", x, output=output.contiguous()).backend == "torch"
+        assert plan.probe("symm", x.contiguous(), output=output).backend == "torch"
+    sliced = torch.randn(192, 640, device=x.device, dtype=x.dtype)[:, ::2]
+    assert not plan.supports(sliced)
+    gram = torch.empty(192, 192, device=x.device, dtype=x.dtype)
+    syrk_out(sliced, gram)
+    assert torch.equal(gram, sliced @ sliced.T)
+    with pytest.raises(ExplicitSelectionError):
+        syrk_out(sliced, gram, backend="cuda")
+    with pytest.raises(ValueError, match="layout"):
+        plan.configure([dict(row, operation="syrk", tile="wmma64")])
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
+def test_cached_selection_tracks_plans_settings_and_overrides():
+    x = torch.randn(192, 320, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(192, 192, device=x.device, dtype=x.dtype)
+    original = select("syrk", x, output)
+    assert select("syrk", x, output) is original
+    cc = sum(a * b for a, b in zip(torch.cuda.get_device_capability(), (10, 1)))
+    row = dict(
+        operation="syrk",
+        cc=cc,
+        rows=192,
+        cols=320,
+        backend="cuda",
+        tile="64x64x32_W16x32_S2",
+    )
+    with plan.override([row]):
+        selected = select("syrk", x, output)
+        assert selected is select("syrk", x, output)
+        assert selected.func is backend.cuda.syrk_out
+        with op_backend(syrk="torch"):
+            assert select("syrk", x, output).func is backend._torch_syrk
+        saved = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        try:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+            assert select("syrk", x, output).func is backend._torch_syrk
+        finally:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = saved
+        set_op("syrk", "torch")
+        try:
+            assert select("syrk", x, output).func is backend._torch_syrk
+        finally:
+            set_op("syrk")
+        assert select("syrk", x, output) is selected
+    assert select("syrk", x, output).func is backend._torch_syrk
+
+
+def test_cached_builtin_selection_bypasses_dynamic_external_implementations():
+    x, output = torch.randn(7, 13), torch.empty(7, 7)
+    select("syrk", x, output)
+    available = [False]
+
+    def dynamic(*args, **kwargs):
+        pass
+
+    record = ImplRecord(
+        "syrk",
+        "dynamic_test",
+        dynamic,
+        Spec.always(),
+        priority=-1,
+        available=lambda: available[0],
+    )
+    register_impl(record)
+    try:
+        assert select("syrk", x, output).func is backend._torch_syrk
+        available[0] = True
+        assert select("syrk", x, output).func is dynamic
+        available[0] = False
+        assert select("syrk", x, output).func is backend._torch_syrk
+    finally:
+        unregister_impl("syrk", "dynamic_test")
+    assert select("syrk", x, output).func is backend._torch_syrk

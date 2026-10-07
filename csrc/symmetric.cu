@@ -138,6 +138,10 @@ __global__ void syrk64_kernel(const __nv_bfloat16* input,
 
 namespace {
 
+bool dense_matrix(const torch::Tensor& x) {
+    return x.is_contiguous() || (x.stride(0) == 1 && x.stride(1) == x.size(0));
+}
+
 void check_buffers(const torch::Tensor& x, const torch::Tensor& output) {
     TORCH_CHECK(x.is_cuda() && output.is_cuda(), "x and output must be CUDA tensors");
     TORCH_CHECK(x.device() == output.device(), "x and output must share a device");
@@ -150,7 +154,7 @@ void check_buffers(const torch::Tensor& x, const torch::Tensor& output) {
                 "matrix dimensions must be positive multiples of 64");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
                 "input must be 16-byte aligned");
-    TORCH_CHECK(x.is_contiguous() && output.is_contiguous(), "x and output must be contiguous");
+    TORCH_CHECK(dense_matrix(x) && dense_matrix(output), "x and output must be dense row/column-major");
     TORCH_CHECK(output.size(0) == rows && output.size(1) == rows,
                 "output must have shape [x.size(0), x.size(0)]");
     TORCH_CHECK(!x.is_alias_of(output), "input and output must not alias");
@@ -167,33 +171,38 @@ void check_addend(const torch::Tensor& output, const c10::optional<torch::Tensor
     if (!addend.has_value() || beta == 0.0f) return;
     TORCH_CHECK(addend->device() == output.device() &&
                 addend->scalar_type() == output.scalar_type() &&
-                addend->sizes() == output.sizes() && addend->is_contiguous(),
+                addend->sizes() == output.sizes() && dense_matrix(*addend),
                 "addend must match output device, dtype, shape and layout");
     TORCH_CHECK(!output.is_alias_of(*addend), "output must not alias addend");
 }
 
 // Reuse GEMM recipes rather than inventing a separate tile vocabulary.
 using namespace astrai::gemm;
-using Tiles = std::tuple<Tile_64x64x32_W16x32_S2, Tile_64x64x32_W16x32_S3,
-                         Tile_64x64x64_W16x32_S2, Tile_64x64x64_W16x32_S3,
-                         Tile_128x64x32_W32x32_S2, Tile_64x128x32_W32x32_S2,
-                         Tile_128x128x32_W32x32_S2, Tile_128x128x64_W64x32_S2>;
-const char* tile_names[] = {"64x64x32_W16x32_S2", "64x64x32_W16x32_S3",
-                           "64x64x64_W16x32_S2", "64x64x64_W16x32_S3",
-                           "128x64x32_W32x32_S2", "64x128x32_W32x32_S2",
-                           "128x128x32_W32x32_S2", "128x128x64_W64x32_S2"};
+using Tiles = TileManifest;
 
-template <typename Tile, bool SymmetricRankK>
+template <typename Tile>
+std::string tile_name() {
+    return std::to_string(Tile::CtaShape::kM) + "x" +
+           std::to_string(Tile::CtaShape::kN) + "x" +
+           std::to_string(Tile::CtaShape::kK) + "_W" +
+           std::to_string(Tile::WarpShape::kM) + "x" +
+           std::to_string(Tile::WarpShape::kN) + "_S" +
+           std::to_string(Tile::kStages);
+}
+
+template <typename Tile, bool RankK, bool ColumnInput = false, bool ColumnOutput = false>
 using Policy = GemmPolicy<__nv_bfloat16, __nv_bfloat16,
-                         std::conditional_t<SymmetricRankK, RowMajor, ColMajor>, ColMajor,
-                         Tile, std::conditional_t<SymmetricRankK, RowMajor, ColMajor>>;
+    std::conditional_t<RankK != ColumnInput, RowMajor, ColMajor>,
+    std::conditional_t<RankK && ColumnInput, RowMajor, ColMajor>, Tile,
+    std::conditional_t<RankK || ColumnOutput, RowMajor, ColMajor>>;
 
 // Rank-K CTAs own a triangular tile; SYMM uses the existing raster scheduler.
-template <typename Tile, bool RankK>
-__global__ void __launch_bounds__(Policy<Tile, RankK>::kCtaThreads,
-                                 Policy<Tile, RankK>::kMinCtas)
-symmetric_kernel(GemmParams p, const __nv_bfloat16* addend, float alpha, float beta) {
-    using P = Policy<Tile, RankK>;
+template <typename Tile, bool RankK, bool ColumnInput, bool ColumnOutput>
+__global__ void __launch_bounds__(Policy<Tile, RankK, ColumnInput, ColumnOutput>::kCtaThreads,
+                                 Policy<Tile, RankK, ColumnInput, ColumnOutput>::kMinCtas)
+symmetric_kernel(GemmParams p, const __nv_bfloat16* addend, int64_t stride0,
+                 int64_t stride1, float alpha, float beta) {
+    using P = Policy<Tile, RankK, ColumnInput, ColumnOutput>;
     using Loop = GemmCollectiveMainloop<P>;
     using Traits = typename P::Traits;
     extern __shared__ __align__(16) char smem[];
@@ -229,8 +238,8 @@ symmetric_kernel(GemmParams p, const __nv_bfloat16* addend, float alpha, float b
                 const int r = row + (element / 2) * 8, c = col + element % 2;
                 cell[element] *= alpha;
                 if (addend && r < p.m && c < p.n) {
-                    const int64_t offset = RankK ? static_cast<int64_t>(r) * p.out_ld + c
-                                                 : static_cast<int64_t>(c) * p.out_ld + r;
+                    const int64_t offset = RankK ? static_cast<int64_t>(r) * stride0 + c * stride1
+                                                 : static_cast<int64_t>(c) * stride0 + r * stride1;
                     cell[element] = fmaf(beta, __bfloat162float(addend[offset]), cell[element]);
                 }
             }
@@ -255,21 +264,30 @@ symmetric_kernel(GemmParams p, const __nv_bfloat16* addend, float alpha, float b
             }
             const auto value = *epilogue.out_elem(r, c);
             output[static_cast<int64_t>(gr) * p.out_ld + gc] = value;
-            if (block.x != block.y)
-                output[static_cast<int64_t>(gc) * p.out_ld + gr] = value;
+        }
+        if (block.x != block.y) {
+            // Traverse the upper tile by output row; transpose the shared read
+            // rather than issuing a strided global store in every warp lane.
+            for (int index = threadIdx.x; index < dim * dim; index += blockDim.x) {
+                const int r = index / dim, c = index % dim;
+                const int gr = block.y * dim + r, gc = block.x * dim + c;
+                if (gr < p.m && gc < p.n)
+                    output[static_cast<int64_t>(gr) * p.out_ld + gc] =
+                        *epilogue.out_elem(c, r);
+            }
         }
     }
 }
 
-template <typename Tile, bool RankK>
-void launch_tile(GemmParams p, const __nv_bfloat16* addend, float alpha, float beta,
-                 cudaStream_t stream) {
-    using P = Policy<Tile, RankK>;
+template <typename Tile, bool RankK, bool ColumnInput, bool ColumnOutput>
+void launch_tile(GemmParams p, const __nv_bfloat16* addend, int64_t stride0,
+                 int64_t stride1, float alpha, float beta, cudaStream_t stream) {
+    using P = Policy<Tile, RankK, ColumnInput, ColumnOutput>;
     using T = typename P::Traits;
     TORCH_CHECK(P::kSmemBytes <= at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin,
                 "tile exceeds device shared memory limit");
     if constexpr (P::kSmemBytes > 48 * 1024) {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(symmetric_kernel<Tile, RankK>,
+        C10_CUDA_CHECK(cudaFuncSetAttribute(symmetric_kernel<Tile, RankK, ColumnInput, ColumnOutput>,
                       cudaFuncAttributeMaxDynamicSharedMemorySize, P::kSmemBytes));
     }
     dim3 grid;
@@ -280,24 +298,47 @@ void launch_tile(GemmParams p, const __nv_bfloat16* addend, float alpha, float b
         grid = dim3((p.n + T::kBlockN - 1) / T::kBlockN,
                     (p.m + T::kBlockM - 1) / T::kBlockM);
     }
-    symmetric_kernel<Tile, RankK><<<grid, P::kCtaThreads, P::kSmemBytes, stream>>>(
-        p, addend, alpha, beta);
+    symmetric_kernel<Tile, RankK, ColumnInput, ColumnOutput><<<grid, P::kCtaThreads, P::kSmemBytes, stream>>>(
+        p, addend, stride0, stride1, alpha, beta);
 }
 
-template <bool RankK, size_t I = 0>
+template <bool RankK, bool ColumnInput, bool ColumnOutput, size_t I = 0>
 bool dispatch_tile(const std::string& name, GemmParams p, const __nv_bfloat16* addend,
-                   float alpha, float beta, cudaStream_t stream) {
+                   int64_t stride0, int64_t stride1, float alpha, float beta, cudaStream_t stream) {
     if constexpr (I < std::tuple_size_v<Tiles>) {
         using Tile = std::tuple_element_t<I, Tiles>;
-        if constexpr (!RankK || Tile::CtaShape::kM == Tile::CtaShape::kN) {
-            if (name == tile_names[I]) {
-                launch_tile<Tile, RankK>(p, addend, alpha, beta, stream);
+        if constexpr ((!RankK || Tile::CtaShape::kM == Tile::CtaShape::kN) &&
+                      (!RankK || !ColumnInput || Tile::CtaShape::kK >= 64)) {
+            if (name == tile_name<Tile>()) {
+                launch_tile<Tile, RankK, ColumnInput, ColumnOutput>(p, addend, stride0, stride1, alpha, beta, stream);
                 return true;
             }
         }
-        return dispatch_tile<RankK, I + 1>(name, p, addend, alpha, beta, stream);
+        return dispatch_tile<RankK, ColumnInput, ColumnOutput, I + 1>(name, p, addend, stride0, stride1, alpha, beta, stream);
     }
     return false;
+}
+
+template <bool RankK>
+bool dispatch_layout(const std::string& tile, GemmParams p,
+                     const c10::optional<torch::Tensor>& addend, float alpha, float beta,
+                     bool column_input, bool column_output, cudaStream_t stream) {
+    const auto* data = beta != 0.0f && addend.has_value()
+        ? reinterpret_cast<const __nv_bfloat16*>(addend->data_ptr<at::BFloat16>()) : nullptr;
+    const int64_t stride0 = data ? addend->stride(0) : 0;
+    const int64_t stride1 = data ? addend->stride(1) : 0;
+    if (column_input) {
+        if constexpr (!RankK) {
+            if (column_output)
+                return dispatch_tile<RankK, true, true>(tile, p, data, stride0, stride1, alpha, beta, stream);
+        }
+        return dispatch_tile<RankK, true, false>(tile, p, data, stride0, stride1, alpha, beta, stream);
+    }
+    if constexpr (!RankK) {
+        if (column_output)
+            return dispatch_tile<RankK, false, true>(tile, p, data, stride0, stride1, alpha, beta, stream);
+    }
+    return dispatch_tile<RankK, false, false>(tile, p, data, stride0, stride1, alpha, beta, stream);
 }
 
 const __nv_bfloat16* addend_data(const c10::optional<torch::Tensor>& addend, float beta) {
@@ -317,6 +358,7 @@ void syrk_out(torch::Tensor x, torch::Tensor output,
     const auto* input = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
     auto* result = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
     if (tile == "wmma64") {
+        TORCH_CHECK(x.is_contiguous(), "wmma64 requires row-major input");
         const int tiles = x.size(0) / 64;
         const dim3 grid(tiles * (tiles + 1) / 2);
         if (c_data)
@@ -329,8 +371,9 @@ void syrk_out(torch::Tensor x, torch::Tensor output,
         GemmParams p{};
         p.a_ptr = input; p.b_ptr = input; p.out_ptr = result;
         p.m = x.size(0); p.n = x.size(0); p.k = x.size(1);
-        p.a_ld = x.size(1); p.b_ld = x.size(1); p.out_ld = x.size(0);
-        TORCH_CHECK(dispatch_tile<true>(tile, p, c_data, alpha, beta, stream),
+        p.a_ld = x.is_contiguous() ? x.size(1) : x.size(0);
+        p.b_ld = p.a_ld; p.out_ld = x.size(0);
+        TORCH_CHECK(dispatch_layout<true>(tile, p, addend, alpha, beta, !x.is_contiguous(), false, stream),
                     "unknown SYRK tile: ", tile);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -352,8 +395,8 @@ void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
                 reinterpret_cast<uintptr_t>(symmetric.data_ptr()) % 16 == 0,
                 "inputs must be 16-byte aligned");
-    TORCH_CHECK(symmetric.is_contiguous() && x.is_contiguous() && output.is_contiguous(),
-                "all tensors must be contiguous");
+    TORCH_CHECK(dense_matrix(symmetric) && dense_matrix(x) && dense_matrix(output),
+                "all tensors must be dense row/column-major");
     TORCH_CHECK(!output.is_alias_of(x) && !output.is_alias_of(symmetric),
                 "output must not alias inputs");
     TORCH_CHECK(rows * cols <= std::numeric_limits<int>::max() &&
@@ -366,9 +409,10 @@ void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
     // (S X)^T = X^T S: no materialized transpose, epilogue restores orientation.
     p.a_ptr = x.data_ptr(); p.b_ptr = symmetric.data_ptr(); p.out_ptr = output.data_ptr();
     p.m = cols; p.n = rows; p.k = rows;
-    p.a_ld = cols; p.b_ld = rows; p.out_ld = cols; p.raster = raster;
-    TORCH_CHECK(dispatch_tile<false>(tile, p, addend_data(addend, beta), alpha, beta,
-                at::cuda::getCurrentCUDAStream().stream()), "unknown SYMM tile: ", tile);
+    p.a_ld = x.is_contiguous() ? cols : rows;
+    p.b_ld = rows; p.out_ld = output.is_contiguous() ? cols : rows; p.raster = raster;
+    TORCH_CHECK(dispatch_layout<false>(tile, p, addend, alpha, beta,
+                !x.is_contiguous(), !output.is_contiguous(), at::cuda::getCurrentCUDAStream().stream()), "unknown SYMM tile: ", tile);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -379,7 +423,9 @@ void append_tiles(py::list& rows, bool rank_k) {
         using P = Policy<Tile, false>;
         if (!rank_k || Tile::CtaShape::kM == Tile::CtaShape::kN) {
             py::dict row;
-            row["name"] = tile_names[I];
+            row["name"] = tile_name<Tile>();
+            row["input_layouts"] = rank_k && Tile::CtaShape::kK < 64
+                ? py::make_tuple("row") : py::make_tuple("row", "column");
             row["block_m"] = Tile::CtaShape::kM; row["block_n"] = Tile::CtaShape::kN;
             row["block_k"] = Tile::CtaShape::kK;
             row["warp_m"] = Tile::WarpShape::kM; row["warp_n"] = Tile::WarpShape::kN;
@@ -396,6 +442,7 @@ py::list tiles(std::string operation) {
     py::list rows;
     if (operation == "syrk") {
         py::dict row;
+        row["input_layouts"] = py::make_tuple("row");
         row["name"] = "wmma64"; row["block_m"] = 64; row["block_n"] = 64;
         row["block_k"] = 64; row["warp_m"] = 32; row["warp_n"] = 32;
         row["stages"] = 1; row["threads"] = 128; row["shared_memory"] = 44032;

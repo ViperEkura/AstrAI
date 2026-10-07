@@ -10,7 +10,7 @@ X = a * X + B @ X
 ```
 
 The reusable `backend.newton_schulz.newton_schulz` function owns this recurrence,
-its scratch buffers and Torch layout conversion. It accepts coefficients,
+its scratch buffers and layout selection. It accepts coefficients,
 iteration count and epsilon from the caller. Muon owns momentum, Nesterov,
 weight decay, learning-rate adjustment and parameter routing, then calls NS.
 The NS backend resolves the three [symmetric operations](symmetric.md) once
@@ -32,9 +32,12 @@ retain the existing gather/orthogonalize/scatter path.
 
 BF16 inputs are normalized in place, matching Torch Muon semantics. Later
 iterations use separate buffers, preserving the normalized caller input and
-persistent momentum state. Packing and final layout conversion use Torch's
-standard `contiguous()` operation. The CUDA module exposes only SYRK, SYMM
-and candidate enumeration.
+persistent momentum state. Dense transposed inputs are passed to BLAS
+operations as column-major views. When a measured Gram plan prefers row-major
+scratch, the first update writes that layout directly; the final update writes
+the caller's orientation directly. No standalone transpose kernel or packing
+copy is needed. Other inputs retain the Torch path. The CUDA module exposes
+only SYRK, SYMM and candidate enumeration.
 
 ## Verification and measurement
 

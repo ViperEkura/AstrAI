@@ -36,14 +36,29 @@ def sweep(
     alpha: float,
     beta: float,
     min_speedup: float,
+    input_layout: str,
+    output_layout: str,
 ) -> Dict[str, Any]:
     torch.manual_seed(31)
-    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(
+        shape if input_layout == "row" else shape[::-1],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if input_layout == "column":
+        x = x.T
     x.div_(x.norm())
     symmetric = torch.randn((shape[0], shape[0]), device=x.device, dtype=x.dtype)
     symmetric = (symmetric + symmetric.T) / 2
     symmetric.div_(symmetric.norm())
-    output = torch.empty_like(symmetric if operation == "syrk" else x)
+    output_shape = (shape[0], shape[0]) if operation == "syrk" else shape
+    output = torch.empty(
+        output_shape if output_layout == "row" else output_shape[::-1],
+        device=x.device,
+        dtype=x.dtype,
+    )
+    if output_layout == "column":
+        output = output.T
     addend = torch.randn_like(output)
     if operation == "syrk":
         addend = (addend + addend.T) / 2
@@ -59,6 +74,10 @@ def sweep(
     for tile in tiles(operation):
         for raster in [1] if operation == "syrk" else rasters:
             record = dict(tile=tile["name"], raster=raster, geometry=tile)
+            if input_layout not in tile["input_layouts"]:
+                record["skip"] = "unsupported input layout"
+                candidates.append(record)
+                continue
             if tile["shared_memory"] > properties.shared_memory_per_block_optin:
                 record["skip"] = "shared memory exceeds device limit"
                 candidates.append(record)
@@ -115,6 +134,8 @@ def sweep(
         rows=shape[0],
         cols=shape[1],
         addend=beta != 0,
+        input_layout=input_layout,
+        output_layout=output_layout,
         backend="torch",
     )
     if best["speedup"] >= min_speedup:
@@ -136,6 +157,8 @@ def main() -> None:
     parser.add_argument("--rasters", default="0,1,2,-1,-2")
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.0)
+    parser.add_argument("--input-layout", choices=("row", "column"), default="row")
+    parser.add_argument("--output-layout", choices=("row", "column"), default="row")
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--min-speedup", type=float, default=1.02)
     parser.add_argument("--output", type=Path)
@@ -169,6 +192,8 @@ def main() -> None:
             args.alpha,
             args.beta,
             args.min_speedup,
+            args.input_layout,
+            args.output_layout,
         )
         rows.append(row)
         print(json.dumps(dict(shape=row["shape"], plan=row["plan"])), flush=True)

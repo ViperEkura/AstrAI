@@ -7,7 +7,7 @@ These out operations do not provide autograd and require separate output storage
 
 import math
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -18,6 +18,7 @@ from astrai.extension.runtime.dispatch import (
     ImplRecord,
     Spec,
     axis,
+    cache_token,
     register_family,
     resolve,
 )
@@ -71,8 +72,19 @@ def _axes(
     x = matrices[-2]
     operands = matrices + ((addend,) if beta != 0 and addend is not None else ())
     return {
-        "cuda": all(plan.supports(matrix) for matrix in operands),
-        "measured": plan.probe(operation, x, addend=beta != 0).backend == "cuda",
+        "cuda": all(plan.supports(matrix) for matrix in operands)
+        and (
+            tile is None
+            or any(
+                candidate["name"] == tile
+                and plan.layout(x) in candidate["input_layouts"]
+                for candidate in cuda.tiles(operation)
+            )
+        ),
+        "measured": plan.probe(
+            operation, x, output=matrices[-1], addend=beta != 0
+        ).backend
+        == "cuda",
     }
 
 
@@ -109,16 +121,65 @@ for _operation in ("syrk", "symm"):
     )
 
 
+_selection_cache: Dict[Tuple[Any, ...], Callable[..., None]] = {}
+
+
+def _selection_key(operation: str, matrices, kwargs) -> Optional[Tuple[Any, ...]]:
+    token = cache_token(operation)
+    if token is None:
+        return None
+    addend = kwargs.get("addend")
+    beta = kwargs.get("beta", 0) != 0
+    operands = matrices + ((addend,) if beta and addend is not None else ())
+    metadata = tuple(
+        (
+            tuple(x.shape),
+            x.stride(),
+            x.dtype,
+            x.device,
+            x.requires_grad,
+            x.data_ptr() % 16,
+        )
+        for x in operands
+    )
+    return (
+        token,
+        plan.revision(),
+        operation,
+        metadata,
+        beta,
+        kwargs.get("tile"),
+        kwargs.get("raster"),
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        torch.are_deterministic_algorithms_enabled(),
+    )
+
+
 def select(
     operation: str, *matrices: Tensor, backend: Optional[str] = None, **kwargs: Any
 ) -> Callable[..., None]:
     """Resolve once; callers can reuse the selected function inside a recurrence."""
+    if operation not in ("syrk", "symm"):
+        raise ValueError("operation must be syrk or symm")
+    if backend == "torch":
+        return _torch_syrk if operation == "syrk" else _torch_symm
+    key = _selection_key(operation, matrices, kwargs) if backend is None else None
+    cached = _selection_cache.get(key) if key is not None else None
+    if cached is not None:
+        return cached
     selected = resolve(operation, *matrices, explicit=backend, **kwargs).record.obj
-    decision = plan.probe(operation, matrices[-2], addend=kwargs.get("beta", 0) != 0)
+    decision = plan.probe(
+        operation, matrices[-2], output=matrices[-1], addend=kwargs.get("beta", 0) != 0
+    )
     options = {"tile": kwargs.get("tile") or decision.tile}
     if operation == "symm":
         options["raster"] = kwargs.get("raster", decision.raster)
-    return partial(selected, **options)
+    function = partial(selected, **options)
+    if key is not None:
+        if len(_selection_cache) >= 128:
+            _selection_cache.clear()
+        _selection_cache[key] = function
+    return function
 
 
 def _validate(

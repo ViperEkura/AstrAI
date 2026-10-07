@@ -9,6 +9,7 @@ from astrai.extension.kernel.symmetric import (
     symm_out,
     syrk_out,
 )
+from astrai.extension.policy import symmetric as plan
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_available(),
@@ -108,3 +109,28 @@ def test_zero_gradient_is_finite():
     gradient = torch.zeros((6912, 1536), device="cuda", dtype=torch.bfloat16)
     actual = newton_schulz(gradient, COEFFICIENTS, 5, 1e-7, backend="auto")
     assert torch.count_nonzero(actual).item() == 0
+
+
+@pytest.mark.parametrize("steps", [0, 1, 2, 4, 5])
+def test_layout_transition_preserves_normalized_input_for_each_step_count(steps):
+    torch.manual_seed(41)
+    gradient = torch.randn(320, 192, device="cuda", dtype=torch.bfloat16)
+    reference_input = gradient.clone()
+    expected = newton_schulz(reference_input, COEFFICIENTS, steps)
+    normalized = gradient.clone()
+    normalized.div_(gradient.T.norm().clamp_min(1e-7))
+    cc = sum(a * b for a, b in zip(torch.cuda.get_device_capability(), (10, 1)))
+    row = dict(
+        operation="syrk",
+        cc=cc,
+        rows=192,
+        cols=320,
+        backend="cuda",
+        tile="64x64x32_W16x32_S2",
+    )
+    with plan.override([row]):
+        actual = newton_schulz(gradient, COEFFICIENTS, steps, backend="auto")
+    assert actual.is_contiguous()
+    assert torch.equal(gradient, normalized)
+    relative = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative.item() <= 0.01

@@ -33,33 +33,60 @@ def newton_schulz(
     tall = x.size(0) > x.size(1)
     if tall:
         x = x.T
-    rank_k = probe("syrk", x, packed=True) if backend == "auto" else None
-    pack = rank_k is not None and rank_k.backend == "cuda"
     x.div_(x.norm().clamp(min=eps))
-    if pack:
-        x = x.contiguous()
     if steps == 0:
         return x.T if tall else x
     gram = torch.empty((x.size(0), x.size(0)), dtype=x.dtype, device=x.device)
     polynomial = torch.empty_like(gram)
-    next_x = torch.empty_like(x)
     explicit = "torch" if backend == "torch" else None
-    gram_op = select("syrk", x, gram, backend=explicit)
+    # The first/last BLAS calls change layout directly when the measured Gram
+    # plan prefers row-major scratch; external tensors keep their orientation.
+    row_work = (
+        backend == "auto"
+        and not x.is_contiguous()
+        and steps > 1
+        and probe("syrk", x, input_layout="row").backend == "cuda"
+    )
+    work = (
+        torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        if row_work
+        else torch.empty_like(x)
+    )
+    spare = torch.empty_like(work) if steps > 1 else work
+    final = torch.empty_like(x) if row_work else None
+    first_gram = select("syrk", x, gram, backend=explicit)
+    gram_op = select("syrk", work, gram, backend=explicit) if row_work else first_gram
     polynomial_op = select(
         "syrk", gram, polynomial, backend=explicit, addend=gram, alpha=c, beta=b
     )
-    update_op = select(
-        "symm", polynomial, x, next_x, backend=explicit, addend=x, beta=a
+    first_update = select(
+        "symm", polynomial, x, work, backend=explicit, addend=x, beta=a
     )
-    input_alias = torch._C._is_alias_of(x, matrix)
+    update_op = (
+        select("symm", polynomial, work, spare, backend=explicit, addend=work, beta=a)
+        if row_work
+        else first_update
+    )
+    final_update = (
+        select("symm", polynomial, work, final, backend=explicit, addend=work, beta=a)
+        if final is not None
+        else update_op
+    )
     for iteration in range(steps):
-        gram_op(x, gram)
+        (first_gram if iteration == 0 else gram_op)(x, gram)
         polynomial_op(gram, polynomial, addend=gram, alpha=c, beta=b)
-        update_op(polynomial, x, next_x, addend=x, beta=a)
-        if iteration == 0 and input_alias and steps > 1:
-            x = next_x
-            next_x = torch.empty_like(x)
-        else:
-            x, next_x = next_x, x
-    result = x.T if tall else x
-    return result.contiguous() if pack else result
+        output = (
+            final
+            if final is not None and iteration == steps - 1
+            else (work if iteration % 2 == 0 else spare)
+        )
+        operation = (
+            first_update
+            if iteration == 0
+            else final_update
+            if output is final
+            else update_op
+        )
+        operation(polynomial, x, output, addend=x, beta=a)
+        x = output
+    return x.T if tall else x

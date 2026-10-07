@@ -27,7 +27,14 @@ def syrk_out(
     tile: Optional[str] = None,
 ) -> None:
     """Write alpha * X X.T + beta * C; C must be fully symmetric."""
-    get_module("symmetric").syrk_out(x, output, addend, alpha, beta, tile or "wmma64")
+    get_module("symmetric").syrk_out(
+        x,
+        output,
+        addend,
+        alpha,
+        beta,
+        tile or ("wmma64" if x.is_contiguous() else "64x64x64_W16x32_S2"),
+    )
 
 
 def symm_out(

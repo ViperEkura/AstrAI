@@ -84,8 +84,8 @@ class TrainConfig(BaseConfig):
         rollout_val_group_size (Optional[int]): Validation responses per prompt override. None inherits the strategy's ``group_size``. Defaults to None.
         rollout_pool_seq_len (Optional[int]): Sequence budget per rollout request when sizing the rollout scheduler's KV pool. None uses the model's ``max_position_embeddings``. Must cover the longest prompt plus ``rollout_max_tokens`` or ``run_batch`` rejects the request. Right-sizing pays off: the pool holds ``2 × layers × (batch_capacity × seq) × kv_heads × head_dim`` bytes — for the 1B policy (24 layers, 4 KV heads, head_dim 64, bf16) the default 32768 context allocates ~3.2 GB against ~400 MB at 4096. Defaults to None.
         rollout_device (Optional[str]): Device for the training rollout backend, e.g. ``"cuda:1"``. None keeps the in-process colocated backend (generation shares the training model object; weight updates are free). Setting it builds a frozen replica whose weights are copied to inside the policy-version lock every optimizer step — the copy is a full state transfer (e.g. ~2GB/step for 1B bf16), so pay it only when backend isolation is worth it. Defaults to None.
-        rollout_mode (str): "sync" retains the existing backend; "async_round" overlaps one learner with four isolated rollout processes. Scripts using async_round must guard Trainer.train() with ``if __name__ == "__main__":``. Defaults to "sync".
-        rollout_devices (List[str]): Four distinct CUDA devices for async_round, separate from the learner device. Defaults to [].
+        rollout_mode (str): "sync" retains the existing backend; "async_round" overlaps one learner with isolated rollout processes. Scripts using async_round must guard Trainer.train() with ``if __name__ == "__main__":``. Defaults to "sync".
+        rollout_devices (List[str]): One or more distinct CUDA devices for async_round, separate from the learner device. Defaults to [].
         rollout_worker_timeout_s (float): Maximum seconds to wait for one async rollout round or weight transfer. Defaults to 600.
         async_train_microbatch_prompts (int): Prompts per learner backward pass in async_round; all microbatches accumulate into one optimizer step. Defaults to 1.
         rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
@@ -390,8 +390,8 @@ class TrainConfig(BaseConfig):
                     "async_round uses rollout_devices, not rollout_device "
                     "or rollout_val_device"
                 )
-            if len(self.rollout_devices) != 4:
-                raise ValueError("async_round requires four distinct rollout_devices")
+            if not self.rollout_devices:
+                raise ValueError("async_round requires at least one rollout device")
             if any(
                 not device.startswith("cuda:") or not device[5:].isdigit()
                 for device in self.rollout_devices
@@ -399,8 +399,10 @@ class TrainConfig(BaseConfig):
                 raise ValueError(
                     "async_round rollout_devices must be indexed CUDA devices"
                 )
-            if len({int(device[5:]) for device in self.rollout_devices}) != 4:
-                raise ValueError("async_round requires four distinct rollout_devices")
+            if len({int(device[5:]) for device in self.rollout_devices}) != len(
+                self.rollout_devices
+            ):
+                raise ValueError("async_round requires distinct rollout_devices")
             if self.rollout_interval != 1 or self.rl_update_epochs != 1:
                 raise ValueError(
                     "async_round requires rollout_interval=1 and rl_update_epochs=1"

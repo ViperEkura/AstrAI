@@ -220,8 +220,9 @@ rollout_devices=worker_devices, rollout_interval=1,
 rollout_max_policy_lag=1)`, where `worker_devices` contains distinct CUDA
 devices separate from the learner device. The learner holds the trainable
 policy, optimizer and frozen KL reference; each listed device hosts one frozen
-generation process. Each worker receives one prompt per round by default.
-The learner accumulates prompt microbatches
+generation process. A round distributes its prompts across the listed workers;
+each worker handles up to `ceil(batch_per_device / len(rollout_devices))`
+prompts. The learner accumulates prompt microbatches
 (`async_train_microbatch_prompts=1`) and steps the optimizer once per round.
 The next round generates while the current round trains, with at most one
 optimizer-version lag; a stale or failed round is never partially trained.

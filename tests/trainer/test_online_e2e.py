@@ -211,6 +211,36 @@ def test_online_config_rejects_contradictory_policy_lag():
     assert config.rollout_max_policy_lag == 0
 
 
+@pytest.mark.parametrize("worker_count", [1, 2, 3, 4])
+def test_async_round_accepts_distinct_worker_counts(worker_count):
+    devices = [f"cuda:{index}" for index in range(1, worker_count + 1)]
+    config = _minimal_online_config(
+        rollout_mode="async_round",
+        rollout_devices=devices,
+        rollout_interval=1,
+        rollout_max_policy_lag=1,
+    )
+    assert config.rollout_devices == devices
+
+
+@pytest.mark.parametrize(
+    "devices, message",
+    [
+        ([], "at least one rollout device"),
+        (["cuda:1", "cuda:01"], "distinct rollout_devices"),
+        (["cpu"], "indexed CUDA devices"),
+    ],
+)
+def test_async_round_rejects_invalid_worker_devices(devices, message):
+    with pytest.raises(ValueError, match=message):
+        _minimal_online_config(
+            rollout_mode="async_round",
+            rollout_devices=devices,
+            rollout_interval=1,
+            rollout_max_policy_lag=1,
+        )
+
+
 def test_async_round_rejects_moe_before_starting_workers():
     config = _minimal_online_config(
         rollout_mode="async_round",

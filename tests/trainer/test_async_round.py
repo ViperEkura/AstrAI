@@ -27,21 +27,10 @@ from astrai.trainer.rollout.protocol import (
 from astrai.trainer.rollout.types import RawRollout, RolloutVersionError, SamplingParams
 
 
-def _fake_worker(
-    conn,
-    device,
-    model_fn,
-    param_path,
-    params,
-    max_batch_size,
-    max_seq_len,
-    policy_version,
-    model_dtype,
-    shm_name,
-    layout,
-    max_prompts_per_worker,
-):
-    shm = SharedMemory(name=shm_name)
+def _fake_worker(conn, spec):
+    device = spec.device
+    policy_version = spec.policy_version
+    shm = SharedMemory(name=spec.shm_name)
     generated = 0
     try:
         send_message(
@@ -67,7 +56,7 @@ def _fake_worker(
                         MessageKind.WEIGHT_ACK,
                         request_id=message.request_id,
                         policy_version=policy_version,
-                        payload=WeightAck(0.0, 0),
+                        payload=WeightAck(0),
                     ),
                 )
                 continue
@@ -169,7 +158,7 @@ def test_four_processes_generate_ordered_round_and_receive_one_snapshot():
         assert coordinator.policy_version == 1
         assert _collect(coordinator, range(4, 8)).policy_version == 1
         assert coordinator._worker_versions == [1] * 4
-        assert not coordinator.publisher._pending
+        assert not coordinator.weights._pending
     finally:
         coordinator.close()
 
@@ -261,14 +250,14 @@ def test_shared_snapshot_cannot_be_reused_before_ack():
         thread = Thread(target=submit)
         thread.start()
         deadline = time.monotonic() + 2
-        while not coordinator.publisher._pending and time.monotonic() < deadline:
+        while not coordinator.weights._pending and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert coordinator.publisher._pending
+        assert coordinator.weights._pending
         with pytest.raises(RuntimeError, match="not been acknowledged"):
-            coordinator.publisher.snapshot(2)
+            coordinator.weights.snapshot(2)
         thread.join(timeout=3)
         assert not thread.is_alive() and not errors
-        assert coordinator.publisher.version == 1
+        assert coordinator.weights.version == 1
     finally:
         coordinator.close()
 
@@ -293,7 +282,7 @@ def test_snapshot_failure_marks_optimizer_commit():
         def fail_snapshot(_version):
             raise RuntimeError("staging failed")
 
-        coordinator.publisher.snapshot = fail_snapshot
+        coordinator.weights.snapshot = fail_snapshot
         before = source.weight.detach().clone()
         with pytest.raises(WeightSnapshotError, match="optimizer committed"):
             coordinator.apply_weight_update(

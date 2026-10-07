@@ -16,10 +16,10 @@ from astrai.trainer import train_context
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.rollout.async_round import (
     AsyncRoundCoordinator,
-    SharedWeightPublisher,
     WeightSnapshotError,
 )
 from astrai.trainer.rollout.setup import configure_rollout
+from astrai.trainer.rollout.weight_transport import SharedWeightBuffer
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
 from tests.helpers import CHAT_TEMPLATE
@@ -398,14 +398,14 @@ def test_async_round_snapshot_failure_checkpoint_resumes_once(
         reward_model_fn=LengthRewardModel,
         collate_fn=instruction_collate_fn,
     )
-    original_snapshot = SharedWeightPublisher.snapshot
+    original_snapshot = SharedWeightBuffer.snapshot
 
     def fail_after_commit(self, version):
         if version == 1:
             raise RuntimeError("injected staging failure")
         return original_snapshot(self, version)
 
-    monkeypatch.setattr(SharedWeightPublisher, "snapshot", fail_after_commit)
+    monkeypatch.setattr(SharedWeightBuffer, "snapshot", fail_after_commit)
     with pytest.raises(WeightSnapshotError, match="optimizer committed"):
         Trainer(config).train(param_path=test_dir)
     checkpoint_path = os.path.join(test_dir, "ckpt", "epoch_0_step_1")
@@ -414,7 +414,7 @@ def test_async_round_snapshot_failure_checkpoint_resumes_once(
     assert checkpoint.meta["optimizer_step"] == 1
     assert checkpoint.consumed_samples == 4
 
-    monkeypatch.setattr(SharedWeightPublisher, "snapshot", original_snapshot)
+    monkeypatch.setattr(SharedWeightBuffer, "snapshot", original_snapshot)
     Trainer(config).train(param_path=checkpoint_path, resume=True)
     resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_2"))
     assert resumed.meta["policy_version"] == 2

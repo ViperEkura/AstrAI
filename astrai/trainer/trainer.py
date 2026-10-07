@@ -14,7 +14,8 @@ from astrai.trainer.callbacks import (
     CallbackFactory,
     TrainCallback,
 )
-from astrai.trainer.rollout.async_round import WeightSnapshotError, _slice_batch
+from astrai.trainer.rollout.async_round import WeightSnapshotError
+from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.rollout.types import RolloutVersionError
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 
@@ -99,7 +100,7 @@ class Trainer:
             size = context.config.async_train_microbatch_prompts
             for begin in range(0, total, size):
                 indices = list(range(begin, min(begin + size, total)))
-                chunk = _slice_batch(prepared, indices, total)
+                chunk = slice_batch(prepared, indices, total)
                 chunk_masks = chunk["masks"]
                 if context.strategy.loss_aggregation == "sequence":
                     count = int(chunk_masks.any(dim=-1).sum().item())

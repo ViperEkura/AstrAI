@@ -38,6 +38,31 @@ class RolloutMessage:
     payload: Any = None
     protocol_version: int = PROTOCOL_VERSION
 
+    def expect(
+        self,
+        kind: MessageKind,
+        request_id: int,
+        *,
+        round_id: int | None = None,
+        policy_version: int | None = None,
+    ) -> None:
+        """Validate a reply against its one outstanding worker command."""
+        if self.kind != kind:
+            raise RolloutProtocolError(f"unexpected rollout message {self.kind}")
+        if self.request_id != request_id:
+            raise RolloutProtocolError("wrong request ID")
+        if round_id is not None and self.round_id != round_id:
+            raise RolloutProtocolError("stale round ID")
+        if policy_version is not None and self.policy_version != policy_version:
+            raise RolloutProtocolError("wrong policy version")
+        expected_payload = {
+            MessageKind.READY: WorkerReady,
+            MessageKind.WEIGHT_ACK: WeightAck,
+            MessageKind.RESULT: GenerationResult,
+        }[kind]
+        if not isinstance(self.payload, expected_payload):
+            raise RolloutProtocolError("invalid rollout payload")
+
 
 @dataclass(frozen=True, slots=True)
 class WorkerReady:
@@ -48,7 +73,6 @@ class WorkerReady:
 
 @dataclass(frozen=True, slots=True)
 class WeightAck:
-    transfer_seconds: float
     peak_gpu_memory: int
 
 

@@ -177,6 +177,32 @@ _DEFAULT_ROWS = [
         "tile": "128x128x32_W32x32_S2",
         "raster": -1,
     },
+    {
+        "operation": "syrk",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 6912,
+        "addend": False,
+        "batch_size": 1,
+        "input_layout": "column",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "64x64x64_W16x16_S2",
+        "raster": 1,
+    },
+    {
+        "operation": "syrk",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 6912,
+        "addend": False,
+        "batch_size": 4,
+        "input_layout": "column",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "128x128x64_W64x32_S2",
+        "raster": 1,
+    },
 ]
 
 

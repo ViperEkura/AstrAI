@@ -187,7 +187,9 @@ void check_addend(const torch::Tensor& output, const c10::optional<torch::Tensor
 
 // Reuse GEMM recipes rather than inventing a separate tile vocabulary.
 using namespace astrai::gemm;
-using Tiles = TileManifest;
+// Expose the existing GEMM small-tile widening with its actual warp name.
+using Tiles = tuple_cat_t<
+    TileManifest, std::tuple<small_16w_t<Tile_64x64x64_W16x32_S2>>>;
 
 template <typename Tile>
 std::string tile_name() {

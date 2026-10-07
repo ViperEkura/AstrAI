@@ -96,3 +96,41 @@ step for every implementation. Complete groups and the partial final group
 are timed separately and multiplied by their actual counts. The result remains
 a weighted estimate over shapes, excluding AdamW and model execution. `--dtype bf16|fp32` selects
 input/parameter dtype; NS computation remains BF16.
+
+## Further optimization
+
+The five-step BF16 recurrence uses the fixed coefficients
+`(3.4445, -4.775, 2.0315)`. Optimizations preserve normalization and the
+BF16 materialization of the Gram matrix `A`, polynomial `B` and updated
+`X` at each step. Changes to reduction order still require the one-percent
+relative L2 accuracy gate. Moving `a * I` into the BF16 polynomial or
+composing several updates changes these rounding boundaries.
+
+Gram recurrence evolves square matrices and materializes the rectangular
+iterate only at segment boundaries. Its exact-arithmetic equivalence does
+not preserve the finite-precision semantics above. A BF16 GPU prototype with a
+restart after the second iteration, compared with the existing BF16 Torch
+recurrence using the same five coefficient triples, produced relative L2 errors of **1.445%** for random
+`1536 x 6912` input and **17.103%** for quantized rank-1 `256 x 1536`
+input. Both exceed the accuracy gate, so this approach remains excluded.
+
+Column-major Gram plans are measured separately for each batch size. The
+single-matrix plan exposes the existing GEMM small-tile widening explicitly,
+while the batched plan uses a different recipe. No model-specific rule enters
+the NS recurrence.
+
+Raw epilogues, warp-level transposed stores, register prefetch and triangular
+L2 grouping were evaluated without a meaningful whole-step improvement.
+Producer/consumer pipelines remain a candidate for a separate generic GEMM
+recipe. Candidate changes require numerical checks, CUDA Graph replay checks
+and interleaved whole-recurrence or optimizer-step measurements before
+entering measured dispatch.
+
+| Primary source | License | Relevant finding |
+| --- | --- | --- |
+| [Quack](https://github.com/Dao-AILab/quack/blob/main/quack/gemm_sm120.py) | [Apache-2.0](https://github.com/Dao-AILab/quack/blob/main/LICENSE) | Producer/consumer pipelines and optional pingpong scheduling are candidates for generic GEMM recipes. |
+| [Dao Gram Newton-Schulz](https://github.com/Dao-AILab/gram-newton-schulz/blob/main/gram_newton_schulz/gram_newton_schulz.py) | [MIT declared in metadata](https://github.com/Dao-AILab/gram-newton-schulz/blob/main/pyproject.toml); standalone license file not verified | Its FP16 iterates and default varying coefficients do not establish compatibility with this BF16 recurrence. |
+| [Microsoft Dion](https://github.com/microsoft/dion/blob/main/dion/newton_schulz_triton.py) | [MIT](https://github.com/microsoft/dion/blob/main/LICENSE) | Same-shape batching and symmetric products are already implemented here. |
+| [Emerging Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers/blob/main/emerging_optimizers/orthogonalized_optimizers/muon.py) | [Apache-2.0](https://github.com/NVIDIA-NeMo/Emerging-Optimizers/blob/main/LICENSE) | Its SYRK capability whitelist and architecture-specific tuning require compatibility checks. |
+| [fused-muon](https://github.com/StarrickLiu/fused-muon/tree/main/csrc) | [Apache-2.0](https://github.com/StarrickLiu/fused-muon/blob/main/LICENSE) | Mirrored stores are already implemented; Split-K is a conditional candidate for underfilled grids. |
+| [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM/blob/main/csrc/jit_kernels/impls/smxx_cublaslt.hpp) | [MIT](https://github.com/deepseek-ai/DeepGEMM/blob/main/LICENSE) | Strided-batched cuBLASLt GEMM is a fallback reference; the reviewed batched helper does not provide the required alpha/beta epilogue. |

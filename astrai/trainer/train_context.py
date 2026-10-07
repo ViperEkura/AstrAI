@@ -73,6 +73,7 @@ class TrainContext:
     val_evaluator: Optional["RolloutEvaluator"] = field(default=None)
     async_rollout: Optional["AsyncRoundCoordinator"] = field(default=None)
     optimizer_steps_completed: Optional[int] = field(default=None)
+    checkpoint_safe: bool = field(default=True)
 
     world_size: int = field(default=1)
     rank: int = field(default=0)

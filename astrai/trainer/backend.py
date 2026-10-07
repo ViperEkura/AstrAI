@@ -155,10 +155,6 @@ class ReplicaBackend:
         with _device_context(self.device):
             return self.scheduler.run_batch(prompt_ids_list, **kwargs)
 
-    def freeze_cuda_graph_captures(self) -> None:
-        """Keep concurrent rollout threads from starting new captures."""
-        self.scheduler._executor._graph_ctx.freeze_captures()
-
     def update_weights(self, policy_version: int) -> int:
         return self.scheduler.update_weights(policy_version)
 

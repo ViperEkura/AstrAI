@@ -99,7 +99,7 @@ class CheckpointCallback(TrainCallback):
             self._save_checkpoint(context)
 
     def on_train_end(self, context: TrainContext):
-        if context.optimizer_step != self.last_ckpt_step:
+        if context.checkpoint_safe and context.optimizer_step != self.last_ckpt_step:
             self._save_checkpoint(context)
 
     def on_error(self, context: TrainContext):
@@ -107,7 +107,9 @@ class CheckpointCallback(TrainCallback):
         # behind: on a slow start the signal can be handled before the
         # first optimizer step, where optimizer_step == last_ckpt_step
         # and the change-based guard alone would skip the save entirely.
-        if not self._saved or context.optimizer_step != self.last_ckpt_step:
+        if context.checkpoint_safe and (
+            not self._saved or context.optimizer_step != self.last_ckpt_step
+        ):
             self._save_checkpoint(context)
 
     @staticmethod

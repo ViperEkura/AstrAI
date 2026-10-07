@@ -4,7 +4,7 @@ import os
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,8 +13,13 @@ from torch.utils.data import Dataset, Subset
 from astrai.config import TrainConfig
 from astrai.serialization import Checkpoint
 from astrai.trainer import train_context
-from astrai.trainer.backend import ReplicaBackend
 from astrai.trainer.rollout import BaseRewardModel
+from astrai.trainer.rollout.async_round import (
+    AsyncRoundCoordinator,
+    SharedWeightPublisher,
+    WeightSnapshotError,
+)
+from astrai.trainer.rollout.setup import configure_rollout
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
 from tests.helpers import CHAT_TEMPLATE
@@ -207,6 +212,41 @@ def test_online_config_rejects_contradictory_policy_lag():
     assert config.rollout_max_policy_lag == 0
 
 
+def test_async_round_rejects_moe_before_starting_workers():
+    config = _minimal_online_config(
+        rollout_mode="async_round",
+        rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
+        rollout_interval=1,
+        rollout_max_policy_lag=1,
+        device_type="cuda",
+        dp_mode="none",
+        grad_accum_steps=1,
+    )
+    model = torch.nn.Linear(2, 2)
+    inference_model = SimpleNamespace(
+        config=SimpleNamespace(ffn_type="moe", max_position_embeddings=8)
+    )
+    context = SimpleNamespace(
+        strategy=SimpleNamespace(supports_online=lambda: True),
+        executor=SimpleNamespace(model_for_inference=lambda _model: inference_model),
+        model=model,
+        checkpoint=None,
+        optimizer_step=0,
+    )
+    tokenizer_cls = SimpleNamespace(from_pretrained=lambda _path: object())
+    with pytest.raises(ValueError, match="dense models only"):
+        configure_rollout(
+            context,
+            config,
+            param_path="unused",
+            strategy_kwargs={"group_size": 2},
+            create_ref_model=lambda **_kwargs: None,
+            validate=lambda _executor: None,
+            scheduler_cls=object,
+            tokenizer_cls=tokenizer_cls,
+        )
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     torch.cuda.device_count() < _DDP_TEST_WORLD_SIZE,
@@ -263,30 +303,22 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
     tokenizer.set_chat_template(CHAT_TEMPLATE)
     tokenizer.save_pretrained(test_dir)
 
-    simultaneous = Barrier(4)
     seen = []
-    original_generate = ReplicaBackend.generate
-    original_init = ReplicaBackend.__init__
+    pools = []
+    original_init = AsyncRoundCoordinator.__init__
+    original_collect = AsyncRoundCoordinator.collect_round
 
     def tracked_init(self, *args, **kwargs):
-        assert kwargs["enable_cuda_graph"] is True
-        result = original_init(self, *args, **kwargs)
-        runner = self.scheduler._executor
-        if runner._graph_supported:
-            assert runner.cuda_graph_enabled
-            assert runner._graph_ctx.has_graph((2,))
+        original_init(self, *args, **kwargs)
+        pools.append(self)
+
+    def tracked_collect(self, handle):
+        result = original_collect(self, handle)
+        seen.append(result.policy_version)
         return result
 
-    def tracked_generate(self, prompt_ids_list, **kwargs):
-        assert self.scheduler._executor._graph_ctx._captures_frozen
-        if self.policy_version == 0:
-            simultaneous.wait(timeout=30)
-        result = original_generate(self, prompt_ids_list, **kwargs)
-        seen.append((str(self.device), self.policy_version))
-        return result
-
-    monkeypatch.setattr(ReplicaBackend, "generate", tracked_generate)
-    monkeypatch.setattr(ReplicaBackend, "__init__", tracked_init)
+    monkeypatch.setattr(AsyncRoundCoordinator, "__init__", tracked_init)
+    monkeypatch.setattr(AsyncRoundCoordinator, "collect_round", tracked_collect)
     config = TrainConfig(
         strategy="online_grpo",
         model_fn=partial(make_online_model, model_config),
@@ -313,8 +345,18 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
     checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_3"))
     assert checkpoint.meta["policy_version"] == 3
     assert checkpoint.consumed_samples == 10
-    assert {device for device, _ in seen} == {"cuda:1", "cuda:2", "cuda:3", "cuda:4"}
-    assert sorted(version for _, version in seen) == [0] * 8 + [1] * 2
+    assert seen == [0, 0, 1]
+    assert len({process.pid for process in pools[0]._processes}) == 4
+    assert set(pools[0].worker_cuda_graph_enabled) == {
+        "cuda:1",
+        "cuda:2",
+        "cuda:3",
+        "cuda:4",
+    }
+    assert all(
+        isinstance(enabled, bool)
+        for enabled in pools[0].worker_cuda_graph_enabled.values()
+    )
 
     resume_config = replace(config, n_epoch=2)
     Trainer(resume_config).train(
@@ -323,6 +365,61 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
     resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_6"))
     assert resumed.meta["policy_version"] == 6
     assert resumed.consumed_samples == 20
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(torch.cuda.device_count() < 5, reason="five CUDA devices required")
+def test_async_round_snapshot_failure_checkpoint_resumes_once(
+    base_test_env, monkeypatch
+):
+    test_dir = base_test_env["test_dir"]
+    tokenizer = base_test_env["tokenizer"]
+    model_config = base_test_env["transformer_config"]
+    tokenizer.set_chat_template(CHAT_TEMPLATE)
+    tokenizer.save_pretrained(test_dir)
+    config = TrainConfig(
+        strategy="online_grpo",
+        model_fn=partial(make_online_model, model_config),
+        dataset=Subset(InstructionDataset(repeats=2), range(8)),
+        optimizer_fn=make_online_optimizer,
+        scheduler_fn=make_online_lr_scheduler,
+        ckpt_dir=os.path.join(test_dir, "ckpt"),
+        n_epoch=1,
+        batch_per_device=4,
+        grad_accum_steps=1,
+        device_type="cuda",
+        dp_mode="none",
+        strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
+        rollout_mode="async_round",
+        rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
+        rollout_interval=1,
+        rollout_max_policy_lag=1,
+        rollout_max_tokens=4,
+        reward_model_fn=LengthRewardModel,
+        collate_fn=instruction_collate_fn,
+    )
+    original_snapshot = SharedWeightPublisher.snapshot
+
+    def fail_after_commit(self, version):
+        if version == 1:
+            raise RuntimeError("injected staging failure")
+        return original_snapshot(self, version)
+
+    monkeypatch.setattr(SharedWeightPublisher, "snapshot", fail_after_commit)
+    with pytest.raises(WeightSnapshotError, match="optimizer committed"):
+        Trainer(config).train(param_path=test_dir)
+    checkpoint_path = os.path.join(test_dir, "ckpt", "epoch_0_step_1")
+    checkpoint = Checkpoint.load(checkpoint_path)
+    assert checkpoint.meta["policy_version"] == 1
+    assert checkpoint.meta["optimizer_step"] == 1
+    assert checkpoint.consumed_samples == 4
+
+    monkeypatch.setattr(SharedWeightPublisher, "snapshot", original_snapshot)
+    Trainer(config).train(param_path=checkpoint_path, resume=True)
+    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_2"))
+    assert resumed.meta["policy_version"] == 2
+    assert resumed.meta["optimizer_step"] == 2
+    assert resumed.consumed_samples == 8
 
 
 def test_rollout_val_overrides_drop_unset_fields():

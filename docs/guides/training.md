@@ -219,23 +219,28 @@ For one-learner online GRPO, `TrainConfig(rollout_mode="async_round",
 rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
 rollout_interval=1, rollout_max_policy_lag=1, batch_per_device=4)`
 uses GPU0 for the trainable policy, optimizer and frozen KL reference, and
-GPU1–4 for four frozen generation replicas. Each replica receives one prompt
+GPU1–4 for four frozen generation processes. Each worker receives one prompt
 per four-prompt round by default. The learner accumulates prompt microbatches
 (`async_train_microbatch_prompts=1`) and steps the optimizer once per round.
 The next round generates while the current round trains, with at most one
 optimizer-version lag; a stale or failed round is never partially trained.
 
-On the 5090 host, peer access is unavailable. The async publisher stages one
-weight snapshot in pinned CPU memory after each learner update and fans it out
-to the four replicas at their next idle boundary. Token IDs, masks, aligned
+On the 5090 host, peer access is unavailable. After each learner update the
+coordinator copies the new weights once into shared host memory. Each worker
+registers that mapping as CUDA pinned memory and copies it to its GPU at the
+next idle boundary; the coordinator waits for all transfer ACKs before reusing
+the mapping. If CUDA host registration is unavailable, pinned local staging
+buffers provide the same synchronization boundary. Token IDs, masks, aligned
 behaviour log-probabilities and CPU rewards are assembled on the host before
 the learner moves them to GPU0; KV cache and full logits remain on the
 generation devices. The async mode is programmatic-only, supports
-`online_grpo` with one CUDA learner, and does not yet support validation.
-The 5090 async replicas use ordinary CUDA forward execution. CUDA Graph
-capture failed on larger decode batches, and an empty captured graph on one
-replica produced incorrect tokens and log-probabilities during replay. Keep
-Graph capture disabled for this path until a device-specific fix is verified.
+`online_grpo` with one CUDA learner and dense models, and does not yet support
+validation. Each worker owns its Scheduler and CUDA Graph state in its own
+process. The worker factory must be pickleable, and a Python script that calls
+`Trainer.train()` must use an `if __name__ == "__main__":` guard. Worker startup
+has a 300-second deadline; `rollout_worker_timeout_s` (default 600) bounds
+generation and weight transfer. A failed worker aborts the whole round and
+the coordinator terminates the remaining workers.
 The existing synchronous backend remains the default.
 
 Where generation physically runs is a *backend* choice

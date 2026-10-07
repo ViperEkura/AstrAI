@@ -1,56 +1,77 @@
-"""Async GRPO round invariants independent of the inference scheduler."""
+"""Process protocol invariants independent of the inference scheduler."""
 
 import time
-from threading import Barrier, Event, Thread
+from functools import partial
+from multiprocessing.shared_memory import SharedMemory
+from threading import Thread
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
-from astrai.trainer.rollout.types import RawRollout, RolloutVersionError
+from astrai.trainer.callbacks.checkpoint import CheckpointCallback
+from astrai.trainer.rollout.async_round import (
+    AsyncRoundCoordinator,
+    WeightSnapshotError,
+)
+from astrai.trainer.rollout.types import RawRollout, RolloutVersionError, SamplingParams
 
 
-class _Backend:
-    def __init__(self, model):
-        self.model = model
-        self.device = torch.device("cpu")
-        self.policy_version = 0
-
-    def apply_weight_update(self, version, update):
-        assert version > self.policy_version
-        update(version)
-        self.policy_version = version
-
-
-class _Generator:
-    def __init__(self, backend, barrier=None, fail=False):
-        self.backend = backend
-        self.barrier = barrier
-        self.fail = fail
-
-    @property
-    def policy_version(self):
-        return self.backend.policy_version
-
-    def generate(self, batch):
-        if self.barrier is not None:
-            self.barrier.wait(timeout=3)
-        if self.fail:
-            raise RuntimeError("worker failed")
-        prompt_ids = [int(value) for value in batch["instruction"]]
-        prompts = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(-1)
-        responses = (prompts + 1).unsqueeze(-1)
-        return RawRollout(
-            prompts=prompts,
-            prompt_mask=torch.ones_like(prompts, dtype=torch.bool),
-            responses=responses,
-            response_mask=torch.ones_like(responses, dtype=torch.bool),
-            logprobs_old=-responses.float() / 100,
-            policy_version=self.backend.policy_version,
-            prompt_texts=[str(value) for value in prompt_ids],
-            response_texts=[[str(value + 1)] for value in prompt_ids],
-            finish_reasons=[["stop"] for _ in prompt_ids],
-        )
+def _fake_worker(
+    conn,
+    device,
+    model_fn,
+    param_path,
+    params,
+    max_batch_size,
+    max_seq_len,
+    policy_version,
+    model_dtype,
+    shm_name,
+    layout,
+    max_prompts_per_worker,
+):
+    shm = SharedMemory(name=shm_name)
+    generated = 0
+    try:
+        conn.send(("ready", policy_version, False, 0, False))
+        while True:
+            message = conn.recv()
+            if message[0] == "stop":
+                return
+            if message[0] == "weight":
+                if device == "slow_ack":
+                    time.sleep(0.3)
+                policy_version = message[1]
+                conn.send(("weight_ack", policy_version, 0.0, 0))
+                continue
+            _, round_id, version, chunk = message
+            if device == "hang":
+                time.sleep(999)
+            if device == "fail":
+                conn.send(("error", "worker failed"))
+                return
+            time.sleep(0.15)
+            prompt_ids = [int(value) for value in chunk["instruction"]]
+            prompts = torch.tensor(prompt_ids, dtype=torch.long).unsqueeze(-1)
+            responses = (prompts + 1).unsqueeze(-1)
+            raw = RawRollout(
+                prompts=prompts,
+                prompt_mask=torch.ones_like(prompts, dtype=torch.bool),
+                responses=responses,
+                response_mask=torch.ones_like(responses, dtype=torch.bool),
+                logprobs_old=-responses.float() / 100,
+                policy_version=version
+                + (device == "stale" or (device == "stale_once" and generated == 0)),
+                prompt_texts=[str(value) for value in prompt_ids],
+                response_texts=[[str(value + 1)] for value in prompt_ids],
+                finish_reasons=[["stop"] for _ in prompt_ids],
+            )
+            conn.send(("result", round_id, version, raw, 0.15, 0))
+            generated += 1
+    finally:
+        conn.close()
+        shm.close()
 
 
 class _Reward:
@@ -58,34 +79,39 @@ class _Reward:
         return torch.ones(len(prompts), 1)
 
 
-def _coordinator(barrier=None, failed_worker=None, max_prompts_per_worker=1):
+def _coordinator(devices=None, timeout=3.0, max_prompts_per_worker=1):
     source = torch.nn.Linear(2, 2)
-    generators = [
-        _Generator(
-            _Backend(torch.nn.Linear(2, 2)),
-            barrier=barrier,
-            fail=index == failed_worker,
-        )
-        for index in range(4)
-    ]
     return source, AsyncRoundCoordinator(
-        source,
-        generators,
-        _Reward(),
-        0,
+        source=source,
+        model_fn=partial(torch.nn.Linear, 2, 2),
+        param_path="unused",
+        devices=devices or ["a", "b", "c", "d"],
+        params=SamplingParams(max_tokens=1, group_size=1),
+        reward_model=_Reward(),
+        policy_version=0,
+        max_batch_size=1,
+        max_seq_len=8,
+        model_dtype=torch.float32,
+        worker_timeout_s=timeout,
         max_prompts_per_worker=max_prompts_per_worker,
+        worker_target=_fake_worker,
     )
 
 
-def test_four_workers_generate_one_ordered_round_and_receive_one_snapshot():
-    source, coordinator = _coordinator(barrier=Barrier(4))
+def _collect(coordinator, values):
+    return coordinator.collect_round(
+        coordinator.submit_round({"instruction": [str(value) for value in values]})
+    )
+
+
+def test_four_processes_generate_ordered_round_and_receive_one_snapshot():
+    source, coordinator = _coordinator()
     try:
-        result = coordinator.collect_round(
-            coordinator.submit_round({"instruction": ["0", "1", "2", "3"]})
-        )
+        started = time.perf_counter()
+        result = _collect(coordinator, range(4))
+        assert time.perf_counter() - started < 0.6
         assert result.prompts[:, 0].tolist() == [0, 1, 2, 3]
         assert result.responses[:, 0, 0].tolist() == [1, 2, 3, 4]
-        assert result.logprobs_old.shape == result.responses.shape
         torch.testing.assert_close(result.logprobs_old, -result.responses.float() / 100)
         assert result.policy_version == 0
 
@@ -95,13 +121,9 @@ def test_four_workers_generate_one_ordered_round_and_receive_one_snapshot():
 
         coordinator.apply_weight_update(None, update)
         assert coordinator.policy_version == 1
-        result = coordinator.collect_round(
-            coordinator.submit_round({"instruction": ["4", "5", "6", "7"]})
-        )
-        assert result.policy_version == 1
-        for generator in coordinator.generators:
-            assert generator.policy_version == 1
-            torch.testing.assert_close(generator.backend.model.weight, source.weight)
+        assert _collect(coordinator, range(4, 8)).policy_version == 1
+        assert coordinator._worker_versions == [1] * 4
+        assert not coordinator.publisher._pending
     finally:
         coordinator.close()
 
@@ -109,14 +131,9 @@ def test_four_workers_generate_one_ordered_round_and_receive_one_snapshot():
 def test_worker_chunks_preserve_prompt_order_and_logprob_alignment():
     _, coordinator = _coordinator(max_prompts_per_worker=2)
     try:
-        result = coordinator.collect_round(
-            coordinator.submit_round(
-                {"instruction": [str(index) for index in range(16)]}
-            )
-        )
+        result = _collect(coordinator, range(16))
         assert result.prompts[:, 0].tolist() == list(range(16))
         assert result.responses[:, 0, 0].tolist() == list(range(1, 17))
-        assert result.logprobs_old.shape == result.responses.shape
         torch.testing.assert_close(result.logprobs_old, -result.responses.float() / 100)
     finally:
         coordinator.close()
@@ -132,108 +149,124 @@ def test_stale_or_mixed_round_is_rejected_before_training():
     finally:
         coordinator.close()
 
-    _, coordinator = _coordinator()
-    original = coordinator.generators[0].generate
-
-    def wrong_version(batch):
-        raw = original(batch)
-        raw.policy_version = 1
-        return raw
-
-    coordinator.generators[0].generate = wrong_version
+    _, coordinator = _coordinator(devices=["stale_once", "b", "c", "d"])
     try:
-        handle = coordinator.submit_round({"instruction": ["0", "1", "2", "3"]})
         with pytest.raises(RolloutVersionError, match="mixed rollout versions"):
-            coordinator.collect_round(handle)
+            _collect(coordinator, range(4))
+        assert _collect(coordinator, range(4)).policy_version == 0
+    finally:
+        coordinator.close()
+
+    _, coordinator = _coordinator(devices=["stale", "b", "c", "d"])
+    try:
+        with pytest.raises(RolloutVersionError, match="mixed rollout versions"):
+            _collect(coordinator, range(4))
     finally:
         coordinator.close()
 
 
-def test_failed_worker_wakes_collector():
-    _, coordinator = _coordinator(failed_worker=2)
+def test_failed_worker_wakes_collector_and_kills_hung_peer():
+    _, coordinator = _coordinator(devices=["hang", "fail", "c", "d"])
+    handle = coordinator.submit_round({"instruction": ["0", "1", "2", "3"]})
+    started = time.perf_counter()
+    with pytest.raises(RuntimeError, match="worker 1 failed"):
+        coordinator.collect_round(handle)
+    assert time.perf_counter() - started < 3
+    assert all(not process.is_alive() for process in coordinator._processes)
+
+
+def test_timeout_kills_all_workers():
+    _, coordinator = _coordinator(devices=["hang", "b", "c", "d"], timeout=0.4)
+    handle = coordinator.submit_round({"instruction": ["0", "1", "2", "3"]})
+    with pytest.raises(TimeoutError, match="timed out"):
+        coordinator.collect_round(handle)
+    assert all(not process.is_alive() for process in coordinator._processes)
+
+
+def test_shared_snapshot_cannot_be_reused_before_ack():
+    source, coordinator = _coordinator(devices=["slow_ack", "b", "c", "d"])
     try:
-        handle = coordinator.submit_round({"instruction": ["0", "1", "2", "3"]})
-        started = time.perf_counter()
-        with pytest.raises(RuntimeError, match="async rollout worker failed"):
-            coordinator.collect_round(handle)
-        assert time.perf_counter() - started < 3
-    finally:
-        coordinator.close()
-
-
-def test_pinned_snapshot_waits_for_replica_transfer_to_finish():
-    _, coordinator = _coordinator()
-    try:
-        publisher = coordinator.publisher
-        publisher.snapshot(1)
-        backend = coordinator.generators[0].backend
-        transfer_started = Event()
-        transfer_done = Event()
-        snapshot_done = Event()
-        original_apply = backend.apply_weight_update
-
-        def delayed_apply(version, update):
-            def wait_after_copy(value):
-                update(value)
-                transfer_started.set()
-                assert transfer_done.wait(timeout=3)
-
-            return original_apply(version, wait_after_copy)
-
-        backend.apply_weight_update = delayed_apply
-        publisher.begin_fanout(1)
-        transfer = Thread(target=publisher.publish_one, args=(0, 1))
-        transfer.start()
-        assert transfer_started.wait(timeout=3)
-        assert backend.policy_version == 0
-
-        def next_snapshot():
-            publisher.snapshot(2)
-            snapshot_done.set()
-
-        snapshot = Thread(target=next_snapshot)
-        snapshot.start()
-        assert not snapshot_done.wait(timeout=0.05)
-        transfer_done.set()
-        transfer.join(timeout=3)
-        snapshot.join(timeout=3)
-        assert not transfer.is_alive() and not snapshot.is_alive()
-        assert backend.policy_version == 1
-        assert publisher.version == 2
-    finally:
-        coordinator.close()
-
-
-def test_weight_publish_during_generation_keeps_round_version_stable():
-    source, coordinator = _coordinator()
-    entered = Barrier(5)
-    release = Event()
-    try:
-        for generator in coordinator.generators:
-            original = generator.generate
-            first_call = [True]
-
-            def held_generate(batch, original=original, first_call=first_call):
-                if first_call[0]:
-                    first_call[0] = False
-                    entered.wait(timeout=3)
-                    assert release.wait(timeout=3)
-                return original(batch)
-
-            generator.generate = held_generate
-
-        handle = coordinator.submit_round({"instruction": ["0", "1", "2", "3"]})
-        entered.wait(timeout=3)
         coordinator.apply_weight_update(
             None, lambda _version: source.weight.data.add_(1)
         )
-        assert all(
-            generator.policy_version == 0 for generator in coordinator.generators
-        )
-        release.set()
-        assert coordinator.collect_round(handle).policy_version == 0
-        next_round = coordinator.submit_round({"instruction": ["4", "5", "6", "7"]})
-        assert coordinator.collect_round(next_round).policy_version == 1
+        errors = []
+
+        def submit():
+            try:
+                _collect(coordinator, range(4))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = Thread(target=submit)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while not coordinator.publisher._pending and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert coordinator.publisher._pending
+        with pytest.raises(RuntimeError, match="not been acknowledged"):
+            coordinator.publisher.snapshot(2)
+        thread.join(timeout=3)
+        assert not thread.is_alive() and not errors
+        assert coordinator.publisher.version == 1
     finally:
-        release.set()
         coordinator.close()
+
+
+def test_weight_publication_during_generation_keeps_round_version():
+    source, coordinator = _coordinator()
+    try:
+        handle = coordinator.submit_round({"instruction": ["0", "1", "2", "3"]})
+        coordinator.apply_weight_update(
+            None, lambda _version: source.weight.data.add_(1)
+        )
+        assert coordinator.collect_round(handle).policy_version == 0
+        assert _collect(coordinator, range(4, 8)).policy_version == 1
+    finally:
+        coordinator.close()
+
+
+def test_snapshot_failure_marks_optimizer_commit():
+    source, coordinator = _coordinator()
+    try:
+
+        def fail_snapshot(_version):
+            raise RuntimeError("staging failed")
+
+        coordinator.publisher.snapshot = fail_snapshot
+        before = source.weight.detach().clone()
+        with pytest.raises(WeightSnapshotError, match="optimizer committed"):
+            coordinator.apply_weight_update(
+                None, lambda _version: source.weight.data.add_(1)
+            )
+        assert coordinator.policy_version == 1
+        torch.testing.assert_close(source.weight, before + 1)
+    finally:
+        coordinator.close()
+
+
+def test_model_factory_must_be_pickleable():
+    with pytest.raises(ValueError, match="model_fn must be pickleable"):
+        AsyncRoundCoordinator(
+            source=torch.nn.Linear(2, 2),
+            model_fn=lambda: torch.nn.Linear(2, 2),
+            param_path="unused",
+            devices=["a", "b", "c", "d"],
+            params=SamplingParams(max_tokens=1, group_size=1),
+            reward_model=_Reward(),
+            policy_version=0,
+            max_batch_size=1,
+            max_seq_len=8,
+            model_dtype=torch.float32,
+            worker_target=_fake_worker,
+        )
+
+
+def test_unsafe_optimizer_state_does_not_write_error_checkpoint():
+    callback = CheckpointCallback("unused", interval=1)
+    callback.last_ckpt_step = 0
+    saved = []
+    callback._save_checkpoint = lambda _context: saved.append(True)
+    context = SimpleNamespace(checkpoint_safe=False, optimizer_step=1)
+    callback.on_error(context)
+    callback.on_train_end(context)
+    assert saved == []

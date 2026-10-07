@@ -14,7 +14,7 @@ from astrai.trainer.callbacks import (
     CallbackFactory,
     TrainCallback,
 )
-from astrai.trainer.rollout.async_round import _slice_batch
+from astrai.trainer.rollout.async_round import WeightSnapshotError, _slice_batch
 from astrai.trainer.rollout.types import RolloutVersionError
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 
@@ -124,12 +124,25 @@ class Trainer:
             context.loss = float(weighted_loss.item())
             context.metrics = weighted_metrics
             self._call_callbacks("before_optimizer_step", context)
-            context.strategy.optimizer_step(context.optimizer)
+            context.checkpoint_safe = False
+            try:
+                context.strategy.optimizer_step(context.optimizer)
+            except WeightSnapshotError:
+                # The learner already changed. Finish the committed round's
+                # accounting before on_error is allowed to save a checkpoint.
+                context.optimizer.zero_grad()
+                if context.scheduler:
+                    context.scheduler.step()
+                context.consumed_samples += total
+                context.optimizer_steps_completed += 1
+                context.checkpoint_safe = True
+                raise
             context.optimizer.zero_grad()
             if context.scheduler:
                 context.scheduler.step()
             context.consumed_samples += total
             context.optimizer_steps_completed += 1
+            context.checkpoint_safe = True
             self._call_callbacks("after_optimizer_step", context)
             self._call_callbacks("on_batch_end", context)
             batch, handle = next_batch, next_handle

@@ -114,6 +114,11 @@ def configure_rollout(
         )
 
     if getattr(cfg, "rollout_mode", "sync") == "async_round":
+        if str(getattr(inference_model.config, "ffn_type", "mlp")) == "moe":
+            raise ValueError(
+                "async_round currently supports dense models only: MoE auxiliary "
+                "loss is not equivalent across learner microbatches"
+            )
         train_index = train_device.index
         available = torch.cuda.device_count()
         devices = [torch.device(name) for name in cfg.rollout_devices]
@@ -123,9 +128,6 @@ def configure_rollout(
             )
         if any(device.index == train_index for device in devices):
             raise ValueError("rollout_devices must exclude the learner device")
-        # Construct replicas sequentially: CUDA permits only one capture in
-        # a process at a time. Each graph runner owns a capture stream on its
-        # device; freeze new shapes before the generator threads start.
         prompts_per_worker = max(1, ceil(cfg.batch_per_device / len(devices)))
         worker_capacity = group_size * prompts_per_worker
         params = SamplingParams(
@@ -135,28 +137,20 @@ def configure_rollout(
             top_k=cfg.rollout_top_k,
             top_p=cfg.rollout_top_p,
         )
-        backends = [
-            _replica(str(device), worker_capacity, enable_cuda_graph=True)
-            for device in devices
-        ]
-        for backend in backends:
-            backend.freeze_cuda_graph_captures()
-        generators = [
-            RolloutGenerator(
-                backend=backend,
-                tokenizer=tokenizer,
-                params=params,
-                output_device="cpu",
-            )
-            for backend in backends
-        ]
         context.async_rollout = AsyncRoundCoordinator(
             source=inference_model,
-            generators=generators,
+            model_fn=cfg.model_fn,
+            param_path=param_path,
+            devices=[str(device) for device in devices],
+            params=params,
             reward_model=cfg.reward_model_fn(),
             policy_version=policy_version,
+            max_batch_size=worker_capacity,
+            max_seq_len=max_seq_len,
+            model_dtype=next(context.model.parameters()).dtype,
             max_policy_lag=1,
             max_prompts_per_worker=prompts_per_worker,
+            worker_timeout_s=cfg.rollout_worker_timeout_s,
         )
         context.optimizer_steps_completed = (
             context.checkpoint.meta.get("optimizer_step", context.optimizer_step)

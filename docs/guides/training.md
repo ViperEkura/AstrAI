@@ -227,10 +227,10 @@ optimizer-version lag; a stale or failed round is never partially trained.
 
 The process control plane uses one ordered duplex `multiprocessing.Pipe` per
 worker. Messages have an explicit kind, request ID, round ID and policy version:
-`READY`, `GENERATE`/`RESULT`, `WEIGHT`/`WEIGHT_ACK`, `ERROR`, and `STOP`.
+`READY`, `GENERATE`/`RESULT`, `WEIGHT_SYNC`/`WEIGHT_SYNC_ACK`, `ERROR`, and `STOP`.
 The coordinator accepts a reply only when its request ID, round and version
 match the pending command. `RESULT` carries CPU rollout tensors, while
-`WEIGHT` carries only a version notification; policy bytes use shared memory.
+`WEIGHT_SYNC` carries only a version notification; policy bytes use shared memory.
 Worker process sentinels and finite deadlines are polled alongside the pipes,
 so a crash or hang aborts the entire round. This is a local one-to-one
 protocol; no network broker or cross-worker traffic is required.

@@ -19,7 +19,6 @@ from astrai.trainer.rollout.protocol import (
     MessageKind,
     RolloutMessage,
     RolloutProtocolError,
-    WeightAck,
     WorkerReady,
     recv_message,
     send_message,
@@ -46,17 +45,16 @@ def _fake_worker(conn, spec):
             message = recv_message(conn)
             if message.kind == MessageKind.STOP:
                 return
-            if message.kind == MessageKind.WEIGHT:
+            if message.kind == MessageKind.WEIGHT_SYNC:
                 if device == "slow_ack":
                     time.sleep(0.3)
                 policy_version = message.policy_version
                 send_message(
                     conn,
                     RolloutMessage(
-                        MessageKind.WEIGHT_ACK,
+                        MessageKind.WEIGHT_SYNC_ACK,
                         request_id=message.request_id,
                         policy_version=policy_version,
-                        payload=WeightAck(0),
                     ),
                 )
                 continue
@@ -213,6 +211,18 @@ def test_protocol_rejects_mismatched_response_envelope(bad_worker, reason):
     with pytest.raises(RolloutProtocolError, match=reason):
         _collect(coordinator, range(4))
     assert all(not process.is_alive() for process in coordinator._processes)
+
+
+def test_weight_sync_ack_has_no_payload():
+    ack = RolloutMessage(MessageKind.WEIGHT_SYNC_ACK, request_id=7, policy_version=3)
+    ack.expect(MessageKind.WEIGHT_SYNC_ACK, 7, policy_version=3)
+    with pytest.raises(RolloutProtocolError, match="must not carry a payload"):
+        RolloutMessage(
+            MessageKind.WEIGHT_SYNC_ACK,
+            request_id=7,
+            policy_version=3,
+            payload={"peak_gpu_memory": 0},
+        ).expect(MessageKind.WEIGHT_SYNC_ACK, 7, policy_version=3)
 
 
 def test_failed_worker_wakes_collector_and_kills_hung_peer():

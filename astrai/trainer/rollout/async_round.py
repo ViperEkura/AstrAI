@@ -5,7 +5,7 @@ import pickle
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import wait
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -214,23 +214,19 @@ class AsyncRoundCoordinator:
         self.weights.begin_fanout(missing)
         started = time.perf_counter()
         request_ids = {
-            index: self._send_command(index, MessageKind.WEIGHT, version=version)
+            index: self._send_command(index, MessageKind.WEIGHT_SYNC, version=version)
             for index in missing
         }
         acks = self._collect_replies(
             missing,
-            MessageKind.WEIGHT_ACK,
+            MessageKind.WEIGHT_SYNC_ACK,
             time.monotonic() + self.worker_timeout_s,
             request_ids,
             version=version,
         )
-        for index, message in acks.items():
+        for index in acks:
             self.weights.acknowledge(index)
             self._worker_versions[index] = version
-            device = str(self._devices[index])
-            self.peak_gpu_memory[device] = max(
-                self.peak_gpu_memory.get(device, 0), message.payload.peak_gpu_memory
-            )
         self.weights.fanout_seconds += time.perf_counter() - started
 
     def apply_weight_update(self, policy_version, update):

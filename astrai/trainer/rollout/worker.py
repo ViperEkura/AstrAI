@@ -16,7 +16,6 @@ from astrai.trainer.rollout.protocol import (
     MessageKind,
     RolloutMessage,
     RolloutProtocolError,
-    WeightAck,
     WorkerReady,
     recv_message,
     send_message,
@@ -109,7 +108,7 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
             request_id = command.request_id
             if command.kind == MessageKind.STOP:
                 break
-            if command.kind == MessageKind.WEIGHT:
+            if command.kind == MessageKind.WEIGHT_SYNC:
                 version = command.policy_version
                 if version is None:
                     raise RolloutProtocolError("weight command is missing a version")
@@ -125,10 +124,9 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
                 send_message(
                     conn,
                     RolloutMessage(
-                        MessageKind.WEIGHT_ACK,
+                        MessageKind.WEIGHT_SYNC_ACK,
                         request_id=request_id,
                         policy_version=version,
-                        payload=WeightAck(torch.cuda.max_memory_allocated(device)),
                     ),
                 )
             elif command.kind == MessageKind.GENERATE:

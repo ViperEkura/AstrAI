@@ -17,8 +17,8 @@ PROTOCOL_VERSION = 1
 
 class MessageKind(StrEnum):
     READY = "ready"
-    WEIGHT = "weight"
-    WEIGHT_ACK = "weight_ack"
+    WEIGHT_SYNC = "weight_sync"
+    WEIGHT_SYNC_ACK = "weight_sync_ack"
     GENERATE = "generate"
     RESULT = "result"
     ERROR = "error"
@@ -55,9 +55,12 @@ class RolloutMessage:
             raise RolloutProtocolError("stale round ID")
         if policy_version is not None and self.policy_version != policy_version:
             raise RolloutProtocolError("wrong policy version")
+        if kind == MessageKind.WEIGHT_SYNC_ACK:
+            if self.payload is not None:
+                raise RolloutProtocolError("weight ACK must not carry a payload")
+            return
         expected_payload = {
             MessageKind.READY: WorkerReady,
-            MessageKind.WEIGHT_ACK: WeightAck,
             MessageKind.RESULT: GenerationResult,
         }[kind]
         if not isinstance(self.payload, expected_payload):
@@ -69,11 +72,6 @@ class WorkerReady:
     cuda_graph_enabled: bool
     peak_gpu_memory: int
     shared_memory_pinned: bool
-
-
-@dataclass(frozen=True, slots=True)
-class WeightAck:
-    peak_gpu_memory: int
 
 
 @dataclass(frozen=True, slots=True)

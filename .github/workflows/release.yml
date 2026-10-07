@@ -83,7 +83,7 @@ jobs:
           with zipfile.ZipFile(wheels[0]) as wheel:
               modules = [name for name in wheel.namelist()
                          if name.startswith("astrai/extension/_C_") and name.endswith(".so")]
-          assert len(modules) == 6, modules
+          assert len(modules) == 7, modules
           print(Path(wheels[0]).name)
           print(*modules, sep="\n")
           PY
@@ -108,7 +108,7 @@ jobs:
           from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
 
           print(KERNEL_NAMES)
-          assert len(KERNEL_NAMES) == 6, KERNEL_NAMES
+          assert len(KERNEL_NAMES) == 7, KERNEL_NAMES
           assert all(is_available(name) for name in KERNEL_NAMES)
           PY
 
@@ -176,7 +176,7 @@ jobs:
               ]
           print(Path(wheels[0]).name)
           print(*modules, sep="\n")
-          assert len(modules) == 6, modules
+          assert len(modules) == 7, modules
           '@ | python -
 
       - name: Install and verify native modules load
@@ -203,7 +203,7 @@ jobs:
           from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
 
           print(KERNEL_NAMES)
-          assert len(KERNEL_NAMES) == 6, KERNEL_NAMES
+          assert len(KERNEL_NAMES) == 7, KERNEL_NAMES
           assert all(is_available(name) for name in KERNEL_NAMES)
           '@ | python - $install
 

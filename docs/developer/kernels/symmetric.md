@@ -24,9 +24,17 @@ on every launch. SYRK reads the lower triangular result and mirrors its
 rounded values, producing bitwise equal halves. These out operations do
 not support autograd.
 
+Both operations also accept rank-3 tensors with a leading batch dimension.
+Every matrix is independent: SYRK takes `[batch, m, k]` and produces
+`[batch, m, m]`; SYMM takes `[batch, m, m]` and `[batch, m, n]`.
+Operands and active addends must have the same batch size; there is no batch
+broadcasting in the public contract.
+
 Torch handles arbitrary valid matrix sizes, floating dtypes and layouts.
 The optional CUDA path currently accepts dense row/column-major BF16 matrices with
-positive dimensions divisible by 64 and aligned input addresses. Runtime
+positive matrix dimensions divisible by 64 and aligned input addresses.
+A CUDA batch has 1 to 65535 matrices packed at constant matrix-size strides;
+each matrix uses the common row- or column-major layout. Runtime
 selection respects deterministic algorithms and BF16 reduction settings.
 Explicit `backend="cuda"` rejects unsupported calls; ordinary dispatch
 falls back to Torch. This is a restricted CUDA implementation of the two
@@ -60,7 +68,8 @@ existing GEMM mainloop, pipeline and epilogue. The latter stage accumulators
 through the shared epilogue before mirroring the lower triangle. SYMM uses
 `(S X).T = X.T S`, the shared raster scheduler, mainloop and transposed
 output epilogue. Both fuse the independent addend and coefficients into
-FP32 accumulators before BF16 rounding.
+FP32 accumulators before BF16 rounding. Batch launches reuse the existing
+`GemmParams` batch strides and `grid.z`; matrices never share accumulators.
 
 Tile candidates reuse the complete `TileManifest` from
 `include/policy/manifest.cuh`. `kernel.symmetric.tiles(operation)` reports
@@ -76,8 +85,8 @@ tile reads the transpose from shared memory, keeping global writes contiguous.
 The two triangles use independent bounds so partial edge tiles remain correct.
 
 Plans are keyed by operation, compute capability, matrix dimensions,
-active addend and input/output layouts. No parameter or model names participate.
-Unknown geometries fall back to Torch. The initial measured table is
+active addend, input/output layouts and batch size (default 1). No parameter or model names participate.
+Unknown geometries and batch sizes fall back to Torch. The initial measured table is
 conservative; replace it with measurements for the current environment:
 
 ```python
@@ -107,6 +116,7 @@ Only candidates beating Torch by the configured margin become CUDA plan rows.
 
 ```bash
 python scripts/benchmark/symmetric.py --operation syrk --list
+python scripts/benchmark/symmetric.py --operation syrk --batch-size 4 --plan-output batch-plan.json
 python scripts/benchmark/symmetric.py --operation syrk \
     --shapes 1536:6912 --output syrk-measurements.json --plan-output syrk-plan.json
 python scripts/benchmark/symmetric.py --operation symm --beta 3.4445 \

@@ -29,6 +29,9 @@ __global__ void syrk64_kernel(const __nv_bfloat16* input,
                               float alpha,
                               float beta) {
     using namespace nvcuda;
+    input += static_cast<int64_t>(blockIdx.z) * dim * reduction;
+    if (addend) addend += static_cast<int64_t>(blockIdx.z) * dim * dim;
+    output += static_cast<int64_t>(blockIdx.z) * dim * dim;
     constexpr int kTile = 64;
     constexpr int kMma = 16;
     constexpr int kTileElements = kTile * kTile;
@@ -139,7 +142,11 @@ __global__ void syrk64_kernel(const __nv_bfloat16* input,
 namespace {
 
 bool dense_matrix(const torch::Tensor& x) {
-    return x.is_contiguous() || (x.stride(0) == 1 && x.stride(1) == x.size(0));
+    if (x.dim() != 2 && x.dim() != 3) return false;
+    if (x.dim() == 3 && (x.size(0) < 1 || x.size(0) > 65535 ||
+                        x.stride(0) != x.size(-2) * x.size(-1))) return false;
+    return x.stride(-1) == 1 && x.stride(-2) == x.size(-1) ||
+           x.stride(-2) == 1 && x.stride(-1) == x.size(-2);
 }
 
 void check_buffers(const torch::Tensor& x, const torch::Tensor& output) {
@@ -147,16 +154,18 @@ void check_buffers(const torch::Tensor& x, const torch::Tensor& output) {
     TORCH_CHECK(x.device() == output.device(), "x and output must share a device");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && output.scalar_type() == at::kBFloat16,
                 "x and output must be bfloat16");
-    TORCH_CHECK(x.dim() == 2 && output.dim() == 2, "x and output must be matrices");
-    const auto rows = x.size(0);
-    const auto reduction = x.size(1);
+    TORCH_CHECK((x.dim() == 2 || x.dim() == 3) && output.dim() == x.dim(),
+                "x and output must be matrices or matrix batches");
+    TORCH_CHECK(x.dim() == 2 || x.size(0) == output.size(0), "batch size mismatch");
+    const auto rows = x.size(-2);
+    const auto reduction = x.size(-1);
     TORCH_CHECK(rows >= 64 && rows % 64 == 0 && reduction >= 64 && reduction % 64 == 0,
                 "matrix dimensions must be positive multiples of 64");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
                 "input must be 16-byte aligned");
     TORCH_CHECK(dense_matrix(x) && dense_matrix(output), "x and output must be dense row/column-major");
-    TORCH_CHECK(output.size(0) == rows && output.size(1) == rows,
-                "output must have shape [x.size(0), x.size(0)]");
+    TORCH_CHECK(output.size(-2) == rows && output.size(-1) == rows,
+                "output must have matching square matrix shape");
     TORCH_CHECK(!x.is_alias_of(output), "input and output must not alias");
     TORCH_CHECK(rows * rows <= std::numeric_limits<int>::max() &&
                     reduction <= std::numeric_limits<int>::max(),
@@ -206,6 +215,10 @@ symmetric_kernel(GemmParams p, const __nv_bfloat16* addend, int64_t stride0,
     using Loop = GemmCollectiveMainloop<P>;
     using Traits = typename P::Traits;
     extern __shared__ __align__(16) char smem[];
+    p.a_ptr = static_cast<const __nv_bfloat16*>(p.a_ptr) + blockIdx.z * p.a_batch_stride;
+    p.b_ptr = static_cast<const __nv_bfloat16*>(p.b_ptr) + blockIdx.z * p.b_batch_stride;
+    p.out_ptr = static_cast<__nv_bfloat16*>(p.out_ptr) + blockIdx.z * p.out_batch_stride;
+    if (addend) addend += blockIdx.z * p.out_batch_stride;
     int2 block;
     if constexpr (RankK) {
         int row = static_cast<int>((sqrtf(8.0f * blockIdx.x + 1.0f) - 1.0f) * 0.5f);
@@ -293,10 +306,10 @@ void launch_tile(GemmParams p, const __nv_bfloat16* addend, int64_t stride0,
     dim3 grid;
     if constexpr (RankK) {
         const int tiles = (p.m + T::kBlockM - 1) / T::kBlockM;
-        grid = dim3(tiles * (tiles + 1) / 2);
+        grid = dim3(tiles * (tiles + 1) / 2, 1, p.batch);
     } else {
         grid = dim3((p.n + T::kBlockN - 1) / T::kBlockN,
-                    (p.m + T::kBlockM - 1) / T::kBlockM);
+                    (p.m + T::kBlockM - 1) / T::kBlockM, p.batch);
     }
     symmetric_kernel<Tile, RankK, ColumnInput, ColumnOutput><<<grid, P::kCtaThreads, P::kSmemBytes, stream>>>(
         p, addend, stride0, stride1, alpha, beta);
@@ -325,8 +338,8 @@ bool dispatch_layout(const std::string& tile, GemmParams p,
                      bool column_input, bool column_output, cudaStream_t stream) {
     const auto* data = beta != 0.0f && addend.has_value()
         ? reinterpret_cast<const __nv_bfloat16*>(addend->data_ptr<at::BFloat16>()) : nullptr;
-    const int64_t stride0 = data ? addend->stride(0) : 0;
-    const int64_t stride1 = data ? addend->stride(1) : 0;
+    const int64_t stride0 = data ? addend->stride(-2) : 0;
+    const int64_t stride1 = data ? addend->stride(-1) : 0;
     if (column_input) {
         if constexpr (!RankK) {
             if (column_output)
@@ -359,20 +372,23 @@ void syrk_out(torch::Tensor x, torch::Tensor output,
     auto* result = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
     if (tile == "wmma64") {
         TORCH_CHECK(x.is_contiguous(), "wmma64 requires row-major input");
-        const int tiles = x.size(0) / 64;
-        const dim3 grid(tiles * (tiles + 1) / 2);
+        const int tiles = x.size(-2) / 64;
+        const dim3 grid(tiles * (tiles + 1) / 2, 1, x.dim() == 3 ? x.size(0) : 1);
         if (c_data)
             astrai::symmetric::syrk::syrk64_kernel<true><<<grid, 128, 0, stream>>>(
-                input, c_data, result, x.size(0), x.size(1), alpha, beta);
+                input, c_data, result, x.size(-2), x.size(-1), alpha, beta);
         else
             astrai::symmetric::syrk::syrk64_kernel<false><<<grid, 128, 0, stream>>>(
-                input, nullptr, result, x.size(0), x.size(1), alpha, beta);
+                input, nullptr, result, x.size(-2), x.size(-1), alpha, beta);
     } else {
         GemmParams p{};
         p.a_ptr = input; p.b_ptr = input; p.out_ptr = result;
-        p.m = x.size(0); p.n = x.size(0); p.k = x.size(1);
-        p.a_ld = x.is_contiguous() ? x.size(1) : x.size(0);
-        p.b_ld = p.a_ld; p.out_ld = x.size(0);
+        p.m = x.size(-2); p.n = x.size(-2); p.k = x.size(-1);
+        p.batch = x.dim() == 3 ? x.size(0) : 1;
+        p.a_batch_stride = p.b_batch_stride = x.size(-2) * x.size(-1);
+        p.out_batch_stride = x.size(-2) * x.size(-2);
+        p.a_ld = x.stride(-1) == 1 ? x.size(-1) : x.size(-2);
+        p.b_ld = p.a_ld; p.out_ld = x.size(-2);
         TORCH_CHECK(dispatch_layout<true>(tile, p, addend, alpha, beta, !x.is_contiguous(), false, stream),
                     "unknown SYRK tile: ", tile);
     }
@@ -386,9 +402,12 @@ void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
     TORCH_CHECK(symmetric.device() == x.device() && x.device() == output.device(), "device mismatch");
     TORCH_CHECK(symmetric.scalar_type() == at::kBFloat16 && x.scalar_type() == at::kBFloat16 &&
                 output.scalar_type() == at::kBFloat16, "all tensors must be bfloat16");
-    TORCH_CHECK(symmetric.dim() == 2 && x.dim() == 2 && output.dim() == 2, "expected matrices");
-    const auto rows = x.size(0), cols = x.size(1);
-    TORCH_CHECK(symmetric.size(0) == rows && symmetric.size(1) == rows &&
+    TORCH_CHECK((x.dim() == 2 || x.dim() == 3) &&
+                symmetric.dim() == x.dim() && output.dim() == x.dim(),
+                "expected matrices or matrix batches");
+    TORCH_CHECK(x.dim() == 2 || symmetric.size(0) == x.size(0), "batch size mismatch");
+    const auto rows = x.size(-2), cols = x.size(-1);
+    TORCH_CHECK(symmetric.size(-2) == rows && symmetric.size(-1) == rows &&
                 output.sizes() == x.sizes(), "matrix shape mismatch");
     TORCH_CHECK(rows >= 64 && cols >= 64 && rows % 64 == 0 && cols % 64 == 0,
                 "matrix dimensions must be positive multiples of 64");
@@ -409,6 +428,9 @@ void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
     // (S X)^T = X^T S: no materialized transpose, epilogue restores orientation.
     p.a_ptr = x.data_ptr(); p.b_ptr = symmetric.data_ptr(); p.out_ptr = output.data_ptr();
     p.m = cols; p.n = rows; p.k = rows;
+    p.batch = x.dim() == 3 ? x.size(0) : 1;
+    p.a_batch_stride = p.out_batch_stride = rows * cols;
+    p.b_batch_stride = rows * rows;
     p.a_ld = x.is_contiguous() ? cols : rows;
     p.b_ld = rows; p.out_ld = output.is_contiguous() ? cols : rows; p.raster = raster;
     TORCH_CHECK(dispatch_layout<false>(tile, p, addend, alpha, beta,

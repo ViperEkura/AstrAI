@@ -38,36 +38,39 @@ def sweep(
     min_speedup: float,
     input_layout: str,
     output_layout: str,
+    batch_size: int = 1,
 ) -> Dict[str, Any]:
     torch.manual_seed(31)
+    prefix = (batch_size,) if batch_size > 1 else ()
     x = torch.randn(
-        shape if input_layout == "row" else shape[::-1],
+        (*prefix, *(shape if input_layout == "row" else shape[::-1])),
         device="cuda",
         dtype=torch.bfloat16,
     )
     if input_layout == "column":
-        x = x.T
+        x = x.transpose(-2, -1)
     x.div_(x.norm())
-    symmetric = torch.randn((shape[0], shape[0]), device=x.device, dtype=x.dtype)
-    symmetric = (symmetric + symmetric.T) / 2
+    symmetric = torch.randn(
+        (*prefix, shape[0], shape[0]), device=x.device, dtype=x.dtype
+    )
+    symmetric = (symmetric + symmetric.transpose(-2, -1)) / 2
     symmetric.div_(symmetric.norm())
     output_shape = (shape[0], shape[0]) if operation == "syrk" else shape
     output = torch.empty(
-        output_shape if output_layout == "row" else output_shape[::-1],
+        (*prefix, *(output_shape if output_layout == "row" else output_shape[::-1])),
         device=x.device,
         dtype=x.dtype,
     )
     if output_layout == "column":
-        output = output.T
+        output = output.transpose(-2, -1)
     addend = torch.randn_like(output)
     if operation == "syrk":
-        addend = (addend + addend.T) / 2
+        addend = (addend + addend.transpose(-2, -1)) / 2
     addend.div_(addend.norm())
-    lhs, rhs = (x, x.T) if operation == "syrk" else (symmetric, x)
-    reference = torch.addmm(addend, lhs, rhs, alpha=alpha, beta=beta)
-    baseline = partial(
-        torch.addmm, addend, lhs, rhs, alpha=alpha, beta=beta, out=output
-    )
+    lhs, rhs = (x, x.transpose(-2, -1)) if operation == "syrk" else (symmetric, x)
+    addmm = torch.addmm if batch_size == 1 else torch.baddbmm
+    reference = addmm(addend, lhs, rhs, alpha=alpha, beta=beta)
+    baseline = partial(addmm, addend, lhs, rhs, alpha=alpha, beta=beta, out=output)
     baseline_graph = capture(baseline)
     properties = torch.cuda.get_device_properties(x.device)
     candidates = []
@@ -102,7 +105,9 @@ def sweep(
             record["max_abs"] = difference.abs().max().item()
             if not torch.isfinite(output).all() or relative > 0.01:
                 raise RuntimeError(f"incorrect candidate {record}")
-            if operation == "syrk" and not torch.equal(output, output.T):
+            if operation == "syrk" and not torch.equal(
+                output, output.transpose(-2, -1)
+            ):
                 raise RuntimeError(f"candidate is not symmetric: {tile['name']}")
             graph = capture(function)
             samples = {"torch": [], "cuda": []}
@@ -134,6 +139,7 @@ def sweep(
         rows=shape[0],
         cols=shape[1],
         addend=beta != 0,
+        batch_size=batch_size,
         input_layout=input_layout,
         output_layout=output_layout,
         backend="torch",
@@ -142,6 +148,7 @@ def sweep(
         measured.update(backend="cuda", tile=best["tile"], raster=best["raster"])
     return dict(
         shape=list(shape),
+        batch_size=batch_size,
         operation=operation,
         alpha=alpha,
         beta=beta,
@@ -159,6 +166,7 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--input-layout", choices=("row", "column"), default="row")
     parser.add_argument("--output-layout", choices=("row", "column"), default="row")
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--min-speedup", type=float, default=1.02)
     parser.add_argument("--output", type=Path)
@@ -174,9 +182,13 @@ def main() -> None:
         tuple(int(value) for value in shape.split(":"))
         for shape in args.shapes.split(",")
     ]
-    if args.repetitions < 1 or any(
-        len(shape) != 2 or min(shape) < 64 or any(value % 64 for value in shape)
-        for shape in shapes
+    if (
+        not 1 <= args.batch_size <= 65535
+        or args.repetitions < 1
+        or any(
+            len(shape) != 2 or min(shape) < 64 or any(value % 64 for value in shape)
+            for shape in shapes
+        )
     ):
         parser.error("positive repetitions and dimensions divisible by 64 are required")
     rasters = [int(value) for value in args.rasters.split(",")]
@@ -194,6 +206,7 @@ def main() -> None:
             args.min_speedup,
             args.input_layout,
             args.output_layout,
+            args.batch_size,
         )
         rows.append(row)
         print(json.dumps(dict(shape=row["shape"], plan=row["plan"])), flush=True)

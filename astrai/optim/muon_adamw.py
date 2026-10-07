@@ -41,25 +41,42 @@ def _single_tensor_muon_reuse_buffers(
     adjust_lr_fn: Optional[str],
     has_complex: bool,
     use_ns_kernels: bool = False,
+    ns_batch_size: int = 4,
 ) -> None:
     if has_complex:
         raise ValueError("Complex parameters are not supported")
     lr = _scalar_lr(lr)
+    buckets: Dict[Tuple[Any, ...], List[Tuple[Tensor, Tensor, Tensor]]] = {}
     for param, grad, buf in zip(params, grads, bufs):
         if grad.ndim != 2:
             raise ValueError("Param gradient must be a 2D matrix")
-        buf.lerp_(grad, 1 - momentum)
-        update = grad.lerp(buf, momentum) if nesterov else buf
-        update = newton_schulz(
-            update,
-            ns_coefficients,
-            ns_steps,
-            eps,
-            backend="auto" if use_ns_kernels else "torch",
-        )
-        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
-        param.mul_(1 - lr * weight_decay)
-        param.add_(update, alpha=-adjusted_lr)
+        key = (tuple(grad.shape), grad.device, grad.dtype, buf.dtype, param.dtype)
+        buckets.setdefault(key, []).append((param, grad, buf))
+    batch_size = ns_batch_size if use_ns_kernels else 1
+    for bucket in buckets.values():
+        for start in range(0, len(bucket), batch_size):
+            chunk = bucket[start : start + batch_size]
+            updates = []
+            for param, grad, buf in chunk:
+                buf.lerp_(grad, 1 - momentum)
+                updates.append(grad.lerp(buf, momentum) if nesterov else buf)
+            packed = torch.stack(updates) if len(chunk) > 1 else updates[0]
+            output = newton_schulz(
+                packed,
+                ns_coefficients,
+                ns_steps,
+                eps,
+                backend="auto" if use_ns_kernels else "torch",
+            )
+            for index, (param, grad, buf) in enumerate(chunk):
+                update = output[index] if len(chunk) > 1 else output
+                # BF16 non-Nesterov NS normalizes the momentum storage itself.
+                # Packing must preserve that state transition on each buffer.
+                if len(chunk) > 1 and not nesterov and buf.dtype == torch.bfloat16:
+                    buf.copy_(packed[index])
+                adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
+                param.mul_(1 - lr * weight_decay)
+                param.add_(update, alpha=-adjusted_lr)
 
 
 def _sharded_orthogonalize(update: Tensor, group: Mapping) -> Tensor:
@@ -101,11 +118,15 @@ class _ShardedMuon(optim.Muon):
         *,
         reuse_ns_buffers: bool = False,
         use_ns_kernels: bool = False,
+        ns_batch_size: int = 4,
         **kwargs,
     ):
         super().__init__(params, **kwargs)
         self.reuse_ns_buffers = reuse_ns_buffers
         self.use_ns_kernels = use_ns_kernels
+        if not isinstance(ns_batch_size, int) or ns_batch_size < 1:
+            raise ValueError("ns_batch_size must be a positive integer")
+        self.ns_batch_size = ns_batch_size
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -130,7 +151,10 @@ class _ShardedMuon(optim.Muon):
                 pp, gg, bb = (list(t) for t in zip(*plain))
                 if self.reuse_ns_buffers or self.use_ns_kernels:
                     step_plain = _single_tensor_muon_reuse_buffers
-                    extra_kwargs = {"use_ns_kernels": self.use_ns_kernels}
+                    extra_kwargs = {
+                        "use_ns_kernels": self.use_ns_kernels,
+                        "ns_batch_size": self.ns_batch_size,
+                    }
                 else:
                     step_plain = _single_tensor_muon
                     extra_kwargs = {}
@@ -178,6 +202,7 @@ class MuonAdamW(optim.Optimizer):
         adjust_lr_fn: str = "match_rms_adamw",
         reuse_ns_buffers: bool = False,
         use_ns_kernels: bool = False,
+        ns_batch_size: int = 4,
     ):
         defaults = {
             "lr": lr,
@@ -216,6 +241,7 @@ class MuonAdamW(optim.Optimizer):
             adjust_lr_fn=adjust_lr_fn,
             reuse_ns_buffers=reuse_ns_buffers,
             use_ns_kernels=use_ns_kernels,
+            ns_batch_size=ns_batch_size,
         )
         self.adamw = optim.AdamW(
             [{"params": other_params, "weight_decay": 0.0}],

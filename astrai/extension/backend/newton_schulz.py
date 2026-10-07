@@ -17,26 +17,31 @@ def newton_schulz(
     *,
     backend: str = "torch",
 ) -> Tensor:
-    """Orthogonalize a matrix with BF16 NS and reusable scratch buffers.
+    """Orthogonalize a matrix or independent matrix batch with BF16 NS.
 
     backend="auto" uses measured symmetric operation plans; "torch" retains
     Torch arithmetic. Coefficients and iteration count are caller supplied.
+    A rank-3 input has independent Frobenius normalization per matrix.
     BF16 inputs are normalized in place, matching Torch Muon semantics, but
     subsequent iterations never overwrite the normalized caller storage.
     """
-    if matrix.ndim != 2 or len(coefficients) != 3 or not 0 <= steps < 100:
+    if matrix.ndim not in (2, 3) or len(coefficients) != 3 or not 0 <= steps < 100:
         raise ValueError("invalid Newton-Schulz matrix, coefficients or steps")
     if backend not in ("torch", "auto"):
         raise ValueError("backend must be torch or auto")
     a, b, c = coefficients
     x = matrix.bfloat16()
-    tall = x.size(0) > x.size(1)
+    tall = x.size(-2) > x.size(-1)
     if tall:
-        x = x.T
-    x.div_(x.norm().clamp(min=eps))
+        x = x.transpose(-2, -1)
+    x.div_(
+        (x.norm() if x.ndim == 2 else x.norm(dim=(-2, -1), keepdim=True)).clamp(min=eps)
+    )
     if steps == 0:
-        return x.T if tall else x
-    gram = torch.empty((x.size(0), x.size(0)), dtype=x.dtype, device=x.device)
+        return x.transpose(-2, -1) if tall else x
+    gram = torch.empty(
+        (*x.shape[:-2], x.size(-2), x.size(-2)), dtype=x.dtype, device=x.device
+    )
     polynomial = torch.empty_like(gram)
     explicit = "torch" if backend == "torch" else None
     # The first/last BLAS calls change layout directly when the measured Gram
@@ -89,4 +94,4 @@ def newton_schulz(
         )
         operation(polynomial, x, output, addend=x, beta=a)
         x = output
-    return x.T if tall else x
+    return x.transpose(-2, -1) if tall else x

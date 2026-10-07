@@ -34,11 +34,13 @@ def _torch_syrk(
     tile: Optional[str] = None,
 ) -> None:
     if beta == 0:
-        torch.mm(x, x.T, out=output)
+        (torch.mm if x.ndim == 2 else torch.bmm)(x, x.transpose(-2, -1), out=output)
         if alpha != 1:
             output.mul_(alpha)
     else:
-        torch.addmm(addend, x, x.T, alpha=alpha, beta=beta, out=output)
+        (torch.addmm if x.ndim == 2 else torch.baddbmm)(
+            addend, x, x.transpose(-2, -1), alpha=alpha, beta=beta, out=output
+        )
 
 
 def _torch_symm(
@@ -53,11 +55,13 @@ def _torch_symm(
     raster: int = 1,
 ) -> None:
     if beta == 0:
-        torch.mm(symmetric, x, out=output)
+        (torch.mm if x.ndim == 2 else torch.bmm)(symmetric, x, out=output)
         if alpha != 1:
             output.mul_(alpha)
     else:
-        torch.addmm(addend, symmetric, x, alpha=alpha, beta=beta, out=output)
+        (torch.addmm if x.ndim == 2 else torch.baddbmm)(
+            addend, symmetric, x, alpha=alpha, beta=beta, out=output
+        )
 
 
 def _axes(
@@ -191,7 +195,7 @@ def _validate(
     alpha: float,
     beta: float,
 ) -> None:
-    if any(t.ndim != 2 for t in operands) or tuple(output.shape) != tuple(shape):
+    if any(t.ndim != x.ndim for t in operands) or tuple(output.shape) != tuple(shape):
         raise ValueError("matrix shape mismatch")
     if not math.isfinite(alpha) or not math.isfinite(beta):
         raise ValueError("coefficients must be finite")
@@ -219,9 +223,11 @@ def syrk_out(
     tile: Optional[str] = None,
 ) -> None:
     """Compute alpha * X X.T + beta * C into output."""
-    if x.ndim != 2:
-        raise ValueError("expected a matrix")
-    _validate(x, output, (x.size(0), x.size(0)), (x,), addend, alpha, beta)
+    if x.ndim not in (2, 3):
+        raise ValueError("expected a matrix or matrix batch")
+    _validate(
+        x, output, (*x.shape[:-2], x.size(-2), x.size(-2)), (x,), addend, alpha, beta
+    )
     select(
         "syrk",
         x,
@@ -248,7 +254,11 @@ def symm_out(
 ) -> None:
     """Compute alpha * S X + beta * C into output."""
     _validate(x, output, x.shape, (symmetric, x), addend, alpha, beta)
-    if symmetric.shape != (x.size(0), x.size(0)):
+    if x.ndim not in (2, 3) or symmetric.shape != (
+        *x.shape[:-2],
+        x.size(-2),
+        x.size(-2),
+    ):
         raise ValueError("symmetric matrix shape mismatch")
     options = {"tile": tile}
     if raster is not None:

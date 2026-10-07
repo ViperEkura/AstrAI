@@ -1,4 +1,4 @@
-"""Benchmark Muon NS or matrix optimizer steps on individual/checkpoint shapes."""
+"""Benchmark Muon NS or grouped matrix optimizer steps on checkpoint shapes."""
 
 import argparse
 import json
@@ -43,64 +43,109 @@ def capture(function):
     for _ in range(5):
         function()
     torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for _ in range(5):
-            function()
-    return graph
+            output = function()
+    return graph, output
 
 
-def _step(optimizer, parameter):
+def _step(optimizer, parameters):
     optimizer.step()
-    return parameter
+    return parameters
 
 
-def step_functions(gradient):
+def step_functions(gradients):
     functions = {}
     for name, options in {
         "torch": {},
         "reuse": {"reuse_ns_buffers": True},
-        "kernels": {"use_ns_kernels": True},
+        "kernels": {
+            "use_ns_kernels": True,
+            "ns_batch_size": gradients.size(0),
+        },
     }.items():
         model = nn.Module()
-        model.register_parameter("matrix", nn.Parameter(gradient.clone()))
-        model.matrix.grad = gradient.clone()
+        parameters = []
+        for index, gradient in enumerate(gradients):
+            parameter = nn.Parameter(gradient.clone())
+            parameter.grad = gradient.clone()
+            model.register_parameter("matrix_" + str(index), parameter)
+            parameters.append(parameter)
         optimizer = MuonAdamW(model, **options)
-        functions[name] = partial(_step, optimizer.muon, model.matrix)
+        functions[name] = partial(_step, optimizer.muon, tuple(parameters))
     return functions
 
 
-def measure_shape(shape, count, repetitions, mode, scope, dtype):
-    torch.manual_seed(17)
-    gradient = torch.randn(shape, device="cuda", dtype=dtype)
-    functions = {
-        "torch": partial(
-            _zeropower_via_newtonschulz, gradient.clone(), COEFFICIENTS, 5, 1e-7
-        ),
-        "reuse": partial(newton_schulz, gradient.clone(), COEFFICIENTS, 5, 1e-7),
-        "kernels": partial(
-            newton_schulz,
-            gradient.clone(),
-            COEFFICIENTS,
-            5,
-            1e-7,
-            backend="auto",
-        ),
-    }
-    if scope == "step":
-        functions = step_functions(gradient)
-    reference = functions["reuse"]()
-    candidate = functions["kernels"]()
-    difference = candidate.float() - reference.float()
-    max_abs = difference.abs().max().item()
-    relative_l2 = (difference.norm() / reference.float().norm()).item()
-    if not torch.isfinite(candidate).all() or relative_l2 > 0.01:
+def check_outputs(reference, candidate):
+    pairs = (
+        zip(reference, candidate)
+        if isinstance(reference, tuple)
+        else [(reference, candidate)]
+    )
+    max_abs = 0.0
+    difference_squared = 0.0
+    reference_squared = 0.0
+    for baseline, result in pairs:
+        # Validate in row slices so FP32 error temporaries remain bounded even
+        # when several large optimizer models and their Graph pools coexist.
+        for row in range(0, baseline.size(-2), 32):
+            baseline_float = baseline[..., row : row + 32, :].float()
+            candidate_slice = result[..., row : row + 32, :]
+            difference = candidate_slice.float() - baseline_float
+            if not torch.isfinite(candidate_slice).all():
+                raise RuntimeError("candidate contains nonfinite values")
+            max_abs = max(max_abs, difference.abs().max().item())
+            difference_squared += difference.square().sum().item()
+            reference_squared += baseline_float.square().sum().item()
+    relative_l2 = (
+        difference_squared / max(reference_squared, torch.finfo(torch.float32).tiny)
+    ) ** 0.5
+    if relative_l2 > 0.01:
         raise RuntimeError("candidate exceeds the numerical error budget")
+    return max_abs, relative_l2
 
+
+def measure_group(shape, batch_size, repetitions, mode, scope, dtype):
+    torch.manual_seed(17)
+    gradients = torch.randn((batch_size, *shape), device="cuda", dtype=dtype)
+    if scope == "step":
+        functions = step_functions(gradients)
+    else:
+        gradient = gradients[0]
+        functions = {
+            "torch": partial(
+                _zeropower_via_newtonschulz, gradient.clone(), COEFFICIENTS, 5, 1e-7
+            ),
+            "reuse": partial(newton_schulz, gradient.clone(), COEFFICIENTS, 5, 1e-7),
+            "kernels": partial(
+                newton_schulz,
+                gradient.clone(),
+                COEFFICIENTS,
+                5,
+                1e-7,
+                backend="auto",
+            ),
+        }
+    # Advance every implementation equally before capturing optimizer state.
+    outputs = {key: function() for key, function in functions.items()}
+    max_abs, relative_l2 = check_outputs(outputs["reuse"], outputs["kernels"])
+    graph_errors = {}
+    torch.cuda.empty_cache()
     if mode == "graph":
-        graphs = {key: capture(function) for key, function in functions.items()}
-        runners = {key: graph.replay for key, graph in graphs.items()}
-        # Keep function closures alive: Graph does not own external input storage.
+        captures = {key: capture(function) for key, function in functions.items()}
+        runners = {key: value[0].replay for key, value in captures.items()}
+        # Keep closures and captured outputs alive: Graph does not own external inputs.
+        for runner in runners.values():
+            runner()
+        graph_max_abs, graph_relative_l2 = check_outputs(
+            captures["reuse"][1], captures["kernels"][1]
+        )
+        graph_errors = {
+            "graph_max_abs_vs_reuse": graph_max_abs,
+            "graph_relative_l2_vs_reuse": graph_relative_l2,
+        }
         calls = 5
     else:
         for function in functions.values():
@@ -120,13 +165,49 @@ def measure_shape(shape, count, repetitions, mode, scope, dtype):
             samples[key].append(start.elapsed_time(end) / calls)
     times = {key: statistics.median(values) for key, values in samples.items()}
     return {
-        "shape": list(shape),
-        "count": count,
+        "batch_size": batch_size,
         "ms": times,
         "speedup_vs_torch": times["torch"] / times["kernels"],
         "speedup_vs_reuse": times["reuse"] / times["kernels"],
         "max_abs_vs_reuse": max_abs,
         "relative_l2_vs_reuse": relative_l2,
+        **graph_errors,
+    }
+
+
+def measure_shape(shape, count, repetitions, mode, scope, dtype, batch_size=1):
+    if count < 1 or batch_size < 1:
+        raise ValueError("matrix count and batch size must be positive")
+    if scope == "ns" and batch_size != 1:
+        raise ValueError("NS scope requires batch size 1 for the 2D Torch reference")
+    full_groups, remainder = divmod(count, batch_size)
+    group_sizes = []
+    if full_groups:
+        group_sizes.append((batch_size, full_groups))
+    if remainder:
+        group_sizes.append((remainder, 1))
+    groups = []
+    for size, group_count in group_sizes:
+        group = measure_group(shape, size, repetitions, mode, scope, dtype)
+        group["group_count"] = group_count
+        groups.append(group)
+        torch.cuda.empty_cache()
+    totals = {
+        key: sum(group["group_count"] * group["ms"][key] for group in groups)
+        for key in ("torch", "reuse", "kernels")
+    }
+    return {
+        "shape": list(shape),
+        "count": count,
+        "group_count": sum(group["group_count"] for group in groups),
+        "groups": groups,
+        # Retain the per-matrix field for consumers of the original benchmark output.
+        "ms": {key: value / count for key, value in totals.items()},
+        "weighted_ms": totals,
+        "speedup_vs_torch": totals["torch"] / totals["kernels"],
+        "speedup_vs_reuse": totals["reuse"] / totals["kernels"],
+        "max_abs_vs_reuse": max(group["max_abs_vs_reuse"] for group in groups),
+        "relative_l2_vs_reuse": max(group["relative_l2_vs_reuse"] for group in groups),
     }
 
 
@@ -142,27 +223,43 @@ def main():
     )
     parser.add_argument("--scope", choices=("ns", "step"), default="ns")
     parser.add_argument("--dtype", choices=("bf16", "fp32"), default="fp32")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Parameters per measured step group; NS scope requires 1.",
+    )
     args = parser.parse_args()
+    if min(args.repetitions, args.rows, args.cols, args.batch_size) < 1:
+        parser.error("dimensions, repetitions, and batch size must be positive")
+    if args.scope == "ns" and args.batch_size != 1:
+        parser.error("NS scope requires --batch-size 1 for the 2D Torch reference")
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     if args.plan:
         configure(json.loads(args.plan.read_text()))
     if not torch.cuda.is_available() or not is_available():
         parser.error("Muon NS CUDA extension is required")
-    if args.repetitions < 1 or args.rows < 1 or args.cols < 1:
-        parser.error("dimensions and repetitions must be positive")
     counts = (
         checkpoint_shapes(args.model)
         if args.model
-        else Counter({(args.rows, args.cols): 1})
+        else Counter({(args.rows, args.cols): args.batch_size})
     )
     rows = []
     for shape, count in sorted(counts.items()):
         rows.append(
-            measure_shape(shape, count, args.repetitions, args.mode, args.scope, dtype)
+            measure_shape(
+                shape,
+                count,
+                args.repetitions,
+                args.mode,
+                args.scope,
+                dtype,
+                args.batch_size,
+            )
         )
         torch.cuda.empty_cache()
     totals = {
-        key: sum(row["count"] * row["ms"][key] for row in rows)
+        key: sum(row["weighted_ms"][key] for row in rows)
         for key in ("torch", "reuse", "kernels")
     }
     print(
@@ -171,14 +268,20 @@ def main():
                 "mode": args.mode,
                 "input_dtype": str(dtype),
                 "compute_dtype": "bfloat16",
+                "batch_size": args.batch_size,
                 "rows": rows,
                 "weighted_ms": totals,
                 "weighted_speedup_vs_torch": totals["torch"] / totals["kernels"],
                 "weighted_speedup_vs_reuse": totals["reuse"] / totals["kernels"],
+                "timing_units": {
+                    "groups.ms": "Measured milliseconds per optimizer group or NS call.",
+                    "rows.ms": "Weighted milliseconds divided by the matrix count.",
+                    "weighted_ms": "Full groups plus a separately measured partial group.",
+                },
                 "scope": (
-                    "Weighted matrix Muon step estimate; includes momentum/parameter updates, excludes AdamW and model execution."
+                    "Weighted grouped matrix Muon step estimate; each full and partial group is measured with its actual parameter count. Includes momentum/parameter updates; excludes AdamW and model execution."
                     if args.scope == "step"
-                    else "Weighted NS estimate; excludes momentum, parameter updates, and AdamW."
+                    else "Weighted single-matrix NS estimate; excludes momentum, parameter updates, and AdamW."
                 ),
             },
             indent=2,

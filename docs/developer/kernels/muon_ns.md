@@ -35,9 +35,35 @@ iterations use separate buffers, preserving the normalized caller input and
 persistent momentum state. Dense transposed inputs are passed to BLAS
 operations as column-major views. When a measured Gram plan prefers row-major
 scratch, the first update writes that layout directly; the final update writes
-the caller's orientation directly. No standalone transpose kernel or packing
-copy is needed. Other inputs retain the Torch path. The CUDA module exposes
+the caller's orientation directly. Layout changes need no standalone transpose kernel or layout-packing
+copy. Other inputs retain the Torch path. The CUDA module exposes
 only SYRK, SYMM and candidate enumeration.
+
+## Batched updates
+
+With `use_ns_kernels=True`, Muon groups plain parameters by matrix shape,
+device and gradient/momentum/parameter dtypes within each optimizer group.
+It packs at most `ns_batch_size` matrices at a time (default 4); the training
+option is `muon_ns_batch_size`. Set it to 1 for single-matrix updates.
+
+NS accepts `[batch, rows, columns]` and normalizes each matrix independently,
+then launches the same three operations over the batch. It never concatenates
+matrices into one orthogonalization problem. Only the current chunk is packed,
+so temporary storage is bounded by the batch size rather than the bucket size.
+A partial final chunk uses its actual size and its own dispatch key.
+
+BF16 non-Nesterov momentum is normalized in place by the original Torch
+algorithm. Packing preserves this transition by copying the normalized input
+slice back to its momentum buffer; the final NS output is not copied back.
+Nesterov momentum and higher-precision momentum retain their original state
+semantics. Parameters without gradients are excluded. Checkpoint keys and
+the sharded DTensor path remain unchanged.
+
+The grouping follows the approach used by
+[Microsoft Dion](https://github.com/microsoft/dion/blob/main/dion/muon.py)
+and its [batched NS kernels](https://github.com/microsoft/dion/blob/main/dion/newton_schulz_triton.py)
+([MIT license](https://github.com/microsoft/dion/blob/main/LICENSE)).
+The implementation reuses AstrAI's CUDA components and existing coefficients.
 
 ## Verification and measurement
 
@@ -53,6 +79,7 @@ python scripts/benchmark/muon_ns.py --model <model-directory> --mode graph
 python scripts/benchmark/muon_ns.py --rows 6912 --cols 1536 --mode eager
 python scripts/benchmark/muon_ns.py --model <model-directory> --plan <plan.json>
 python scripts/benchmark/muon_ns.py --model <model-directory> --scope step --dtype bf16
+python scripts/benchmark/muon_ns.py --model <model-directory> --scope step --dtype bf16 --batch-size 4 --mode eager
 ```
 
 The benchmark reads safetensors headers without loading model weights onto
@@ -64,6 +91,8 @@ so it is not an end-to-end training speedup. Plan files may combine unique
 rows from the SYRK and SYMM sweeps.
 
 `--scope step` includes momentum, NS, weight decay and the matrix parameter
-update. It still reports a weighted estimate over independently timed matrix
-shapes, excluding AdamW and the model execution. `--dtype bf16|fp32` selects
+update. `--batch-size` measures that many independent parameters in one optimizer
+step for every implementation. Complete groups and the partial final group
+are timed separately and multiplied by their actual counts. The result remains
+a weighted estimate over shapes, excluding AdamW and model execution. `--dtype bf16|fp32` selects
 input/parameter dtype; NS computation remains BF16.

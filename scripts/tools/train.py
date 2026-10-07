@@ -160,6 +160,13 @@ _SPECS = [
         help="Use optional symmetric kernels for eligible Muon NS matrices.",
     ),
     OptSpec(
+        "muon_ns_batch_size",
+        "Optimizer",
+        type=int,
+        default=4,
+        help="Maximum same-shape matrices per optional Muon NS batch.",
+    ),
+    OptSpec(
         "muon_adjust_lr",
         "Optimizer",
         choices=["original", "match_rms_adamw"],
@@ -721,6 +728,7 @@ def train(
         "ns_steps": kwargs.pop("muon_ns_steps", 5),
         "reuse_ns_buffers": kwargs.pop("muon_reuse_ns_buffers", False),
         "use_ns_kernels": kwargs.pop("muon_ns_kernels", False),
+        "ns_batch_size": kwargs.pop("muon_ns_batch_size", 4),
         "adjust_lr_fn": kwargs.pop("muon_adjust_lr", "match_rms_adamw"),
         "mano_momentum": kwargs.pop("mano_momentum", 0.95),
         "mano_nesterov": kwargs.pop("mano_nesterov", True),
@@ -764,6 +772,7 @@ def train(
                 "ns_steps",
                 "reuse_ns_buffers",
                 "use_ns_kernels",
+                "ns_batch_size",
                 "adjust_lr_fn",
             )
         }

@@ -23,7 +23,7 @@ class Plan:
     raster: int = 1
 
 
-Key = Tuple[str, int, int, int, bool, str, str]
+Key = Tuple[str, int, int, int, bool, str, str, int]
 # Seeded by interleaved CUDA-event measurements; configure() can replace them.
 _DEFAULT_ROWS = [
     {
@@ -86,6 +86,97 @@ _DEFAULT_ROWS = [
         "tile": "128x128x32_W32x32_S2",
         "raster": -2,
     },
+    {
+        "operation": "syrk",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 1536,
+        "addend": False,
+        "input_layout": "row",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "128x128x32_W32x32_S2",
+        "raster": 1,
+        "batch_size": 4,
+    },
+    {
+        "operation": "syrk",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 6912,
+        "addend": False,
+        "input_layout": "row",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "128x128x32_W32x32_S2",
+        "raster": 1,
+        "batch_size": 4,
+    },
+    {
+        "operation": "syrk",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 1536,
+        "addend": True,
+        "batch_size": 4,
+        "input_layout": "row",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "128x128x32_W32x32_S2",
+        "raster": 1,
+    },
+    {
+        "operation": "symm",
+        "cc": 120,
+        "rows": 256,
+        "cols": 1536,
+        "addend": True,
+        "batch_size": 4,
+        "input_layout": "row",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "64x64x32_W16x32_S2",
+        "raster": 0,
+    },
+    {
+        "operation": "symm",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 6912,
+        "addend": True,
+        "batch_size": 4,
+        "input_layout": "row",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "128x128x32_W32x32_S2",
+        "raster": -2,
+    },
+    {
+        "operation": "symm",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 6912,
+        "addend": True,
+        "batch_size": 4,
+        "input_layout": "column",
+        "output_layout": "row",
+        "backend": "cuda",
+        "tile": "128x128x32_W32x32_S2",
+        "raster": -2,
+    },
+    {
+        "operation": "symm",
+        "cc": 120,
+        "rows": 1536,
+        "cols": 6912,
+        "addend": True,
+        "batch_size": 4,
+        "input_layout": "row",
+        "output_layout": "column",
+        "backend": "cuda",
+        "tile": "128x128x32_W32x32_S2",
+        "raster": -1,
+    },
 ]
 
 
@@ -98,6 +189,7 @@ def _key(row: Mapping[str, Any]) -> Key:
         bool(row.get("addend", False)),
         row.get("input_layout", "row"),
         row.get("output_layout", "row"),
+        int(row.get("batch_size", 1)),
     )
 
 
@@ -115,7 +207,7 @@ def configure(
     """Replace measured rows atomically; no argument reads the current table.
 
     Every row has operation, cc, rows, cols and backend. Optional fields include
-    addend, tile, raster, input_layout and output_layout (row or column).
+    addend, tile, raster, input/output layout and batch_size (default 1).
     An empty table disables automatic CUDA selection. Duplicate keys are errors.
     """
     global _rows, _plans, _revision
@@ -124,7 +216,9 @@ def configure(
         plans: Dict[Key, Plan] = {}
         vocabulary: Dict[str, Dict[str, Any]] = {}
         for row in copied:
-            operation, cc, m, n, addend, input_layout, output_layout = _key(row)
+            operation, cc, m, n, addend, input_layout, output_layout, batch_size = _key(
+                row
+            )
             backend = row["backend"]
             raster = row.get("raster", 1)
             if (
@@ -137,12 +231,13 @@ def configure(
             if (
                 m < 1
                 or n < 1
+                or not 1 <= batch_size <= 65535
                 or cc < 0
                 or not isinstance(raster, int)
                 or abs(raster) > 32
             ):
                 raise ValueError("invalid geometry, capability or raster")
-            key = (operation, cc, m, n, addend, input_layout, output_layout)
+            key = (operation, cc, m, n, addend, input_layout, output_layout, batch_size)
             if key in plans:
                 raise ValueError("duplicate symmetric plan key")
             if backend == "cuda":
@@ -185,11 +280,15 @@ def revision() -> int:
 
 def layout(x: Tensor) -> Optional[str]:
     """Recognize dense BLAS layouts without materializing a transpose."""
-    if x.ndim != 2:
+    if x.ndim not in (2, 3):
+        return None
+    if x.ndim == 3 and (
+        not 1 <= x.size(0) <= 65535 or x.stride(0) != x.size(-2) * x.size(-1)
+    ):
         return None
     if x.is_contiguous():
         return "row"
-    if x.stride(0) == 1 and x.stride(1) == x.size(0):
+    if x.stride(-2) == 1 and x.stride(-1) == x.size(-2):
         return "column"
     return None
 
@@ -204,16 +303,16 @@ def _capability(device: torch.device) -> Tuple[int, int]:
 def supports(x: Tensor) -> bool:
     """Common CUDA matrix capability for dense row/column-major matrices."""
     return (
-        x.ndim == 2
+        x.ndim in (2, 3)
         and x.is_cuda
         and x.dtype == torch.bfloat16
         and (layout(x) is not None)
         and x.data_ptr() % 16 == 0
-        and min(x.shape) >= 64
-        and x.size(0) % 64 == 0
-        and x.size(1) % 64 == 0
+        and min(x.shape[-2:]) >= 64
+        and x.size(-2) % 64 == 0
+        and x.size(-1) % 64 == 0
         and x.numel() <= 2147483647
-        and x.size(0) ** 2 <= 2147483647
+        and x.size(-2) ** 2 <= 2147483647
         and _capability(x.device)[0] >= 8
         and torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
         and not torch.are_deterministic_algorithms_enabled()
@@ -241,11 +340,12 @@ def probe(
         (
             operation,
             major * 10 + minor,
-            x.size(0),
-            x.size(1),
+            x.size(-2),
+            x.size(-1),
             addend,
             input_layout or layout(x),
             output_layout or (layout(output) if output is not None else "row"),
+            x.size(0) if x.ndim == 3 else 1,
         ),
         Plan(),
     )

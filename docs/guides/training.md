@@ -215,6 +215,29 @@ model factory.
 
 ### Rollout backends and validation sampling
 
+For one-learner online GRPO, `TrainConfig(rollout_mode="async_round",
+rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
+rollout_interval=1, rollout_max_policy_lag=1, batch_per_device=4)`
+uses GPU0 for the trainable policy, optimizer and frozen KL reference, and
+GPU1–4 for four frozen generation replicas. Each replica receives one prompt
+per four-prompt round by default. The learner accumulates prompt microbatches
+(`async_train_microbatch_prompts=1`) and steps the optimizer once per round.
+The next round generates while the current round trains, with at most one
+optimizer-version lag; a stale or failed round is never partially trained.
+
+On the 5090 host, peer access is unavailable. The async publisher stages one
+weight snapshot in pinned CPU memory after each learner update and fans it out
+to the four replicas at their next idle boundary. Token IDs, masks, aligned
+behaviour log-probabilities and CPU rewards are assembled on the host before
+the learner moves them to GPU0; KV cache and full logits remain on the
+generation devices. The async mode is programmatic-only, supports
+`online_grpo` with one CUDA learner, and does not yet support validation.
+The 5090 async replicas use ordinary CUDA forward execution. CUDA Graph
+capture failed on larger decode batches, and an empty captured graph on one
+replica produced incorrect tokens and log-probabilities during replay. Keep
+Graph capture disabled for this path until a device-specific fix is verified.
+The existing synchronous backend remains the default.
+
 Where generation physically runs is a *backend* choice
 (`astrai/trainer/backend.py`): by default the scheduler wraps the training
 model object in-process (`ColocatedBackend`, weight updates are free).

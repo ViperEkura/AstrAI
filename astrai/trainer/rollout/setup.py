@@ -5,6 +5,7 @@ this module owns rollout wiring without owning model restoration or topology.
 """
 
 from dataclasses import replace
+from math import ceil
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -18,6 +19,7 @@ from astrai.trainer.rollout import (
     RolloutRunner,
     SamplingParams,
 )
+from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 
 if TYPE_CHECKING:
     from astrai.trainer.train_context import TrainContext
@@ -87,7 +89,9 @@ def configure_rollout(
             )
         )
 
-    def _replica(device: str, max_batch_size: int) -> ReplicaBackend:
+    def _replica(
+        device: str, max_batch_size: int, enable_cuda_graph: bool = True
+    ) -> ReplicaBackend:
         model = create_ref_model(
             model_fn=cfg.model_fn,
             executor=context.executor,
@@ -106,7 +110,59 @@ def configure_rollout(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             policy_version=policy_version,
+            enable_cuda_graph=enable_cuda_graph,
         )
+
+    if getattr(cfg, "rollout_mode", "sync") == "async_round":
+        train_index = train_device.index
+        available = torch.cuda.device_count()
+        devices = [torch.device(name) for name in cfg.rollout_devices]
+        if any(device.index >= available for device in devices):
+            raise ValueError(
+                f"rollout_devices exceed available CUDA devices ({available})"
+            )
+        if any(device.index == train_index for device in devices):
+            raise ValueError("rollout_devices must exclude the learner device")
+        # Multi-device graph capture can silently produce an empty graph on
+        # this host. Use live forward for all async replicas; the complete
+        # per-worker prompt shard runs as one inference batch.
+        prompts_per_worker = max(1, ceil(cfg.batch_per_device / len(devices)))
+        worker_capacity = group_size * prompts_per_worker
+        params = SamplingParams(
+            max_tokens=cfg.rollout_max_tokens,
+            group_size=group_size,
+            temperature=cfg.rollout_temperature,
+            top_k=cfg.rollout_top_k,
+            top_p=cfg.rollout_top_p,
+        )
+        backends = [
+            _replica(str(device), worker_capacity, enable_cuda_graph=False)
+            for device in devices
+        ]
+        generators = [
+            RolloutGenerator(
+                backend=backend,
+                tokenizer=tokenizer,
+                params=params,
+                output_device="cpu",
+            )
+            for backend in backends
+        ]
+        context.async_rollout = AsyncRoundCoordinator(
+            source=inference_model,
+            generators=generators,
+            reward_model=cfg.reward_model_fn(),
+            policy_version=policy_version,
+            max_policy_lag=1,
+            max_prompts_per_worker=prompts_per_worker,
+        )
+        context.optimizer_steps_completed = (
+            context.checkpoint.meta.get("optimizer_step", context.optimizer_step)
+            if context.checkpoint is not None
+            else context.optimizer_step
+        )
+        context.strategy.set_rollout_runner(context.async_rollout)
+        return
 
     batch_capacity = group_size * max(1, cfg.batch_per_device)
     publishers: list = []

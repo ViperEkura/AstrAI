@@ -2,6 +2,7 @@ import logging
 from typing import List, Optional
 
 import torch.distributed as dist
+from torch import Tensor
 
 from astrai.config import TrainConfig
 from astrai.parallel.setup import spawn_parallel_fn
@@ -13,6 +14,8 @@ from astrai.trainer.callbacks import (
     CallbackFactory,
     TrainCallback,
 )
+from astrai.trainer.rollout.async_round import _slice_batch
+from astrai.trainer.rollout.types import RolloutVersionError
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,78 @@ class Trainer:
             if method:
                 method(context)
 
+    def _train_async_epoch(self, context: TrainContext) -> None:
+        """Keep one rollout round ahead of a single GRPO optimizer update."""
+        coordinator = context.async_rollout
+        batches = iter(context.dataloader)
+        batch = next(batches, None)
+        if batch is None:
+            return
+        handle = coordinator.submit_round(batch)
+        while batch is not None and not context.stop_requested:
+            try:
+                rollout = coordinator.collect_round(handle)
+            except RolloutVersionError:
+                # Discard the entire old round. No optimizer step has run.
+                handle = coordinator.submit_round(batch)
+                rollout = coordinator.collect_round(handle)
+
+            next_batch = next(batches, None)
+            next_handle = (
+                coordinator.submit_round(next_batch) if next_batch is not None else None
+            )
+
+            self._call_callbacks("on_batch_begin", context)
+            context.strategy._on_rollout_refresh()
+            prepared = context.strategy.prepare_from_rollout(rollout)
+            total = prepared["prompts"].shape[0]
+            masks = prepared["masks"]
+            if context.strategy.loss_aggregation == "sequence":
+                denominator = int(masks.any(dim=-1).sum().item())
+            else:
+                denominator = int(masks.sum().item())
+            if denominator == 0:
+                raise RuntimeError("async GRPO round has no valid response tokens")
+            weighted_loss = None
+            weighted_metrics = {}
+            size = context.config.async_train_microbatch_prompts
+            for begin in range(0, total, size):
+                indices = list(range(begin, min(begin + size, total)))
+                chunk = _slice_batch(prepared, indices, total)
+                chunk_masks = chunk["masks"]
+                if context.strategy.loss_aggregation == "sequence":
+                    count = int(chunk_masks.any(dim=-1).sum().item())
+                else:
+                    count = int(chunk_masks.sum().item())
+                if count == 0:
+                    continue
+                weight = count / denominator
+                output = context.strategy.compute_loss_output(chunk)
+                loss = output["loss"] * weight
+                context.executor.backward(loss)
+                detached = loss.detach()
+                weighted_loss = (
+                    detached if weighted_loss is None else weighted_loss + detached
+                )
+                for name, value in output["metrics"].items():
+                    metric = value.detach() if isinstance(value, Tensor) else value
+                    weighted_metrics[name] = weighted_metrics.get(name, 0.0) + (
+                        float(metric) * weight
+                    )
+
+            context.loss = float(weighted_loss.item())
+            context.metrics = weighted_metrics
+            self._call_callbacks("before_optimizer_step", context)
+            context.strategy.optimizer_step(context.optimizer)
+            context.optimizer.zero_grad()
+            if context.scheduler:
+                context.scheduler.step()
+            context.consumed_samples += total
+            context.optimizer_steps_completed += 1
+            self._call_callbacks("after_optimizer_step", context)
+            self._call_callbacks("on_batch_end", context)
+            batch, handle = next_batch, next_handle
+
     def _trainer_loop(self, param_path: Optional[str] = None, resume: bool = False):
         context = (
             TrainContextBuilder(self.train_config)
@@ -77,6 +152,11 @@ class Trainer:
                     break
                 context.epoch = epoch
                 self._call_callbacks("on_epoch_begin", context)
+
+                if context.async_rollout is not None:
+                    self._train_async_epoch(context)
+                    self._call_callbacks("on_epoch_end", context)
+                    continue
 
                 for batch in context.dataloader:
                     if context.stop_requested:
@@ -123,6 +203,8 @@ class Trainer:
             self._call_callbacks("on_error", context)
             raise
         finally:
+            if context.async_rollout is not None:
+                context.async_rollout.close()
             self._call_callbacks("on_train_end", context)
             if executor.use_distributed and dist.is_initialized():
                 dist.barrier()

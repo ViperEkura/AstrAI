@@ -19,6 +19,7 @@ DP_MODES = frozenset({"none", "ddp", "fsdp"})
 BACKENDS = frozenset({"nccl", "gloo"})
 START_METHODS = frozenset({"spawn", "fork", "forkserver"})
 _COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
+ROLLOUT_MODES = frozenset({"sync", "async_round"})
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True))
@@ -82,6 +83,9 @@ class TrainConfig(BaseConfig):
         rollout_val_group_size (Optional[int]): Validation responses per prompt override. None inherits the strategy's ``group_size``. Defaults to None.
         rollout_pool_seq_len (Optional[int]): Sequence budget per rollout request when sizing the rollout scheduler's KV pool. None uses the model's ``max_position_embeddings``. Must cover the longest prompt plus ``rollout_max_tokens`` or ``run_batch`` rejects the request. Right-sizing pays off: the pool holds ``2 × layers × (batch_capacity × seq) × kv_heads × head_dim`` bytes — for the 1B policy (24 layers, 4 KV heads, head_dim 64, bf16) the default 32768 context allocates ~3.2 GB against ~400 MB at 4096. Defaults to None.
         rollout_device (Optional[str]): Device for the training rollout backend, e.g. ``"cuda:1"``. None keeps the in-process colocated backend (generation shares the training model object; weight updates are free). Setting it builds a frozen replica whose weights are copied to inside the policy-version lock every optimizer step — the copy is a full state transfer (e.g. ~2GB/step for 1B bf16), so pay it only when backend isolation is worth it. Defaults to None.
+        rollout_mode (str): "sync" retains the existing backend; "async_round" overlaps one learner with four rollout replicas. Defaults to "sync".
+        rollout_devices (List[str]): Four distinct CUDA devices for async_round, separate from the learner device. Defaults to [].
+        async_train_microbatch_prompts (int): Prompts per learner backward pass in async_round; all microbatches accumulate into one optimizer step. Defaults to 1.
         rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
         rl_update_epochs (int): Learner passes over one collected online rollout round (classic PPO-style multiple epochs per batch). Each pass recomputes the loss against the round's fixed rewards/logprobs_old and takes its own optimizer steps. Values >1 trade on-policy freshness for sample efficiency; watch ``clip_fraction`` for stale-ratio blowup. Requires ``grad_accum_steps=1`` online. Defaults to 1.
         rl_minibatch_prompts (Optional[int]): Prompts per learner update within one rollout round; None updates on the whole round at once. Slicing always keeps prompt groups intact, and PPO's rollout-pinned advantages are shared views, so targets never shift between updates. Each minibatch update is a full optimizer step (and a weight publication). Defaults to None.
@@ -155,6 +159,9 @@ class TrainConfig(BaseConfig):
     rollout_val_group_size: Optional[int] = None
     rollout_pool_seq_len: Optional[int] = None
     rollout_device: Optional[str] = None
+    rollout_mode: str = "sync"
+    rollout_devices: List[str] = field(default_factory=list)
+    async_train_microbatch_prompts: int = 1
     rollout_val_device: Optional[str] = None
     rl_update_epochs: int = 1
     rl_minibatch_prompts: Optional[int] = None
@@ -243,6 +250,7 @@ class TrainConfig(BaseConfig):
         "rollout_interval",
         "rollout_max_tokens",
         "rl_update_epochs",
+        "async_train_microbatch_prompts",
     )
     def _validate_positive_int(cls, v: int) -> int:
         if v <= 0:
@@ -322,6 +330,12 @@ class TrainConfig(BaseConfig):
             raise ValueError("rollout device must be a device string or None")
         return v
 
+    @field_validator("rollout_mode")
+    def _validate_rollout_mode(cls, v: str) -> str:
+        if v not in ROLLOUT_MODES:
+            raise ValueError(f"rollout_mode must be one of {sorted(ROLLOUT_MODES)}")
+        return v
+
     def rollout_val_overrides(self) -> Dict[str, Any]:
         """Only the validation sampling fields explicitly set by the user.
 
@@ -355,6 +369,42 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
+        if self.rollout_mode == "async_round":
+            if self.strategy != "online_grpo":
+                raise ValueError("async_round currently supports online_grpo only")
+            if self.nprocs != 1 or self.dp_mode != "none" or self.device_type != "cuda":
+                raise ValueError(
+                    "async_round requires one CUDA learner with dp_mode='none'"
+                )
+            if self.rollout_device is not None or self.rollout_val_device is not None:
+                raise ValueError(
+                    "async_round uses rollout_devices, not rollout_device "
+                    "or rollout_val_device"
+                )
+            if len(self.rollout_devices) != 4:
+                raise ValueError("async_round requires four distinct rollout_devices")
+            if any(
+                not device.startswith("cuda:") or not device[5:].isdigit()
+                for device in self.rollout_devices
+            ):
+                raise ValueError(
+                    "async_round rollout_devices must be indexed CUDA devices"
+                )
+            if len({int(device[5:]) for device in self.rollout_devices}) != 4:
+                raise ValueError("async_round requires four distinct rollout_devices")
+            if self.rollout_interval != 1 or self.rl_update_epochs != 1:
+                raise ValueError(
+                    "async_round requires rollout_interval=1 and rl_update_epochs=1"
+                )
+            if self.rl_minibatch_prompts is not None or self.grad_accum_steps != 1:
+                raise ValueError(
+                    "async_round uses async_train_microbatch_prompts and "
+                    "requires grad_accum_steps=1"
+                )
+            if self.rollout_max_policy_lag not in (None, 1):
+                raise ValueError("async_round requires rollout_max_policy_lag=1")
+            if self.val_dataset is not None or self.val_split is not None:
+                raise ValueError("async_round validation is not supported yet")
         if self.strategy.startswith("online_"):
             if self.reward_model_fn is None:
                 raise ValueError(

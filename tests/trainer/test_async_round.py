@@ -216,6 +216,8 @@ def test_protocol_rejects_mismatched_response_envelope(bad_worker, reason):
 def test_weight_sync_ack_has_no_payload():
     ack = RolloutMessage(MessageKind.WEIGHT_SYNC_ACK, request_id=7, policy_version=3)
     ack.expect(MessageKind.WEIGHT_SYNC_ACK, 7, policy_version=3)
+    with pytest.raises(RolloutProtocolError, match="wrong policy version"):
+        ack.expect(MessageKind.WEIGHT_SYNC_ACK, 7, policy_version=4)
     with pytest.raises(RolloutProtocolError, match="must not carry a payload"):
         RolloutMessage(
             MessageKind.WEIGHT_SYNC_ACK,

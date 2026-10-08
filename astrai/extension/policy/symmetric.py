@@ -1,8 +1,8 @@
-"""Measured shape plans for symmetric operations, independently of optimizers.
+"""Measured and geometry plans for symmetric operations, independent of optimizers.
 
-Unknown shapes use Torch. Sweep results can replace the table without rebuilding
-CUDA kernels. Plan keys describe the operation, compute capability and matrix
-geometry; no model or parameter names participate in dispatch.
+Exact measured rows take precedence over the generic geometry heuristic. Sweep
+results can replace the table without rebuilding CUDA kernels. Plan keys describe
+operation, device capability and matrix metadata; no model names participate.
 """
 
 from contextlib import contextmanager
@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from astrai.extension.kernel.symmetric import is_available, tiles
+from astrai.extension.kernel.symmetric import plan as heuristic_plan
 
 
 @dataclass(frozen=True)
@@ -205,6 +206,35 @@ _DEFAULT_ROWS = [
     },
 ]
 
+# Exact Torch winners from the same tile sweep; no global size threshold.
+_DEFAULT_ROWS += [
+    {
+        "operation": operation,
+        "cc": 120,
+        "rows": rows,
+        "cols": cols,
+        "addend": addend,
+        "batch_size": batch,
+        "input_layout": input_layout,
+        "output_layout": "row",
+        "backend": "torch",
+    }
+    for operation, rows, cols, addend, batch, input_layout in (
+        ("syrk", 192, 384, False, 4, "row"),
+        ("syrk", 192, 192, True, 4, "row"),
+        ("syrk", 256, 256, False, 4, "row"),
+        ("syrk", 256, 256, True, 4, "row"),
+        ("syrk", 256, 1536, False, 4, "row"),
+        ("symm", 1536, 1536, True, 4, "row"),
+        ("syrk", 256, 256, False, 1, "row"),
+        ("syrk", 256, 256, True, 1, "row"),
+        ("syrk", 256, 1536, False, 1, "row"),
+        ("symm", 1536, 1536, True, 1, "row"),
+        ("symm", 1536, 6912, True, 1, "row"),
+        ("symm", 1536, 6912, True, 1, "column"),
+    )
+]
+
 
 def _key(row: Mapping[str, Any]) -> Key:
     return (
@@ -220,6 +250,7 @@ def _key(row: Mapping[str, Any]) -> Key:
 
 
 _revision = 0
+_heuristic = True
 _rows: List[Dict[str, Any]] = [dict(row) for row in _DEFAULT_ROWS]
 _plans: Dict[Key, Plan] = {
     _key(row): Plan(row["backend"], row.get("tile"), row.get("raster", 1))
@@ -229,14 +260,21 @@ _plans: Dict[Key, Plan] = {
 
 def configure(
     rows: Optional[Iterable[Mapping[str, Any]]] = None,
+    *,
+    heuristic: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """Replace measured rows atomically; no argument reads the current table.
 
     Every row has operation, cc, rows, cols and backend. Optional fields include
     addend, tile, raster, input/output layout and batch_size (default 1).
-    An empty table disables automatic CUDA selection. Duplicate keys are errors.
+    Replacing rows defaults to table-only dispatch; heuristic=True enables
+    geometry fallback for missing keys. A matching Torch row always wins.
+    With no arguments, the current table and dispatch mode are unchanged.
+    Duplicate keys are errors, and failed validation leaves both modes intact.
     """
-    global _rows, _plans, _revision
+    global _rows, _plans, _revision, _heuristic
+    if heuristic is not None and not isinstance(heuristic, bool):
+        raise ValueError("heuristic must be bool")
     if rows is not None:
         copied = [dict(row) for row in rows]
         plans: Dict[Key, Plan] = {}
@@ -282,20 +320,26 @@ def configure(
                     raise ValueError("tile does not support input layout")
             plans[key] = Plan(backend, row.get("tile"), raster)
         _rows, _plans = copied, plans
+        _heuristic = heuristic if heuristic is not None else False
+        _revision += 1
+    elif heuristic is not None:
+        _heuristic = heuristic
         _revision += 1
     return [dict(row) for row in _rows]
 
 
 @contextmanager
-def override(rows: Iterable[Mapping[str, Any]]) -> Iterator[None]:
-    """Temporarily replace measured rows, restoring even when a call fails."""
-    global _rows, _plans, _revision
-    saved_rows, saved_plans = _rows, _plans
-    configure(rows)
+def override(
+    rows: Iterable[Mapping[str, Any]], *, heuristic: bool = False
+) -> Iterator[None]:
+    """Scope table-only rows or a hybrid plan, restoring both after errors."""
+    global _rows, _plans, _revision, _heuristic
+    saved_rows, saved_plans, saved_heuristic = _rows, _plans, _heuristic
+    configure(rows, heuristic=heuristic)
     try:
         yield
     finally:
-        _rows, _plans = saved_rows, saved_plans
+        _rows, _plans, _heuristic = saved_rows, saved_plans, saved_heuristic
         _revision += 1
 
 
@@ -347,6 +391,25 @@ def supports(x: Tensor) -> bool:
     )
 
 
+@lru_cache(maxsize=256)
+def _heuristic_decision(
+    operation: str,
+    rows: int,
+    cols: int,
+    batch_size: int,
+    input_layout: str,
+    output_layout: str,
+    addend: bool,
+    device: int,
+) -> Plan:
+    metadata = heuristic_plan(
+        operation, rows, cols, batch_size, input_layout, output_layout, addend, device
+    )
+    if not metadata:
+        return Plan()
+    return Plan("cuda", metadata["tile"], metadata["raster"])
+
+
 def probe(
     operation: str,
     x: Tensor,
@@ -356,22 +419,37 @@ def probe(
     input_layout: Optional[str] = None,
     output_layout: Optional[str] = None,
 ) -> Plan:
-    """Inspect a measured decision without launching any kernel."""
+    """Inspect a measured or geometry decision without launching a kernel."""
     if operation not in ("syrk", "symm"):
         raise ValueError("operation must be syrk or symm")
     if not supports(x) or (output is not None and not supports(output)):
         return Plan()
     major, minor = _capability(x.device)
-    return _plans.get(
-        (
-            operation,
-            major * 10 + minor,
-            x.size(-2),
-            x.size(-1),
-            addend,
-            input_layout or layout(x),
-            output_layout or (layout(output) if output is not None else "row"),
-            x.size(0) if x.ndim == 3 else 1,
-        ),
-        Plan(),
+    rows, cols = x.size(-2), x.size(-1)
+    batch_size = x.size(0) if x.ndim == 3 else 1
+    input_layout = input_layout or layout(x)
+    output_layout = output_layout or (layout(output) if output is not None else "row")
+    key = (
+        operation,
+        major * 10 + minor,
+        rows,
+        cols,
+        addend,
+        input_layout,
+        output_layout,
+        batch_size,
+    )
+    if key in _plans:
+        return _plans[key]
+    if not _heuristic:
+        return Plan()
+    return _heuristic_decision(
+        operation,
+        rows,
+        cols,
+        batch_size,
+        input_layout,
+        output_layout,
+        addend,
+        x.device.index,
     )

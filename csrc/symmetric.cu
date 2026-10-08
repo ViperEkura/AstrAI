@@ -5,6 +5,8 @@
 #include <kernel/gemm/mainloop.cuh>
 #include <epilogue/writer.cuh>
 #include <scheduler.cuh>
+#include <launcher/gemm_cost.h>
+#include <launcher/kernel_resources.cuh>
 
 #include <cmath>
 #include <limits>
@@ -14,6 +16,8 @@
 #include <mma.h>
 
 #include <cstdint>
+#include <vector>
+#include <algorithm>
 
 namespace astrai::symmetric::syrk {
 
@@ -313,6 +317,9 @@ void launch_tile(GemmParams p, const __nv_bfloat16* addend, int64_t stride0,
         grid = dim3((p.n + T::kBlockN - 1) / T::kBlockN,
                     (p.m + T::kBlockM - 1) / T::kBlockM, p.batch);
     }
+    const auto* properties = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(grid.x <= properties->maxGridSize[0] && grid.y <= properties->maxGridSize[1],
+                "tile exceeds device grid limit");
     symmetric_kernel<Tile, RankK, ColumnInput, ColumnOutput><<<grid, P::kCtaThreads, P::kSmemBytes, stream>>>(
         p, addend, stride0, stride1, alpha, beta);
 }
@@ -440,6 +447,102 @@ void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+
+// Price the kernels actually instantiated here, including layout-specific
+// register counts and shared-memory allocation. No timing or launch is used.
+template <bool RankK, bool ColumnInput, bool ColumnOutput, size_t I = 0>
+void append_plans(std::vector<std::pair<double, py::dict>>& rows,
+                  const PlanQuery& q, bool addend) {
+    if constexpr (I < std::tuple_size_v<Tiles>) {
+        using Tile = std::tuple_element_t<I, Tiles>;
+        if constexpr ((!RankK || Tile::CtaShape::kM == Tile::CtaShape::kN) &&
+                      (!RankK || !ColumnInput || Tile::CtaShape::kK >= 64) &&
+                      std::is_same_v<Tile, warp_widened_t<__nv_bfloat16, __nv_bfloat16, Tile>>) {
+            using P = Policy<Tile, RankK, ColumnInput, ColumnOutput>;
+            auto resource = kernel_resources<
+                symmetric_kernel<Tile, RankK, ColumnInput, ColumnOutput>, P>(q);
+            const GemmRecipe r{(int)tile_class<Tile>(), Tile::kStages, Tile::kTile,
+                Tile::CtaShape::kM, Tile::CtaShape::kN,
+                Tile::WarpShape::kM, Tile::WarpShape::kN,
+                P::kCtaThreads, P::kSmemBytes};
+            const double mt = std::ceil((double)q.m / r.bm);
+            const double nt = std::ceil((double)q.n / r.bn);
+            if (!RankK && mt > 65535)
+                return append_plans<RankK, ColumnInput, ColumnOutput, I + 1>(rows, q, addend);
+            const double blocks = q.batch * (RankK ? mt * (mt + 1) / 2 : mt * nt);
+            // Average valid epilogue traffic, including partial edge tiles.
+            // Diagonal CTAs read a complete valid square before mirroring.
+            const double grid = RankK ? mt * (mt + 1) / 2 : mt * nt;
+            double cells = (double)q.m * q.n;
+            if (addend) {
+                if constexpr (RankK) {
+                    const double tail = q.m - (mt - 1) * r.bm;
+                    const double diagonal = (mt - 1) * r.bm * r.bm + tail * tail;
+                    cells += ((double)q.m * q.n + diagonal) / 2;
+                } else cells *= 2;
+            }
+            const double score = geometry_cost(r, q, resource.resident, blocks,
+                (double)q.out_elem_bytes * cells / grid);
+            if (std::isfinite(score)) {
+                py::dict row;
+                row["tile"] = tile_name<Tile>();
+                row["raster"] = RankK ? 1 : std::clamp(geometry_raster(q, r.bm, r.bn), -32, 32);
+                row["score"] = score; row["blocks"] = blocks;
+                row["resident_ctas"] = resource.resident;
+                row["registers"] = resource.registers;
+                row["local_bytes"] = resource.local_bytes;
+                row["shared_memory"] = r.smem;
+                rows.emplace_back(score, std::move(row));
+            }
+        }
+        append_plans<RankK, ColumnInput, ColumnOutput, I + 1>(rows, q, addend);
+    }
+}
+
+py::dict plan(std::string operation, int64_t rows, int64_t cols, int64_t batch_size,
+              std::string input_layout, std::string output_layout, bool addend, int device) {
+    TORCH_CHECK(operation == "syrk" || operation == "symm", "operation must be syrk or symm");
+    TORCH_CHECK((input_layout == "row" || input_layout == "column") &&
+                (output_layout == "row" || output_layout == "column"), "invalid matrix layout");
+    // Match the public BF16 domain, with overflow-safe product limits.
+    const int64_t limit = std::numeric_limits<int>::max();
+    if (rows < 64 || cols < 64 || rows % 64 || cols % 64 ||
+        batch_size < 1 || batch_size > 65535 ||
+        rows > limit / rows || cols > limit / rows ||
+        batch_size > limit / (rows * cols) || batch_size > limit / (rows * rows))
+        return py::dict();
+    TORCH_CHECK(device >= 0 && device < c10::cuda::device_count(), "invalid CUDA device ordinal");
+    const c10::cuda::CUDAGuard guard(device);
+    const auto dev = astrai::device_facts();
+    if (dev.cc < 80) return py::dict();
+    PlanQuery q{};
+    q.m = operation == "syrk" ? rows : cols;
+    q.n = rows; q.k = operation == "syrk" ? cols : rows;
+    q.batch = batch_size; q.dev = dev; q.tma = false;
+    q.crosswise = operation == "syrk" ? (input_layout == "column" ? 2 : 0)
+                                            : (input_layout == "column" ? 0 : 1);
+    std::vector<std::pair<double, py::dict>> ranked;
+    const bool column_input = input_layout == "column", column_output = output_layout == "column";
+    if (operation == "syrk") {
+        if (column_input) append_plans<true, true, false>(ranked, q, addend);
+        else append_plans<true, false, false>(ranked, q, addend);
+    } else if (column_input) {
+        if (column_output) append_plans<false, true, true>(ranked, q, addend);
+        else append_plans<false, true, false>(ranked, q, addend);
+    } else {
+        if (column_output) append_plans<false, false, true>(ranked, q, addend);
+        else append_plans<false, false, false>(ranked, q, addend);
+    }
+    if (ranked.empty()) return py::dict();
+    std::stable_sort(ranked.begin(), ranked.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+    py::dict result = ranked.front().second.attr("copy")();
+    py::list candidates;
+    for (const auto& entry : ranked) candidates.append(entry.second);
+    result["candidates"] = candidates;
+    return result;
+}
+
 template <size_t I = 0>
 void append_tiles(py::list& rows, bool rank_k) {
     if constexpr (I < std::tuple_size_v<Tiles>) {
@@ -480,6 +583,9 @@ py::list tiles(std::string operation) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("tiles", &tiles, py::arg("operation"));
+    m.def("plan", &plan, py::arg("operation"), py::arg("rows"), py::arg("cols"),
+          py::arg("batch_size") = 1, py::arg("input_layout") = "row",
+          py::arg("output_layout") = "row", py::arg("addend") = false, py::arg("device") = 0);
     m.def("symm_out", &symm_out, py::arg("symmetric"), py::arg("x"), py::arg("output"),
           py::arg("addend") = py::none(), py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
           py::arg("tile") = "64x64x32_W16x32_S2", py::arg("raster") = 1);

@@ -19,7 +19,7 @@ def newton_schulz(
 ) -> Tensor:
     """Orthogonalize a matrix or independent matrix batch with BF16 NS.
 
-    backend="auto" uses measured symmetric operation plans; "torch" retains
+    backend="auto" uses symmetric dispatch plans; "torch" retains
     Torch arithmetic. Coefficients and iteration count are caller supplied.
     A rank-3 input has independent Frobenius normalization per matrix.
     BF16 inputs are normalized in place, matching Torch Muon semantics, but
@@ -44,7 +44,7 @@ def newton_schulz(
     )
     polynomial = torch.empty_like(gram)
     explicit = "torch" if backend == "torch" else None
-    # The first/last BLAS calls change layout directly when the measured Gram
+    # The first/last BLAS calls change layout directly when the selected Gram
     # plan prefers row-major scratch; external tensors keep their orientation.
     row_work = (
         backend == "auto"

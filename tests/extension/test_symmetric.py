@@ -163,7 +163,7 @@ def test_injected_plan_handles_new_shape_and_respects_runtime_settings():
         tile="128x64x32_W32x32_S2",
         raster=-2,
     )
-    assert plan.probe("symm", x).backend == "torch"
+    original = plan.probe("symm", x)
     with plan.override([row]):
         assert plan.probe("symm", x).tile == row["tile"]
         saved = torch.are_deterministic_algorithms_enabled()
@@ -172,7 +172,7 @@ def test_injected_plan_handles_new_shape_and_respects_runtime_settings():
             assert plan.probe("symm", x).backend == "torch"
         finally:
             torch.use_deterministic_algorithms(saved)
-    assert plan.probe("symm", x).backend == "torch"
+    assert plan.probe("symm", x) == original
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
@@ -277,7 +277,9 @@ def test_cached_selection_tracks_plans_settings_and_overrides():
         finally:
             set_op("syrk")
         assert select("syrk", x, output) is selected
-    assert select("syrk", x, output).func is backend._torch_syrk
+    restored = select("syrk", x, output)
+    assert restored.func is original.func
+    assert restored.keywords == original.keywords
 
 
 def test_cached_builtin_selection_bypasses_dynamic_external_implementations():

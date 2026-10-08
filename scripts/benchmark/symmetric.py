@@ -3,6 +3,7 @@
 Like the GEMM tile sweep, candidates bypass automatic planning, are checked
 against Torch, and are measured in interleaved order. CUDA Graph replay removes
 Python dispatch gaps. Exported rows can be passed to policy.symmetric.configure.
+Native heuristic scores rank geometry; paired timings evaluate their selection.
 """
 
 import argparse
@@ -14,7 +15,15 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 
-from astrai.extension.kernel.symmetric import is_available, symm_out, syrk_out, tiles
+from astrai.extension.kernel.symmetric import (
+    is_available,
+    symm_out,
+    syrk_out,
+    tiles,
+)
+from astrai.extension.kernel.symmetric import (
+    plan as kernel_plan,
+)
 
 
 def capture(function: Callable[[], None]) -> torch.cuda.CUDAGraph:
@@ -26,6 +35,70 @@ def capture(function: Callable[[], None]) -> torch.cuda.CUDAGraph:
         for _ in range(10):
             function()
     return graph
+
+
+def validate_plan(
+    heuristic: Dict[str, Any],
+    available: List[Dict[str, Any]],
+    operation: str,
+    input_layout: str,
+    shared_memory_limit: int,
+) -> None:
+    if not heuristic:
+        return
+    tile = next(
+        (
+            candidate
+            for candidate in available
+            if candidate["name"] == heuristic.get("tile")
+        ),
+        None,
+    )
+    raster = heuristic.get("raster")
+    if tile is None:
+        raise RuntimeError(f"heuristic selected an unknown tile: {heuristic}")
+    if (
+        not isinstance(raster, int)
+        or abs(raster) > 32
+        or (operation == "syrk" and raster != 1)
+    ):
+        raise RuntimeError(f"heuristic selected an invalid raster: {heuristic}")
+    if input_layout not in tile["input_layouts"]:
+        raise RuntimeError(
+            f"heuristic selected an unsupported input layout: {heuristic}"
+        )
+    if tile["shared_memory"] > shared_memory_limit:
+        raise RuntimeError(
+            f"heuristic exceeds the device shared memory limit: {heuristic}"
+        )
+
+
+def accuracy(
+    output: torch.Tensor,
+    reference: torch.Tensor,
+    operation: str,
+    description: Dict[str, Any],
+) -> Dict[str, float]:
+    difference = output.float() - reference.float()
+    relative = difference.norm().item() / max(reference.float().norm().item(), 1e-30)
+    result = dict(relative_l2=relative, max_abs=difference.abs().max().item())
+    if not torch.isfinite(output).all() or relative > 0.01:
+        raise RuntimeError(f"incorrect candidate {description}: {result}")
+    if operation == "syrk" and not torch.equal(output, output.transpose(-2, -1)):
+        raise RuntimeError(f"candidate is not symmetric: {description}")
+    return result
+
+
+def comparison(candidate: Dict[str, Any], best_speedup: float) -> Dict[str, Any]:
+    speedup = candidate["speedup"]
+    return dict(
+        tile=candidate["tile"],
+        raster=candidate["raster"],
+        ms=candidate["ms"],
+        speedup=speedup,
+        regret_vs_best_pct=100 * (best_speedup / speedup - 1),
+        regret_vs_torch_pct=100 * (1 / speedup - 1),
+    )
 
 
 def sweep(
@@ -71,12 +144,43 @@ def sweep(
     addmm = torch.addmm if batch_size == 1 else torch.baddbmm
     reference = addmm(addend, lhs, rhs, alpha=alpha, beta=beta)
     baseline = partial(addmm, addend, lhs, rhs, alpha=alpha, beta=beta, out=output)
-    baseline_graph = capture(baseline)
     properties = torch.cuda.get_device_properties(x.device)
+    available = tiles(operation)
+    heuristic = kernel_plan(
+        operation,
+        *shape,
+        batch_size=batch_size,
+        input_layout=input_layout,
+        output_layout=output_layout,
+        addend=beta != 0,
+        device=x.device.index,
+    )
+    validate_plan(
+        heuristic,
+        available,
+        operation,
+        input_layout,
+        properties.shared_memory_per_block_optin,
+    )
+    baseline_graph = capture(baseline)
     candidates = []
-    for tile in tiles(operation):
-        for raster in [1] if operation == "syrk" else rasters:
-            record = dict(tile=tile["name"], raster=raster, geometry=tile)
+    for tile in available:
+        candidate_rasters = [1] if operation == "syrk" else list(dict.fromkeys(rasters))
+        if (
+            heuristic.get("tile") == tile["name"]
+            and heuristic["raster"] not in candidate_rasters
+        ):
+            candidate_rasters.append(heuristic["raster"])
+        for raster in candidate_rasters:
+            record = dict(
+                tile=tile["name"],
+                raster=raster,
+                geometry=tile,
+                heuristic_selected=(
+                    heuristic.get("tile") == tile["name"]
+                    and heuristic.get("raster") == raster
+                ),
+            )
             if input_layout not in tile["input_layouts"]:
                 record["skip"] = "unsupported input layout"
                 candidates.append(record)
@@ -97,19 +201,10 @@ def sweep(
                 **({"raster": raster} if operation == "symm" else {}),
             )
             function()
-            difference = output.float() - reference.float()
-            relative = difference.norm().item() / max(
-                reference.float().norm().item(), 1e-30
-            )
-            record["relative_l2"] = relative
-            record["max_abs"] = difference.abs().max().item()
-            if not torch.isfinite(output).all() or relative > 0.01:
-                raise RuntimeError(f"incorrect candidate {record}")
-            if operation == "syrk" and not torch.equal(
-                output, output.transpose(-2, -1)
-            ):
-                raise RuntimeError(f"candidate is not symmetric: {tile['name']}")
+            record.update(accuracy(output, reference, operation, record))
             graph = capture(function)
+            graph.replay()
+            record["graph_accuracy"] = accuracy(output, reference, operation, record)
             samples = {"torch": [], "cuda": []}
             for _ in range(repetitions):
                 for key, target in (
@@ -131,7 +226,20 @@ def sweep(
             record["speedup"] = record["ms"]["torch"] / record["ms"]["cuda"]
             candidates.append(record)
     valid = [row for row in candidates if "skip" not in row]
+    if not valid:
+        raise RuntimeError("no eligible CUDA candidate was measured")
     best = max(valid, key=lambda row: row["speedup"])
+    best_speedup = max(1.0, best["speedup"])
+    best_summary = dict(
+        backend="cuda" if best["speedup"] > 1 else "torch",
+        tile=best["tile"] if best["speedup"] > 1 else None,
+        raster=best["raster"] if best["speedup"] > 1 else None,
+        ms=best["ms"]["cuda"] if best["speedup"] > 1 else best["ms"]["torch"],
+        speedup=best_speedup,
+    )
+    selected = next((row for row in valid if row["heuristic_selected"]), None)
+    if heuristic and selected is None:
+        raise RuntimeError(f"heuristic candidate was not measured: {heuristic}")
     major, minor = torch.cuda.get_device_capability(x.device)
     measured = dict(
         operation=operation,
@@ -153,6 +261,12 @@ def sweep(
         alpha=alpha,
         beta=beta,
         candidates=candidates,
+        heuristic=heuristic,
+        heuristic_measurement=(
+            comparison(selected, best_speedup) if selected is not None else None
+        ),
+        best=best_summary,
+        torch_regret_vs_best_pct=100 * (best_speedup - 1),
         plan=measured,
     )
 
@@ -209,10 +323,29 @@ def main() -> None:
             args.batch_size,
         )
         rows.append(row)
-        print(json.dumps(dict(shape=row["shape"], plan=row["plan"])), flush=True)
+        print(
+            json.dumps(
+                dict(
+                    shape=row["shape"],
+                    plan=row["plan"],
+                    heuristic={
+                        key: value
+                        for key, value in row["heuristic"].items()
+                        if key != "candidates"
+                    },
+                    heuristic_measurement=row["heuristic_measurement"],
+                    best=row["best"],
+                    torch_regret_vs_best_pct=row["torch_regret_vs_best_pct"],
+                )
+            ),
+            flush=True,
+        )
         torch.cuda.empty_cache()
     report = dict(
         method="interleaved ABBA CUDA Graph, ten calls per replay",
+        comparison="paired Torch speedup; best includes Torch",
+        regret="relative slowdown in percent; versus Torch can be negative",
+        heuristic_score="geometry ranking proxy, not a latency prediction",
         dtype="bfloat16",
         rows=rows,
     )

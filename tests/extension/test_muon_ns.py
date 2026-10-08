@@ -57,11 +57,21 @@ def test_newton_schulz_production_shapes_have_bounded_error(shape, dtype):
     assert (difference.norm() / expected.float().norm()).item() <= 0.01
 
 
-def test_unmeasured_shape_keeps_torch_path():
+def test_unmeasured_shape_uses_geometry_with_table_only_fallback():
+    torch.manual_seed(31)
     gradient = torch.randn((192, 384), device="cuda", dtype=torch.float32)
-    expected = newton_schulz(gradient, COEFFICIENTS, 5, 1e-7)
-    actual = newton_schulz(gradient, COEFFICIENTS, 5, 1e-7, backend="auto")
-    assert torch.equal(actual, expected)
+    expected = newton_schulz(gradient.clone(), COEFFICIENTS, 5, 1e-7)
+    with plan.override([], heuristic=True):
+        assert plan.probe("syrk", gradient.bfloat16()).backend == "cuda"
+        actual = newton_schulz(gradient.clone(), COEFFICIENTS, 5, 1e-7, backend="auto")
+    assert torch.isfinite(actual).all()
+    relative = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert relative.item() <= 0.01
+    with plan.override([]):
+        fallback = newton_schulz(
+            gradient.clone(), COEFFICIENTS, 5, 1e-7, backend="auto"
+        )
+    assert torch.equal(fallback, expected)
 
 
 @pytest.mark.parametrize("shape", PRODUCTION_SHAPES)

@@ -14,8 +14,14 @@ its scratch buffers and layout selection. It accepts coefficients,
 iteration count and epsilon from the caller. Muon owns momentum, Nesterov,
 weight decay, learning-rate adjustment and parameter routing, then calls NS.
 The NS backend resolves the three [symmetric operations](symmetric.md) once
-before its loop, using independently measured plans for the Gram matrix,
-polynomial and final update.
+before its loop, using separate dispatch decisions for the Gram matrix,
+polynomial and final update. Default automatic dispatch prefers exact measured
+rows, then uses the shared GEMM geometry planner for unlisted legal BF16
+shapes, layouts and batch sizes. Unsupported inputs retain Torch operations.
+Geometry planning uses actual kernel resources and corrected triangular, batch
+and partial-tile traffic; its five relative work proxies do not predict absolute
+execution time. It performs no online benchmark. See the
+[dispatch and planning contract](symmetric.md#geometry-planning).
 
 ```python
 from astrai.extension import newton_schulz
@@ -23,21 +29,25 @@ from astrai.extension import newton_schulz
 result = newton_schulz(matrix, (3.4445, -4.775, 2.0315), steps=5, backend="auto")
 ```
 
-`backend="torch"` is the default. Enable measured CUDA operations for Muon with
-`MuonAdamW(..., use_ns_kernels=True)` or the training option
-`muon_ns_kernels=True`. Unsupported inputs and unknown shape plans retain
-Torch matrix operations. The separate `reuse_ns_buffers` option enables only
-scratch reuse. Neither changes checkpoint keys. Sharded DTensor updates
+`backend="torch"` remains the NS function default. Enable automatic symmetric
+operations for Muon with `MuonAdamW(..., use_ns_kernels=True)` or the training
+option `muon_ns_kernels=True`. `policy.symmetric.configure(rows)` limits
+automatic CUDA selection to those rows unless `heuristic=True` is supplied; a
+matching Torch row always wins. A scoped `override` restores both its previous
+table and heuristic setting, including after an exception. The separate
+`reuse_ns_buffers` option enables only scratch reuse. Kernel selection and
+scratch reuse preserve checkpoint keys. Sharded DTensor updates
 retain the existing gather/orthogonalize/scatter path.
 
 BF16 inputs are normalized in place, matching Torch Muon semantics. Later
 iterations use separate buffers, preserving the normalized caller input and
 persistent momentum state. Dense transposed inputs are passed to BLAS
-operations as column-major views. When a measured Gram plan prefers row-major
+operations as column-major views. When automatic Gram dispatch permits row-major
 scratch, the first update writes that layout directly; the final update writes
-the caller's orientation directly. Layout changes need no standalone transpose kernel or layout-packing
-copy. Other inputs retain the Torch path. The CUDA module exposes
-only SYRK, SYMM and candidate enumeration.
+the caller's orientation directly. Layout changes need no standalone transpose
+kernel or layout-packing copy. Inputs outside the CUDA contract retain Torch. The CUDA module exposes
+SYRK, SYMM, candidate enumeration and metadata-only `kernel.symmetric.plan`
+inspection. The optimizer does not own tile selection or plan scores.
 
 ## Batched updates
 
@@ -71,24 +81,30 @@ BF16 accumulation order and symmetry enforcement can change rounding.
 Tests bound five-step relative L2 error to one percent on the tested matrix
 shapes. Repeated optimizer updates compare parameter and exact momentum state
 with Nesterov enabled and disabled. Other checks cover independent addends,
-non-production dimensions, each compiled tile, output overlap, shape fallback,
-injected plans, deterministic settings and CUDA Graph replay.
+unlisted dimensions, each compiled tile, output overlap, unsupported-input
+fallback, injected plans, deterministic settings and CUDA Graph replay.
 
 ```bash
 python scripts/benchmark/muon_ns.py --model <model-directory> --mode graph
-python scripts/benchmark/muon_ns.py --rows 6912 --cols 1536 --mode eager
+python scripts/benchmark/muon_ns.py --rows <rows> --cols <cols> --mode eager
 python scripts/benchmark/muon_ns.py --model <model-directory> --plan <plan.json>
 python scripts/benchmark/muon_ns.py --model <model-directory> --scope step --dtype bf16
-python scripts/benchmark/muon_ns.py --model <model-directory> --scope step --dtype bf16 --batch-size 4 --mode eager
+python scripts/benchmark/muon_ns.py --model <model-directory> --scope step \
+    --dtype bf16 --batch-size <batch-size> --mode eager
 ```
 
-The benchmark reads safetensors headers without loading model weights onto
-the GPU. It compares Torch Muon, scratch-buffer reuse and measured kernels
+Replace angle-bracket placeholders before running these commands. The benchmark
+reads safetensors headers without loading weights onto the GPU. It compares
+Torch Muon, scratch-buffer reuse and automatic symmetric dispatch
 in interleaved order. Graph mode measures five calls per replay; eager mode
 includes dispatch gaps. Header shape counts produce a weighted NS estimate.
 This excludes momentum, parameter updates, AdamW and model forward/backward,
 so it is not an end-to-end training speedup. Plan files may combine unique
-rows from the SYRK and SYMM sweeps.
+rows from the SYRK and SYMM sweeps. Supplying a plan makes the benchmark
+use table-only dispatch; without a supplied plan it evaluates the default
+measured-first hybrid policy. Inspect `kernel.symmetric.plan` to see geometry
+candidates without running the benchmark, or `policy.symmetric.probe` to see
+the automatic decision for an existing tensor.
 
 `--scope step` includes momentum, NS, weight decay and the matrix parameter
 update. `--batch-size` measures that many independent parameters in one optimizer
@@ -114,10 +130,11 @@ recurrence using the same five coefficient triples, produced relative L2 errors 
 `1536 x 6912` input and **17.103%** for quantized rank-1 `256 x 1536`
 input. Both exceed the accuracy gate, so this approach remains excluded.
 
-Column-major Gram plans are measured separately for each batch size. The
-single-matrix plan exposes the existing GEMM small-tile widening explicitly,
-while the batched plan uses a different recipe. No model-specific rule enters
-the NS recurrence.
+Column-major Gram plans are measured separately for each batch size. Missing
+legal keys use geometry fallback in hybrid mode, while table-only mode retains
+Torch for missing keys. Batch size changes dispatch metadata and scheduling
+waves without changing the recurrence. Candidate tile or pipeline changes
+require measurement before becoming exact measured rows.
 
 Raw epilogues, warp-level transposed stores, register prefetch and triangular
 L2 grouping were evaluated without a meaningful whole-step improvement.

@@ -1,4 +1,4 @@
-"""Symmetric BLAS operations with measured CUDA dispatch and Torch fallback.
+"""Symmetric BLAS operations with planned CUDA dispatch and Torch fallback.
 
 SYRK: out = alpha * X X.T + beta * C (C fully symmetric).
 SYMM: out = alpha * S X + beta * C (S fully symmetric).
@@ -85,6 +85,7 @@ def _axes(
                 for candidate in cuda.tiles(operation)
             )
         ),
+        # Retain the registry axis name for existing dispatch overrides.
         "measured": plan.probe(
             operation, x, output=matrices[-1], addend=beta != 0
         ).backend

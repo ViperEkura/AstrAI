@@ -241,34 +241,65 @@ symmetric_kernel(GemmParams p, const __nv_bfloat16* addend, int64_t stride0,
     loop.prologue();
     loop.accumulate(acc);
     astrai::PipelineSync<Loop::kStages>{}.drain();
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int row0 = block.x * Traits::kBlockM +
-                    (warp / Traits::kWarpsN) * Traits::kWarpM + lane / 4;
-    const int col0 = block.y * Traits::kBlockN +
-                    (warp % Traits::kWarpsN) * Traits::kWarpN + (lane % 4) * 2;
-#pragma unroll
-    for (int mt = 0; mt < Traits::kMt; ++mt) {
-#pragma unroll
-        for (int nt = 0; nt < Traits::kNt; ++nt) {
-            const int row = row0 + mt * 16, col = col0 + nt * 8;
-            auto& cell = *acc(mt, nt);
-#pragma unroll
-            for (int element = 0; element < 4; ++element) {
-                const int r = row + (element / 2) * 8, c = col + element % 2;
-                cell[element] *= alpha;
-                if (addend && r < p.m && c < p.n) {
-                    const int64_t offset = RankK ? static_cast<int64_t>(r) * stride0 + c * stride1
-                                                 : static_cast<int64_t>(c) * stride0 + r * stride1;
-                    cell[element] = fmaf(beta, __bfloat162float(addend[offset]), cell[element]);
-                }
-            }
-        }
-    }
     GemmCollectiveEpilogue<P> epilogue(smem, p, block.x, block.y, threadIdx.x);
     auto* output = static_cast<__nv_bfloat16*>(p.out_ptr);
     if constexpr (!RankK) {
-        epilogue.run(acc, output);
+        // Fuse the SYMM addend and BF16 rounding with output staging.
+        // The rank-K path still mirrors its triangular tile after staging.
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        const int row0 = (warp / Traits::kWarpsN) * Traits::kWarpM + lane / 4;
+        const int col0 = (warp % Traits::kWarpsN) * Traits::kWarpN + (lane % 4) * 2;
+#pragma unroll
+        for (int nt = 0; nt < Traits::kNt; ++nt) {
+#pragma unroll
+            for (int mt = 0; mt < Traits::kMt; ++mt) {
+                const int r0 = row0 + mt * 16;
+                const int c0 = col0 + nt * 8;
+                const auto& cell = *acc(mt, nt);
+#pragma unroll
+                for (int element = 0; element < 4; ++element) {
+                    const int r = r0 + (element / 2) * 8;
+                    const int c = c0 + element % 2;
+                    float value = alpha * cell[element];
+                    if (addend && block.x * Traits::kBlockM + r < p.m &&
+                        block.y * Traits::kBlockN + c < p.n) {
+                        const int64_t global_r = block.x * Traits::kBlockM + r;
+                        const int64_t global_c = block.y * Traits::kBlockN + c;
+                        const int64_t offset = global_c * stride0 + global_r * stride1;
+                        value = fmaf(beta, __bfloat162float(addend[offset]), value);
+                    }
+                    if constexpr (GemmCollectiveEpilogue<P>::t_out)
+                        *epilogue.out_elem(c, r) = __float2bfloat16_rn(value);
+                    else
+                        *epilogue.out_elem(r, c) = __float2bfloat16_rn(value);
+                }
+            }
+        }
+        __syncthreads();
+        epilogue.store(output);
     } else {
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        const int row0 = block.x * Traits::kBlockM +
+                         (warp / Traits::kWarpsN) * Traits::kWarpM + lane / 4;
+        const int col0 = block.y * Traits::kBlockN +
+                         (warp % Traits::kWarpsN) * Traits::kWarpN + (lane % 4) * 2;
+#pragma unroll
+        for (int mt = 0; mt < Traits::kMt; ++mt) {
+#pragma unroll
+            for (int nt = 0; nt < Traits::kNt; ++nt) {
+                const int row = row0 + mt * 16, col = col0 + nt * 8;
+                auto& cell = *acc(mt, nt);
+#pragma unroll
+                for (int element = 0; element < 4; ++element) {
+                    const int r = row + (element / 2) * 8, c = col + element % 2;
+                    cell[element] *= alpha;
+                    if (addend && r < p.m && c < p.n) {
+                        const int64_t offset = static_cast<int64_t>(r) * stride0 + c * stride1;
+                        cell[element] = fmaf(beta, __bfloat162float(addend[offset]), cell[element]);
+                    }
+                }
+            }
+        }
         static_assert(Traits::kBlockM == Traits::kBlockN, "triangular tiles must be square");
         epilogue.stage(acc);
         __syncthreads();

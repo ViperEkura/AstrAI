@@ -50,11 +50,16 @@ flowchart LR
     Registry --> Policy[policy.symmetric]
     Registry --> Torch[Torch fallback]
     Registry --> Adapter[kernel.symmetric]
-    Adapter --> CUDA[symmetric.cu]
+    Adapter --> CUDA[symmetric module]
     CUDA --> Mainloop[GemmCollectiveMainloop]
     CUDA --> Epilogue[GemmCollectiveEpilogue]
     CUDA --> Scheduler[GemmTileScheduler]
 ```
+
+The C++ module has three translation units: \`bindings.cu\` owns the pybind
+surface, \`entry.cu\` validates tensors and packs GEMM parameters, and
+\`kernels.cu\` owns the typed kernels, launch dispatch and their resource
+planner. Their declarations are private to \`symmetric/entry.h\`.
 
 The kernel adapter forwards execution arguments and exposes candidate and plan
 metadata. The backend owns validation, operator registration and fallback. The

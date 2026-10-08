@@ -19,6 +19,8 @@
 #include <vector>
 #include <algorithm>
 
+#include "entry.h"
+
 namespace astrai::symmetric::syrk {
 
 // A 64x64 triangular CTA, with four warps computing one 32x32 quadrant
@@ -144,50 +146,6 @@ __global__ void syrk64_kernel(const __nv_bfloat16* input,
 } // namespace astrai::symmetric::syrk
 
 namespace {
-
-bool dense_matrix(const torch::Tensor& x) {
-    if (x.dim() != 2 && x.dim() != 3) return false;
-    if (x.dim() == 3 && (x.size(0) < 1 || x.size(0) > 65535 ||
-                        x.stride(0) != x.size(-2) * x.size(-1))) return false;
-    return x.stride(-1) == 1 && x.stride(-2) == x.size(-1) ||
-           x.stride(-2) == 1 && x.stride(-1) == x.size(-2);
-}
-
-void check_buffers(const torch::Tensor& x, const torch::Tensor& output) {
-    TORCH_CHECK(x.is_cuda() && output.is_cuda(), "x and output must be CUDA tensors");
-    TORCH_CHECK(x.device() == output.device(), "x and output must share a device");
-    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && output.scalar_type() == at::kBFloat16,
-                "x and output must be bfloat16");
-    TORCH_CHECK((x.dim() == 2 || x.dim() == 3) && output.dim() == x.dim(),
-                "x and output must be matrices or matrix batches");
-    TORCH_CHECK(x.dim() == 2 || x.size(0) == output.size(0), "batch size mismatch");
-    const auto rows = x.size(-2);
-    const auto reduction = x.size(-1);
-    TORCH_CHECK(rows >= 64 && rows % 64 == 0 && reduction >= 64 && reduction % 64 == 0,
-                "matrix dimensions must be positive multiples of 64");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
-                "input must be 16-byte aligned");
-    TORCH_CHECK(dense_matrix(x) && dense_matrix(output), "x and output must be dense row/column-major");
-    TORCH_CHECK(output.size(-2) == rows && output.size(-1) == rows,
-                "output must have matching square matrix shape");
-    TORCH_CHECK(!x.is_alias_of(output), "input and output must not alias");
-    TORCH_CHECK(rows * rows <= std::numeric_limits<int>::max() &&
-                    reduction <= std::numeric_limits<int>::max(),
-                "matrix dimensions exceed the kernel limit");
-}
-
-
-void check_addend(const torch::Tensor& output, const c10::optional<torch::Tensor>& addend,
-                  float alpha, float beta) {
-    TORCH_CHECK(std::isfinite(alpha) && std::isfinite(beta), "coefficients must be finite");
-    TORCH_CHECK(beta == 0.0f || addend.has_value(), "nonzero beta requires an addend");
-    if (!addend.has_value() || beta == 0.0f) return;
-    TORCH_CHECK(addend->device() == output.device() &&
-                addend->scalar_type() == output.scalar_type() &&
-                addend->sizes() == output.sizes() && dense_matrix(*addend),
-                "addend must match output device, dtype, shape and layout");
-    TORCH_CHECK(!output.is_alias_of(*addend), "output must not alias addend");
-}
 
 // Reuse GEMM recipes rather than inventing a separate tile vocabulary.
 using namespace astrai::gemm;
@@ -399,86 +357,6 @@ const __nv_bfloat16* addend_data(const c10::optional<torch::Tensor>& addend, flo
         ? reinterpret_cast<const __nv_bfloat16*>(addend->data_ptr<at::BFloat16>()) : nullptr;
 }
 
-void syrk_out(torch::Tensor x, torch::Tensor output,
-              c10::optional<torch::Tensor> addend, float alpha, float beta,
-              std::string tile) {
-    check_buffers(x, output);
-    check_addend(output, addend, alpha, beta);
-    const at::cuda::OptionalCUDAGuard guard(device_of(x));
-    TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major >= 8, "BF16 tensor cores required");
-    const auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const auto* c_data = addend_data(addend, beta);
-    const auto* input = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>());
-    auto* result = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
-    if (tile == "wmma64") {
-        TORCH_CHECK(x.is_contiguous(), "wmma64 requires row-major input");
-        const int tiles = x.size(-2) / 64;
-        const dim3 grid(tiles * (tiles + 1) / 2, 1, x.dim() == 3 ? x.size(0) : 1);
-        if (c_data)
-            astrai::symmetric::syrk::syrk64_kernel<true><<<grid, 128, 0, stream>>>(
-                input, c_data, result, x.size(-2), x.size(-1), alpha, beta);
-        else
-            astrai::symmetric::syrk::syrk64_kernel<false><<<grid, 128, 0, stream>>>(
-                input, nullptr, result, x.size(-2), x.size(-1), alpha, beta);
-    } else {
-        GemmParams p{};
-        p.a_ptr = input; p.b_ptr = input; p.out_ptr = result;
-        p.m = x.size(-2); p.n = x.size(-2); p.k = x.size(-1);
-        p.batch = x.dim() == 3 ? x.size(0) : 1;
-        p.a_batch_stride = p.b_batch_stride = x.size(-2) * x.size(-1);
-        p.out_batch_stride = x.size(-2) * x.size(-2);
-        p.a_ld = x.stride(-1) == 1 ? x.size(-1) : x.size(-2);
-        p.b_ld = p.a_ld; p.out_ld = x.size(-2);
-        TORCH_CHECK(dispatch_layout<true>(tile, p, addend, alpha, beta, !x.is_contiguous(), false, stream),
-                    "unknown SYRK tile: ", tile);
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
-              c10::optional<torch::Tensor> addend, float alpha, float beta,
-              std::string tile, int raster) {
-    TORCH_CHECK(symmetric.is_cuda() && x.is_cuda() && output.is_cuda(), "all tensors must be CUDA");
-    TORCH_CHECK(symmetric.device() == x.device() && x.device() == output.device(), "device mismatch");
-    TORCH_CHECK(symmetric.scalar_type() == at::kBFloat16 && x.scalar_type() == at::kBFloat16 &&
-                output.scalar_type() == at::kBFloat16, "all tensors must be bfloat16");
-    TORCH_CHECK((x.dim() == 2 || x.dim() == 3) &&
-                symmetric.dim() == x.dim() && output.dim() == x.dim(),
-                "expected matrices or matrix batches");
-    TORCH_CHECK(x.dim() == 2 || symmetric.size(0) == x.size(0), "batch size mismatch");
-    const auto rows = x.size(-2), cols = x.size(-1);
-    TORCH_CHECK(symmetric.size(-2) == rows && symmetric.size(-1) == rows &&
-                output.sizes() == x.sizes(), "matrix shape mismatch");
-    TORCH_CHECK(rows >= 64 && cols >= 64 && rows % 64 == 0 && cols % 64 == 0,
-                "matrix dimensions must be positive multiples of 64");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
-                reinterpret_cast<uintptr_t>(symmetric.data_ptr()) % 16 == 0,
-                "inputs must be 16-byte aligned");
-    TORCH_CHECK(dense_matrix(symmetric) && dense_matrix(x) && dense_matrix(output),
-                "all tensors must be dense row/column-major");
-    TORCH_CHECK(!output.is_alias_of(x) && !output.is_alias_of(symmetric),
-                "output must not alias inputs");
-    TORCH_CHECK(rows * cols <= std::numeric_limits<int>::max() &&
-                rows * rows <= std::numeric_limits<int>::max(), "matrix exceeds kernel limit");
-    TORCH_CHECK(raster >= -32 && raster <= 32, "raster must be in [-32, 32]");
-    check_addend(output, addend, alpha, beta);
-    const at::cuda::OptionalCUDAGuard guard(device_of(x));
-    TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major >= 8, "BF16 tensor cores required");
-    GemmParams p{};
-    // (S X)^T = X^T S: no materialized transpose, epilogue restores orientation.
-    p.a_ptr = x.data_ptr(); p.b_ptr = symmetric.data_ptr(); p.out_ptr = output.data_ptr();
-    p.m = cols; p.n = rows; p.k = rows;
-    p.batch = x.dim() == 3 ? x.size(0) : 1;
-    p.a_batch_stride = p.out_batch_stride = rows * cols;
-    p.b_batch_stride = rows * rows;
-    p.a_ld = x.is_contiguous() ? cols : rows;
-    p.b_ld = rows; p.out_ld = output.is_contiguous() ? cols : rows; p.raster = raster;
-    TORCH_CHECK(dispatch_layout<false>(tile, p, addend, alpha, beta,
-                !x.is_contiguous(), !output.is_contiguous(), at::cuda::getCurrentCUDAStream().stream()), "unknown SYMM tile: ", tile);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-
 // Price the kernels actually instantiated here, including layout-specific
 // register counts and shared-memory allocation. No timing or launch is used.
 template <bool RankK, bool ColumnInput, bool ColumnOutput, size_t I = 0>
@@ -530,7 +408,7 @@ void append_plans(std::vector<std::pair<double, py::dict>>& rows,
     }
 }
 
-py::dict plan(std::string operation, int64_t rows, int64_t cols, int64_t batch_size,
+py::dict plan_impl(std::string operation, int64_t rows, int64_t cols, int64_t batch_size,
               std::string input_layout, std::string output_layout, bool addend, int device) {
     TORCH_CHECK(operation == "syrk" || operation == "symm", "operation must be syrk or symm");
     TORCH_CHECK((input_layout == "row" || input_layout == "column") &&
@@ -595,7 +473,7 @@ void append_tiles(py::list& rows, bool rank_k) {
     }
 }
 
-py::list tiles(std::string operation) {
+py::list tiles_impl(std::string operation) {
     TORCH_CHECK(operation == "syrk" || operation == "symm", "operation must be syrk or symm");
     py::list rows;
     if (operation == "syrk") {
@@ -612,15 +490,44 @@ py::list tiles(std::string operation) {
 
 } // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("tiles", &tiles, py::arg("operation"));
-    m.def("plan", &plan, py::arg("operation"), py::arg("rows"), py::arg("cols"),
-          py::arg("batch_size") = 1, py::arg("input_layout") = "row",
-          py::arg("output_layout") = "row", py::arg("addend") = false, py::arg("device") = 0);
-    m.def("symm_out", &symm_out, py::arg("symmetric"), py::arg("x"), py::arg("output"),
-          py::arg("addend") = py::none(), py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
-          py::arg("tile") = "64x64x32_W16x32_S2", py::arg("raster") = 1);
-    m.def("syrk_out", &syrk_out, py::arg("x"), py::arg("output"),
-          py::arg("addend") = py::none(), py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
-          py::arg("tile") = "wmma64");
+namespace astrai::symmetric {
+
+void launch_syrk(gemm::GemmParams p, const c10::optional<torch::Tensor>& addend,
+                 float alpha, float beta, const std::string& tile,
+                 bool column_input, cudaStream_t stream) {
+    const auto* c_data = addend_data(addend, beta);
+    if (tile == "wmma64") {
+        const auto* input = reinterpret_cast<const __nv_bfloat16*>(p.a_ptr);
+        auto* result = reinterpret_cast<__nv_bfloat16*>(p.out_ptr);
+        const int tiles = p.m / 64;
+        const dim3 grid(tiles * (tiles + 1) / 2, 1, p.batch);
+        if (c_data)
+            syrk::syrk64_kernel<true><<<grid, 128, 0, stream>>>(
+                input, c_data, result, p.m, p.k, alpha, beta);
+        else
+            syrk::syrk64_kernel<false><<<grid, 128, 0, stream>>>(
+                input, nullptr, result, p.m, p.k, alpha, beta);
+    } else {
+        TORCH_CHECK(dispatch_layout<true>(tile, p, addend, alpha, beta,
+                    column_input, false, stream), "unknown SYRK tile: ", tile);
+    }
 }
+
+void launch_symm(gemm::GemmParams p, const c10::optional<torch::Tensor>& addend,
+                 float alpha, float beta, const std::string& tile,
+                 bool column_input, bool column_output, cudaStream_t stream) {
+    TORCH_CHECK(dispatch_layout<false>(tile, p, addend, alpha, beta,
+                column_input, column_output, stream), "unknown SYMM tile: ", tile);
+}
+
+py::dict plan(std::string operation, int64_t rows, int64_t cols, int64_t batch_size,
+              std::string input_layout, std::string output_layout, bool addend, int device) {
+    return plan_impl(operation, rows, cols, batch_size, input_layout, output_layout,
+                     addend, device);
+}
+
+py::list tiles(std::string operation) {
+    return tiles_impl(operation);
+}
+
+} // namespace astrai::symmetric

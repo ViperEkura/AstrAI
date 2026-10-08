@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from collections.abc import Callable
@@ -13,6 +14,8 @@ from astrai.trainer.optional_extras import (
     snapshot_component_extras,
 )
 from astrai.trainer.train_context import TrainContext
+
+logger = logging.getLogger(__name__)
 
 _TOKENIZER_FILES = (
     "tokenizer.json",
@@ -61,10 +64,12 @@ class CheckpointCallback(TrainCallback):
         self.weight_only = weight_only
         self.save_extra_fn = save_extra_fn or CheckpointCallback.save_extra
         self.last_ckpt_step = None
+        self.last_consumed_samples = None
         self._saved = False
 
     def on_train_begin(self, context: TrainContext):
         self.last_ckpt_step = context.optimizer_step
+        self.last_consumed_samples = context.consumed_samples
 
     def _save_checkpoint(self, context: TrainContext):
         with context.executor.checkpoint_context(context.model) as state_dict:
@@ -78,6 +83,8 @@ class CheckpointCallback(TrainCallback):
                     **context.config.to_dict(),
                     "optimizer_step": context.optimizer_step,
                 }
+                if context.optimizer_steps is not None:
+                    meta["optimizer_steps"] = context.optimizer_steps
                 policy_version = context.strategy.policy_version
                 if policy_version is not None:
                     meta["policy_version"] = policy_version
@@ -92,17 +99,44 @@ class CheckpointCallback(TrainCallback):
                 context.checkpoint.save(save_path)
                 _copy_tokenizer_files(context.param_path, save_path)
         self.last_ckpt_step = context.optimizer_step
+        self.last_consumed_samples = context.consumed_samples
         self._saved = True
 
     def after_optimizer_step(self, context: TrainContext):
+        if context.optimizer_steps is not None:
+            return
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
             self._save_checkpoint(context)
 
+    def on_batch_end(self, context: TrainContext):
+        if (
+            context.optimizer_steps is not None
+            and context.optimizer_step - self.last_ckpt_step >= self.interval
+        ):
+            self._save_checkpoint(context)
+
+    def _incomplete_round(self, context):
+        if context.optimizer_steps is not None and context.kwargs.get(
+            "grpo_update_in_progress"
+        ):
+            logger.warning(
+                "GRPO stopped during an incomplete round; retain the last completed-round checkpoint"
+            )
+            return True
+        return False
+
     def on_train_end(self, context: TrainContext):
-        if context.optimizer_step != self.last_ckpt_step:
+        if self._incomplete_round(context):
+            return
+        if context.optimizer_step != self.last_ckpt_step or (
+            context.optimizer_steps is not None
+            and context.consumed_samples != self.last_consumed_samples
+        ):
             self._save_checkpoint(context)
 
     def on_error(self, context: TrainContext):
+        if self._incomplete_round(context):
+            return
         # An interrupted run must always leave at least one checkpoint
         # behind: on a slow start the signal can be handled before the
         # first optimizer step, where optimizer_step == last_ckpt_step

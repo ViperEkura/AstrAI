@@ -458,10 +458,12 @@ def test_online_minibatch_round_publication_and_reference_resume(base_test_env):
     config = _online_config(base_test_env, rl_update_epochs=2, rl_minibatch_prompts=1)
     Trainer(config).train(param_path=test_dir)
 
-    checkpoint_dir = os.path.join(test_dir, "ckpt", "epoch_0_step_2")
+    checkpoint_dir = os.path.join(test_dir, "ckpt", "epoch_0_step_8")
     checkpoint = Checkpoint.load(checkpoint_dir)
     # 2 batches × (2 minibatches × 2 epochs) publications.
     assert checkpoint.meta["policy_version"] == 8
+    assert checkpoint.meta["optimizer_steps"] == 8
+    assert checkpoint.consumed_samples == 4
     assert "reference_model" in checkpoint.extra
     assert "rng_state" in checkpoint.extra
     ref_keys = set(checkpoint.extra["reference_model"])

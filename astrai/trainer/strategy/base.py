@@ -320,6 +320,13 @@ class BaseStrategy(ABC):
             for chunk in slices:
                 yield self.compute_loss_output(chunk)
 
+    def training_updates(
+        self, batch: Dict[str, Tensor]
+    ) -> Iterator[Iterator[LossOutput]]:
+        """Group backward outputs by their single optimizer/publication step."""
+        for output in self.training_steps(batch):
+            yield iter((output,))
+
     def _split_rollout_batch(self, prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Slice one prepared rollout batch along the prompt dimension.
 

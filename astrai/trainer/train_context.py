@@ -60,6 +60,7 @@ class TrainContext:
     executor: BaseExecutor = field(default=None)
     epoch: int = field(default=0)
     consumed_samples: int = field(default=0)
+    optimizer_steps: int | None = field(default=None)
     loss: float = field(default=0.0)
     metrics: dict[str, float] = field(default_factory=dict)
     grad_norm: float | None = field(default=None)
@@ -105,6 +106,8 @@ class TrainContext:
 
     @property
     def optimizer_step(self) -> int:
+        if self.optimizer_steps is not None:
+            return self.optimizer_steps
         return self.consumed_samples // (
             self.config.batch_per_device * self.dp_size * self.config.grad_accum_steps
         )
@@ -116,6 +119,7 @@ class _PreloadedState:
     state_dict: dict | None = None
     epoch: int = 0
     consumed_samples: int = 0
+    optimizer_steps: int | None = None
     checkpoint: Checkpoint | None = None
 
 
@@ -262,9 +266,22 @@ class TrainContextBuilder:
                         * self._topology.dp_size
                         * cfg.grad_accum_steps
                     )
-                    state.consumed_samples = (
-                        checkpoint.consumed_samples // per_step * per_step
-                    )
+                    if cfg.strategy in ("grpo", "online_grpo"):
+                        state.consumed_samples = checkpoint.consumed_samples
+                        if state.consumed_samples % self._topology.dp_size:
+                            raise ValueError(
+                                "GRPO resume requires a balanced per-rank data cursor"
+                            )
+                        state.optimizer_steps = checkpoint.meta.get(
+                            "optimizer_steps",
+                            checkpoint.meta.get(
+                                "policy_version", state.consumed_samples // per_step
+                            ),
+                        )
+                    else:
+                        state.consumed_samples = (
+                            checkpoint.consumed_samples // per_step * per_step
+                        )
                     state.checkpoint = checkpoint
         if not state.model_config:
             model = cfg.model_fn()
@@ -275,6 +292,11 @@ class TrainContextBuilder:
     def _create_context(
         self, state: _PreloadedState, executor: BaseExecutor
     ) -> TrainContext:
+        steps = state.optimizer_steps
+        if steps is None and self.config.strategy in ("grpo", "online_grpo"):
+            steps = state.consumed_samples // (
+                self.config.batch_per_device * self._topology.dp_size
+            )
         return TrainContext(
             world_size=get_world_size(),
             rank=get_rank(),
@@ -284,6 +306,7 @@ class TrainContextBuilder:
             executor=executor,
             epoch=state.epoch,
             consumed_samples=state.consumed_samples,
+            optimizer_steps=steps,
             checkpoint=state.checkpoint,
             param_path=self._param_path,
         )
@@ -416,6 +439,11 @@ class TrainContextBuilder:
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
         kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)
+        if cfg.strategy in ("grpo", "online_grpo"):
+            kwargs.setdefault("rl_microbatch_prompts", cfg.rl_microbatch_prompts)
+            kwargs["loss_process_group"] = getattr(
+                context.model, "process_group", self._topology.dp_group
+            )
         kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
         if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"):
             kwargs["ref_model"] = create_ref_model(

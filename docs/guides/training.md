@@ -181,7 +181,40 @@ $$
 
 where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the
 per-token importance sampling ratio against the behaviour policy
-and the expectations are over valid response tokens. Online GRPO reuses the
+and the expectations are over valid response tokens. GRPO reduces over the
+actual data-parallel group: each rank backpropagates its local response-loss
+sum multiplied by the DP degree and divided by the global valid-token count.
+Sequence aggregation uses the global count of nonempty responses instead.
+Policy and KL terms share this denominator. A rank with no valid response
+tokens contributes zero while joining the same collective schedule.
+
+Use `rl_microbatch_prompts=1` to backpropagate one complete prompt group at
+a time within an optimizer update. The denominator is frozen over the whole
+update before its first forward. The trainer performs one optimizer step,
+scheduler step and online version publication after the last microbatch.
+`rl_minibatch_prompts` still creates independent optimizer updates, and
+`rl_update_epochs` repeats those updates over the collected rollout; neither
+is a substitute for microbatch accumulation. GRPO requires
+`grad_accum_steps=1`; other strategies retain the legacy accumulation API.
+
+Unequal local group counts use zero-token scheduling padding, which never
+enters the objective or consumed-prompt cursor. A globally empty update
+performs no backward, weight decay, scheduler step or version publication.
+GRPO checkpoints record actual optimizer updates separately from consumed
+prompts, preserve short final batches, and save after a complete rollout
+round. An error during a partial round retains the last complete checkpoint.
+Resume currently requires the same balanced per-rank data cursor.
+
+The MoE auxiliary objective keeps its independent coefficient and existing
+rank-local router-statistics convention. A nonzero auxiliary coefficient
+with multiple microbatches or an empty-group rank is rejected: summing local
+auxiliary means cannot reproduce the nonlinear whole-batch router objective.
+Dense DDP gradient parity is covered by CPU/Gloo oracles; GPU, FSDP and
+MoE auxiliary microbatch support need separate qualification. Reported loss,
+policy and KL metrics sum across the update; other diagnostics describe the
+last local microbatch.
+
+Online GRPO reuses the
 per-token `logprobs_old` captured by the rollout sampler, avoiding an
 `old_model` copy and a repeated forward pass. Offline GRPO keeps `old_model` as
 a compatibility fallback. The KL term regularises $\pi_\theta$ towards a frozen

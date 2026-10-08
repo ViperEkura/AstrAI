@@ -85,6 +85,7 @@ class TrainConfig(BaseConfig):
         rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
         rl_update_epochs (int): Learner passes over one collected online rollout round (classic PPO-style multiple epochs per batch). Each pass recomputes the loss against the round's fixed rewards/logprobs_old and takes its own optimizer steps. Values >1 trade on-policy freshness for sample efficiency; watch ``clip_fraction`` for stale-ratio blowup. Requires ``grad_accum_steps=1`` online. Defaults to 1.
         rl_minibatch_prompts (Optional[int]): Prompts per learner update within one rollout round; None updates on the whole round at once. Slicing always keeps prompt groups intact, and PPO's rollout-pinned advantages are shared views, so targets never shift between updates. Each minibatch update is a full optimizer step (and a weight publication). Defaults to None.
+        rl_microbatch_prompts (Optional[int]): Complete prompt groups per GRPO forward/backward inside one optimizer update. All microbatches share its global denominator and policy version. Requires grad_accum_steps=1. Defaults to None.
         gradient_chunked_logprobs (bool): Compute training-path log-probs through the checkpointed chunked lm_head instead of materializing the full ``[N, S, V]`` logits (gradients identical up to GEMM tiling noise; peak memory drops by the logits tensor). Off keeps the historical full-tensor path. Defaults to False.
         save_reference_model (bool): Persist the frozen reference model as a ``reference_model`` checkpoint extra whenever the strategy has one (DPO/GRPO/PPO KL anchor). Resuming without it would silently re-anchor the KL target to the resumed actor. Adds one extra weight copy per checkpoint. Defaults to True.
         allow_reference_reanchor (bool): Escape hatch for resuming a reference-model strategy from a checkpoint saved without ``reference_model``: False (default) fails the resume explicitly, True proceeds with the reference re-anchored to the resumed actor and logs a warning. Defaults to False.
@@ -158,6 +159,7 @@ class TrainConfig(BaseConfig):
     rollout_val_device: Optional[str] = None
     rl_update_epochs: int = 1
     rl_minibatch_prompts: Optional[int] = None
+    rl_microbatch_prompts: Optional[int] = None
     gradient_chunked_logprobs: bool = False
     save_reference_model: bool = True
     allow_reference_reanchor: bool = False
@@ -307,7 +309,9 @@ class TrainConfig(BaseConfig):
             raise ValueError(f"rollout_val_group_size must be >= 1, got {v}")
         return v
 
-    @field_validator("rollout_pool_seq_len", "rl_minibatch_prompts")
+    @field_validator(
+        "rollout_pool_seq_len", "rl_minibatch_prompts", "rl_microbatch_prompts"
+    )
     def _validate_optional_positive_int(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
             raise ValueError(f"must be positive or None, got {v}")
@@ -355,6 +359,16 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
+        if self.strategy in {"grpo", "online_grpo"} and self.grad_accum_steps != 1:
+            raise ValueError(
+                "GRPO requires grad_accum_steps=1; use rl_microbatch_prompts "
+                "to accumulate complete groups under one global update denominator"
+            )
+        if self.rl_microbatch_prompts is not None and self.strategy not in {
+            "grpo",
+            "online_grpo",
+        }:
+            raise ValueError("rl_microbatch_prompts supports GRPO only")
         if self.strategy.startswith("online_"):
             if self.reward_model_fn is None:
                 raise ValueError(

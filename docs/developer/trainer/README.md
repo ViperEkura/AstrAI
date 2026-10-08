@@ -61,3 +61,25 @@ There is no astrai.trainer.train_callback compatibility module; import
 callbacks from astrai.trainer.callbacks. The implementation files may change
 as responsibilities evolve, so prefer these package-level imports unless
 working directly on an implementation.
+# FSDP module ownership
+
+`FSDPExecutor` applies `fully_shard` to each distinct `DecoderBlock`, then
+to the root model. The root owns remaining embeddings, final norms and
+output heads; a tied embedding/head is a single root parameter. Reusing the
+same block in a loop wraps it once. Parameters shared across distinct blocks
+or between a block and the root are rejected before wrapping.
+
+Configure `executor_kwargs={"reshard_after_forward": True,
+"root_reshard_after_forward": False}` to reshard blocks after forward while
+keeping the root parameters available through backward. These are the
+defaults; each can be set explicitly for a capacity/communication experiment.
+The policy follows the bottom-up grouping described in the
+[PyTorch FSDP2 documentation](https://docs.pytorch.org/docs/main/distributed.fsdp.fully_shard.html).
+
+CPU checks validate the call order, unique parameter ownership, dynamic
+root class compatibility and reshard arguments. The two-GPU test compares
+updates and canonical weight checkpoints for tied/untied heads. It requires
+assigned test GPUs. Real all-gather traces, peak memory and official weights
+are separate qualification results; CPU checks do not establish GPU support.
+This change does not address full-weight loading peaks or reference-model
+replication, and distributed FSDP online rollout remains gated.

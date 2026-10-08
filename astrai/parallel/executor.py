@@ -20,6 +20,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from astrai.factory import BaseFactory
+from astrai.model.components.decoder_block import DecoderBlock
 from astrai.parallel.setup import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
@@ -359,9 +360,10 @@ class DDPExecutor(BaseExecutor):
 class FSDPExecutor(BaseExecutor):
     """FSDP executor using `torch.distributed.fsdp.fully_shard` (per-module API).
 
-    Wraps each child module individually via ``fully_shard``.
-    Skips the root model because ``ABC + Generic[T]`` in the MRO makes
-    ``fully_shard``'s dynamic ``__class__`` assignment fail at the CPython level.
+    Shards each distinct DecoderBlock bottom-up, then the root's remaining
+    parameters. Embeddings, final norms and heads share the root group,
+    keeping tied embedding/head storage under one owner. AutoModel now
+    inherits nn.Module directly and supports FSDP's dynamic root class.
     Original ``Parameter`` objects are preserved (as DTensors) — no
     ``FlatParameter``, no ``use_orig_params=True`` hack.
     """
@@ -371,17 +373,41 @@ class FSDPExecutor(BaseExecutor):
         grad_accum_steps: int = 1,
         mesh: Optional[Any] = None,
         mp_policy: Optional[Any] = None,
-        reshard_after_forward: bool = False,
+        reshard_after_forward: bool | int = True,
+        root_reshard_after_forward: bool | int = False,
     ):
         super().__init__(grad_accum_steps=grad_accum_steps)
         self._mesh = mesh
         self._mp_policy = mp_policy
         self._reshard_after_forward = reshard_after_forward
+        self._root_reshard_after_forward = root_reshard_after_forward
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         if not self.use_distributed:
             logger.warning("FSDP backend selected but world_size=1, model not wrapped")
             return model
+
+        if any(isinstance(module, FSDPModule) for module in model.modules()):
+            raise ValueError("FSDP executor requires an unsharded model")
+        blocks = [
+            module for module in model.modules() if isinstance(module, DecoderBlock)
+        ]
+        block_modules = {id(module) for block in blocks for module in block.modules()}
+        root_params = {
+            id(param)
+            for module in model.modules()
+            if id(module) not in block_modules
+            for param in module.parameters(recurse=False)
+        }
+        owners = {}
+        for index, block in enumerate(blocks):
+            for param in block.parameters():
+                key = id(param)
+                if key in owners or key in root_params:
+                    raise ValueError(
+                        "FSDP cannot shard a parameter shared across distinct decoder blocks or between a block and the root"
+                    )
+                owners[key] = index
 
         kwargs = dict(
             mesh=self._mesh,
@@ -390,16 +416,16 @@ class FSDPExecutor(BaseExecutor):
         )
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-        for child in model.children():
-            if isinstance(child, nn.ModuleList):
-                for sub in child:
-                    fully_shard(sub, **kwargs)
-            else:
-                fully_shard(child, **kwargs)
+        for block in blocks:
+            fully_shard(block, **kwargs)
+        fully_shard(
+            model,
+            **{**kwargs, "reshard_after_forward": self._root_reshard_after_forward},
+        )
 
         logger.info(
-            "FSDP wrapping applied to %d direct children (root skipped for ABC compat)",
-            len(list(model.children())),
+            "FSDP wrapping applied to %d distinct decoder blocks and one root",
+            len(blocks),
         )
         return model
 

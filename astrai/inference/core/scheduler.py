@@ -512,7 +512,8 @@ class Scheduler:
         self._stop_ids = frozenset(self._requests.tokenizer.stop_ids)
         requests, errors = [], []
         backend = get_backend(use_default=False)
-        for ids in prompt_ids_list:
+        batch_id = uuid.uuid4().hex
+        for index, ids in enumerate(prompt_ids_list):
             error = None
             if not ids:
                 error = "prompt_empty"
@@ -528,7 +529,7 @@ class Scheduler:
             request = None
             if error is None:
                 request = Request(
-                    f"batch_{uuid.uuid4().hex}",
+                    f"batch_{batch_id}_{index:08d}",
                     ids,
                     limit,
                     temperature,

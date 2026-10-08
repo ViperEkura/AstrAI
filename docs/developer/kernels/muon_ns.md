@@ -44,8 +44,9 @@ iterations use separate buffers, preserving the normalized caller input and
 persistent momentum state. Dense transposed inputs are passed to BLAS
 operations as column-major views. When automatic Gram dispatch permits row-major
 scratch, the first update writes that layout directly; the final update writes
-the caller's orientation directly. Layout changes need no standalone transpose
-kernel or layout-packing copy. Inputs outside the CUDA contract retain Torch. The CUDA module exposes
+the caller's orientation directly. A measured column-work case keeps column
+layout across all iterations instead. Layout changes need no standalone
+transpose kernel or layout-packing copy. Inputs outside the CUDA contract retain Torch. The CUDA module exposes
 SYRK, SYMM, candidate enumeration and metadata-only `kernel.symmetric.plan`
 inspection. The optimizer does not own tile selection or plan scores.
 
@@ -89,6 +90,8 @@ python scripts/benchmark/muon_ns.py --model <model-directory> --mode graph
 python scripts/benchmark/muon_ns.py --rows <rows> --cols <cols> --mode eager
 python scripts/benchmark/muon_ns.py --model <model-directory> --plan <plan.json>
 python scripts/benchmark/muon_ns.py --model <model-directory> --scope step --dtype bf16
+python scripts/benchmark/muon_ns.py --rows <rows> --cols <cols> \\
+    --scope step --dtype bf16 --mode graph --profile-stages
 python scripts/benchmark/muon_ns.py --model <model-directory> --scope step \
     --dtype bf16 --batch-size <batch-size> --mode eager
 ```
@@ -105,6 +108,13 @@ use table-only dispatch; without a supplied plan it evaluates the default
 measured-first hybrid policy. Inspect `kernel.symmetric.plan` to see geometry
 candidates without running the benchmark, or `policy.symmetric.probe` to see
 the automatic decision for an existing tensor.
+
+`--profile-stages` records GPU event time for each of the five SYRK,
+polynomial and SYMM operations, plus input/output layouts, selected backend,
+tile, raster, and peak allocated/reserved memory. Graph mode uses external
+CUDA events so each captured operation can be timed on replay. The stage
+profile excludes normalization and its event instrumentation adds overhead;
+compare complete optimizer steps with the ordinary interleaved timing fields.
 
 `--scope step` includes momentum, NS, weight decay and the matrix parameter
 update. `--batch-size` measures that many independent parameters in one optimizer

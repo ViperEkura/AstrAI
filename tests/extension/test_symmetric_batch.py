@@ -99,7 +99,7 @@ def test_cuda_batch_layouts_and_independent_addend(
 
 @CUDA_ONLY
 @pytest.mark.parametrize(
-    "operation,tile", [("syrk", "wmma64"), ("symm", "64x64x32_W16x32_S2")]
+    "operation,tile", [("syrk", "64x64x32_W16x32_S2"), ("symm", "64x64x32_W16x32_S2")]
 )
 def test_cuda_batch_results_do_not_mix_matrices(operation, tile):
     x = torch.zeros(3, 64, 128, device="cuda", dtype=torch.bfloat16)

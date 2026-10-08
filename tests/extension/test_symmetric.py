@@ -76,6 +76,11 @@ def test_plan_configuration_is_atomic_and_scoped():
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
+def test_syrk_uses_shared_mma_tile_family():
+    assert all(tile["name"] != "wmma64" for tile in tiles("syrk"))
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
 @pytest.mark.parametrize("operation", ["syrk", "symm"])
 @pytest.mark.parametrize("input_layout", ["row", "column"])
 @pytest.mark.parametrize("output_layout", ["row", "column"])
@@ -148,6 +153,17 @@ def test_every_tile_on_nonproduction_geometry_and_graph(
         torch.testing.assert_close(
             output, expected, atol=0.0001, rtol=0.02, msg=tile["name"]
         )
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
+def test_measured_narrow_symm_tile_is_single_matrix_only():
+    capability = torch.cuda.get_device_capability()
+    if capability[0] * 10 + capability[1] != 120:
+        pytest.skip("measured row is specific to compute capability 120")
+    single = torch.empty((256, 1536), device="cuda", dtype=torch.bfloat16)
+    grouped = torch.empty((4, 256, 1536), device="cuda", dtype=torch.bfloat16)
+    assert plan.probe("symm", single, addend=True).tile == "32x32x32_W16x16_S2"
+    assert plan.probe("symm", grouped, addend=True).tile == "64x64x32_W16x32_S2"
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
@@ -240,8 +256,8 @@ def test_layout_plans_and_nondense_fallback():
     assert torch.equal(gram, sliced @ sliced.T)
     with pytest.raises(ExplicitSelectionError):
         syrk_out(sliced, gram, backend="cuda")
-    with pytest.raises(ValueError, match="layout"):
-        plan.configure([dict(row, operation="syrk", tile="wmma64")])
+    with pytest.raises(ValueError, match="tile"):
+        plan.configure([dict(row, operation="syrk", tile="unknown")])
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")

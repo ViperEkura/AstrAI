@@ -72,7 +72,7 @@ _DEFAULT_ROWS = [
         "input_layout": "row",
         "output_layout": "row",
         "backend": "cuda",
-        "tile": "64x64x32_W16x32_S2",
+        "tile": "32x32x32_W16x16_S2",
         "raster": 0,
     },
     {

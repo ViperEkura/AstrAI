@@ -9,6 +9,21 @@ from astrai.extension.backend.symmetric import select
 from astrai.extension.policy.symmetric import probe
 
 
+def _use_row_work(x: Tensor, steps: int, backend: str) -> bool:
+    if backend != "auto" or x.is_contiguous() or steps <= 1:
+        return False
+    # This measured single-matrix shape keeps its column layout throughout.
+    batch_size = x.size(0) if x.ndim == 3 else 1
+    if (
+        x.is_cuda
+        and batch_size == 1
+        and x.shape[-2:] == (1536, 6912)
+        and torch.cuda.get_device_capability(x.device) == (12, 0)
+    ):
+        return False
+    return probe("syrk", x, input_layout="row").backend == "cuda"
+
+
 def newton_schulz(
     matrix: Tensor,
     coefficients: Tuple[float, float, float],
@@ -46,12 +61,7 @@ def newton_schulz(
     explicit = "torch" if backend == "torch" else None
     # The first/last BLAS calls change layout directly when the selected Gram
     # plan prefers row-major scratch; external tensors keep their orientation.
-    row_work = (
-        backend == "auto"
-        and not x.is_contiguous()
-        and steps > 1
-        and probe("syrk", x, input_layout="row").backend == "cuda"
-    )
+    row_work = _use_row_work(x, steps, backend)
     work = (
         torch.empty(x.shape, dtype=x.dtype, device=x.device)
         if row_work

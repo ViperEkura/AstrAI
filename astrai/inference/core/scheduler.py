@@ -33,6 +33,7 @@ from astrai.inference.core.request import (
 )
 from astrai.inference.core.stepper import SchedulerStep
 from astrai.inference.core.versioning import PolicyVersionGuard
+from astrai.inference.sampling_rng import validate_seed
 from astrai.inference.worker.model_runner import GPUModelRunner
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
@@ -111,7 +112,8 @@ class Scheduler:
             cache = BlockPool(
                 n_layers=config.num_hidden_layers,
                 n_kv_heads=config.num_key_value_heads,
-                head_dim=config.hidden_size // config.num_attention_heads,
+                head_dim=getattr(config, "head_dim", None)
+                or config.hidden_size // config.num_attention_heads,
                 max_batch_size=max_batch_size,
                 max_seq_len=self.max_seq_len,
                 device=self.device,
@@ -508,11 +510,18 @@ class Scheduler:
         rep_window: int = 64,
         return_logprobs: bool = False,
         return_details: bool = False,
+        request_seeds: Optional[List[int]] = None,
     ) -> List[Any]:
+        if request_seeds is not None:
+            if len(request_seeds) != len(prompt_ids_list):
+                raise ValueError("one sampling seed is required per request")
+            for seed in request_seeds:
+                validate_seed(seed)
         self._stop_ids = frozenset(self._requests.tokenizer.stop_ids)
         requests, errors = [], []
         backend = get_backend(use_default=False)
-        for ids in prompt_ids_list:
+        batch_id = uuid.uuid4().hex
+        for index, ids in enumerate(prompt_ids_list):
             error = None
             if not ids:
                 error = "prompt_empty"
@@ -528,7 +537,7 @@ class Scheduler:
             request = None
             if error is None:
                 request = Request(
-                    f"batch_{uuid.uuid4().hex}",
+                    f"batch_{batch_id}_{index:08d}",
                     ids,
                     limit,
                     temperature,
@@ -537,6 +546,9 @@ class Scheduler:
                     frequency_penalty,
                     rep_window,
                     backend,
+                    sampling_seed=request_seeds[index]
+                    if request_seeds is not None
+                    else None,
                 )
                 if not self._kv_manager.alloc_slots(
                     request.request_id, request.prompt_ids
@@ -552,9 +564,13 @@ class Scheduler:
             live = [r for r in requests if r is not None]
             with self._backend_context():
                 while live:
-                    decoded, aborted = self._stepper.step(
-                        live, return_logprobs=return_logprobs
-                    )
+                    if self._enable_overlap:
+                        self.engine_core.tick(live, return_logprobs=return_logprobs)
+                        decoded, aborted = live, []
+                    else:
+                        decoded, aborted = self._stepper.step(
+                            live, return_logprobs=return_logprobs
+                        )
                     for request in aborted:
                         self.finish(
                             request,
@@ -569,8 +585,13 @@ class Scheduler:
                         for r in decoded
                         if not r.terminal_emitted and not r.is_finished(self.stop_ids)
                     ]
+        except BaseException:
+            # Fence failed overlapped work before retiring requests/KV.
+            self.engine_core.fence()
+            raise
         finally:
-            self.engine_core.drain()
+            if not self.engine_core._shutdown_failed:
+                self.engine_core.drain()
             for request in requests:
                 if request is not None and not request.terminal_emitted:
                     self.finish(

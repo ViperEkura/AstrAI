@@ -423,6 +423,7 @@ class SamplingPipeline(BaseSamplingStrategy):
         input_ids: Optional[Tensor] = None,
         input_mask: Optional[Tensor] = None,
         return_logprobs: bool = False,
+        uniforms: Optional[Tensor] = None,
     ):
         """Apply strategies then sample (softmax + multinomial).
 
@@ -437,6 +438,8 @@ class SamplingPipeline(BaseSamplingStrategy):
                 where ``logprobs[i]`` is the log-probability of
                 ``tokens[i]`` under the raw (pre-strategy) model
                 distribution, matching training-side policy logprobs.
+            uniforms: Optional independent draws in [0, 1) for inverse-CDF
+                sampling. None preserves the shared multinomial RNG.
 
         Returns:
             Sampled token IDs ``[batch]``, or — when ``return_logprobs``
@@ -458,9 +461,23 @@ class SamplingPipeline(BaseSamplingStrategy):
             raw_log_probs = torch.log_softmax(logits.float(), dim=-1)
 
         transformed = self.apply(logits, filter_value, input_ids, input_mask)
-        tokens = torch.multinomial(
-            torch.softmax(transformed, dim=-1), num_samples=1
-        ).squeeze(-1)
+        if uniforms is None:
+            tokens = torch.multinomial(
+                torch.softmax(transformed, dim=-1), num_samples=1
+            ).squeeze(-1)
+        else:
+            if uniforms.shape != logits.shape[:-1]:
+                raise ValueError("one sampling uniform is required per logit row")
+            # FP32 CDF sampling keeps request-local draws independent of row
+            # order, variable EOS and speculative steps later discarded.
+            cdf = torch.softmax(transformed.float(), dim=-1).cumsum(dim=-1)
+            cdf = cdf / cdf[..., -1:]
+            uniforms = uniforms.to(device=cdf.device, dtype=cdf.dtype).clamp(
+                min=0, max=1 - 2**-24
+            )
+            tokens = torch.searchsorted(
+                cdf.contiguous(), uniforms.unsqueeze(-1).contiguous(), right=True
+            ).squeeze(-1)
         if not return_logprobs:
             return tokens
         # Log-probabilities of the raw (pre-strategy) model distribution,
@@ -520,6 +537,7 @@ def sample(
     filter_value: float = -float("inf"),
     return_logprobs: bool = False,
     meta: Optional[SamplingMeta] = None,
+    uniforms: Optional[Tensor] = None,
 ):
     """Apply sampling strategies then sample (softmax + multinomial).
 
@@ -565,4 +583,5 @@ def sample(
         input_ids=input_ids,
         input_mask=input_mask,
         return_logprobs=return_logprobs,
+        uniforms=uniforms,
     )

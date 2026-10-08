@@ -132,24 +132,33 @@ class EngineCore:
             )
         return True
 
-    def tick(self):
+    def tick(self, requests=None, *, return_logprobs=False):
+        """Advance serving admission or a fixed synchronous batch.
+
+        Both callers share submit/commit, the device token relay and
+        depth-two draining. Fixed batches do not admit unrelated requests.
+        """
         scheduler = self.scheduler
-        scheduler.release_finished()
-        scheduler.admit_requests()
-        active = scheduler.active_requests()
+
+        def refresh():
+            scheduler.release_finished()
+            if requests is None:
+                scheduler.admit_requests()
+                return scheduler.active_requests()
+            return [request for request in requests if not request.terminal_emitted]
+
+        active = refresh()
         overlap = self._can_overlap(active)
         if self._pending and not overlap:
             self.drain()
-            scheduler.release_finished()
-            scheduler.admit_requests()
-            active = scheduler.active_requests()
+            active = refresh()
             overlap = self._can_overlap(active)
         if not active:
             self.drain()
             scheduler.release_finished()
             return False
         old_count = len(self._pending)
-        plan = scheduler.schedule(active)
+        plan = scheduler.schedule(active, return_logprobs=return_logprobs)
         if (
             old_count
             and overlap
@@ -159,9 +168,8 @@ class EngineCore:
             # input snapshots are then stale and the D2D relay cannot match.
             scheduler.rollback_schedule(plan)
             self.drain()
-            scheduler.release_finished()
-            active = scheduler.active_requests()
-            plan = scheduler.schedule(active)
+            active = refresh()
+            plan = scheduler.schedule(active, return_logprobs=return_logprobs)
             overlap = False
         self.submit(plan)
         if (

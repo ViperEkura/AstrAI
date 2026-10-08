@@ -85,7 +85,7 @@ def _init_single_rank_process_group(tmp_path, backend):
     )
 
 
-def _rollout_config(*, compile_mode=None):
+def _rollout_config(*, compile_mode=None, enable_overlap=False):
     return SimpleNamespace(
         strategy="online_grpo",
         compile_mode=compile_mode,
@@ -95,6 +95,7 @@ def _rollout_config(*, compile_mode=None):
         rollout_top_k=0,
         rollout_top_p=1.0,
         rollout_interval=1,
+        rollout_enable_overlap=enable_overlap,
         rollout_max_policy_lag=None,
         rollout_pool_seq_len=None,
         rollout_device=None,
@@ -129,7 +130,10 @@ def test_ddp_executor_returns_the_public_underlying_module(tmp_path):
         dist.destroy_process_group()
 
 
-def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enable_overlap", [False, True])
+def test_train_context_passes_ddp_inference_view_to_rollout(
+    tmp_path, monkeypatch, enable_overlap
+):
     _init_single_rank_process_group(tmp_path, "gloo")
     captured = {}
 
@@ -147,13 +151,14 @@ def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatc
         model = _ConfigModel()
         wrapped = DDP(model)
         context = _rollout_context(wrapped, DDPExecutor())
-        builder = TrainContextBuilder(_rollout_config())
+        builder = TrainContextBuilder(_rollout_config(enable_overlap=enable_overlap))
 
         builder._configure_rollout(context, {"group_size": 2})
 
         assert captured["model"] is model
         assert captured["max_seq_len"] == 32
         assert captured["max_batch_size"] == 2
+        assert captured["enable_overlap"] is enable_overlap
         assert (
             context.strategy.runner.generator.backend.scheduler.__class__ is _Scheduler
         )

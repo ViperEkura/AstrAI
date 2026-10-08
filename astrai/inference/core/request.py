@@ -20,6 +20,7 @@ from tokenizers.decoders import DecodeStream
 from astrai.config.inference_config import InferenceConfig
 from astrai.inference.contracts import ExecutionRequest, RequestIdentity, SamplingParams
 from astrai.inference.core.metrics import MetricsCollector
+from astrai.inference.sampling_rng import validate_seed
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 if TYPE_CHECKING:
@@ -94,7 +95,10 @@ class Request:
         frequency_penalty: float = 0.0,
         rep_window: int = _config.default_rep_window,
         backend: Optional["AttentionBackend"] = None,
+        sampling_seed: Optional[int] = None,
     ):
+        if sampling_seed is not None:
+            validate_seed(sampling_seed)
         self.request_id = request_id
         self.identity = RequestIdentity(request_id, uuid.uuid4().hex)
         self.prompt_ids = list(prompt_ids)
@@ -107,7 +111,7 @@ class Request:
         self.rep_window = rep_window
         self.backend = backend
         self._sampling = SamplingParams(
-            temperature, top_p, top_k, frequency_penalty, rep_window
+            temperature, top_p, top_k, frequency_penalty, rep_window, sampling_seed
         )
 
         # Scoring only: how many trailing tokens of ``prompt_ids`` form the

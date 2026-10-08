@@ -70,6 +70,8 @@ class TrainConfig(BaseConfig):
         neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
         moe_aux_loss_coef (float): Weight applied to the MoE load-balancing loss. Defaults to 0.01.
         rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
+        rollout_enable_overlap (bool): Reuse the native depth-two submit/commit pipeline for complete rollout batches. Frequency penalties and batch changes drain before replanning. Defaults to False.
+        rollout_seed (Optional[int]): Seed request-local sampling by prompt, policy version and response index. None uses the historical shared RNG. Defaults to None.
         rollout_max_policy_lag (Optional[int]): Maximum accepted gap between rollout and live policy versions. None derives ``rollout_interval - 1``. Defaults to None.
         rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
         rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
@@ -143,6 +145,8 @@ class TrainConfig(BaseConfig):
     moe_aux_loss_coef: float = 0.01
 
     rollout_interval: int = 512
+    rollout_enable_overlap: bool = False
+    rollout_seed: Optional[int] = None
     rollout_max_policy_lag: Optional[int] = None
     rollout_temperature: float = 0.7
     rollout_top_k: int = 0
@@ -273,6 +277,12 @@ class TrainConfig(BaseConfig):
     def _validate_optional_non_negative_int(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v < 0:
             raise ValueError(f"rollout_max_policy_lag must be non-negative, got {v}")
+        return v
+
+    @field_validator("rollout_seed", mode="before")
+    def _validate_rollout_seed(cls, v):
+        if v is not None and (type(v) is not int or not 0 <= v < 2**63):
+            raise ValueError("rollout_seed must be an integer in [0, 2**63-1]")
         return v
 
     @field_validator("rollout_val_temperature")

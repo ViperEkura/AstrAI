@@ -133,6 +133,7 @@ class ReplicaBackend:
         max_seq_len: Optional[int] = None,
         policy_version: int = 0,
         enable_cuda_graph: bool = True,
+        enable_overlap: bool = False,
     ):
         model.eval()
         with _device_context(device):
@@ -143,6 +144,7 @@ class ReplicaBackend:
                 max_seq_len=max_seq_len,
                 device=str(device) if isinstance(device, torch.device) else device,
                 enable_cuda_graph=enable_cuda_graph,
+                enable_overlap=enable_overlap,
                 policy_version=policy_version,
             )
         self.model = model

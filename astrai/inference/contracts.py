@@ -43,6 +43,7 @@ class SamplingParams:
     top_k: int = 50
     frequency_penalty: float = 0.0
     rep_window: int = 64
+    seed: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,10 @@ class ExecutionRequest:
     @property
     def rep_window(self) -> int:
         return self.sampling.rep_window
+
+    @property
+    def sampling_position(self) -> int:
+        return self.materialized_end - len(self.prompt_ids)
 
 
 @dataclass(frozen=True)

@@ -110,6 +110,11 @@ class SamplingParams:
     :func:`dataclasses.replace` so only the fields that differ from the
     training rollout need to be stated — ``temperature=0.0`` selects the
     greedy decode path.
+
+    ``seed`` binds independent sampling streams to tokenized prompt,
+    policy version, response index and duplicate occurrence within the batch.
+    For unique prompts the stream survives row reordering and batch splitting.
+    ``None`` keeps the shared multinomial RNG path.
     """
 
     temperature: float = 1.0
@@ -119,3 +124,4 @@ class SamplingParams:
     group_size: int = 8
     frequency_penalty: float = 0.0
     rep_window: int = 64
+    seed: Optional[int] = None

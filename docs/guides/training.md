@@ -211,6 +211,25 @@ Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
 
 ### Online Rollout
 
+`rollout_enable_overlap=True` enables the native collector's depth-two
+submit/commit loop for complete batches, on both colocated and replica
+backends. It reuses the serving driver's device token relay and pinned copy
+slots. Batch request IDs preserve input order so the prefill row sort cannot
+randomly reassign sampling draws to responses. Frequency penalties,
+batch-identity changes, KV extension failures
+and token limits use its drain/replan rules. All requests finish and resources
+drain before a rollout returns or a policy update can publish. CPU uses
+synchronous tensor commits and provides no hardware overlap.
+
+The default remains `False` for a comparable synchronous control. CPU gates
+cover greedy variable-stop parity, grouped sampling with fixed-length
+responses, token/logprob/mask/finish attribution, repeated weight versions
+and failure cleanup. Seeded stochastic runs with early stopping can consume
+extra speculative draws, so identical global RNG streams are only compared
+under fixed response lengths; per-request RNG is separate work. C32–256
+collection and complete RL throughput/quality comparisons require assigned
+GPU qualification and are not implied by the CPU gates.
+
 `online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with
 a `RolloutRunner`. The runner renders prompts through the tokenizer chat
 template, generates grouped responses through `Scheduler`, then scores

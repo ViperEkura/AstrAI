@@ -81,7 +81,7 @@ def syrk_out(
         addend,
         alpha,
         beta,
-        tile or ("wmma64" if x.is_contiguous() else "64x64x64_W16x32_S2"),
+        tile or ("64x64x32_W16x32_S2" if x.is_contiguous() else "64x64x64_W16x32_S2"),
     )
 
 

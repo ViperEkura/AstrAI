@@ -64,8 +64,6 @@ void syrk_out(torch::Tensor x, torch::Tensor output,
     check_addend(output, addend, alpha, beta);
     const at::cuda::OptionalCUDAGuard guard(device_of(x));
     TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major >= 8, "BF16 tensor cores required");
-    if (tile == "wmma64")
-        TORCH_CHECK(x.is_contiguous(), "wmma64 requires row-major input");
     gemm::GemmParams p{};
     p.a_ptr = x.data_ptr(); p.b_ptr = x.data_ptr(); p.out_ptr = output.data_ptr();
     p.m = x.size(-2); p.n = x.size(-2); p.k = x.size(-1);

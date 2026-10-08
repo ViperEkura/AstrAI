@@ -12,9 +12,10 @@ from safetensors import safe_open
 from torch import nn
 from torch.optim._muon import _zeropower_via_newtonschulz
 
-from astrai.extension.backend.newton_schulz import newton_schulz
-from astrai.extension.kernel.symmetric import is_available
-from astrai.extension.policy.symmetric import configure
+from astrai.extension.backend.newton_schulz import _use_row_work, newton_schulz
+from astrai.extension.backend.symmetric import select
+from astrai.extension.kernel.symmetric import is_available, tiles
+from astrai.extension.policy.symmetric import configure, layout, probe
 from astrai.optim.muon_adamw import MuonAdamW
 
 COEFFICIENTS = (3.4445, -4.775, 2.0315)
@@ -105,6 +106,127 @@ def check_outputs(reference, candidate):
     if relative_l2 > 0.01:
         raise RuntimeError("candidate exceeds the numerical error budget")
     return max_abs, relative_l2
+
+
+def profile_stages(shape, batch_size, repetitions, mode, dtype):
+    """Time the three matrix operations in each production NS iteration."""
+    torch.manual_seed(17)
+    source = torch.randn((batch_size, *shape), device="cuda", dtype=dtype)
+    reference = newton_schulz(source.clone(), COEFFICIENTS, backend="auto")
+    x = source.bfloat16()
+    tall = x.size(-2) > x.size(-1)
+    if tall:
+        x = x.transpose(-2, -1)
+    x.div_(x.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-7))
+    gram = torch.empty(
+        (*x.shape[:-2], x.size(-2), x.size(-2)), device=x.device, dtype=x.dtype
+    )
+    polynomial = torch.empty_like(gram)
+    row_work = _use_row_work(x, 5, "auto")
+    work = (
+        torch.empty(x.shape, device=x.device, dtype=x.dtype)
+        if row_work
+        else torch.empty_like(x)
+    )
+    spare = torch.empty_like(work)
+    final = torch.empty_like(x) if row_work else None
+    buffers = (work, spare)
+    operations = []
+    metadata = []
+    tile_info = {
+        operation: {item["name"]: item for item in tiles(operation)}
+        for operation in ("syrk", "symm")
+    }
+
+    def append(iteration, stage, operation, left, output, *, right=None, **kwargs):
+        matrix = right if right is not None else left
+        decision = probe(
+            operation, matrix, output=output, addend=kwargs.get("beta", 0) != 0
+        )
+        geometry = tile_info[operation].get(decision.tile, {})
+        matrices = (left, output) if right is None else (left, right, output)
+        selected = select(operation, *matrices, **kwargs)
+        operations.append(partial(selected, *matrices, **kwargs))
+        metadata.append(
+            {
+                "iteration": iteration,
+                "stage": stage,
+                "backend": decision.backend,
+                "tile": decision.tile,
+                "raster": decision.raster,
+                "input_layout": layout(matrix),
+                "output_layout": layout(output),
+                "shared_memory_bytes": geometry.get("shared_memory"),
+            }
+        )
+
+    a, b, c = COEFFICIENTS
+    for iteration in range(5):
+        append(iteration, "syrk", "syrk", x, gram)
+        append(
+            iteration,
+            "polynomial",
+            "syrk",
+            gram,
+            polynomial,
+            addend=gram,
+            alpha=c,
+            beta=b,
+        )
+        output = (
+            final if final is not None and iteration == 4 else buffers[iteration % 2]
+        )
+        append(iteration, "symm", "symm", polynomial, output, right=x, addend=x, beta=a)
+        x = output
+
+    output = x.transpose(-2, -1) if tall else x
+    events = [
+        (
+            torch.cuda.Event(enable_timing=True, external=True),
+            torch.cuda.Event(enable_timing=True, external=True),
+        )
+        for _ in operations
+    ]
+
+    def run():
+        for function, (start, end) in zip(operations, events):
+            start.record()
+            function()
+            end.record()
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    max_abs, relative_l2 = check_outputs(reference, output)
+    graph = None
+    if mode == "graph":
+        torch.cuda.empty_cache()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        runner = graph.replay
+    else:
+        runner = run
+    torch.cuda.reset_peak_memory_stats()
+    samples = [[] for _ in operations]
+    for _ in range(repetitions):
+        runner()
+        torch.cuda.synchronize()
+        for values, (start, end) in zip(samples, events):
+            values.append(start.elapsed_time(end))
+    for row, values in zip(metadata, samples):
+        row["ms"] = statistics.median(values)
+    return {
+        "stages": metadata,
+        "stage_totals_ms": {
+            name: sum(row["ms"] for row in metadata if row["stage"] == name)
+            for name in ("syrk", "polynomial", "symm")
+        },
+        "max_abs_vs_production": max_abs,
+        "relative_l2_vs_production": relative_l2,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
+    }
 
 
 def measure_group(shape, batch_size, repetitions, mode, scope, dtype):
@@ -219,6 +341,11 @@ def main():
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
     parser.add_argument(
+        "--profile-stages",
+        action="store_true",
+        help="Record each NS matrix operation and layout.",
+    )
+    parser.add_argument(
         "--plan", type=Path, help="Load measured symmetric dispatch rows."
     )
     parser.add_argument("--scope", choices=("ns", "step"), default="ns")
@@ -258,6 +385,13 @@ def main():
             )
         )
         torch.cuda.empty_cache()
+        if args.profile_stages:
+            row = rows[-1]
+            row["stage_profiles"] = [
+                profile_stages(shape, size, args.repetitions, args.mode, dtype)
+                for size in sorted({group["batch_size"] for group in row["groups"]})
+            ]
+            torch.cuda.empty_cache()
     totals = {
         key: sum(row["weighted_ms"][key] for row in rows)
         for key in ("torch", "reuse", "kernels")

@@ -10,5 +10,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("tile") = "64x64x32_W16x32_S2", py::arg("raster") = 1);
     m.def("syrk_out", &astrai::symmetric::syrk_out, py::arg("x"), py::arg("output"),
           py::arg("addend") = py::none(), py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
-          py::arg("tile") = "wmma64");
+          py::arg("tile") = "64x64x32_W16x32_S2");
 }

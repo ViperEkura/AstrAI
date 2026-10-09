@@ -23,7 +23,7 @@ from astrai.config.train_config import (
 )
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM, ValueModel
-from astrai.model.components.decoder_block import DecoderBlock
+from astrai.model.components.mlp import MLP
 from astrai.optim import OptimizerFactory
 from astrai.trainer import SchedulerFactory, Trainer
 from astrai.trainer.strategy import StrategyFactory
@@ -217,6 +217,20 @@ _SPECS = [
         type=float,
         default=0.0,
         help="Label smoothing.",
+    ),
+    OptSpec(
+        "loss_backend",
+        "Training",
+        choices=["torch", "cuda_linear_ce"],
+        default="torch",
+        help="Cross-entropy implementation for seq/SFT training.",
+    ),
+    OptSpec(
+        "loss_chunk_size",
+        "Training",
+        type=int,
+        default=512,
+        help="Token chunk size for CUDA linear cross-entropy.",
     ),
     OptSpec("dpo_beta", "Algorithm", type=float, default=0.1, help="DPO beta."),
     OptSpec("group_size", "Algorithm", type=int, default=4, help="GRPO group size."),
@@ -752,6 +766,13 @@ def train(
         "gae_lambda": kwargs.pop("ppo_gae_lambda"),
         "vf_coef": kwargs.pop("ppo_vf_coef"),
     }
+    loss_backend = kwargs.pop("loss_backend")
+    loss_chunk_size = kwargs.pop("loss_chunk_size")
+    if train_type in ("seq", "sft"):
+        strategy_kwargs["loss_backend"] = loss_backend
+        strategy_kwargs["loss_chunk_size"] = loss_chunk_size
+    elif loss_backend != "torch" or loss_chunk_size != 512:
+        raise ValueError("loss_backend and loss_chunk_size require seq or sft training")
 
     rollout_interval = kwargs.pop("rollout_interval", 512)
     rollout_max_policy_lag = kwargs.pop("rollout_max_policy_lag", None)
@@ -891,7 +912,7 @@ def train(
         **scheduler_kwargs,
     )
 
-    grad_ckpt_modules = [DecoderBlock] if gradient_checkpointing else []
+    grad_ckpt_modules = [MLP] if gradient_checkpointing else []
     compile_mode = kwargs.pop("compile_mode", None)
 
     collate_fn = None

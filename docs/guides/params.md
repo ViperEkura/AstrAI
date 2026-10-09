@@ -21,6 +21,8 @@
 | `--n_epoch` | Total training epochs | 1 |
 | `--batch_per_device` | Batch size per device | 1 |
 | `--grad_accum_steps` | Gradient accumulation steps between optimizer steps | 1 |
+| `--loss_backend` | Cross-entropy backend for `seq`/`sft` (`torch` or `cuda_linear_ce`) | `torch` |
+| `--loss_chunk_size` | Token chunk size for `cuda_linear_ce` | 512 |
 
 ### Learning Rate Scheduling
 
@@ -111,7 +113,7 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--gradient_checkpointing`, `--no-gradient_checkpointing` | Enable or disable activation checkpointing for DecoderBlock modules | disabled |
+| `--gradient_checkpointing`, `--no-gradient_checkpointing` | Enable or disable activation checkpointing for MLP modules | disabled |
 
 ### Miscellaneous
 

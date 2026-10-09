@@ -322,12 +322,17 @@ Created by `SchedulerFactory.create(schedule_type, optimizer, **kwargs)`. Valid 
 Trades compute for memory by recomputing activations during backward pass. Specify module types via `gradient_checkpointing_modules`:
 
 ```python
-from astrai.model.components.decoder_block import DecoderBlock
+from astrai.model.components.mlp import MLP
 
-config = TrainConfig(..., gradient_checkpointing_modules=[DecoderBlock])
+config = TrainConfig(..., gradient_checkpointing_modules=[MLP])
 ```
 
-Callback wraps each `DecoderBlock.forward` with `torch.utils.checkpoint.checkpoint(use_reentrant=False)`, compatible with `torch.compile`. Uses `nn.Module.apply()` for traversal — works through DDP wrappers without manual unwrap. Empty list (default) means no-op.
+The training CLI's `--gradient_checkpointing` selects MLP modules, leaving
+attention forwards unwrapped. The callback wraps each selected module's
+`forward` with `torch.utils.checkpoint.checkpoint(use_reentrant=False)`,
+compatible with `torch.compile`. It uses `nn.Module.apply()` for traversal and
+works through DDP wrappers without manual unwrap. An empty list (default) is a
+no-op.
 
 ## Checkpoint
 

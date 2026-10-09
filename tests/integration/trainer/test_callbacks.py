@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 
 from astrai.model.components.decoder_block import DecoderBlock
+from astrai.model.components.mlp import MLP
 from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks import (
     GradientCheckpointingCallback,
@@ -95,6 +96,28 @@ def test_gradient_checkpointing_backward(test_model):
     model.zero_grad()
     for name, p in model.named_parameters():
         assert p.grad is None or p.grad.sum().item() == 0, f"{name} grad not zeroed"
+
+
+def test_mlp_only_checkpoint_keeps_attention_unwrapped(test_model):
+    model = test_model["model"]
+    device = test_model["device"]
+    callback = GradientCheckpointingCallback(modules=[MLP])
+    model.apply(callback._enable)
+
+    for layer in model.model.layers:
+        assert hasattr(layer.mlp, "_original_forward")
+        assert not hasattr(layer.attention, "_original_forward")
+        assert not hasattr(layer, "_original_forward")
+
+    input_ids = torch.randint(0, 1000, (2, 32)).to(device)
+    target_ids = torch.randint(0, 1000, (2, 32)).to(device)
+    logits = model(input_ids)["logits"]
+    torch.nn.functional.cross_entropy(
+        logits.flatten(0, 1).float(), target_ids.flatten()
+    ).backward()
+    assert all(p.grad is not None for p in model.parameters() if p.requires_grad)
+
+    model.apply(callback._disable)
 
 
 def test_gradient_checkpointing_trainer_integration(

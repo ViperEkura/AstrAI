@@ -14,6 +14,7 @@ from astrai.config.cli import (
     apply_specs,
     option_from_spec,
 )
+from astrai.model.components.mlp import MLP
 from scripts.tools import train as train_module
 from tests.support.models import make_rollout_config
 
@@ -289,6 +290,40 @@ def test_cli_rejects_unknown_yaml_parameters(tmp_path):
     )
     assert result.exit_code == 2
     assert "Unknown config keys: learner_device" in result.output
+
+
+def test_sft_cli_routes_linear_ce_options_from_yaml(tmp_path, monkeypatch):
+    make_rollout_config().to_file(tmp_path / "config.json")
+    yaml = tmp_path / "train.yaml"
+    yaml.write_text(
+        f"training:\n  train_type: sft\n  param_path: {tmp_path}\n"
+        f"  data_root_path: {tmp_path}\n  dp_mode: none\n"
+        "  loss_backend: cuda_linear_ce\n  loss_chunk_size: 128\n"
+        "  gradient_checkpointing: true\n"
+    )
+    captured = []
+
+    class Trainer:
+        def __init__(self, config):
+            captured.append(config)
+
+        def train(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(train_module, "Trainer", Trainer)
+    monkeypatch.setattr(
+        train_module.DatasetFactory,
+        "load",
+        lambda **kwargs: TensorDataset(torch.ones(5)),
+    )
+    result = CliRunner().invoke(
+        train_module.train_command,
+        ["--config", str(yaml), "--loss_chunk_size", "256"],
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert captured[0].strategy_kwargs["loss_backend"] == "cuda_linear_ce"
+    assert captured[0].strategy_kwargs["loss_chunk_size"] == 256
+    assert captured[0].gradient_checkpointing_modules == [MLP]
 
 
 @pytest.mark.parametrize("reference", ["missing_separator", "math:pi"])

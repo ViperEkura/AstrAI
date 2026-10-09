@@ -1,11 +1,13 @@
 """One learner coordinating versioned online GRPO rollout rounds."""
 
+import logging
 import multiprocessing as mp
+import os
 import pickle
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import wait
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional
 
 import torch
 from torch import nn
@@ -13,6 +15,7 @@ from torch import nn
 from astrai.trainer.rollout.batching import merge_rollouts, slice_batch
 from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
 from astrai.trainer.rollout.protocol import (
+    GenerationRequest,
     MessageKind,
     RolloutMessage,
     RolloutProtocolError,
@@ -20,12 +23,15 @@ from astrai.trainer.rollout.protocol import (
     send_message,
 )
 from astrai.trainer.rollout.runner import _score_rewards
+from astrai.trainer.rollout.seeding import response_seeds
 from astrai.trainer.rollout.types import (
     RolloutResult,
     RolloutVersionError,
     SamplingParams,
 )
 from astrai.trainer.rollout.worker import RolloutWorkerSpec, run_rollout_worker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +42,7 @@ class PendingRound:
     round_id: int
     started: float
     request_ids: Dict[int, int]
+    seeds: List[int]
 
 
 class AsyncRoundCoordinator:
@@ -58,6 +65,10 @@ class AsyncRoundCoordinator:
         worker_timeout_s: float = 600.0,
         worker_target=None,
         weight_channel=None,
+        startup_timeout_s: float = 300.0,
+        weight_timeout_s: Optional[float] = None,
+        random_seed: int = 3407,
+        sample_cursor: int = 0,
     ):
         try:
             pickle.dumps(model_fn)
@@ -68,6 +79,12 @@ class AsyncRoundCoordinator:
         self.max_policy_lag = max_policy_lag
         self.max_prompts_per_worker = max_prompts_per_worker
         self.worker_timeout_s = worker_timeout_s
+        self.weight_timeout_s = (
+            worker_timeout_s if weight_timeout_s is None else weight_timeout_s
+        )
+        self.random_seed = random_seed
+        self._sample_cursor = sample_cursor
+        self._group_size = params.group_size
         self._devices = list(devices)
         self._round_id = 0
         self._request_id = 0
@@ -78,17 +95,44 @@ class AsyncRoundCoordinator:
         self.peak_gpu_memory = {}
         self.worker_cuda_graph_enabled = {}
         self.weights = weight_channel or NCCLWeightChannel(source, policy_version)
-        self._nccl_timeout_s = min(30.0, max(5.0, worker_timeout_s))
+        self._nccl_timeout_s = self.weight_timeout_s
         self._ctx = mp.get_context("spawn")
         self._processes = []
         self._pipes = []
         self._worker_versions = []
         self._active_round = None
         self._worker_target = worker_target or run_rollout_worker
+        logger.info(
+            "async rollout: learner=%s workers=%s CUDA_VISIBLE_DEVICES=%s sampling=%s startup_timeout=%s generation_timeout=%s weight_timeout=%s seed=%s cursor=%s",
+            next(source.parameters()).device,
+            devices,
+            os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
+            params,
+            startup_timeout_s,
+            worker_timeout_s,
+            self.weight_timeout_s,
+            random_seed,
+            sample_cursor,
+        )
+        if next(source.parameters()).device.type == "cuda":
+            logger.info(
+                "rollout GPU UUIDs: %s",
+                {
+                    str(device): str(
+                        getattr(
+                            torch.cuda.get_device_properties(device),
+                            "uuid",
+                            "unavailable",
+                        )
+                    )
+                    for device in [next(source.parameters()).device]
+                    + [torch.device(name) for name in devices]
+                },
+            )
         try:
-            startup_deadline = time.monotonic() + 300.0
+            startup_deadline = time.monotonic() + startup_timeout_s
             self._rendezvous_port = self.weights.prepare_rendezvous(
-                len(devices) + 1, 300.0
+                len(devices) + 1, startup_timeout_s
             )
             for index, device in enumerate(devices):
                 parent, child = self._ctx.Pipe(duplex=True)
@@ -238,7 +282,7 @@ class AsyncRoundCoordinator:
         acks = self._collect_replies(
             missing,
             MessageKind.WEIGHT_SYNC_ACK,
-            time.monotonic() + self.worker_timeout_s,
+            time.monotonic() + self.weight_timeout_s,
             request_ids,
             version=version,
         )
@@ -273,7 +317,7 @@ class AsyncRoundCoordinator:
                 rollout = self.collect_round(handle)
             except RolloutVersionError:
                 # A stale round contributes no gradient or sample accounting.
-                handle = self.submit_round(batch)
+                handle = self.submit_round(batch, seeds=handle.seeds)
                 rollout = self.collect_round(handle)
 
             next_batch = next(batches, None)
@@ -283,7 +327,9 @@ class AsyncRoundCoordinator:
             yield rollout
             batch, handle = next_batch, next_handle
 
-    def submit_round(self, batch: Dict) -> PendingRound:
+    def submit_round(
+        self, batch: Dict, seeds: Optional[List[int]] = None
+    ) -> PendingRound:
         if self._closed:
             raise RuntimeError("async rollout coordinator is closed")
         if self._active_round is not None:
@@ -291,6 +337,13 @@ class AsyncRoundCoordinator:
         total = len(next(iter(batch.values())))
         if total == 0:
             raise ValueError("async rollout round cannot be empty")
+        fresh = seeds is None
+        if fresh:
+            seeds = response_seeds(
+                self.random_seed, self._sample_cursor, total, self._group_size
+            )
+        if len(seeds) != total * self._group_size:
+            raise ValueError("rollout seeds must match the prompt/response count")
         version = self._policy_version
         jobs = {
             index: list(range(index, total, len(self._processes)))
@@ -306,12 +359,27 @@ class AsyncRoundCoordinator:
                     MessageKind.GENERATE,
                     round_id=self._round_id,
                     version=version,
-                    payload=slice_batch(batch, indices, total),
+                    payload=GenerationRequest(
+                        slice_batch(batch, indices, total),
+                        [
+                            seeds[i * self._group_size + g]
+                            for i in indices
+                            for g in range(self._group_size)
+                        ],
+                    ),
                 )
             handle = PendingRound(
-                total, jobs, version, self._round_id, time.monotonic(), request_ids
+                total,
+                jobs,
+                version,
+                self._round_id,
+                time.monotonic(),
+                request_ids,
+                seeds,
             )
             self._active_round = handle
+            if fresh:
+                self._sample_cursor += total
             return handle
         except BaseException:
             self.close(force=True)

@@ -423,6 +423,7 @@ class SamplingPipeline(BaseSamplingStrategy):
         input_ids: Optional[Tensor] = None,
         input_mask: Optional[Tensor] = None,
         return_logprobs: bool = False,
+        seeds: Optional[List[Optional[int]]] = None,
     ):
         """Apply strategies then sample (softmax + multinomial).
 
@@ -458,9 +459,27 @@ class SamplingPipeline(BaseSamplingStrategy):
             raw_log_probs = torch.log_softmax(logits.float(), dim=-1)
 
         transformed = self.apply(logits, filter_value, input_ids, input_mask)
-        tokens = torch.multinomial(
-            torch.softmax(transformed, dim=-1), num_samples=1
-        ).squeeze(-1)
+        probabilities = torch.softmax(transformed, dim=-1)
+        if seeds is None:
+            tokens = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+        else:
+            if len(seeds) != logits.shape[0]:
+                raise ValueError("sampling seeds must match the batch size")
+            tokens = torch.cat(
+                [
+                    torch.multinomial(
+                        probabilities[i],
+                        num_samples=1,
+                        generator=(
+                            None
+                            if seed is None
+                            else torch.Generator(device=logits.device).manual_seed(seed)
+                        ),
+                    )
+                    for i, seed in enumerate(seeds)
+                ]
+            )
+
         if not return_logprobs:
             return tokens
         # Log-probabilities of the raw (pre-strategy) model distribution,
@@ -520,6 +539,7 @@ def sample(
     filter_value: float = -float("inf"),
     return_logprobs: bool = False,
     meta: Optional[SamplingMeta] = None,
+    seeds: Optional[List[Optional[int]]] = None,
 ):
     """Apply sampling strategies then sample (softmax + multinomial).
 
@@ -565,4 +585,5 @@ def sample(
         input_ids=input_ids,
         input_mask=input_mask,
         return_logprobs=return_logprobs,
+        seeds=seeds,
     )

@@ -8,11 +8,11 @@ serialized through these messages.
 from dataclasses import dataclass
 from enum import Enum
 from multiprocessing.connection import Connection
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from astrai.trainer.rollout.types import RawRollout
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 
 class MessageKind(str, Enum):
@@ -72,6 +72,12 @@ class RolloutMessage:
 class WorkerReady:
     cuda_graph_enabled: bool
     peak_gpu_memory: int
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationRequest:
+    batch: Dict
+    seeds: List[int]
 
 
 @dataclass(frozen=True, slots=True)

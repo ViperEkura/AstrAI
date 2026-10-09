@@ -1,3 +1,4 @@
+import importlib
 import os
 from collections.abc import Callable
 from functools import partial
@@ -17,6 +18,7 @@ from astrai.config.cli import (
 from astrai.config.train_config import (
     BACKENDS,
     DP_MODES,
+    ROLLOUT_MODES,
     START_METHODS,
     TRAIN_TYPES,
 )
@@ -25,7 +27,6 @@ from astrai.model import AutoRegressiveLM, ValueModel
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.optim import OptimizerFactory
 from astrai.trainer import SchedulerFactory, Trainer
-from astrai.trainer.rollout import BaseRewardModel
 
 # Re-exported under its historical name for tests importing it from here.
 _merge_yaml_into_kwargs = merge_yaml_into_kwargs
@@ -301,6 +302,55 @@ _SPECS = [
         "Algorithm",
         help="MoE load balancing auxiliary loss coefficient (0=disable).",
     ),
+    OptSpec(
+        "rollout_mode",
+        "Algorithm",
+        choices=sorted(ROLLOUT_MODES),
+        help="Synchronous or asynchronous rollout.",
+    ),
+    OptSpec(
+        "rollout_devices",
+        "Algorithm",
+        help="Indexed logical CUDA devices; repeat once per async worker.",
+    ),
+    OptSpec(
+        "rollout_worker_timeout_s",
+        "Algorithm",
+        help="Generation timeout per async round.",
+    ),
+    OptSpec(
+        "rollout_startup_timeout_s", "Algorithm", help="Async worker startup timeout."
+    ),
+    OptSpec(
+        "rollout_weight_timeout_s",
+        "Algorithm",
+        help="NCCL weight synchronization timeout.",
+    ),
+    OptSpec(
+        "async_train_microbatch_prompts",
+        "Algorithm",
+        help="Prompts per backward pass in an async update.",
+    ),
+    OptSpec(
+        "reward_model",
+        "Algorithm",
+        type=str,
+        default=None,
+        help="Reward factory as module:qualified_name.",
+    ),
+    OptSpec(
+        "rl_update_epochs", "Algorithm", help="Learner epochs per collected round."
+    ),
+    OptSpec(
+        "rl_minibatch_prompts",
+        "Algorithm",
+        help="Prompts per independent learner update.",
+    ),
+    OptSpec(
+        "gradient_chunked_logprobs",
+        "Algorithm",
+        help="Recompute training logprobs in chunks.",
+    ),
     OptSpec("rollout_interval", "Algorithm", help="Steps between rollouts."),
     OptSpec(
         "rollout_max_policy_lag",
@@ -491,7 +541,13 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
             for key in kwargs
             if ctx.get_parameter_source(key) is ParameterSource.COMMANDLINE
         }
-        kwargs = _merge_yaml_into_kwargs(config_path, kwargs, explicit_keys)
+        kwargs = _merge_yaml_into_kwargs(
+            config_path,
+            kwargs,
+            explicit_keys,
+            allowed_keys=list(kwargs),
+            strict_unknown=True,
+        )
 
     required = ["train_type", "data_root_path", "param_path"]
     missing = [k for k in required if kwargs.get(k) is None]
@@ -503,6 +559,7 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
 
     # Convert tuple back to list
     kwargs["metrics"] = list(kwargs["metrics"])
+    kwargs["rollout_devices"] = list(kwargs["rollout_devices"])
     kwargs["tp_size"] = kwargs.pop("tp_size") or 1
     kwargs["cp_size"] = kwargs.pop("cp_size") or 1
     kwargs["dp_size"] = kwargs.pop("dp_size") or 1
@@ -511,7 +568,10 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
         _print_dry_run(kwargs)
         return
 
-    train(**kwargs)
+    try:
+        train(**kwargs)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
 
 
 def _print_dry_run(kwargs: dict) -> None:
@@ -527,7 +587,10 @@ def _print_dry_run(kwargs: dict) -> None:
         ("DP replicas", str(dp_size)),
         ("CP size", str(cp_size)),
         ("TP size", str(tp_size)),
-        ("GPUs", str(dp_size * cp_size * tp_size)),
+        ("Learner GPUs", str(dp_size * cp_size * tp_size)),
+        ("Rollout mode", kwargs.get("rollout_mode", "sync")),
+        ("Worker devices", str(kwargs.get("rollout_devices", []))),
+        ("Reward factory", kwargs.get("reward_model")),
         ("Epochs", str(kwargs.get("n_epoch", 1))),
         ("Batch/device", str(kwargs.get("batch_per_device", 1))),
         ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
@@ -545,6 +608,18 @@ def _print_dry_run(kwargs: dict) -> None:
     for key, val in rows:
         click.echo(f"  {key:<{max_len}s} : {val}")
     click.secho("=" * 40, fg="cyan")
+
+
+def load_reward_factory(reference: str) -> Callable:
+    module_name, separator, qualified_name = reference.partition(":")
+    if not separator or not module_name or not qualified_name:
+        raise ValueError("reward_model must use module:qualified_name")
+    factory = importlib.import_module(module_name)
+    for name in qualified_name.split("."):
+        factory = getattr(factory, name)
+    if not callable(factory):
+        raise ValueError("reward_model must resolve to a callable factory")
+    return factory
 
 
 def create_model(config):
@@ -692,7 +767,14 @@ def train(
     rollout_device = kwargs.pop("rollout_device", None)
     rollout_val_device = kwargs.pop("rollout_val_device", None)
     rollout_pool_seq_len = kwargs.pop("rollout_pool_seq_len", None)
-    reward_model_fn: Callable[[], BaseRewardModel] | None = None
+    reward_reference = kwargs.pop("reward_model", None)
+    reward_model_fn = (
+        None if reward_reference is None else load_reward_factory(reward_reference)
+    )
+    if train_type.startswith("online_") and reward_model_fn is None:
+        raise ValueError(
+            "online training requires --reward_model module:qualified_name"
+        )
     critic_model_fn = None
     if train_type == "online_ppo":
         # The optimizer defaults to the policy's; critic_optimizer_fn can
@@ -858,6 +940,15 @@ def train(
         strategy_kwargs=strategy_kwargs,
         neftune_alpha=neftune_alpha,
         collate_fn=collate_fn,
+        rollout_mode=kwargs.pop("rollout_mode", "sync"),
+        rollout_devices=list(kwargs.pop("rollout_devices", [])),
+        rollout_worker_timeout_s=kwargs.pop("rollout_worker_timeout_s", 600.0),
+        rollout_startup_timeout_s=kwargs.pop("rollout_startup_timeout_s", 300.0),
+        rollout_weight_timeout_s=kwargs.pop("rollout_weight_timeout_s", 600.0),
+        async_train_microbatch_prompts=kwargs.pop("async_train_microbatch_prompts", 1),
+        rl_update_epochs=kwargs.pop("rl_update_epochs", 1),
+        rl_minibatch_prompts=kwargs.pop("rl_minibatch_prompts", None),
+        gradient_chunked_logprobs=kwargs.pop("gradient_chunked_logprobs", False),
         rollout_interval=rollout_interval,
         rollout_max_policy_lag=rollout_max_policy_lag,
         rollout_temperature=rollout_temperature,

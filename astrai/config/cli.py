@@ -82,6 +82,7 @@ def merge_yaml_into_kwargs(
     explicit_keys: set[str] | None = None,
     sections: Sequence[str] = DEFAULT_YAML_SECTIONS,
     allowed_keys: Sequence[str] | None = None,
+    strict_unknown: bool = False,
 ) -> dict:
     """Merge option defaults, YAML values, then explicit CLI values.
 
@@ -112,6 +113,8 @@ def merge_yaml_into_kwargs(
     if allowed_keys is not None:
         unknown = sorted(seen - set(allowed_keys))
         if unknown:
+            if strict_unknown:
+                raise click.UsageError(f"Unknown config keys: {', '.join(unknown)}")
             click.echo(
                 f"Warning: ignoring unknown config keys: {', '.join(unknown)}",
                 err=True,

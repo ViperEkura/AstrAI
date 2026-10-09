@@ -130,3 +130,34 @@ also needs a qualified actor-loading/reference-memory path and a full-policy
 publication protocol for sharded state. The rollout-only NCCL group must stay
 separate from those training groups. Merely removing the single-learner
 configuration gate would not supply these guarantees.
+
+### Parameter resolution and reproducible sampling
+
+`TrainConfig` rejects unknown fields. The common training parameters
+`rl_update_epochs`, `rl_minibatch_prompts`, `gradient_chunked_logprobs` and
+`moe_aux_loss_coef` belong on `TrainConfig`; putting them in `strategy_kwargs`
+is an error. The strategy owns its resolved `group_size` (GRPO defaults to 4,
+requires at least 2 online), and rollout uses that same value.
+
+Before loading models, the builder checks the actual distributed world size:
+`async_round` requires one learner even under torchrun. Rollout setup resolves
+devices, sampling, capacities, timeouts and the committed sample cursor into
+an immutable `ResolvedAsyncRolloutConfig`. All CUDA indexes are logical indexes
+after `CUDA_VISIBLE_DEVICES`; worker devices must be distinct and exclude the
+learner. Startup logs include device assignments, GPU UUIDs, effective sampling,
+seed/cursor and the three independent deadlines:
+
+- `rollout_startup_timeout_s`: startup, default 300 seconds.
+- `rollout_worker_timeout_s`: generation, default 600 seconds.
+- `rollout_weight_timeout_s`: NCCL broadcast and ACK, default 600 seconds.
+
+Each generated response receives a seed derived from `random_seed`, its global
+prompt cursor and its response index. Request execution derives a stateless
+per-token stream from that seed and token position. Sampling therefore does not
+consume the worker's global RNG and is independent of worker assignment,
+request order and batch compaction. A stale retry reuses its seeds; resume derives
+new requests from the committed cursor, discarding prefetched results as before.
+Identical weights and logits are required for token equality. Resume can load a
+newer policy than an abandoned prefetched round, and different numerical kernels
+can produce different logits; request seed equality alone cannot remove those
+differences.

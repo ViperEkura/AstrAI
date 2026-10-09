@@ -13,6 +13,7 @@ from astrai.trainer.rollout.batching import merge_rollouts, slice_batch
 from astrai.trainer.rollout.generator import RolloutGenerator
 from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
 from astrai.trainer.rollout.protocol import (
+    GenerationRequest,
     GenerationResult,
     MessageKind,
     RolloutMessage,
@@ -145,14 +146,24 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
                     command.policy_version,
                     command.payload,
                 )
-                if round_id is None or version is None or not isinstance(chunk, dict):
+                if (
+                    round_id is None
+                    or version is None
+                    or not isinstance(chunk, GenerationRequest)
+                ):
                     raise RolloutProtocolError("generate command is incomplete")
                 if backend.policy_version != version:
                     raise RuntimeError(
                         "rollout worker did not receive requested version"
                     )
+                seeds = chunk.seeds
+                chunk = chunk.batch
                 started = time.perf_counter()
                 total = len(next(iter(chunk.values())))
+                if len(seeds) != total * spec.params.group_size:
+                    raise RolloutProtocolError(
+                        "generate seeds do not match the prompt count"
+                    )
                 pieces = []
                 for begin in range(0, total, spec.max_prompts_per_worker):
                     indices = list(
@@ -164,7 +175,14 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
                     pieces.append(
                         (
                             indices,
-                            generator.generate(slice_batch(chunk, indices, total)),
+                            generator.generate(
+                                slice_batch(chunk, indices, total),
+                                seeds=[
+                                    seeds[i * spec.params.group_size + g]
+                                    for i in indices
+                                    for g in range(spec.params.group_size)
+                                ],
+                            ),
                         )
                     )
                 raw = merge_rollouts(pieces, total)

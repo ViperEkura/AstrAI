@@ -179,6 +179,10 @@ class TrainContextBuilder:
         return self
 
     def build(self) -> TrainContext:
+        if self.config.rollout_mode == "async_round" and get_world_size() != 1:
+            raise ValueError(
+                "async_round requires actual world_size=1; check torchrun and distributed state"
+            )
         # Resolve the (dp, cp, tp) rank layout before anything consumes it.
         self._topology = build_topology(
             cp_size=self.config.cp_size,
@@ -423,7 +427,7 @@ class TrainContextBuilder:
         if self._topology is not None and self._topology.cp_size > 1:
             self._validate_cp(context)
             cp_state = CPState(self._topology)
-        kwargs = dict(cfg.strategy_kwargs)
+        kwargs = cfg._validate_strategy_kwargs(dict(cfg.strategy_kwargs))
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
         kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)

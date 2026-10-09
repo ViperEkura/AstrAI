@@ -88,6 +88,7 @@ def _init_single_rank_process_group(tmp_path, backend):
 def _rollout_config(*, compile_mode=None):
     return SimpleNamespace(
         strategy="online_grpo",
+        rollout_mode="sync",
         compile_mode=compile_mode,
         batch_per_device=1,
         rollout_max_tokens=4,

@@ -23,7 +23,7 @@ _COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
 ROLLOUT_MODES = frozenset({"sync", "async_round"})
 
 
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
 class TrainConfig(BaseConfig):
     """Training configuration.
 
@@ -72,7 +72,7 @@ class TrainConfig(BaseConfig):
         neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
         moe_aux_loss_coef (float): Weight applied to the MoE load-balancing loss. Defaults to 0.01.
         rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
-        rollout_max_policy_lag (Optional[int]): Maximum accepted gap between rollout and live policy versions. None derives ``rollout_interval - 1``. Defaults to None.
+        rollout_max_policy_lag (Optional[int]): Maximum accepted gap between rollout and live policy versions. None derives ``rollout_interval - 1`` for sync and normalizes to 1 for async_round. Defaults to None.
         rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
         rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
         rollout_top_p (float): Top-p (nucleus) filtering for online rollout. Defaults to 0.9.
@@ -86,7 +86,9 @@ class TrainConfig(BaseConfig):
         rollout_device (Optional[str]): Device for the training rollout backend, e.g. ``"cuda:1"``. None keeps the in-process colocated backend (generation shares the training model object; weight updates are free). Setting it builds a frozen replica whose weights are copied to inside the policy-version lock every optimizer step — the copy is a full state transfer (e.g. ~2GB/step for 1B bf16), so pay it only when backend isolation is worth it. Defaults to None.
         rollout_mode (str): "sync" retains the existing backend; "async_round" overlaps one learner with isolated rollout processes. Scripts using async_round must guard Trainer.train() with ``if __name__ == "__main__":``. Defaults to "sync".
         rollout_devices (List[str]): One or more distinct CUDA devices for async_round, separate from the learner device. Defaults to [].
-        rollout_worker_timeout_s (float): Maximum seconds to wait for one async rollout round or weight transfer. Defaults to 600.
+        rollout_worker_timeout_s (float): Maximum seconds to wait for generation in one async rollout round. Defaults to 600.
+        rollout_startup_timeout_s (float): Deadline for initializing async workers. Defaults to 300.
+        rollout_weight_timeout_s (float): NCCL and weight ACK deadline. Defaults to 600.
         async_train_microbatch_prompts (int): Prompts per learner backward pass in async_round; all microbatches accumulate into one optimizer step. Defaults to 1.
         rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
         rl_update_epochs (int): Learner passes over one collected online rollout round (classic PPO-style multiple epochs per batch). Each pass recomputes the loss against the round's fixed rewards/logprobs_old and takes its own optimizer steps. Values >1 trade on-policy freshness for sample efficiency; watch ``clip_fraction`` for stale-ratio blowup. Requires ``grad_accum_steps=1`` online. Defaults to 1.
@@ -164,6 +166,8 @@ class TrainConfig(BaseConfig):
     rollout_mode: str = "sync"
     rollout_devices: List[str] = field(default_factory=list)
     rollout_worker_timeout_s: float = 600.0
+    rollout_startup_timeout_s: float = 300.0
+    rollout_weight_timeout_s: float = 600.0
     async_train_microbatch_prompts: int = 1
     rollout_val_device: Optional[str] = None
     rl_update_epochs: int = 1
@@ -262,8 +266,8 @@ class TrainConfig(BaseConfig):
 
     @field_validator("rollout_temperature")
     def _validate_positive_float(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError(f"must be positive, got {v}")
+        if not isfinite(v) or v <= 0:
+            raise ValueError(f"must be finite and positive, got {v}")
         return v
 
     @field_validator("rollout_top_p")
@@ -290,7 +294,7 @@ class TrainConfig(BaseConfig):
     def _validate_rollout_val_temperature(cls, v: Optional[float]) -> Optional[float]:
         # 0.0 is legal here (unlike rollout_temperature): validation may
         # want greedy decode while training keeps a positive temperature.
-        if v is not None and v < 0:
+        if v is not None and (not isfinite(v) or v < 0):
             raise ValueError(f"rollout_val_temperature must be non-negative, got {v}")
         return v
 
@@ -339,10 +343,14 @@ class TrainConfig(BaseConfig):
             raise ValueError(f"rollout_mode must be one of {sorted(ROLLOUT_MODES)}")
         return v
 
-    @field_validator("rollout_worker_timeout_s")
+    @field_validator(
+        "rollout_worker_timeout_s",
+        "rollout_startup_timeout_s",
+        "rollout_weight_timeout_s",
+    )
     def _validate_rollout_worker_timeout(cls, v: float) -> float:
         if not isfinite(v) or v <= 0:
-            raise ValueError("rollout_worker_timeout_s must be finite and positive")
+            raise ValueError("rollout timeouts must be finite and positive")
         return v
 
     def rollout_val_overrides(self) -> Dict[str, Any]:
@@ -376,8 +384,36 @@ class TrainConfig(BaseConfig):
             raise ValueError(f"val_split must be in (0, 1) or None, got {v}")
         return v
 
+    @field_validator("strategy_kwargs")
+    def _validate_strategy_kwargs(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        reserved = {
+            "moe_aux_loss_coef",
+            "rl_update_epochs",
+            "rl_minibatch_prompts",
+            "gradient_chunked_logprobs",
+        }
+        duplicates = sorted(reserved.intersection(values))
+        if duplicates:
+            raise ValueError(
+                f"set these parameters on TrainConfig, not strategy_kwargs: {', '.join(duplicates)}"
+            )
+        if "group_size" in values:
+            group_size = values["group_size"]
+            if (
+                isinstance(group_size, bool)
+                or not isinstance(group_size, int)
+                or group_size < 1
+            ):
+                raise ValueError("group_size must be a positive integer")
+        return values
+
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
+        if (
+            self.strategy == "online_grpo"
+            and self.strategy_kwargs.get("group_size", 4) < 2
+        ):
+            raise ValueError("online_grpo group_size must be >= 2")
         if self.rollout_mode == "async_round":
             if self.strategy != "online_grpo":
                 raise ValueError("async_round currently supports online_grpo only")
@@ -414,6 +450,8 @@ class TrainConfig(BaseConfig):
                 )
             if self.rollout_max_policy_lag not in (None, 1):
                 raise ValueError("async_round requires rollout_max_policy_lag=1")
+            if self.rollout_max_policy_lag is None:
+                self.rollout_max_policy_lag = 1
             if self.val_dataset is not None or self.val_split is not None:
                 raise ValueError("async_round validation is not supported yet")
         if self.strategy.startswith("online_"):

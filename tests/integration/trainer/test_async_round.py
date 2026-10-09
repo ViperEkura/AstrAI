@@ -19,6 +19,7 @@ from astrai.trainer.rollout.protocol import (
     recv_message,
     send_message,
 )
+from astrai.trainer.rollout.seeding import response_seeds
 from astrai.trainer.rollout.types import RawRollout, RolloutVersionError, SamplingParams
 
 
@@ -74,7 +75,7 @@ def _fake_worker(conn, spec):
             round_id, version, chunk = (
                 message.round_id,
                 message.policy_version,
-                message.payload,
+                message.payload.batch,
             )
             if device == "hang":
                 time.sleep(999)
@@ -382,3 +383,20 @@ def test_unsafe_optimizer_state_does_not_write_error_checkpoint():
     callback.on_error(context)
     callback.on_train_end(context)
     assert saved == []
+
+
+def test_prefetch_resume_cursor_and_retry_keep_response_seeds():
+    _, pool = _coordinator()
+    try:
+        first = pool.submit_round({"instruction": [str(i) for i in range(4)]})
+        pool.collect_round(first)
+        next_round = pool.submit_round({"instruction": ["4", "5"]})
+        pool.collect_round(next_round)
+        retry = pool.submit_round({"instruction": ["4", "5"]}, seeds=next_round.seeds)
+        pool.collect_round(retry)
+        assert retry.seeds == next_round.seeds
+        assert pool._sample_cursor == 6
+    finally:
+        pool.close()
+
+    assert next_round.seeds == response_seeds(pool.random_seed, 4, 2, 1)

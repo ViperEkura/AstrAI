@@ -403,3 +403,39 @@ nohup python scripts/tools/train.py \
 Full parameter reference at [params.md](params.md).
 
 > Document Update Time: 2026-09-20
+
+### Configuring asynchronous rollout from the CLI
+
+Use a reward factory import path (`module:qualified_name`) returning your reward
+model. A YAML example for one learner and two rollout workers:
+
+```yaml
+training:
+  train_type: online_grpo
+  param_path: /path/to/policy
+  data_root_path: /path/to/dataset
+  dp_mode: none
+  rollout_mode: async_round
+  rollout_devices: [cuda:1, cuda:2]
+  rollout_interval: 1
+  rollout_max_policy_lag: 1
+  group_size: 4
+  reward_model: my_rewards:make_reward
+  rollout_startup_timeout_s: 300
+  rollout_worker_timeout_s: 600
+  rollout_weight_timeout_s: 600
+  async_train_microbatch_prompts: 1
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=2,4,5 .venv/bin/python scripts/tools/train.py --config train.yaml
+```
+
+Here the learner uses logical `cuda:0` (physical GPU 2), and workers use logical
+`cuda:1`/`cuda:2` (physical GPUs 4/5). Repeat `--rollout_devices cuda:N` for each
+worker when overriding YAML; explicit flags replace the YAML list. Unknown keys
+in supported YAML sections raise an error. The CLI maps its `group_size` option
+to the algorithm's `strategy_kwargs`; Python callers use
+`strategy_kwargs={"group_size": 4}`. Python model factories must be pickleable and
+should construct models on CPU; worker placement is resolved afterward. Guard
+`Trainer.train()` with `if __name__ == "__main__":` when using a custom script.

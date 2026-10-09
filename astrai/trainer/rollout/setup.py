@@ -5,7 +5,6 @@ this module owns rollout wiring without owning model restoration or topology.
 """
 
 from dataclasses import replace
-from math import ceil
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -20,6 +19,7 @@ from astrai.trainer.rollout import (
     SamplingParams,
 )
 from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
+from astrai.trainer.rollout.configuration import resolve_async_rollout
 
 if TYPE_CHECKING:
     from astrai.trainer.train_context import TrainContext
@@ -43,7 +43,9 @@ def configure_rollout(
     validate(context.executor)
     inference_model = context.executor.model_for_inference(context.model)
     tokenizer = tokenizer_cls.from_pretrained(param_path)
-    group_size = strategy_kwargs.get("group_size", 1)
+    group_size = getattr(
+        context.strategy, "group_size", strategy_kwargs.get("group_size", 1)
+    )
     policy_version = (
         context.checkpoint.meta.get("policy_version", context.optimizer_step)
         if context.checkpoint is not None
@@ -119,17 +121,6 @@ def configure_rollout(
                 "async_round currently supports dense models only: MoE auxiliary "
                 "loss is not equivalent across learner microbatches"
             )
-        train_index = train_device.index
-        available = torch.cuda.device_count()
-        devices = [torch.device(name) for name in cfg.rollout_devices]
-        if any(device.index >= available for device in devices):
-            raise ValueError(
-                f"rollout_devices exceed available CUDA devices ({available})"
-            )
-        if any(device.index == train_index for device in devices):
-            raise ValueError("rollout_devices must exclude the learner device")
-        prompts_per_worker = max(1, ceil(cfg.batch_per_device / len(devices)))
-        worker_capacity = group_size * prompts_per_worker
         params = SamplingParams(
             max_tokens=cfg.rollout_max_tokens,
             group_size=group_size,
@@ -137,20 +128,27 @@ def configure_rollout(
             top_k=cfg.rollout_top_k,
             top_p=cfg.rollout_top_p,
         )
+        resolved = resolve_async_rollout(
+            cfg, train_device, params, max_seq_len, context.consumed_samples
+        )
         context.async_rollout = AsyncRoundCoordinator(
             source=inference_model,
             model_fn=cfg.model_fn,
             param_path=param_path,
-            devices=[str(device) for device in devices],
-            params=params,
+            devices=list(resolved.devices),
+            params=resolved.params,
             reward_model=cfg.reward_model_fn(),
             policy_version=policy_version,
-            max_batch_size=worker_capacity,
-            max_seq_len=max_seq_len,
+            max_batch_size=resolved.max_batch_size,
+            max_seq_len=resolved.max_seq_len,
             model_dtype=next(context.model.parameters()).dtype,
-            max_policy_lag=1,
-            max_prompts_per_worker=prompts_per_worker,
-            worker_timeout_s=cfg.rollout_worker_timeout_s,
+            max_policy_lag=resolved.max_policy_lag,
+            max_prompts_per_worker=resolved.max_prompts_per_worker,
+            worker_timeout_s=resolved.generation_timeout_s,
+            startup_timeout_s=resolved.startup_timeout_s,
+            weight_timeout_s=resolved.weight_timeout_s,
+            random_seed=resolved.random_seed,
+            sample_cursor=resolved.sample_cursor,
         )
         context.optimizer_steps_completed = (
             context.checkpoint.meta.get("optimizer_step", context.optimizer_step)

@@ -508,11 +508,22 @@ class Scheduler:
         rep_window: int = 64,
         return_logprobs: bool = False,
         return_details: bool = False,
+        seeds: Optional[List[int]] = None,
     ) -> List[Any]:
+        if seeds is not None and (
+            len(seeds) != len(prompt_ids_list)
+            or any(
+                isinstance(seed, bool)
+                or not isinstance(seed, int)
+                or not 0 <= seed < 2**63
+                for seed in seeds
+            )
+        ):
+            raise ValueError("seeds must contain one integer in [0, 2**63) per request")
         self._stop_ids = frozenset(self._requests.tokenizer.stop_ids)
         requests, errors = [], []
         backend = get_backend(use_default=False)
-        for ids in prompt_ids_list:
+        for index, ids in enumerate(prompt_ids_list):
             error = None
             if not ids:
                 error = "prompt_empty"
@@ -537,6 +548,7 @@ class Scheduler:
                     frequency_penalty,
                     rep_window,
                     backend,
+                    seed=None if seeds is None else seeds[index],
                 )
                 if not self._kv_manager.alloc_slots(
                     request.request_id, request.prompt_ids

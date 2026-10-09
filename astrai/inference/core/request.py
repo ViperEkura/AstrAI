@@ -94,6 +94,8 @@ class Request:
         frequency_penalty: float = 0.0,
         rep_window: int = _config.default_rep_window,
         backend: Optional["AttentionBackend"] = None,
+        *,
+        seed: Optional[int] = None,
     ):
         self.request_id = request_id
         self.identity = RequestIdentity(request_id, uuid.uuid4().hex)
@@ -107,7 +109,7 @@ class Request:
         self.rep_window = rep_window
         self.backend = backend
         self._sampling = SamplingParams(
-            temperature, top_p, top_k, frequency_penalty, rep_window
+            temperature, top_p, top_k, frequency_penalty, rep_window, seed
         )
 
         # Scoring only: how many trailing tokens of ``prompt_ids`` form the

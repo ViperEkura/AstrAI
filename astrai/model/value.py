@@ -7,6 +7,7 @@ from torch import Tensor
 
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.automodel import AutoModel, ModelFactory
+from astrai.model.components.initialization import should_initialize
 from astrai.model.components.linear import Linear
 from astrai.model.transformer import TransformerModel, init_module_weights
 
@@ -33,8 +34,9 @@ class ValueModel(AutoModel):
         self.apply(init_module_weights)
         # Zero head so training starts from V(s) == 0 and the first GAE
         # advantages are driven purely by rewards.
-        nn.init.zeros_(self.value_head.weight)
-        nn.init.zeros_(self.value_head.bias)
+        if should_initialize():
+            nn.init.zeros_(self.value_head.weight)
+            nn.init.zeros_(self.value_head.bias)
 
     def load_state_dict(self, state_dict: Mapping[str, Any], strict=True, assign=False):
         state_dict = {

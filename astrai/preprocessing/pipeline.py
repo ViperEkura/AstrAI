@@ -72,10 +72,10 @@ class Pipeline:
         self.tokenizer, self.mask_builder, self._position_id = (
             build_preprocessing_components(config, tokenizer_path)
         )
-        self._packer = PackingStrategyFactory.create(
+        self._packer = PackingStrategyFactory.create_checked(
             config.preprocessing.packing_strategy
         )
-        self._writer = StoreWriterFactory.create(config.output.storage_format)
+        self._writer = StoreWriterFactory.create_checked(config.output.storage_format)
 
     def transform(self, item: dict) -> Optional[dict]:
         return self.mask_builder.build(item, self.config, self.tokenizer)

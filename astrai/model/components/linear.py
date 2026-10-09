@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.model.components.initialization import should_initialize
+
 
 class Linear(nn.Module):
     def __init__(
@@ -18,6 +20,8 @@ class Linear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        if not should_initialize():
+            return
         nn.init.normal_(self.weight, mean=0.0, std=self.init_std)
         if self.bias is not None:
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)

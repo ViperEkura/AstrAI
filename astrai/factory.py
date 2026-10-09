@@ -2,6 +2,7 @@
 
 import inspect
 import sys
+import warnings
 from abc import ABC
 from typing import (
     Callable,
@@ -129,8 +130,33 @@ class BaseFactory(ABC, Generic[T]):
                 for p in sig.parameters.values()
                 if p.name != "self" and p.kind != inspect.Parameter.VAR_KEYWORD
             }
+            discarded = sorted(set(kwargs) - valid)
+            if discarded:
+                warnings.warn(
+                    f"{cls.__name__}.create({name!r}) ignored arguments {discarded}; "
+                    "this will raise TypeError in the next minor release",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
             kwargs = {k: v for k, v in kwargs.items() if k in valid}
         return component_cls(*args, **kwargs)
+
+    @classmethod
+    def create_checked(cls, name: str, *args, **kwargs) -> T:
+        """Instantiate with Python's normal signature validation."""
+        component_cls = cls.get_component_class(name)
+        inspect.signature(component_cls).bind(*args, **kwargs)
+        return component_cls(*args, **kwargs)
+
+    @classmethod
+    def create_from_config(cls, name: str, config: dict, **explicit) -> T:
+        """Map a broad model config to one registered component's parameters."""
+        component_cls = cls.get_component_class(name)
+        sig = inspect.signature(component_cls)
+        valid = set(sig.parameters)
+        kwargs = {key: value for key, value in config.items() if key in valid}
+        kwargs.update(explicit)
+        return cls.create_checked(name, **kwargs)
 
     @classmethod
     def get_component_class(cls, name: str) -> Type[T]:

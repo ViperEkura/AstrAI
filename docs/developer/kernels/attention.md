@@ -256,6 +256,5 @@ obvious next step.
 The other three stages — the inter-chunk state recurrence, the `w`/`u` sandwich
 with the UT solve's backward, and the chunk-local cumsum — are not written yet,
 and the reference `chunk_gated_delta_rule` remains the only complete trainable
-path. `gdn_ops.chunk_gated_delta_rule_backward` is autograd through that
-reference: it is the ground truth a backward kernel is checked against, not a
-second implementation to maintain.
+path. Autograd through the reference is the ground truth for checking a complete
+backward kernel; a separate backward wrapper is unnecessary.

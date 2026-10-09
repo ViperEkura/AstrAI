@@ -1,18 +1,13 @@
 import logging
 from typing import List, Optional
 
-import torch.distributed as dist
-
 from astrai.config import TrainConfig
 from astrai.parallel.setup import spawn_parallel_fn
-from astrai.signal_handler import (
-    register_signal_handlers,
-    unregister_signal_handlers,
-)
 from astrai.trainer.callbacks import (
     CallbackFactory,
     TrainCallback,
 )
+from astrai.trainer.session import TrainSession
 from astrai.trainer.train_context import TrainContext, TrainContextBuilder
 
 logger = logging.getLogger(__name__)
@@ -31,16 +26,16 @@ class Trainer:
     def _get_default_callbacks(self) -> List[TrainCallback]:
         cfg = self.train_config
         callbacks = [
-            CallbackFactory.create(
+            CallbackFactory.create_checked(
                 "gradient_checkpointing",
                 modules=cfg.gradient_checkpointing_modules,
             ),
-            CallbackFactory.create(
+            CallbackFactory.create_checked(
                 "checkpoint",
                 cfg.ckpt_dir,
                 cfg.ckpt_interval,
             ),
-            CallbackFactory.create(
+            CallbackFactory.create_checked(
                 "metric",
                 ckpt_dir=cfg.ckpt_dir,
                 save_interval=cfg.ckpt_interval,
@@ -48,8 +43,8 @@ class Trainer:
                 val_step=cfg.val_step,
                 grad_snr_interval=cfg.grad_snr_interval,
             ),
-            CallbackFactory.create("progress_bar", cfg.n_epoch),
-            CallbackFactory.create("gradient_clipping", cfg.max_grad_norm),
+            CallbackFactory.create_checked("progress_bar", cfg.n_epoch),
+            CallbackFactory.create_checked("gradient_clipping", cfg.max_grad_norm),
         ]
         return callbacks
 
@@ -134,18 +129,15 @@ class Trainer:
         self._call_callbacks("on_epoch_end", context)
 
     def _trainer_loop(self, param_path: Optional[str] = None, resume: bool = False):
-        context = (
-            TrainContextBuilder(self.train_config)
-            .with_param_path(param_path, resume=resume)
-            .build()
-        )
-        register_signal_handlers(context)
-        executor = context.executor
-        self._call_callbacks("on_train_begin", context)
-
-        try:
+        with TrainSession(
+            lambda: (
+                TrainContextBuilder(self.train_config)
+                .with_param_path(param_path, resume=resume)
+                .build()
+            ),
+            self._call_callbacks,
+        ) as context:
             context.model.train()
-
             for epoch in range(context.epoch, context.config.n_epoch):
                 if context.stop_requested:
                     break
@@ -156,18 +148,6 @@ class Trainer:
                     "Training interrupted by signal, saving emergency checkpoint..."
                 )
                 self._call_callbacks("on_error", context)
-
-        except Exception as e:
-            logger.error("Training failed: %s", str(e), exc_info=True)
-            self._call_callbacks("on_error", context)
-            raise
-        finally:
-            if context.async_rollout is not None:
-                context.async_rollout.close()
-            self._call_callbacks("on_train_end", context)
-            if executor.use_distributed and dist.is_initialized():
-                dist.barrier()
-            unregister_signal_handlers()
 
     def train(self, param_path: Optional[str] = None, resume: bool = False):
         cfg = self.train_config

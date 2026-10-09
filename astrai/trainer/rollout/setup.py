@@ -19,6 +19,7 @@ from astrai.trainer.rollout import (
     SamplingParams,
 )
 from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
+from astrai.trainer.strategy import StrategyFactory
 
 if TYPE_CHECKING:
     from astrai.trainer.train_context import TrainContext
@@ -92,7 +93,7 @@ def configure_rollout(
     tokenizer_cls: type,
 ) -> None:
     cfg = config
-    if not cfg.strategy.startswith("online_"):
+    if not StrategyFactory.capabilities(cfg.strategy).online:
         return
     if not context.strategy.supports_online():
         raise ValueError(f"Strategy '{cfg.strategy}' does not support online rollout")

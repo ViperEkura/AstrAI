@@ -38,11 +38,13 @@ class DecoderBlock(nn.Module):
             down_init_std=0.02 / (2 * config.num_hidden_layers) ** 0.5,
         )
         self.attention_type = attn_type
-        self.attention = AttnFactory.create(attn_type, **cfg, layer_id=layer_id)
+        self.attention = AttnFactory.create_from_config(
+            attn_type, cfg, layer_id=layer_id
+        )
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         ffn_type = self._resolve_ffn_type(config, layer_id)
-        self.mlp = FFNFactory.create(ffn_type, **cfg)
+        self.mlp = FFNFactory.create_from_config(ffn_type, cfg)
 
     @staticmethod
     def _resolve_ffn_type(config, layer_id: int) -> str:

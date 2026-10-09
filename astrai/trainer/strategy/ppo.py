@@ -13,7 +13,7 @@ from torch.optim import Optimizer
 
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.strategy.base import BaseStrategy
-from astrai.trainer.strategy.factory import StrategyFactory
+from astrai.trainer.strategy.factory import StrategyCapabilities, StrategyFactory
 from astrai.trainer.strategy.ops import (
     LossOutput,
     _importance_ratio_metrics,
@@ -26,7 +26,10 @@ from astrai.trainer.strategy.ops import (
 )
 
 
-@StrategyFactory.register("online_ppo")
+@StrategyFactory.register(
+    "online_ppo",
+    capabilities=StrategyCapabilities(online=True, reference_model=True, critic=True),
+)
 class PPOStrategy(BaseStrategy):
     """Proximal Policy Optimization with a learned critic (actor-critic).
 

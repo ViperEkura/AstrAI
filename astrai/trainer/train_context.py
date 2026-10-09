@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader, random_split
 
 from astrai.config.model_config import ConfigFactory
-from astrai.config.train_config import TrainConfig
+from astrai.config.train_config import TrainConfig, _TrainRuntimeDependencies
 from astrai.dataset import RDSampler
 from astrai.inference.core.scheduler import Scheduler
 from astrai.model.components.lora import inject_lora
@@ -169,6 +169,7 @@ class TrainContextBuilder:
         config: TrainConfig,
     ):
         self.config = config
+        self.runtime = _TrainRuntimeDependencies.capture(config)
         self._param_path: str | None = None
         self._resume: bool = False
         self._topology: ParallelTopology | None = None
@@ -207,18 +208,27 @@ class TrainContextBuilder:
         executor = self._create_executor()
         self._validate_rollout_configuration(executor)
         context = self._create_context(preloaded_state, executor)
-        self._prepare_model(context, executor, preloaded_state)
-        self._restore_optimizer_state(context)
+        try:
+            self._prepare_model(context, executor, preloaded_state)
+            self._restore_optimizer_state(context)
 
-        # Resolve datasets.
-        train_dataset, val_dataset = self._get_datasets()
-        self._create_dataloaders(context, train_dataset, val_dataset)
+            # Resolve datasets.
+            train_dataset, val_dataset = self._get_datasets()
+            self._create_dataloaders(context, train_dataset, val_dataset)
 
-        # Strategies depend on the prepared model; online rollout depends on both.
-        strategy_kwargs = self._create_strategy(context, executor)
-        self._configure_rollout(context, strategy_kwargs)
-
-        return context
+            # Strategies depend on the prepared model; online rollout depends on both.
+            strategy_kwargs = self._create_strategy(context, executor)
+            self._configure_rollout(context, strategy_kwargs)
+            return context
+        except BaseException:
+            if context.async_rollout is not None:
+                try:
+                    context.async_rollout.close()
+                except BaseException:
+                    logger.exception(
+                        "Failed to close rollout after training build error"
+                    )
+            raise
 
     def _create_executor(self) -> BaseExecutor:
         cfg = self.config
@@ -231,7 +241,7 @@ class TrainContextBuilder:
                 kwargs.setdefault("process_group", self._topology.dp_group)
             elif cfg.dp_mode == "fsdp":
                 kwargs.setdefault("mesh", self._topology.mesh["dp"])
-        return ExecutorFactory.create(
+        return ExecutorFactory.create_checked(
             cfg.dp_mode,
             grad_accum_steps=cfg.grad_accum_steps,
             **kwargs,
@@ -282,7 +292,7 @@ class TrainContextBuilder:
                     )
                     state.checkpoint = checkpoint
         if not state.model_config:
-            model = cfg.model_fn()
+            model = self.runtime.model_fn()
             if hasattr(model, "config"):
                 state.model_config = model.config.to_dict()
         return state
@@ -345,21 +355,23 @@ class TrainContextBuilder:
             return model
 
         context.model, context.optimizer, context.scheduler = executor.prepare(
-            cfg.model_fn,
-            cfg.optimizer_fn,
-            cfg.scheduler_fn,
+            self.runtime.model_fn,
+            self.runtime.optimizer_fn,
+            self.runtime.scheduler_fn,
             before_wrap=before_wrap,
             after_wrap=after_wrap,
         )
 
     def _get_datasets(self):
         cfg = self.config
-        if cfg.val_dataset is not None or cfg.val_split is None:
-            return cfg.dataset, cfg.val_dataset
-        n_val = max(1, int(len(cfg.dataset) * cfg.val_split))
+        if self.runtime.val_dataset is not None or cfg.val_split is None:
+            return self.runtime.dataset, self.runtime.val_dataset
+        n_val = max(1, int(len(self.runtime.dataset) * cfg.val_split))
         generator = torch.Generator().manual_seed(cfg.random_seed)
         return random_split(
-            cfg.dataset, [len(cfg.dataset) - n_val, n_val], generator=generator
+            self.runtime.dataset,
+            [len(self.runtime.dataset) - n_val, n_val],
+            generator=generator,
         )
 
     def _create_dataloaders(
@@ -398,7 +410,7 @@ class TrainContextBuilder:
             sampler=sampler,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
-            collate_fn=cfg.collate_fn,
+            collate_fn=self.runtime.collate_fn,
         )
         # PyTorch rejects prefetch_factor/persistent_workers when workers=0.
         if cfg.num_workers > 0:
@@ -432,28 +444,31 @@ class TrainContextBuilder:
         kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
         kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)
         kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
-        if cfg.strategy in ("dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"):
+        capabilities = StrategyFactory.capabilities(cfg.strategy)
+        if capabilities.reference_model:
             kwargs["ref_model"] = create_ref_model(
-                cfg.model_fn,
+                self.runtime.model_fn,
                 executor=executor,
                 model=context.model,
                 device=get_current_device(),
             )
-        if cfg.strategy == "grpo":
-            kwargs["old_model"] = create_ref_model(
-                cfg.model_fn,
-                executor=executor,
-                model=context.model,
-                device=get_current_device(),
+        if capabilities.old_model:
+            kwargs["old_model"] = (
+                create_ref_model(
+                    self.runtime.model_fn,
+                    executor=executor,
+                    model=context.model,
+                    device=get_current_device(),
+                )
+                if capabilities.initialize_old_model
+                else None
             )
-        elif cfg.strategy == "online_grpo":
-            kwargs["old_model"] = None
-        if cfg.strategy == "online_ppo":
+        if capabilities.critic:
             critic, critic_optimizer = self._create_critic(context, executor)
             kwargs["critic"] = critic
             kwargs["critic_optimizer"] = critic_optimizer
             kwargs.setdefault("max_grad_norm", cfg.max_grad_norm)
-        context.strategy = StrategyFactory.create(
+        context.strategy = StrategyFactory.create_checked(
             cfg.strategy,
             model=context.model,
             device=get_current_device(),
@@ -509,7 +524,7 @@ class TrainContextBuilder:
         cfg = self.config
         strategy_cls = StrategyFactory.get_component_class(cfg.strategy)
         if strategy_cls.loss_reduction is not LossReduction.TOKEN_MEAN:
-            online = cfg.strategy.startswith("online_")
+            online = StrategyFactory.capabilities(cfg.strategy).online
             reason = (
                 "rollouts run on the single-GPU inference scheduler, which "
                 "has no context-parallel path"
@@ -560,7 +575,7 @@ class TrainContextBuilder:
         state_dict = executor.unwrap_model(context.model)
         if executor.use_distributed:
             state_dict = broadcast_state_dict(state_dict)
-        critic = cfg.critic_model_fn()
+        critic = self.runtime.critic_model_fn()
         if state_dict is not None:
             state_dict = strip_compile_prefix(state_dict)
             result = critic.load_state_dict(state_dict, strict=False)
@@ -582,7 +597,9 @@ class TrainContextBuilder:
         critic = critic.to(device)
         critic.train()
 
-        optimizer_factory = cfg.critic_optimizer_fn or cfg.optimizer_fn
+        optimizer_factory = (
+            self.runtime.critic_optimizer_fn or self.runtime.optimizer_fn
+        )
         critic_optimizer = optimizer_factory(critic)
         if checkpoint is not None:
             load_component_extra(
@@ -604,7 +621,7 @@ class TrainContextBuilder:
 
     def _validate_rollout_configuration(self, executor: BaseExecutor) -> None:
         cfg = self.config
-        if not cfg.strategy.startswith("online_"):
+        if not StrategyFactory.capabilities(cfg.strategy).online:
             return
         if cfg.compile_mode is not None:
             raise ValueError(

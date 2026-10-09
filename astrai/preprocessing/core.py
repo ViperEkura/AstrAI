@@ -28,8 +28,8 @@ def build_preprocessing_components(config: PipelineConfig, tokenizer_path: str):
     to create the position-id strategy).
     """
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    mask_builder = MaskBuilderFactory.create("sectioned")
-    position_strategy = PositionIdStrategyFactory.create(
+    mask_builder = MaskBuilderFactory.create_checked("sectioned")
+    position_strategy = PositionIdStrategyFactory.create_checked(
         config.output.position_ids_mode
     )
     return tokenizer, mask_builder, position_strategy

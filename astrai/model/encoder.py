@@ -8,6 +8,7 @@ from astrai.config.model_config import EncoderConfig
 from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
+from astrai.model.components.initialization import should_initialize
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
 from astrai.model.masking import process_attention_mask
@@ -47,7 +48,7 @@ class EmbeddingEncoder(AutoModel):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if hasattr(module, "reset_parameters"):
+        if should_initialize() and hasattr(module, "reset_parameters"):
             module.reset_parameters()
 
     def load_state_dict(self, state_dict: Mapping[str, Any], strict=True, assign=False):

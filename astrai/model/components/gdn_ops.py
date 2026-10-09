@@ -278,38 +278,3 @@ def recurrent_gated_delta_rule(
         outputs.append(output)
     stacked = torch.stack(outputs, dim=2)
     return _from_heads(stacked, dtype), (state if output_final_state else None)
-
-
-def chunk_gated_delta_rule_backward(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    g: Tensor,
-    beta: Tensor,
-    do: Tensor,
-    dh: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Reference gradients for :func:`chunk_gated_delta_rule`.
-
-    This is autograd through the reference forward, not a hand-derived reverse
-    pass: the reference is already differentiable and is what every fused
-    kernel in this file is checked against, so it is the natural ground truth
-    for the backward kernels too. Hand-deriving it would add a second thing to
-    get wrong without adding an independent opinion.
-
-    Returns ``(dq, dk, dv, dg, dbeta)`` in the caller's layout and dtypes.
-    """
-    inputs = [
-        t.detach().clone().requires_grad_(True) for t in (query, key, value, g, beta)
-    ]
-    with torch.enable_grad():
-        output, final_state = chunk_gated_delta_rule(
-            *inputs, output_final_state=dh is not None
-        )
-        grads = [do]
-        if dh is not None:
-            grads.append(dh)
-        torch.autograd.backward(
-            [output] + ([final_state] if dh is not None else []), grads
-        )
-    return tuple(t.grad for t in inputs)

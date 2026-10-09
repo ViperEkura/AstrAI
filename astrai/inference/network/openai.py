@@ -76,7 +76,7 @@ class OpenAIResponseBuilder(ResponseBuilder):
         self._parser: Optional[BaseToolParser] = None
         if tools:
             tool_choice = _resolve_tool_choice(request)
-            self._parser = ToolParserFactory.create(
+            self._parser = ToolParserFactory.create_checked(
                 "simple_json", tools=tools, tool_choice=tool_choice
             )
         self._content_started = False

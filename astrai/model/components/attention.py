@@ -7,10 +7,12 @@ from torch import Tensor
 
 from astrai.extension.backend import apply_rotary_emb, attention
 from astrai.factory import BaseFactory
+from astrai.model.components.conv import Conv1d
 from astrai.model.components.gdn_ops import (
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule_step,
 )
+from astrai.model.components.initialization import should_initialize
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
 from astrai.model.kv_cache import KVCache
@@ -178,7 +180,7 @@ class GDN(nn.Module):
         self.q_proj = Linear(dim, q_size)
         self.k_proj = Linear(dim, k_size)
         self.v_proj = Linear(dim, v_size)
-        self.conv = nn.Conv1d(
+        self.conv = Conv1d(
             self.conv_channels,
             self.conv_channels,
             self.conv_kernel_size,
@@ -195,6 +197,8 @@ class GDN(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        if not should_initialize():
+            return
         # Qwen's parameterization: decay = exp(-exp(A_log) * softplus(a + dt_bias))
         # with A = exp(A_log) drawn from U(0, 16) and dt_bias = 1. The lower bound
         # is kept just above zero because log(0) is -inf.

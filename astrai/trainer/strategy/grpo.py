@@ -18,7 +18,7 @@ from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.strategy.base import BaseStrategy
-from astrai.trainer.strategy.factory import StrategyFactory
+from astrai.trainer.strategy.factory import StrategyCapabilities, StrategyFactory
 from astrai.trainer.strategy.ops import (
     LossOutput,
     _importance_ratio_metrics,
@@ -29,7 +29,12 @@ from astrai.trainer.strategy.ops import (
 )
 
 
-@StrategyFactory.register("grpo")
+@StrategyFactory.register(
+    "grpo",
+    capabilities=StrategyCapabilities(
+        reference_model=True, old_model=True, initialize_old_model=True
+    ),
+)
 class GRPOStrategy(BaseStrategy):
     """Group Relative Policy Optimization strategy.
 
@@ -337,4 +342,13 @@ class GRPOStrategy(BaseStrategy):
 
 
 # Online GRPO uses the same objective with a rollout runner.
-StrategyFactory.register("online_grpo")(GRPOStrategy)
+StrategyFactory.register(
+    "online_grpo",
+    capabilities=StrategyCapabilities(
+        online=True,
+        reference_model=True,
+        old_model=True,
+        async_round=True,
+        min_group_size=2,
+    ),
+)(GRPOStrategy)

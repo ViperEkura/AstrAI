@@ -29,10 +29,16 @@ classDiagram
     }
     class EngineCoreClient {
         <<abstract · STRATEGY>>
+        +set_event_sink(sink)
+        +start()
         +send_request(**kwargs) str
         +send_requests(prompts, **kwargs) List~str~
         +abort_request(request_id) bool
+        +score_ids(prompts, continuations, per_token)
         +stats() Dict
+        +max_batch_size int
+        +backend_name str
+        +cuda_graph_enabled bool
         +shutdown()
     }
     class InprocClient {
@@ -106,11 +112,12 @@ classDiagram
   text to count tokens). Degrades to token-id-as-string when the
   tokenizer lacks the Rust streaming handle, so a stream always
   terminates.
-- **`EngineCoreClient`** routes submission, cancellation and shutdown through
-  `InprocClient` and the live `Scheduler` facade. The facade delegates
-  execution lifecycle to its in-process `EngineCore`; no transport or model
-  process is introduced. Existing score and diagnostic access through the
-  scheduler uses the same core operation boundary.
+- **EngineCoreClient** owns the frontend-to-core boundary for requests,
+  scoring, status, event delivery and lifecycle. The engine accepts an
+  injected client through the core_client constructor argument. The default
+  InprocClient still calls the live Scheduler facade in the same process.
+  Direct InferenceEngine.scheduler access warns in the first refactor release
+  and remains available for one minor version.
 - **`RequestTracker`** holds bounded per-request event queues for blocking
   consumers and supports async subscriptions for streaming consumers. A
   subscriber atomically takes the queued backlog and becomes the live route;

@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.model.components.initialization import should_initialize
+
 
 class Embedding(nn.Module):
     def __init__(self, vocab_size: int, embedding_dim: int, neftune_alpha: float = 0.0):
@@ -18,6 +20,8 @@ class Embedding(nn.Module):
         self.neftune_noise_alpha = alpha
 
     def reset_parameters(self):
+        if not should_initialize():
+            return
         nn.init.normal_(self.weight, mean=0.0, std=0.02)
 
     def forward(self, x: Tensor) -> Tensor:

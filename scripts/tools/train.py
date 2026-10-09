@@ -20,18 +20,18 @@ from astrai.config.train_config import (
     DP_MODES,
     ROLLOUT_MODES,
     START_METHODS,
-    TRAIN_TYPES,
 )
 from astrai.dataset import DatasetFactory, dpo_collate_fn, grpo_collate_fn
 from astrai.model import AutoRegressiveLM, ValueModel
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.optim import OptimizerFactory
 from astrai.trainer import SchedulerFactory, Trainer
+from astrai.trainer.strategy import StrategyFactory
 
 # Re-exported under its historical name for tests importing it from here.
 _merge_yaml_into_kwargs = merge_yaml_into_kwargs
 
-_TRAIN_TYPE = sorted(TRAIN_TYPES)
+_TRAIN_TYPE = StrategyFactory.list_registered()
 _DP = sorted(DP_MODES)
 _SCHEDULES = ["cosine", "sgdr", "wsd"]
 _OPTIMIZERS = OptimizerFactory.list_registered()

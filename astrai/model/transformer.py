@@ -7,19 +7,17 @@ from torch import Tensor
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.embedding import Embedding
+from astrai.model.components.initialization import should_initialize
 from astrai.model.components.norm import RMSNorm
 from astrai.model.components.rope import RotaryEmbedding
 from astrai.model.kv_cache import KVCache
 from astrai.model.masking import (
     prepare_decoder_masks,
 )
-from astrai.model.masking import (
-    process_attention_mask as process_attention_mask,
-)
 
 
 def init_module_weights(module: nn.Module):
-    if hasattr(module, "reset_parameters"):
+    if should_initialize() and hasattr(module, "reset_parameters"):
         module.reset_parameters()
 
 

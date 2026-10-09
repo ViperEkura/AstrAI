@@ -372,7 +372,7 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
         )
 
         store_window = cls._store_window_for(train_type, window_size)
-        store = StoreFactory.create(
+        store = StoreFactory.create_checked(
             storage_type,
             window_size=store_window,
             stride=stride if stride else store_window,

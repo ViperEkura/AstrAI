@@ -27,6 +27,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Optional
 
+import numpy as np
 import torch
 
 from astrai.extension.policy.quantization import autocast
@@ -47,7 +48,7 @@ def _rng_extra() -> dict:
     """Snapshot every RNG the training loop draws from.
 
     Covers python's ``random``, torch CPU and (when initialized) CUDA
-    generators, and numpy if installed.  Without this, a resumed run's
+    generators, and numpy.  Without this, a resumed run's
     dropout masks, init draws, and rollout sampling diverge from the
     uninterrupted run from the very first step.
     """
@@ -57,10 +58,6 @@ def _rng_extra() -> dict:
     }
     if torch.cuda.is_available():
         state["torch_cuda"] = torch.cuda.get_rng_state_all()
-    try:
-        import numpy as np
-    except ImportError:
-        return state
     state["numpy"] = np.random.get_state()
     return state
 
@@ -73,8 +70,6 @@ def _rng_restore(state: dict) -> None:
         # fits rather than failing the whole load.
         torch.cuda.set_rng_state_all(state["torch_cuda"][: torch.cuda.device_count()])
     if "numpy" in state:
-        import numpy as np
-
         np.random.set_state(state["numpy"])
 
 

@@ -2,7 +2,6 @@
 AutoModel base class for model loading and saving.
 """
 
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Union
 
@@ -10,6 +9,7 @@ import torch.nn as nn
 
 from astrai.config.model_config import BaseModelConfig, ConfigFactory
 from astrai.factory import BaseFactory
+from astrai.model.components.initialization import skip_parameter_init
 from astrai.serialization import (
     adapt_config,
     convert_hf_weights,
@@ -19,33 +19,6 @@ from astrai.serialization import (
     looks_like_hf_state_dict,
     save_model,
 )
-
-
-@contextmanager
-def _disable_random_init(enable: bool = True):
-    if not enable:
-        yield
-        return
-
-    names = (
-        "xavier_normal_",
-        "xavier_uniform_",
-        "kaiming_normal_",
-        "kaiming_uniform_",
-        "zeros_",
-        "ones_",
-        "constant_",
-        "normal_",
-        "uniform_",
-    )
-    orig = {n: getattr(nn.init, n) for n in names if hasattr(nn.init, n)}
-    for n in orig:
-        setattr(nn.init, n, lambda *a, **kw: None)
-    try:
-        yield
-    finally:
-        for n, fn in orig.items():
-            setattr(nn.init, n, fn)
 
 
 class ModelFactory(BaseFactory[nn.Module]):
@@ -72,8 +45,8 @@ class AutoModel(nn.Module):
         Args:
             path: Directory containing ``config.json`` and optionally
                 ``model.safetensors``.
-            disable_random_init: Replace parameter initializers with no-ops
-                while building the model.
+            disable_random_init: Skip AstrAI parameter initialization when a
+                complete checkpoint is loaded into a supported model.
             strict: Passed to ``load_state_dict``.
             weights_format: ``"auto"`` reads a model-directory mapping and
                 detects compatible HF weight keys; ``"astrai"`` skips conversion;
@@ -110,12 +83,14 @@ class AutoModel(nn.Module):
 
         actual_cls = ModelFactory.get_component_class(model_type)
 
-        with _disable_random_init(enable=disable_random_init):
-            model = actual_cls(config)
-
         weights_path = model_path / "model.safetensors"
         index_path = model_path / "model.safetensors.index.json"
-        if weights_path.exists() or index_path.exists():
+        has_weights = weights_path.exists() or index_path.exists()
+        fast_load = bool(disable_random_init and strict and has_weights)
+        with skip_parameter_init(fast_load):
+            model = actual_cls(config)
+
+        if has_weights:
             state_dict = load_model_weights(str(model_path))
             is_hf_weights = weights_format == "hf" or (
                 weights_format == "auto" and looks_like_hf_state_dict(state_dict)

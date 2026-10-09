@@ -1,4 +1,13 @@
-from dataclasses import field
+import json
+from dataclasses import (
+    asdict,
+    field,
+    fields,
+    is_dataclass,
+)
+from dataclasses import (
+    dataclass as plain_dataclass,
+)
 from math import isfinite
 from typing import Any, Callable, Dict, List, Optional
 
@@ -12,15 +21,55 @@ from torch.utils.data import Dataset
 from astrai.config.base import BaseConfig
 from astrai.model.components.lora import LoRAConfig
 
-TRAIN_TYPES = frozenset(
-    {"seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"}
-)
 # Data-parallel gradient-sync strategies.
 DP_MODES = frozenset({"none", "ddp", "fsdp"})
 BACKENDS = frozenset({"nccl", "gloo"})
 START_METHODS = frozenset({"spawn", "fork", "forkserver"})
 _COMPILE_MODES = frozenset({"default", "reduce-overhead", "max-autotune"})
 ROLLOUT_MODES = frozenset({"sync", "async_round"})
+
+
+@plain_dataclass(frozen=True)
+class _TrainRuntimeDependencies:
+    model_fn: Callable
+    dataset: Dataset
+    optimizer_fn: Callable
+    scheduler_fn: Callable
+    collate_fn: Optional[Callable]
+    val_dataset: Optional[Dataset]
+    reward_model_fn: Optional[Callable]
+    critic_model_fn: Optional[Callable]
+    critic_optimizer_fn: Optional[Callable]
+
+    @classmethod
+    def capture(cls, config: "TrainConfig") -> "_TrainRuntimeDependencies":
+        return cls(
+            **{item.name: getattr(config, item.name, None) for item in fields(cls)}
+        )
+
+
+@plain_dataclass(frozen=True)
+class _CheckpointSettingsSnapshot:
+    values: Dict[str, Any]
+
+    @classmethod
+    def capture(cls, config: "TrainConfig") -> "_CheckpointSettingsSnapshot":
+        runtime_names = {item.name for item in fields(_TrainRuntimeDependencies)}
+        values = {}
+        for item in fields(config):
+            value = getattr(config, item.name)
+            if item.name in runtime_names and value is not None:
+                continue
+            if is_dataclass(value):
+                value = asdict(value)
+            elif isinstance(value, tuple):
+                value = list(value)
+            try:
+                json.dumps(value)
+            except (TypeError, ValueError):
+                continue
+            values[item.name] = value
+        return cls(values)
 
 
 @dataclass(config=ConfigDict(arbitrary_types_allowed=True, extra="forbid"))
@@ -182,11 +231,17 @@ class TrainConfig(BaseConfig):
     executor_kwargs: Dict[str, Any] = field(default_factory=dict)
     strategy_kwargs: Dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Capture checkpoint settings without copying runtime dependencies."""
+        return _CheckpointSettingsSnapshot.capture(self).values
+
     @field_validator("strategy")
     def _validate_strategy(cls, v: str) -> str:
-        if v not in TRAIN_TYPES:
+        from astrai.trainer.strategy import StrategyFactory
+
+        if not StrategyFactory.is_registered(v):
             raise ValueError(
-                f"strategy must be one of {sorted(TRAIN_TYPES)}, got {v!r}"
+                f"strategy must be one of {StrategyFactory.list_registered()}, got {v!r}"
             )
         return v
 
@@ -409,13 +464,15 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
-        if (
-            self.strategy == "online_grpo"
-            and self.strategy_kwargs.get("group_size", 4) < 2
-        ):
-            raise ValueError("online_grpo group_size must be >= 2")
+        from astrai.trainer.strategy import StrategyFactory
+
+        capabilities = StrategyFactory.capabilities(self.strategy)
+        if self.strategy_kwargs.get("group_size", 4) < capabilities.min_group_size:
+            raise ValueError(
+                f"{self.strategy} group_size must be >= {capabilities.min_group_size}"
+            )
         if self.rollout_mode == "async_round":
-            if self.strategy != "online_grpo":
+            if not capabilities.async_round:
                 raise ValueError("async_round currently supports online_grpo only")
             if self.nprocs != 1 or self.dp_mode != "none" or self.device_type != "cuda":
                 raise ValueError(
@@ -454,15 +511,15 @@ class TrainConfig(BaseConfig):
                 self.rollout_max_policy_lag = 1
             if self.val_dataset is not None or self.val_split is not None:
                 raise ValueError("async_round validation is not supported yet")
-        if self.strategy.startswith("online_"):
+        if capabilities.online:
             if self.reward_model_fn is None:
                 raise ValueError(
                     f"reward_model_fn is required for online RL strategy "
                     f"{self.strategy!r}"
                 )
-            if self.strategy == "online_ppo" and self.critic_model_fn is None:
+            if capabilities.critic and self.critic_model_fn is None:
                 raise ValueError(
-                    "critic_model_fn is required for online RL strategy 'online_ppo'"
+                    f"critic_model_fn is required for strategy {self.strategy!r}"
                 )
             if self.nprocs > 1 and self.dp_mode != "ddp":
                 raise ValueError(

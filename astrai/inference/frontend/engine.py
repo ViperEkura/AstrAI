@@ -11,6 +11,7 @@ import asyncio
 import gc
 import logging
 import time
+import warnings
 from pathlib import Path
 from typing import (
     Any,
@@ -59,25 +60,25 @@ class InferenceEngine:
         enable_cuda_graph: bool = True,
         backend: Optional[Union[str, ATTN_BACKEND, AttentionBackend, type]] = None,
         enable_overlap: bool = False,
+        core_client: Optional[EngineCoreClient] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.scheduler = Scheduler(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            max_batch_size=max_batch_size,
-            max_seq_len=max_seq_len,
-            cache=cache,
-            enable_cuda_graph=enable_cuda_graph,
-            backend=backend,
-            enable_overlap=enable_overlap,
-        )
-        # Frontend plumbing: id minting, event queues, output folding.
-        # All core access goes through the EngineCoreClient seam (T0:
-        # in-process direct calls; T1 swaps in a transport client).
-        self._core: EngineCoreClient = InprocClient(self.scheduler)
+        if core_client is None:
+            scheduler = Scheduler(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                max_batch_size=max_batch_size,
+                max_seq_len=max_seq_len,
+                cache=cache,
+                enable_cuda_graph=enable_cuda_graph,
+                backend=backend,
+                enable_overlap=enable_overlap,
+            )
+            core_client = InprocClient(scheduler)
+        self._core = core_client
         self._tracker = RequestTracker()
-        self.scheduler.set_event_sink(self._tracker.sink)
+        self._core.set_event_sink(self._tracker.sink)
         resolved_len = max_seq_len
         if resolved_len is None:
             cfg_len = getattr(model.config, "max_position_embeddings", None)
@@ -85,7 +86,19 @@ class InferenceEngine:
         self._max_seq_len = int(resolved_len)
         self._input_processor = InputProcessor(tokenizer, int(resolved_len))
 
-        self.scheduler.start()
+        self._core.start()
+
+    @property
+    def scheduler(self) -> Scheduler:
+        warnings.warn(
+            "InferenceEngine.scheduler is deprecated; use EngineCoreClient "
+            "for request, scoring, status and lifecycle operations",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if not isinstance(self._core, InprocClient):
+            raise AttributeError("The injected core client has no local scheduler")
+        return self._core.scheduler
 
     def __enter__(self):
         return self
@@ -252,11 +265,11 @@ class InferenceEngine:
 
         # The executor holds max_batch_size worth of fixed-shape buffers, so
         # split a long batch here rather than failing deep in the executor.
-        chunk = max(1, self.scheduler.max_batch_size)
+        chunk = max(1, self._core.max_batch_size)
         results: List[Any] = []
         for start in range(0, len(prompts), chunk):
             results.extend(
-                self.scheduler.score_ids(
+                self._core.score_ids(
                     prompts[start : start + chunk],
                     conts[start : start + chunk],
                     per_token=per_token,
@@ -528,11 +541,11 @@ class InferenceEngine:
 
     @property
     def backend_name(self) -> str:
-        return self.scheduler.backend_name
+        return self._core.backend_name
 
     @property
     def cuda_graph_enabled(self) -> bool:
-        return self.scheduler.cuda_graph_enabled
+        return self._core.cuda_graph_enabled
 
     def shutdown(self):
         self._core.shutdown()

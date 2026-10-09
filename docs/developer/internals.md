@@ -2,6 +2,8 @@
 
 Mathematical foundations and internal algorithms for AstrAI's training, inference, and preprocessing pipelines. For practical usage guides, see [Training](../guides/training.md), [Inference](../guides/inference.md), and [Preprocessing](../guides/preprocessing.md).
 
+For training component ownership, startup and failure cleanup, see [Trainer internals](trainer/README.md).
+
 ## Contents
 
 - [Autoregression & Causal Masking](#autoregression--causal-masking)
@@ -156,8 +158,8 @@ would double-count.
 | `on_batch_end` | Every batch | — |
 | `after_optimizer_step` | Every accumulation window, after `optimizer.step()` and `scheduler.step()` | `CheckpointCallback` |
 | `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
-| `on_error` | On exception during training | `CheckpointCallback`, `MetricCallback` |
-| `on_train_end` | Training exits after `on_train_begin` completes (via `finally`) | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
+| `on_error` | On exception after context construction, or requested stop | `CheckpointCallback`, `MetricCallback` |
+| `on_train_end` | Session teardown after context construction, including a failed start callback | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 
 Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm, rank-0), `gradient_clipping`. The gradient-clipping callback is always registered and always calls `executor.clip_grad_norm()` with the numeric `max_grad_norm` value.
 

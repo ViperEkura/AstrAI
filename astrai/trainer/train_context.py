@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import threading
 from collections.abc import Callable
@@ -13,7 +14,7 @@ from astrai.config.model_config import ConfigFactory
 from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
 from astrai.inference.core.scheduler import Scheduler
-from astrai.model.components.lora import inject_lora
+from astrai.model.components.lora import LoRALinear, inject_lora
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -26,11 +27,15 @@ from astrai.parallel.topology import ParallelTopology, build_topology
 from astrai.parallel.tp import TPState
 from astrai.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.serialization import (
+    HF_MAPPING_FILENAME,
     Checkpoint,
     adapt_config,
-    convert_hf_weights,
+    load_hf_mapping,
     load_json,
-    looks_like_hf_state_dict,
+)
+from astrai.serialization.pretrained import (
+    load_pretrained_state_dict,
+    prepare_pretrained_weights,
 )
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.callbacks.metric_util import GradSNRTracker
@@ -58,6 +63,7 @@ class TrainContext:
     checkpoint: Checkpoint = field(default=None)
     config: TrainConfig = field(default=None)
     model_config: dict = field(default_factory=dict)
+    pretrained_metadata: dict = field(default_factory=dict)
     executor: BaseExecutor = field(default=None)
     epoch: int = field(default=0)
     consumed_samples: int = field(default=0)
@@ -119,6 +125,7 @@ class TrainContext:
 @dataclass
 class _PreloadedState:
     model_config: dict = field(default_factory=dict)
+    pretrained_metadata: dict = field(default_factory=dict)
     state_dict: dict | None = None
     epoch: int = 0
     consumed_samples: int = 0
@@ -246,26 +253,48 @@ class TrainContextBuilder:
         if self._param_path:
             config_path = Path(self._param_path) / "config.json"
             if config_path.exists():
-                state.model_config = adapt_config(
-                    load_json(config_path), self._param_path
+                raw_config = load_json(config_path)
+                state.model_config = adapt_config(raw_config, self._param_path)
+                state.pretrained_metadata = {
+                    "source_path": str(Path(self._param_path).resolve()),
+                    "model_source": raw_config.get("_name_or_path"),
+                    "model_revision": raw_config.get("_commit_hash"),
+                }
+            mapping = load_hf_mapping(self._param_path)
+            if mapping is not None:
+                mapping_path = Path(self._param_path) / HF_MAPPING_FILENAME
+                state.pretrained_metadata.update(
+                    mapping_sha256=hashlib.sha256(
+                        mapping_path.read_bytes()
+                    ).hexdigest(),
+                    excluded_prefixes=mapping.get("weights", {}).get(
+                        "skip_prefixes", []
+                    ),
                 )
             checkpoint = Checkpoint.load_any(self._param_path)
+            if checkpoint is None and (mapping is not None or self._resume):
+                raise FileNotFoundError(
+                    f"No pretrained policy weights found in {self._param_path}"
+                )
             if checkpoint is not None:
                 if checkpoint.config:
                     checkpoint.config = adapt_config(
                         checkpoint.config, self._param_path
                     )
-                if checkpoint.state_dict and looks_like_hf_state_dict(
-                    checkpoint.state_dict
-                ):
-                    checkpoint.state_dict = convert_hf_weights(
+                if checkpoint.state_dict:
+                    checkpoint.state_dict = prepare_pretrained_weights(
                         checkpoint.state_dict,
                         ConfigFactory.load(checkpoint.config or state.model_config),
+                        mapping=mapping,
+                        strict=self._resume or not cfg.allow_partial_pretrained,
                     )
                 checkpoint.state_dict = strip_compile_prefix(checkpoint.state_dict)
                 state.state_dict = checkpoint.state_dict
                 state.model_config = checkpoint.config or state.model_config
                 if self._resume:
+                    state.pretrained_metadata = dict(
+                        checkpoint.meta.get("pretrained", state.pretrained_metadata)
+                    )
                     state.epoch = checkpoint.epoch
                     per_step = (
                         cfg.batch_per_device
@@ -281,6 +310,10 @@ class TrainContextBuilder:
                         else checkpoint.consumed_samples // per_step * per_step
                     )
                     state.checkpoint = checkpoint
+            else:
+                # param_path also supplies a tokenizer for factory-initialized
+                # native policies; no checkpoint was requested in this mode.
+                state.pretrained_metadata = {}
         if not state.model_config:
             model = cfg.model_fn()
             if hasattr(model, "config"):
@@ -296,6 +329,7 @@ class TrainContextBuilder:
             topology=self._topology,
             config=self.config,
             model_config=state.model_config,
+            pretrained_metadata=state.pretrained_metadata,
             executor=executor,
             epoch=state.epoch,
             consumed_samples=state.consumed_samples,
@@ -319,14 +353,32 @@ class TrainContextBuilder:
                     target_modules=set(cfg.lora.target_modules),
                 )
             if state.state_dict is not None:
-                result = model.load_state_dict(state.state_dict, strict=False)
-                if result.missing_keys or result.unexpected_keys:
+                allowed_missing = {
+                    f"{name}.{parameter}" if name else parameter
+                    for name, module in model.named_modules()
+                    if isinstance(module, LoRALinear) and not self._resume
+                    for parameter in ("lora_A", "lora_B")
+                }
+                result = load_pretrained_state_dict(
+                    model,
+                    state.state_dict,
+                    strict=self._resume or not cfg.allow_partial_pretrained,
+                    allowed_missing_keys=allowed_missing,
+                )
+                missing = sorted(set(result.missing_keys) - allowed_missing)
+                context.pretrained_metadata.update(
+                    loaded_tensor_count=len(state.state_dict),
+                    allowed_new_parameters=sorted(allowed_missing),
+                    partial_warm_start=cfg.allow_partial_pretrained
+                    and not self._resume,
+                )
+                if missing or result.unexpected_keys:
                     logger.warning(
                         "preloaded state dict mismatch: %d missing, %d unexpected "
                         "(first missing: %s, first unexpected: %s)",
-                        len(result.missing_keys),
+                        len(missing),
                         len(result.unexpected_keys),
-                        result.missing_keys[:3],
+                        missing[:3],
                         result.unexpected_keys[:3],
                     )
             if self._topology.tp_size > 1:

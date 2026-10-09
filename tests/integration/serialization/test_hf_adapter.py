@@ -1,5 +1,6 @@
 """Tests for HuggingFace checkpoint/config adaptation."""
 
+import hashlib
 import json
 
 import pytest
@@ -7,11 +8,14 @@ import safetensors.torch as st
 import torch
 import torch.nn.functional as F
 
+from astrai.config import TrainConfig
 from astrai.config.model_config import ConfigFactory
 from astrai.model import AutoModel, AutoRegressiveLM
 from astrai.model.components.attention import GQA
+from astrai.model.components.lora import LoRAConfig
 from astrai.model.components.rope import get_rotary_emb
 from astrai.serialization import (
+    Checkpoint,
     adapt_config,
     convert_hf_config,
     convert_hf_weights,
@@ -19,6 +23,8 @@ from astrai.serialization import (
     save_model,
 )
 from astrai.serialization.hf_adapter import _half_to_interleaved
+from astrai.trainer.callbacks.checkpoint import CheckpointCallback
+from astrai.trainer.train_context import TrainContextBuilder
 from tests.support.checkpoint import assert_state_dicts_equal
 from tests.support.models import make_tiny_config
 
@@ -75,6 +81,28 @@ TEST_MAPPING = {
 
 def _write_mapping(model_dir, mapping=TEST_MAPPING):
     (model_dir / "hf_mapping.json").write_text(json.dumps(mapping))
+
+
+def _load_training_policy(path, cfg, monkeypatch, *, resume=False, **overrides):
+    monkeypatch.setenv("LOCAL_DEVICE", "cpu")
+    options = dict(
+        model_fn=lambda: AutoRegressiveLM(cfg),
+        strategy="seq",
+        dataset=torch.utils.data.TensorDataset(torch.zeros(2, 4, dtype=torch.long)),
+        optimizer_fn=lambda model: torch.optim.SGD(model.parameters(), lr=0.1),
+        scheduler_fn=lambda optim: torch.optim.lr_scheduler.LambdaLR(
+            optim, lambda _: 1
+        ),
+        device_type="cpu",
+        batch_per_device=1,
+        ckpt_dir=str(path / "checkpoints"),
+    )
+    options.update(overrides)
+    return (
+        TrainContextBuilder(TrainConfig(**options))
+        .with_param_path(str(path), resume=resume)
+        .build()
+    )
 
 
 MOE_RAW = {
@@ -660,7 +688,7 @@ def test_hybrid_weight_layout_converts_fused_gates_and_gdn_parameters():
     assert len(converted) == 10
 
 
-def test_from_pretrained_gated_zero_centered_hf_directory(tmp_path):
+def test_from_pretrained_gated_zero_centered_hf_directory(tmp_path, monkeypatch):
     cfg = make_tiny_config(use_gated_attention=True, use_qk_norm=True)
     reference = AutoRegressiveLM(cfg).eval()
     hf_state = to_hf_keys(reference.state_dict(), head_dim=4)
@@ -695,11 +723,166 @@ def test_from_pretrained_gated_zero_centered_hf_directory(tmp_path):
     }
     _write_mapping(tmp_path, mapping)
     loaded = AutoModel.from_pretrained(tmp_path, strict=True).eval()
+    context = _load_training_policy(tmp_path, cfg, monkeypatch)
+    trained = context.model.eval()
+    assert_state_dicts_equal(trained.state_dict(), loaded.state_dict())
     input_ids = torch.tensor([[1, 2, 3, 4]])
+    input_mask = torch.tensor([[True, True, True, False]])
     with torch.no_grad():
         torch.testing.assert_close(
             loaded(input_ids)["logits"], reference(input_ids)["logits"]
         )
+        torch.testing.assert_close(
+            trained(input_ids, input_mask=input_mask)["logits"],
+            loaded(input_ids, input_mask=input_mask)["logits"],
+        )
+    metadata = context.pretrained_metadata
+    assert (
+        metadata["mapping_sha256"]
+        == hashlib.sha256((tmp_path / "hf_mapping.json").read_bytes()).hexdigest()
+    )
+    assert metadata["excluded_prefixes"] == ["model.visual.", "mtp."]
+    callback = CheckpointCallback(str(tmp_path / "saved"), interval=1)
+    callback._save_checkpoint(context)
+    saved_path = tmp_path / "saved" / "epoch_0_step_0"
+    saved = Checkpoint.load(str(saved_path))
+    assert saved.meta["pretrained"] == metadata
+    resumed = _load_training_policy(saved_path, cfg, monkeypatch, resume=True)
+    assert resumed.pretrained_metadata["mapping_sha256"] == metadata["mapping_sha256"]
+    assert_state_dicts_equal(resumed.model.state_dict(), trained.state_dict())
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_training_hf_tied_weight_ownership(tmp_path, monkeypatch, tied):
+    cfg = make_tiny_config(tie_word_embeddings=tied)
+    reference = AutoRegressiveLM(cfg).eval()
+    save_model(
+        {**LLAMA_RAW, "tie_word_embeddings": tied},
+        _hf_keyed_state_dict(reference, cfg),
+        str(tmp_path),
+    )
+    _write_mapping(tmp_path)
+    loaded = AutoModel.from_pretrained(tmp_path).eval()
+    context = _load_training_policy(tmp_path, cfg, monkeypatch)
+    assert_state_dicts_equal(context.model.state_dict(), loaded.state_dict())
+    assert (
+        context.model.lm_head.weight is context.model.model.embed_tokens.weight
+    ) == tied
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    ["model.layers.0.attention.q_proj.weight", "model.norm.weight", "lm_head.weight"],
+)
+def test_missing_policy_weights_fail_before_optimizer(
+    tmp_path, monkeypatch, missing_key
+):
+    cfg = make_tiny_config()
+    state = dict(AutoRegressiveLM(cfg).state_dict())
+    del state[missing_key]
+    save_model(cfg.to_dict(), state, str(tmp_path))
+    optimizer_calls = []
+
+    def optimizer_fn(model):
+        optimizer_calls.append(model)
+        return torch.optim.SGD(model.parameters(), lr=0.1)
+
+    with pytest.raises(RuntimeError, match=missing_key):
+        _load_training_policy(tmp_path, cfg, monkeypatch, optimizer_fn=optimizer_fn)
+    assert not optimizer_calls
+    with pytest.raises(RuntimeError, match=missing_key):
+        AutoModel.from_pretrained(tmp_path)
+
+
+def test_partial_warm_start_is_explicit_and_never_relaxes_resume(
+    tmp_path, monkeypatch, caplog
+):
+    cfg = make_tiny_config()
+    state = dict(AutoRegressiveLM(cfg).state_dict())
+    del state["lm_head.weight"]
+    save_model(cfg.to_dict(), state, str(tmp_path))
+    context = _load_training_policy(
+        tmp_path, cfg, monkeypatch, allow_partial_pretrained=True
+    )
+    assert "lm_head.weight" in caplog.text
+    assert context.pretrained_metadata["partial_warm_start"]
+    with pytest.raises(RuntimeError, match="lm_head.weight"):
+        _load_training_policy(
+            tmp_path, cfg, monkeypatch, allow_partial_pretrained=True, resume=True
+        )
+
+
+def test_new_lora_adapters_are_allowed_but_backbone_and_resume_are_complete(
+    tmp_path, monkeypatch
+):
+    cfg = make_tiny_config()
+    reference = AutoRegressiveLM(cfg)
+    save_model(cfg.to_dict(), reference.state_dict(), str(tmp_path))
+    lora = LoRAConfig(r=2, alpha=4, target_modules=("q_proj",))
+    context = _load_training_policy(tmp_path, cfg, monkeypatch, lora=lora)
+    assert_state_dicts_equal(
+        {k: context.model.state_dict()[k] for k in reference.state_dict()},
+        reference.state_dict(),
+    )
+    assert len(context.pretrained_metadata["allowed_new_parameters"]) == 4
+    with pytest.raises(RuntimeError, match="lora_A"):
+        _load_training_policy(tmp_path, cfg, monkeypatch, lora=lora, resume=True)
+    state = dict(reference.state_dict())
+    del state["model.layers.0.attention.q_proj.weight"]
+    save_model(cfg.to_dict(), state, str(tmp_path))
+    with pytest.raises(RuntimeError, match="q_proj.weight"):
+        _load_training_policy(tmp_path, cfg, monkeypatch, lora=lora)
+
+
+def test_unsupported_packed_experts_fail_loading(tmp_path, monkeypatch):
+    cfg = make_tiny_config(**MOE_KWARGS)
+    source = _hf_keyed_state_dict(AutoRegressiveLM(cfg), cfg)
+    for key in tuple(source):
+        if ".mlp.experts." in key:
+            del source[key]
+    source["model.layers.0.mlp.experts.gate_up_proj"] = torch.zeros(2, 32, 8)
+    source["model.layers.0.mlp.experts.down_proj"] = torch.zeros(2, 8, 16)
+    save_model(MOE_RAW, source, str(tmp_path))
+    _write_mapping(tmp_path, {**TEST_MAPPING, "constants": {"ffn_type": "moe"}})
+    with pytest.raises(RuntimeError, match="routed_experts"):
+        _load_training_policy(tmp_path, cfg, monkeypatch)
+
+
+def test_unmapped_hf_weights_require_an_explicit_exclusion(tmp_path, monkeypatch):
+    cfg = make_tiny_config()
+    source = _hf_keyed_state_dict(AutoRegressiveLM(cfg), cfg)
+    source["model.visual.dummy.weight"] = torch.ones(1)
+    save_model(LLAMA_RAW, source, str(tmp_path))
+    _write_mapping(tmp_path)
+    for load in (
+        lambda: AutoModel.from_pretrained(tmp_path),
+        lambda: _load_training_policy(tmp_path, cfg, monkeypatch),
+    ):
+        with pytest.raises(ValueError, match="model.visual.dummy.weight"):
+            load()
+
+
+def test_hf_pretrained_training_requires_weight_files(tmp_path, monkeypatch):
+    cfg = make_tiny_config()
+    (tmp_path / "config.json").write_text(json.dumps(LLAMA_RAW))
+    _write_mapping(tmp_path)
+    with pytest.raises(FileNotFoundError, match="No pretrained policy weights"):
+        _load_training_policy(tmp_path, cfg, monkeypatch)
+
+
+def test_native_factory_initialization_without_weights(tmp_path, monkeypatch):
+    cfg = make_tiny_config()
+    (tmp_path / "config.json").write_text(json.dumps(cfg.to_dict()))
+    context = _load_training_policy(tmp_path, cfg, monkeypatch)
+    assert context.model is not None
+    assert context.optimizer is not None
+    assert not context.pretrained_metadata
+    with pytest.raises(FileNotFoundError, match="No pretrained policy weights"):
+        _load_training_policy(tmp_path, cfg, monkeypatch, resume=True)
+
+
+def test_linear_attention_hf_weights_are_detected():
+    assert looks_like_hf_state_dict({"model.layers.0.linear_attn.A_log": torch.ones(1)})
 
 
 @pytest.mark.parametrize(

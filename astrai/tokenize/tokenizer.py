@@ -29,6 +29,7 @@ class AutoTokenizer:
         self._tokenizer: Tokenizer = None
         self._chat_template: Optional[ChatTemplate] = None
         self._special_token_map: Optional[Dict] = special_token_map or {}
+        self._stop_token_ids: Optional[List[int]] = None
 
         if chat_template:
             self.set_chat_template(chat_template)
@@ -42,6 +43,7 @@ class AutoTokenizer:
         tokenizer_file = path / "tokenizer.json"
         config_file = path / "tokenizer_config.json"
         self._tokenizer = Tokenizer.from_file(str(tokenizer_file))
+        self._stop_token_ids = None
 
         if config_file.exists():
             with open(config_file, "r", encoding="utf-8") as f:
@@ -49,6 +51,49 @@ class AutoTokenizer:
 
             if "special_tokens" in config:
                 self._special_token_map.update(config["special_tokens"])
+            else:
+                # HF stores named tokens at the top level, sometimes as
+                # AddedToken dictionaries rather than plain strings.
+                for name in ("bos_token", "eos_token", "pad_token", "unk_token"):
+                    value = config.get(name)
+                    if isinstance(value, dict):
+                        value = value.get("content")
+                    if isinstance(value, str):
+                        self._special_token_map[name] = value
+                if any(name in config for name in ("eos_token", "pad_token")):
+                    eos = self._special_token_map.get("eos_token")
+                    token_id = self._tokenizer.token_to_id(eos) if eos else None
+                    if eos and token_id is None:
+                        raise ValueError("declared EOS token is absent from tokenizer")
+                    self._stop_token_ids = [] if token_id is None else [token_id]
+                    generation_path = path / "generation_config.json"
+                    if generation_path.is_file():
+                        generation = json.loads(generation_path.read_text())
+                        ids = generation.get("eos_token_id")
+                        if ids is not None:
+                            if type(ids) is int:
+                                ids = [ids]
+                            if not isinstance(ids, list) or any(
+                                type(i) is not int
+                                or not 0 <= i < 2**32
+                                or self._tokenizer.id_to_token(i) is None
+                                for i in ids
+                            ):
+                                raise ValueError("invalid declared generation EOS ids")
+                            self._stop_token_ids = list(
+                                dict.fromkeys(self._stop_token_ids + ids)
+                            )
+
+            if "stop_token_ids" in config:
+                ids = config["stop_token_ids"]
+                if not isinstance(ids, list) or any(
+                    type(i) is not int
+                    or not 0 <= i < 2**32
+                    or self._tokenizer.id_to_token(i) is None
+                    for i in ids
+                ):
+                    raise ValueError("invalid declared stop_token_ids")
+                self._stop_token_ids = list(dict.fromkeys(ids))
 
             # Load chat template from config
             if "chat_template" in config:
@@ -100,6 +145,8 @@ class AutoTokenizer:
         config = {}
         if self._special_token_map is not None:
             config["special_tokens"] = self._special_token_map
+        if self._stop_token_ids is not None:
+            config["stop_token_ids"] = self._stop_token_ids
         if self._chat_template is not None:
             config["chat_template"] = self._chat_template.template_str
 
@@ -174,6 +221,8 @@ class AutoTokenizer:
 
         # Handle stop_ids - return IDs for all special tokens
         if key == "stop_ids":
+            if self._stop_token_ids is not None:
+                return list(self._stop_token_ids)
             stop_ids = []
 
             if self._tokenizer is None:
@@ -219,7 +268,9 @@ class AutoTokenizer:
             KeyError: If template name is not registered.
         """
         if isinstance(template, str):
-            self._chat_template = ChatTemplate.from_string(template)
+            self._chat_template = ChatTemplate.from_string(
+                template, special_tokens=self._special_token_map
+            )
         elif isinstance(template, ChatTemplate):
             self._chat_template = template
         else:

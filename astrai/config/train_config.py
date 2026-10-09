@@ -49,6 +49,7 @@ class TrainConfig(BaseConfig):
         ckpt_dir (str): Checkpoint directory. Defaults to "./checkpoint".
         ckpt_interval (int): Number of optimizer steps between checkpoints. Defaults to 5000.
         lora (Optional[LoRAConfig]): LoRA config. None means full fine-tuning. Defaults to None.
+        allow_partial_pretrained (bool): Permit a partial pretrained warm-start with warnings. Resume always requires complete policy weights. Defaults to False.
         metrics (List[str]): Metrics to record during training. Defaults to ["loss", "lr", "grad_norm"].
         grad_snr_interval (int): Update GradSNR every N optimizer steps when the metric is requested. Defaults to 1.
         random_seed (int): Random seed. Defaults to 3407.
@@ -123,6 +124,7 @@ class TrainConfig(BaseConfig):
     ckpt_interval: int = 5000
 
     lora: Optional[LoRAConfig] = None
+    allow_partial_pretrained: bool = False
 
     metrics: List[str] = field(default_factory=lambda: ["loss", "lr", "grad_norm"])
     grad_snr_interval: int = 1

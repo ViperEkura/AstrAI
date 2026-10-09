@@ -62,6 +62,7 @@ def _half_to_interleaved(head_dim: int) -> torch.Tensor:
 #: trunk prefix, so the prefix alone cannot identify an HF checkpoint.
 _HF_MARKERS = (
     "self_attn.",
+    "linear_attn.",
     "input_layernorm",
     "post_attention_layernorm",
     "mlp.gate_proj",
@@ -97,12 +98,14 @@ def convert_hf_weights(
     state_dict: Mapping[str, Any],
     config: BaseConfig,
     mapping: Mapping[str, Any] | None = None,
+    *,
+    strict: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Rename HF state dict keys to AstrAI names.
 
     Keys that are already AstrAI-style pass through unchanged; unmapped
-    HF keys are dropped with a warning. Use with ``strict=True`` to fail
-    loudly when the checkpoint does not match the config.
+    HF keys are dropped with a warning, or rejected when ``strict=True``.
+    Mapping-declared ``skip_prefixes`` remain explicit exclusions.
     """
     if getattr(config, "attn_type", "gqa") == "mla":
         if any("kv_a_proj_with_mqa" in key for key in state_dict):
@@ -286,6 +289,11 @@ def convert_hf_weights(
             converted[new_key] = tensor
 
     if skipped:
+        if strict:
+            raise ValueError(
+                f"Unmapped HuggingFace weight key(s) ({len(skipped)}): "
+                + ", ".join(sorted(skipped)[:10])
+            )
         logger.warning(
             "Dropped %d unmapped HuggingFace weight key(s): %s",
             len(skipped),

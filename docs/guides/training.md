@@ -363,6 +363,26 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 - Creates `RDSampler` for shuffle+resume
 - Builds strategy via `StrategyFactory.create(train_type, model, device, **kwargs)`
 
+Pretrained policy loading uses the same model-owned `hf_mapping.json` weight
+conversion as `AutoModel.from_pretrained`, including norm offsets and declared
+vision/MTP exclusions. Missing required tensors or unsupported HF weight keys
+fail before the optimizer is created. An untied output head must be present in
+the checkpoint; a tied embedding/head uses the model's canonical embedding key.
+New LoRA adapter parameters may be initialized when loading a base policy, while
+resume requires the saved adapters as well as the backbone. Critic head
+initialization remains separate from policy loading.
+
+For a deliberate partial warm-start, set
+`TrainConfig(..., allow_partial_pretrained=True)`. This logs missing/unexpected
+weights and never relaxes resume checks. The CLI keeps complete loading by
+default. Checkpoint metadata records the available source revision, mapping
+SHA-256, explicit exclusions, and adapter initialization; an unavailable source
+revision is recorded as `null`.
+
+For factory-initialized native training, `param_path` may supply only the native
+config/tokenizer directory. A directory declaring an HF mapping must contain
+policy weights, and resume always requires checkpoint weights.
+
 ## Training CLI
 
 ```bash

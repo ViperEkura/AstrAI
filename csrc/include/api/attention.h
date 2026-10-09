@@ -16,19 +16,17 @@ torch::Tensor attn_decode(torch::Tensor q,
                           torch::Tensor k,
                           torch::Tensor v,
                           c10::optional<torch::Tensor> mask,
-                          int64_t causal_offset,
-                          double scale,
+                          c10::optional<double> scale,
                           int64_t layout,
                           c10::optional<torch::Tensor> o_part_buf,
-                          c10::optional<torch::Tensor> ml_part_buf);
+                          c10::optional<torch::Tensor> ml_part_buf, bool is_causal);
 
 torch::Tensor attn_prefill(torch::Tensor q,
                            torch::Tensor k,
                            torch::Tensor v,
                            c10::optional<torch::Tensor> mask,
-                           int64_t causal_offset,
-                           double scale,
-                           int64_t layout);
+                           c10::optional<double> scale,
+                           int64_t layout, bool is_causal);
 
 torch::Tensor attn_paged_decode(torch::Tensor q,
                                 torch::Tensor k_cache,
@@ -39,11 +37,10 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
                                 c10::optional<torch::Tensor> new_k,
                                 c10::optional<torch::Tensor> new_v,
                                 c10::optional<torch::Tensor> mask,
-                                int64_t causal_offset,
-                                double scale,
+                                c10::optional<double> scale,
                                 c10::optional<torch::Tensor> o_part_buf,
                                 c10::optional<torch::Tensor> ml_part_buf,
-                                c10::optional<torch::Tensor> out_buf);
+                                c10::optional<torch::Tensor> out_buf, bool is_causal);
 
 torch::Tensor attn_paged_prefill(torch::Tensor q,
                                  torch::Tensor k_cache,
@@ -55,8 +52,7 @@ torch::Tensor attn_paged_prefill(torch::Tensor q,
                                  torch::Tensor q_tile_to_batch,
                                  torch::Tensor q_tile_to_index,
                                  c10::optional<torch::Tensor> mask,
-                                 int64_t causal_offset,
-                                 double scale);
+                                 c10::optional<double> scale, bool is_causal);
 
 } // namespace attention
 } // namespace astrai

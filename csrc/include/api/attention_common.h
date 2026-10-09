@@ -37,18 +37,17 @@ struct AttentionParams {
 
     // Attention behavior
     float scale;
-    // -1 = non-causal; >=0 = absolute position of first Q token
-    int causal_offset = -1;
-    int use_mask = 0;
+    bool is_causal = false;
 
     // pointers (element type = the kernel's element-type parameter)
     const void* __restrict__ q_ptr = nullptr;
-    const void* __restrict__ k_ptr = nullptr;
+    // Keep K/V pointer pairs aligned for shared parameter loads.
+    alignas(16) const void* __restrict__ k_ptr = nullptr;
     const void* __restrict__ v_ptr = nullptr;
     const bool* __restrict__ mask = nullptr;
     void* __restrict__ o_ptr = nullptr;
 
-    const void* __restrict__ new_k_ptr = nullptr;
+    alignas(16) const void* __restrict__ new_k_ptr = nullptr;
     const void* __restrict__ new_v_ptr = nullptr;
 
     // strides
@@ -68,6 +67,8 @@ struct AttentionParams {
     int mask_b_stride;
     int mask_h_stride;
     int mask_l_stride;
+    int mask_k_len = 0;
+    int mask_q_len = 0;
 
     // Paged K/V addressing
     const int* __restrict__ req_to_token = nullptr;     // [num_reqs, max_context_len]
@@ -80,7 +81,8 @@ struct AttentionParams {
     int max_context_len; // req_to_token stride (dim 1)
 
     // Decode split-KV workspace (fp32 online-softmax accumulators, always)
-    int num_splits;
+    int num_splits = 0;
+    bool direct_output = false;
     float* __restrict__ o_part = nullptr;
     float* __restrict__ ml_part = nullptr;
 };

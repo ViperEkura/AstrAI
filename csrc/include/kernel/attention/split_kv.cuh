@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 
 #include <api/attention_common.h>
+#include <arith/softmax.cuh>
 #include <memory/layout_policies.cuh>
 #include <kernel/attention/mma.cuh>
 
@@ -18,16 +19,18 @@ namespace attention {
  * each K/V tile across all G heads (head-packing details in the prefill
  * kernel header).
  *
- * KV = ContigKV or PagedKV; IsCausal/HasMask compile-time. Traits =
+ * KV = ContigKV or PagedKV; HasMask is compile-time. Traits =
  * KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
  */
-template <typename Traits, typename KV, bool IsCausal, bool HasMask>
-__global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
+template <typename Traits, typename KV, bool HasMask, bool DirectOutput = false>
+__global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
     using T = typename Traits::Elem;
+    using Mma = AttentionMma<Traits>;
+    using Layout = typename Traits::FragmentLayout;
 
     const int lane = threadIdx.x;
-    const int gid = lane >> 2;
-    const int tid4 = lane & 3;
+    const int gid = Layout::row(lane);
+    const int tid4 = Layout::column(lane) / 2;
 
     const int pass = blockIdx.x / p.kv_head;
     const int kv_head = blockIdx.x % p.kv_head;
@@ -64,8 +67,8 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
-    unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(q_gmem + q_base,
+    typename Traits::QueryFragment Qa;
+    Mma::load_query(q_gmem + q_base,
                                  q_gmem + q_base,
                                  p.q_d_stride,
                                  qra * p.q_h_stride,
@@ -75,11 +78,19 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
                                  tid4,
                                  Qa);
 
-    float Oacc[Traits::DN8][4];
-#pragma unroll
-    for (int j = 0; j < Traits::DN8; j++)
-        Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
-    float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
+    typename Traits::OutputFragment Oacc;
+    Mma::clear(Oacc);
+    WarpSoftmax<Traits> softmax;
+    const float& m0 = softmax.rows[0].m;
+    const float& m1 = softmax.rows[1].m;
+    const float& l0 = softmax.rows[0].l;
+    const float& l1 = softmax.rows[1].l;
+
+    // Visibility is fixed for these query rows across all K/V tiles.
+    const MaskView mask_view{p.mask, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
+                             batch, q_head0 + gid, q_head0 + gid + 8, 0, 0,
+                             p.mask_k_len, p.mask_q_len};
+    const AttentionMask<HasMask> mask{mask_view, seq_len, seq_len, va, vb};
 
     const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
@@ -91,7 +102,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
      * only the first GQA pass persists new K/V to the pool) ----
      */
     auto load_tile = [&](int ti, int buf) {
-        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
+        KVTileLoader<Traits>::load(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
             return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, kc, d, valid,
                                                          pass == 0);
         });
@@ -110,21 +121,12 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         const T* bV = sV + buf * Traits::BC * Traits::LD;
         int kv0 = (ti_begin + it) * Traits::BC;
 
-        float Sacc[Traits::NC8][4];
-        mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
+        typename Traits::ScoreFragment Sacc;
+        Mma::scores(Qa, bK, lane, Sacc);
 
-        /*
-         * Decode: q_len=1 so qrow0=qrow1=0. Paged treats [0, seq_len) as
-         * the causal range; contig clips to the causal_offset bound.
-         */
-        int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
-        MaskView mv{p.mask, p.mask_b_stride, p.mask_h_stride,   p.mask_l_stride,
-                    batch,  q_head0 + gid,   q_head0 + gid + 8, 0,
-                    0};
-        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc, mv, va, vb, scale_log2, Sacc, Oacc, m0,
-                                          m1, l0, l1, lane);
+        softmax.update(kv0, scale_log2, Sacc, Oacc, lane, mask);
 
-        mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
+        Mma::values(Sacc, bV, lane, Oacc);
     };
 
     if (ntiles >= STAGES) {
@@ -151,6 +153,27 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         __syncwarp();
         for (int it = 0; it < ntiles; it++)
             process_tile(it, it);
+    }
+
+    if constexpr (DirectOutput) {
+        T* output = static_cast<T*>(p.o_ptr);
+        const float inv0 = l0 > 1e-20f ? 1.0f / l0 : 0.0f;
+        const float inv1 = l1 > 1e-20f ? 1.0f / l1 : 0.0f;
+#pragma unroll
+        for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
+            const int d = dn8 * 8 + 2 * tid4;
+            if (va) {
+                const int off = KV::q_decode_base(p, batch, q_head0 + gid) + d * p.q_d_stride;
+                output[off] = ElemTrait<T>::from_float(Oacc[dn8][0] * inv0);
+                output[off + p.q_d_stride] = ElemTrait<T>::from_float(Oacc[dn8][1] * inv0);
+            }
+            if (vb) {
+                const int off = KV::q_decode_base(p, batch, q_head0 + gid + 8) + d * p.q_d_stride;
+                output[off] = ElemTrait<T>::from_float(Oacc[dn8][2] * inv1);
+                output[off + p.q_d_stride] = ElemTrait<T>::from_float(Oacc[dn8][3] * inv1);
+            }
+        }
+        return;
     }
 
     // Write unnormalized partials for this split
@@ -196,7 +219,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
  * Split-combine: merges the per-split partials (o_part/ml_part) into the
  * final normalised O (KV selects the O addressing and element type).
  */
-template <typename KV> __global__ void attn_decode_combine_kernel(AttentionParams p) {
+template <typename KV> __global__ void attn_decode_combine_kernel(const AttentionParams p) {
     using T = typename KV::Elem;
 
     int bh = blockIdx.x;

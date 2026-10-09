@@ -35,6 +35,7 @@ class CudaBackend(AttentionBackend):
 
     # Head dims supported by the CUDA kernels (single source of truth).
     HEAD_DIMS = (32, 64, 128, 256)
+    supports_scale = True
     priority = 0
     modes = frozenset(("infer",))
 
@@ -44,11 +45,21 @@ class CudaBackend(AttentionBackend):
 
     @classmethod
     def supports_axes(cls, ax: Axes) -> bool:
+        mask = ax["_call"][2]
         # The CUDA kernels take one precision per build — bf16 today, and the
         # instantiated set lives in csrc/include/api/attention_dtypes.h.
         return (
             ax["fwd"] in ("prefill", "decode")
             and ax["has_cache"]
+            and (ax.get("scale") is None or ax["scale"] > 0)
+            and (
+                mask is None
+                or (
+                    mask.dtype == torch.bool
+                    and 2 <= mask.ndim <= 4
+                    and mask.stride(-1) == 1
+                )
+            )
             and ax["ndim"] == 3
             and ax["dtype"] == torch.bfloat16
             and ax["head_dim"] in cls.HEAD_DIMS
@@ -62,8 +73,10 @@ class CudaBackend(AttentionBackend):
         attn_mask: Optional[Tensor],
         is_causal: bool,
         fwd: Optional[str],
+        *,
+        scale: Optional[float] = None,
     ) -> bool:
-        return self.supports_axes(_axes(q, kv_cache, attn_mask, is_causal, fwd))
+        return self.supports_axes(_axes(q, kv_cache, attn_mask, is_causal, fwd, scale))
 
     @staticmethod
     def supports_graph() -> bool:
@@ -79,13 +92,17 @@ class CudaBackend(AttentionBackend):
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
         fwd: Optional[str] = None,
+        *,
+        scale: Optional[float] = None,
     ) -> Tensor:
         self._check_fwd(fwd)
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
         if fwd == "decode":
-            return self._decode(q, k, v, kv_cache, layer_id)
-        return self._prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal)
+            return self._decode(
+                q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale
+            )
+        return self._prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale)
 
     def _decode(
         self,
@@ -94,6 +111,9 @@ class CudaBackend(AttentionBackend):
         v: Tensor,
         kv_cache: "KVCache",
         layer_id: int,
+        attn_mask: Optional[Tensor],
+        is_causal: bool,
+        scale: Optional[float],
     ) -> Tensor:
         kv_indptr = kv_cache.kv_indptr
 
@@ -106,7 +126,9 @@ class CudaBackend(AttentionBackend):
             kv_indptr,
             new_k=k,
             new_v=v,
-            is_causal=True,
+            mask=attn_mask,
+            is_causal=is_causal,
+            scale=scale,
             o_part_buf=kv_cache.decode_o_part,
             ml_part_buf=kv_cache.decode_ml_part,
             out_buf=kv_cache.decode_out,
@@ -122,6 +144,7 @@ class CudaBackend(AttentionBackend):
         layer_id: int,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        scale: Optional[float] = None,
     ) -> Tensor:
         loc = kv_cache.out_cache_loc
         kv_cache.k_buffer[layer_id, loc] = k
@@ -139,5 +162,6 @@ class CudaBackend(AttentionBackend):
             kv_cache.q_tile_to_index,
             attn_mask,
             is_causal=is_causal,
+            scale=scale,
         )
         return out

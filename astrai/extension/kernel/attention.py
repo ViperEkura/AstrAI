@@ -5,7 +5,9 @@ available, raises ``RuntimeError``. Fallback to torch SDPA is the
 responsibility of the attention backend, not this module.
 
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
-(blhd). Scale is always ``1/sqrt(head_dim)``.
+(blhd). ``scale=None`` selects ``1/sqrt(head_dim)``; native kernels require
+a finite positive scale. Causal queries align to the end of the KV sequence,
+including when the resulting first-query position is negative.
 
 Interface (all functions):
     is_causal: True = causal mask; False = non-causal
@@ -37,6 +39,8 @@ def attn_decode(
     v: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
+    *,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """GQA decode attention (q_len == 1).
 
@@ -51,9 +55,14 @@ def attn_decode(
         [batch, 1, n_heads, head_dim] (blhd, bf16)
     """
     mod = get_module("attention")
-    causal_offset = (k.size(1) - 1) if is_causal else -1
     return mod.attn_decode(
-        q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
+        q,
+        k,
+        v,
+        mask=mask,
+        layout=TensorLayout.BLHD,
+        scale=scale,
+        is_causal=is_causal,
     )
 
 
@@ -63,6 +72,8 @@ def attn_prefill(
     v: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
+    *,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """GQA prefill attention (q_len > 1).
 
@@ -78,9 +89,14 @@ def attn_prefill(
         [batch, q_len, n_heads, head_dim] (blhd, bf16)
     """
     mod = get_module("attention")
-    causal_offset = (k.size(1) - q.size(1)) if is_causal else -1
     return mod.attn_prefill(
-        q, k, v, mask=mask, causal_offset=causal_offset, layout=TensorLayout.BLHD
+        q,
+        k,
+        v,
+        mask=mask,
+        layout=TensorLayout.BLHD,
+        scale=scale,
+        is_causal=is_causal,
     )
 
 
@@ -98,6 +114,8 @@ def attn_paged_decode(
     o_part_buf: Optional[torch.Tensor] = None,
     ml_part_buf: Optional[torch.Tensor] = None,
     out_buf: Optional[torch.Tensor] = None,
+    *,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """SGLang-style paged decode (q_len == 1, flat KV pool).
 
@@ -124,7 +142,6 @@ def attn_paged_decode(
         [batch, n_heads, head_dim] (bf16, 3D)
     """
     mod = get_module("attention")
-    causal_offset = 0 if is_causal else -1
     return mod.attn_paged_decode(
         q,
         k_cache,
@@ -135,10 +152,11 @@ def attn_paged_decode(
         new_k=new_k,
         new_v=new_v,
         mask=mask,
-        causal_offset=causal_offset,
         o_part_buf=o_part_buf,
         ml_part_buf=ml_part_buf,
         out_buf=out_buf,
+        scale=scale,
+        is_causal=is_causal,
     )
 
 
@@ -154,6 +172,8 @@ def attn_paged_prefill(
     q_tile_to_index: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     is_causal: bool = False,
+    *,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """SGLang-style paged prefill (ragged batch, flat KV pool).
 
@@ -178,7 +198,6 @@ def attn_paged_prefill(
         [total_q, n_heads, head_dim] (bf16, 3D)
     """
     mod = get_module("attention")
-    causal_offset = 0 if is_causal else -1
     return mod.attn_paged_prefill(
         q,
         k_cache,
@@ -190,7 +209,8 @@ def attn_paged_prefill(
         q_tile_to_batch,
         q_tile_to_index,
         mask,
-        causal_offset=causal_offset,
+        scale=scale,
+        is_causal=is_causal,
     )
 
 

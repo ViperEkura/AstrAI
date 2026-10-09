@@ -14,7 +14,6 @@ from . import (
     AttentionBackendFactory,
     _axes,
     _flash_attn,
-    repeat_kv,
 )
 
 if TYPE_CHECKING:
@@ -34,6 +33,7 @@ class FlashAttnBackend(AttentionBackend):
     dense 4-D calls go through ``flash_attn_func`` (mask-free only).
     """
 
+    supports_scale = True
     priority = 10
 
     @classmethod
@@ -43,6 +43,8 @@ class FlashAttnBackend(AttentionBackend):
     @classmethod
     def supports_axes(cls, ax: Axes) -> bool:
         if not _attention.flash_attn_available():
+            return False
+        if ax["has_mask"]:
             return False
         if ax["dtype"] not in (torch.float16, torch.bfloat16):
             return False
@@ -58,8 +60,10 @@ class FlashAttnBackend(AttentionBackend):
         attn_mask: Optional[Tensor],
         is_causal: bool,
         fwd: Optional[str],
+        *,
+        scale: Optional[float] = None,
     ) -> bool:
-        return self.supports_axes(_axes(q, kv_cache, attn_mask, is_causal, fwd))
+        return self.supports_axes(_axes(q, kv_cache, attn_mask, is_causal, fwd, scale))
 
     def forward(
         self,
@@ -71,12 +75,16 @@ class FlashAttnBackend(AttentionBackend):
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
         fwd: Optional[str] = None,
+        *,
+        scale: Optional[float] = None,
     ) -> Tensor:
         self._check_fwd(fwd)
+        if attn_mask is not None:
+            raise ValueError("FlashAttnBackend cannot handle a custom attention mask")
         # Decode is always packed; prefill/training split by layout.
         if fwd == "decode" or q.ndim == 3:
-            return self._forward_packed(q, k, v, kv_cache, layer_id)
-        return self._forward_dense(q, k, v, attn_mask, is_causal)
+            return self._forward_packed(q, k, v, kv_cache, layer_id, is_causal, scale)
+        return self._forward_dense(q, k, v, attn_mask, is_causal, scale)
 
     def _forward_dense(
         self,
@@ -85,12 +93,8 @@ class FlashAttnBackend(AttentionBackend):
         v: Tensor,
         attn_mask: Optional[Tensor] = None,
         is_causal: bool = False,
+        scale: Optional[float] = None,
     ) -> Tensor:
-        n_rep = q.size(2) // k.size(2)
-        if n_rep > 1:
-            k = repeat_kv(k, n_rep)
-            v = repeat_kv(v, n_rep)
-
         if attn_mask is not None:
             raise ValueError(
                 "FlashAttnBackend cannot handle a custom attention mask; "
@@ -107,6 +111,7 @@ class FlashAttnBackend(AttentionBackend):
             k.contiguous(),
             v.contiguous(),
             causal=is_causal,
+            softmax_scale=scale,
         )
         return out.contiguous()
 
@@ -117,6 +122,8 @@ class FlashAttnBackend(AttentionBackend):
         v: Tensor,
         kv_cache: "KVCache",
         layer_id: int,
+        is_causal: bool,
+        scale: Optional[float],
     ) -> Tensor:
         fa = _flash_attn
         if fa is None or not hasattr(fa, "flash_attn_varlen_func"):
@@ -139,6 +146,7 @@ class FlashAttnBackend(AttentionBackend):
             int((kv_cache.qo_indptr[1:] - kv_cache.qo_indptr[:-1]).max()),
             int(kv_cache.seq_lens.max()),
             dropout_p=0.0,
-            causal=True,
+            causal=is_causal,
+            softmax_scale=scale,
         )
         return out

@@ -149,7 +149,7 @@ template <typename QSchedule, typename KV> struct PrefillLauncher {
  */
 template <typename KV> struct DecodeLauncher {
     template <int HEAD_DIM, bool IsCausal, bool HasMask>
-    static void launch(AttentionParams& p, cudaStream_t stream) {
+    static void plan(AttentionParams& p, cudaStream_t) {
         int G = p.q_head / p.kv_head;
         constexpr int MAX_G = 16;
         int num_passes = (G + MAX_G - 1) / MAX_G;
@@ -159,12 +159,36 @@ template <typename KV> struct DecodeLauncher {
         using Traits = KernelTraits<HEAD_DIM, BC, 1, 2, typename KV::Elem>;
         p.num_splits = compute_num_splits(
             p.batch * p.kv_head * num_passes, tiles_total,
-            decode_wave_capacity<attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask>,
+            decode_wave_capacity<attn_decode_split_kv_mma_kernel<Traits, KV, HasMask>,
                                  32>(),
             2);
-        dim3 grid(p.kv_head * num_passes, p.batch, p.num_splits);
-        attn_decode_split_kv_mma_kernel<Traits, KV, IsCausal, HasMask><<<grid, 32, 0, stream>>>(p);
+        // Wider direct-output kernels lose graph latency; retain the split path.
+        p.direct_output = p.num_splits == 1 && HEAD_DIM <= 128;
+    }
+
+    template <int HEAD_DIM, bool IsCausal, bool HasMask>
+    static void launch(AttentionParams& p, cudaStream_t stream) {
+        using Traits = KernelTraits<HEAD_DIM, 16, 1, 2, typename KV::Elem>;
+        const int passes = (p.q_head / p.kv_head + 15) / 16;
+        const dim3 grid(p.kv_head * passes, p.batch, p.num_splits);
+        if constexpr (HEAD_DIM <= 128) {
+            if (p.direct_output) {
+                attn_decode_split_kv_mma_kernel<Traits, KV, HasMask, true>
+                    <<<grid, 32, 0, stream>>>(p);
+                ASTRAI_LAUNCH_CHECK();
+                return;
+            }
+        }
+        attn_decode_split_kv_mma_kernel<Traits, KV, HasMask>
+            <<<grid, 32, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
+    }
+};
+
+template <typename KV> struct DecodePlanner {
+    template <int HEAD_DIM, bool IsCausal, bool HasMask>
+    static void launch(AttentionParams& p, cudaStream_t stream) {
+        DecodeLauncher<KV>::template plan<HEAD_DIM, IsCausal, HasMask>(p, stream);
     }
 };
 
@@ -190,8 +214,8 @@ inline void dispatch_causal_mask(bool causal, bool mask, AttentionParams& p, cud
 
 template <typename QSchedule, typename KV, int HEAD_DIM>
 static inline void dispatch_prefill_impl(AttentionParams& p, cudaStream_t stream) {
-    bool is_causal = (p.causal_offset >= 0);
-    bool has_mask = (p.use_mask && p.mask);
+    bool is_causal = p.is_causal;
+    bool has_mask = (p.mask != nullptr);
 
     using Launcher = PrefillLauncher<QSchedule, KV>;
     dispatch_causal_mask<HEAD_DIM, Launcher>(is_causal, has_mask, p, stream);
@@ -203,14 +227,17 @@ static inline void dispatch_prefill_impl(AttentionParams& p, cudaStream_t stream
  */
 template <typename KV, int HEAD_DIM>
 static inline void dispatch_decode_impl(AttentionParams& p, cudaStream_t stream) {
-    bool is_causal = (p.causal_offset >= 0);
-    bool has_mask = (p.use_mask && p.mask);
+    bool has_mask = (p.mask != nullptr);
 
+    if (p.num_splits == 0)
+        dispatch_causal_mask<HEAD_DIM, DecodePlanner<KV>>(false, has_mask, p, stream);
     using Launcher = DecodeLauncher<KV>;
-    dispatch_causal_mask<HEAD_DIM, Launcher>(is_causal, has_mask, p, stream);
+    dispatch_causal_mask<HEAD_DIM, Launcher>(false, has_mask, p, stream);
 
-    attn_decode_combine_kernel<KV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
-    ASTRAI_LAUNCH_CHECK();
+    if (!p.direct_output) {
+        attn_decode_combine_kernel<KV><<<p.batch * p.q_head, p.head_dim, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
+    }
 }
 
 /*

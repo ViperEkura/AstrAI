@@ -216,3 +216,36 @@ def test_cudabackend_is_context_manager():
     with CudaBackend():
         assert isinstance(get_backend(), CudaBackend)
     assert get_backend() is default
+
+
+@pytest.mark.parametrize("q_len,kv_len", [(7, 3), (3, 7)])
+@pytest.mark.parametrize("scale", [None, 0.0, -0.3, 0.2])
+def test_attention_causal_scale_and_mask_share_one_contract(q_len, kv_len, scale):
+    torch.manual_seed(22)
+    q = torch.randn(2, q_len, 4, 8)
+    k = torch.randn(2, kv_len, 2, 8)
+    v = torch.randn_like(k)
+    padding = torch.ones(1, kv_len, dtype=torch.bool)
+    padding[:, -1] = False
+    causal = torch.arange(q_len)[:, None] + kv_len - q_len >= torch.arange(kv_len)[None]
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.repeat_interleave(2, dim=2).transpose(1, 2),
+        v.repeat_interleave(2, dim=2).transpose(1, 2),
+        attn_mask=causal & padding[:, None, None, :],
+        scale=scale,
+    ).transpose(1, 2)
+    actual = attention(
+        q, k, v, attn_mask=padding, is_causal=True, backend="torch_native", scale=scale
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_flash_packed_mask_is_rejected_before_cache_mutation(monkeypatch):
+    _flash_available(monkeypatch)
+    flash = _attn_module._instance(_attn_module.FlashAttnBackend)
+    q = torch.zeros(2, 4, 8, dtype=torch.bfloat16)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    assert not flash.supports_call(q, object(), mask, True, "prefill")
+    with pytest.raises(ValueError, match="custom attention mask"):
+        flash.forward(q, q, q, object(), 0, attn_mask=mask, fwd="prefill")

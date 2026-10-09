@@ -3,6 +3,7 @@
 #include <api/attention_common.h>
 #include <utils/define.cuh>
 #include <datatype/element.cuh>
+#include <memory/pipeline.cuh>
 
 /*
  * Q scheduling is independent of K/V storage. DenseQSchedule/PackedQSchedule
@@ -12,6 +13,70 @@
 
 namespace astrai {
 namespace attention {
+
+/* One shared-memory layout is used by both the tile producer and MMA consumer. */
+template <int LeadingDim> struct SharedTileLayout {
+    static_assert(LeadingDim >= 16 && (LeadingDim & (LeadingDim - 1)) == 0,
+                  "shared attention tiles require a power-of-two leading dimension");
+    static constexpr int kMask = LeadingDim >= 64 ? 7 : LeadingDim / 8 - 1;
+    static DEVICE_FORCEINLINE int column(int d, int row) {
+        return (((d >> 3) ^ (row & kMask)) << 3) | (d & 7);
+    }
+};
+
+template <typename Traits> struct KVTileLoader {
+    template <typename AddrFn>
+    static __device__ inline void load(typename Traits::Elem* sK, // ring bases (STAGES * BC * LD each)
+                                        typename Traits::Elem* sV,
+                                        int ti,
+                                        int buf, // tile index, ring slot
+                                        int seq_len,
+                                        const AddrFn& addr) {
+        int kv0 = ti * Traits::BC;
+        typename Traits::Elem* dK = sK + buf * Traits::BC * Traits::LD;
+        typename Traits::Elem* dV = sV + buf * Traits::BC * Traits::LD;
+#pragma unroll
+        for (int i = threadIdx.x * Traits::VEC; i < Traits::TOTAL;
+             i += Traits::NUM_THREADS * Traits::VEC) {
+            int r = i / Traits::HEAD_DIM, d = i % Traits::HEAD_DIM;
+            int kc = kv0 + r;
+            bool valid = kc < seq_len;
+            auto a = addr(kc, d, valid);
+            int off = r * Traits::LD + Traits::SharedLayout::column(d, r);
+            astrai::cp_async_16(&dK[off], a.k, a.valid);
+            astrai::cp_async_16(&dV[off], a.v, a.valid);
+        }
+        astrai::cp_async_commit_group();
+    }
+
+};
+
+struct MaskView {
+    const bool* __restrict__ mask;
+    int b_stride, h_stride, l_stride;
+    int batch, head0, head1;
+    int qrow0, qrow1;
+    int kv_len, q_len;
+};
+
+template <bool HasMask> struct AttentionMask {
+    const bool* __restrict__ mask;
+    int base0, base1, max_key0, max_key1;
+    bool valid0, valid1;
+    DEVICE_FORCEINLINE AttentionMask(MaskView view, int max0, int max1, bool row0, bool row1)
+        : mask(view.mask),
+          base0(view.batch * view.b_stride + view.head0 * view.h_stride + view.qrow0 * view.l_stride),
+          base1(view.batch * view.b_stride + view.head1 * view.h_stride + view.qrow1 * view.l_stride),
+          max_key0(HasMask ? min(max0, view.kv_len) : max0),
+          max_key1(HasMask ? min(max1, view.kv_len) : max1),
+          valid0(row0 && (!HasMask || view.q_len == 1 || view.qrow0 < view.q_len)),
+          valid1(row1 && (!HasMask || view.q_len == 1 || view.qrow1 < view.q_len)) {}
+
+    DEVICE_FORCEINLINE bool is_masked(int row, int key) const {
+        return !(row ? valid1 : valid0) || key >= (row ? max_key1 : max_key0) ||
+               (HasMask && !mask[(row ? base1 : base0) + key]);
+    }
+};
 
 /*
  * Q scheduling policies
@@ -150,13 +215,6 @@ template <typename T> struct ContigKV {
     }
 
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int) { return p.kv_len; }
-    static DEVICE_FORCEINLINE int causal_offset(const AttentionParams& p, int, int) {
-        return p.causal_offset;
-    }
-    // decode: exclusive bound of the single query's attend range
-    static DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int) {
-        return (p.kv_len < p.causal_offset + 1) ? p.kv_len : (p.causal_offset + 1);
-    }
 
     template <int HEAD_DIM>
     static DEVICE_FORCEINLINE KVContext make_ctx(const AttentionParams& p, int batch, int kv_head) {
@@ -216,13 +274,6 @@ template <typename T> struct PagedKV {
 
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
         return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
-    }
-    static DEVICE_FORCEINLINE int causal_offset(const AttentionParams& p, int batch, int q_len) {
-        return kv_len(p, batch) - q_len;
-    }
-    // decode: the query is the last token, so [0, seq_len) IS its causal range
-    static DEVICE_FORCEINLINE int decode_attend_len(const AttentionParams& p, int batch) {
-        return kv_len(p, batch);
     }
 
     template <int HEAD_DIM>

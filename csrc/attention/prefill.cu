@@ -17,14 +17,13 @@ torch::Tensor attn_prefill(torch::Tensor q,
                            torch::Tensor k,
                            torch::Tensor v,
                            c10::optional<torch::Tensor> mask,
-                           int64_t causal_offset,
-                           double scale,
-                           int64_t layout) {
+                           c10::optional<double> scale,
+                           int64_t layout, bool is_causal) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
     AttentionParams p;
-    attn_pack_params(q, k, v, mask, causal_offset, scale, layout, p);
+    attn_pack_params(q, k, v, mask, scale, layout, p, is_causal);
     TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
 
     auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());

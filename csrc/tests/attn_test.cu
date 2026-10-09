@@ -66,8 +66,7 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int cau
     p.q_len = ql;
     p.kv_len = kl;
     p.head_dim = D;
-    p.use_mask = 0;
-    p.causal_offset = causal ? 0 : -1;
+    p.is_causal = causal;
     p.scale = 1.0f / sqrtf((float)D);
     set_default_strides(p);
     p.q_ptr = dQ;
@@ -158,8 +157,7 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causa
     p.q_len = ql;
     p.kv_len = kl;
     p.head_dim = D;
-    p.use_mask = 0;
-    p.causal_offset = causal ? 0 : -1;
+    p.is_causal = causal;
     p.scale = 1.0f / sqrtf((float)D);
     set_default_strides(p);
     p.q_ptr = dQ;

@@ -46,7 +46,7 @@ is_causal: True = causal mask; False = non-causal
 mask:      2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True=keep)
 ```
 
-Layout convention: all q/k/v are `[batch, seq_len, n_heads, head_dim]` (blhd). Scale is always `1/sqrt(head_dim)`.
+Layout convention: dense q/k/v use `[batch, seq_len, n_heads, head_dim]` (BLHD); packed inference uses `[total_q, n_heads, head_dim]`. `scale=None` selects `1/sqrt(head_dim)`. The public backend accepts any finite scale; native CUDA currently accepts finite positive scales, and automatic selection routes other scales to a capable backend.
 
 ## Q Scheduling and KV Addressing
 
@@ -68,33 +68,129 @@ q_tile_to_batch = [0, 0, 1, 2, 2, 2]
 q_tile_to_index = [0, 1, 0, 0, 1, 2]
 ```
 
-Paged prefill launches (MMA path, GQA head packing):
+Paged prefill folds query heads and token rows into one packed row space:
 
 ```text
-grid.x = num_q_tiles * HB   # HB = min(G, WARPS): q heads packed per block
-grid.y = kv_heads * ceil(G / HB)
-grid.z = 1
+G = q_heads / kv_heads
+BLOCK_M = 16 * WARPS
+blocks_per_host_tile = G * HOST_Q_TILE_ROWS / BLOCK_M
+grid = (num_q_tiles * blocks_per_host_tile, kv_heads, 1)
+packed_row = token_row * G + head_in_group
 ```
 
-The tensor-core prefill kernel packs `HB = min(G, WARPS)` query heads of one
-kv-head group into a block, so K/V tiles stream once per block instead of once
-per q head (~HB× less global K/V traffic). Warp `w` handles head slot `w / WPH`
-and 16-row chunk `w % WPH`, where `WPH = WARPS / HB`; `G = q_heads / kv_heads`
-and `G = 1` (MHA) degenerates to the historical one-head-per-block layout.
-Each host Q tile (64 rows, `Q_TILE_ROWS`) splits into `HB` packed blocks along
-`grid.x`. Each block resolves its request and request-local row range in O(1):
+Each block resolves its request using the host tile map and its packed row
+range inside that tile. The query schedule handles dense or packed rows;
+`ContigKV` and `PagedKV` resolve storage addresses. Both use the same tiled
+online softmax and tensor-core computation.
 
-```cpp
-host_tile = blockIdx.x / HB;
-batch = q_tile_to_batch[host_tile];
-row_base = q_tile_to_index[host_tile] * 64 + (blockIdx.x % HB) * (64 / HB);
-```
+## Attention tool responsibilities
 
-The kernel then uses `qo_indptr[batch]` for the packed Q base and adjacent
-`qo_indptr` / `kv_indptr` entries for that request's Q and KV lengths. This
-avoids the previous per-block linear scan over the batch, shared-memory
-broadcast, mapping barrier, and upper-bound grid with potentially invalid
-blocks.
+| Tool | Responsibility | Ownership |
+|---|---|---|
+| `MmaOp` / `Mma16x8Layout` | Warp instruction, fragment sizes and lane mapping | No tensor or cache state |
+| `KernelTraits` | Compile-time tile recipe and typed query/score/output fragments | No execution state |
+| `SharedTileLayout` / `KVTileLoader` | Shared-memory placement and asynchronous tile copies | Borrows storage and an address policy |
+| `AttentionMma` | Load query fragments, compute QK, accumulate PV | Borrows typed fragments |
+| `AttentionMask` | Prepare row bounds and mask addresses once per query tile | Immutable visibility policy |
+| `WarpSoftmax` | Online row maxima/sums and output rescaling | Owns two row states |
+| split-Q / split-KV kernels | Compose the tools and orchestrate the pipeline | Own register/shared-memory storage |
+
+The producer and consumer share one shared-memory layout. Fragment array sizes
+come from the selected MMA atom instead of repeating register counts in every
+kernel. Compile-time checks reject incompatible element widths, instruction
+shapes and incomplete tiles. No runtime virtual dispatch or heap allocations
+are introduced in the device path. These tools remain in existing headers.
+
+## Parameter boundaries
+
+- Callers choose `is_causal`, `mask` and `scale`. Dense alignment comes from
+  Q/K lengths; packed alignment comes from each request's device metadata.
+- Shapes and strides are extracted from tensors at entry. Native tensor layout
+  selection remains available; Python wrappers use BLHD consistently.
+- Page-table indices and Q tile maps belong to the cache/workspace binding.
+  They remain on device during CUDA Graph replay; no CPU length readback is
+  required. Tile maps cannot be inferred from packed Q shape alone.
+- Decode scratch tensors are a paired execution resource, retained until both
+  launches are submitted. Output buffers allow stable CUDA Graph addresses.
+  Split counts and direct-output selection are planned internally.
+- With lower-right alignment, a single decode query sees the full KV sequence.
+  Decode therefore shares one kernel for causal and noncausal calls.
+
+## Interface contract and execution ownership
+
+- Causality is an explicit boolean. No caller-supplied position offset is needed.
+  Dense queries align to the end of K/V: `query_position =
+  kv_len - q_len + query_row`. Packed queries use each request's lengths.
+  Fully masked rows return zero. The torch adapter constructs the same mask
+  for unequal lengths instead of relying on SDPA's upper-left alignment.
+- Boolean masks mean `True=keep`. Layouts are `[batch, key]`,
+  `[batch, query, key]`, or `[batch, head, query, key]`; singleton batch,
+  head and query axes broadcast. Torch also supports additive floating masks.
+  FlashAttention rejects custom masks before updating the cache. Native
+  masked loads are bounded by the supplied mask extents. Absent masks have
+  zero extents; a query extent of one broadcasts. The mask pointer is the
+  single source of truth for selecting masked kernels.
+- `scale` is forwarded unchanged through backend selection and execution.
+  Unsupported native scales are rejected explicitly, never replaced by the
+  default. Existing external backends receive their original arguments when
+  the caller does not supply a scale.
+- Cached decode can append the current K/V in the attention kernel. The
+  caller reserves the destination and supplies sequence metadata including
+  that token. Attention does not advance the scheduler's sequence lengths.
+- Decode planning uses shape, the host KV capacity, and cached device occupancy
+  before allocating workspace. It does not inspect device sequence lengths.
+  One split writes the normalized output directly for head dimensions up to
+  128; dimension 256 retains the measured faster graph path. Other calls retain
+  the existing partial and combine kernels.
+- The native entry owns temporary workspace tensors until all launches are
+  enqueued on the current CUDA stream. Explicit scratch buffers must be passed
+  together, be contiguous FP32 tensors, and share Q's device. Graph callers
+  retain their persistent buffers and output; changing device-side request
+  lengths does not change the captured launch plan.
+
+## Implementation plan and performance gates
+
+1. Establish the shared contract and retain the existing fast kernel variants.
+   Separate split planning from launches, fix workspace ownership, and add
+   direct output for one split. Cover masks, signed causal positions, custom
+   scale, irregular layouts, fused append and graph replay. This is the
+   current implementation stage.
+2. Extend prefill configuration using measured query/key tile sizes, warp
+   counts and pipeline stages. Keep query scheduling and KV addressing as
+   compile-time policies. Check register and shared-memory limits for each
+   architecture; FA SM120 configurations are candidates for measurement.
+3. Add native training forward/backward together: forward retains FP32 LSE;
+   backward reconstructs probability tiles, computes row `dot(dO, O)`, and
+   accumulates dQ/dK/dV without storing the full attention matrix. Aggregate
+   GQA gradients over query-head groups. Register autograd and FakeTensor
+   behavior through the torch dispatcher before enabling compiled training.
+4. Evaluate a separate multi-warp decode variant for wider heads and long KV.
+   Its split policy must include combine overhead and preserve current fast
+   variants for shapes where the candidate does not improve performance.
+
+Before changing a default, compare baseline and candidate in one process in
+baseline/candidate/candidate/baseline order for three rounds, at matching
+precision, inputs and GPU clocks. Measure eager calls, graph execution and
+model-level training or inference separately. A reproducible regression in
+any representative shape blocks the default switch; averages do not hide it.
+Keep raw latency measurements per GPU. Eight-GPU training throughput estimates
+must be labelled as assuming linear scaling.
+
+Reference scope:
+
+- Implemented: [FA2 split launch](https://github.com/Dao-AILab/flash-attention/blob/e9cf2c1651d2303191eb40a739a3c135fda00999/csrc/flash_attn/src/flash_fwd_launch_template.h)
+  omits the combine launch when there is only one split. AstrAI uses direct
+  output for measured favorable head dimensions; its kernels were not copied.
+- Architecture check: [FA SM120 adapter](https://github.com/Dao-AILab/flash-attention/blob/e9cf2c1651d2303191eb40a739a3c135fda00999/flash_attn/cute/flash_fwd_sm120.py)
+  confirms SM80-style MMA and the smaller shared-memory capacity. No FA tile
+  configuration or pipeline was ported in this stage.
+- Planned only: [FA backward](https://github.com/Dao-AILab/flash-attention/blob/e9cf2c1651d2303191eb40a739a3c135fda00999/csrc/flash_attn/src/flash_bwd_kernel.h)
+  informs the LSE-based backward design in step 3. No native attention backward
+  was added here.
+- Planned only: [PyTorch custom operators](https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html)
+  describes dispatcher, autograd and FakeTensor integration for step 3. This
+  stage keeps the existing pybind interface.
+
 
 ## Gated DeltaNet reference path
 

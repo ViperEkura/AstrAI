@@ -102,3 +102,169 @@ def test_uninstantiated_head_dim_raises():
     k = torch.zeros(1, KV_LEN, N_KV_HEADS, 96, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="head_dim 96 has no kernel instantiation"):
         attn_decode(q, k, k)
+
+
+def _reference(q, k, v, mask=None, causal=False, scale=None):
+    # Explicit lower-right causality also covers queries longer than K/V.
+    heads = q.size(2) // k.size(2)
+    k = k.repeat_interleave(heads, dim=2)
+    v = v.repeat_interleave(heads, dim=2)
+    if mask is not None:
+        if mask.ndim == 2:
+            mask = mask[:, None, None, :]
+        elif mask.ndim == 3:
+            mask = mask[:, None, :, :]
+    if causal:
+        allowed = (
+            torch.arange(q.size(1), device=q.device)[:, None] + k.size(1) - q.size(1)
+            >= torch.arange(k.size(1), device=q.device)[None, :]
+        )
+        mask = allowed if mask is None else allowed & mask
+    return torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        attn_mask=mask,
+        scale=scale,
+    ).transpose(1, 2)
+
+
+@skip_no_kernel
+@pytest.mark.parametrize("q_len,kv_len", [(13, 7), (7, 13), (7, 7), (137, 7)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_prefill_signed_query_positions(q_len, kv_len, causal):
+    torch.manual_seed(19)
+    q = torch.randn(2, q_len, 6, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, kv_len, 2, 64, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = attn_prefill(q, k, v, is_causal=causal, scale=0.17)
+    expected = _reference(q, k, v, causal=causal, scale=0.17)
+    torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+    if causal and q_len > kv_len:
+        assert torch.count_nonzero(out[:, : q_len - kv_len]) == 0
+
+
+@skip_no_kernel
+@pytest.mark.parametrize("kv_len", [15, 127, 513])
+def test_decode_mask_broadcast_and_temporary_workspace(kv_len):
+    torch.manual_seed(20)
+    # Preserve noncontiguous batch/head strides in the output.
+    q = torch.randn(2, 1, 12, 64, device="cuda", dtype=torch.bfloat16)[:, :, ::2]
+    k = torch.randn(2, kv_len, 2, 64, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    mask = torch.ones(1, 6, 1, kv_len, device="cuda", dtype=torch.bool)
+    mask[:, 0] = False
+    mask[..., 2::3] = False
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        stream.wait_stream(torch.cuda.current_stream())
+        out = attn_decode(q, k, v, mask=mask, scale=0.13)
+        scratch = torch.empty(2, 6, 32, 64, device="cuda", dtype=torch.float32)
+        scratch.fill_(999)
+    torch.cuda.current_stream().wait_stream(stream)
+    expected = _reference(q, k, v, mask=mask, scale=0.13)
+    torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+    assert torch.count_nonzero(out[:, :, 0]) == 0
+
+
+@skip_no_kernel
+def test_paged_decode_graph_replays_single_split_append():
+    torch.manual_seed(21)
+    batch, width, heads, kv_heads, dim = 2, 31, 6, 2, 64
+    q = torch.randn(batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.randn(batch * width, kv_heads, dim, device="cuda", dtype=q.dtype)
+    v_cache = torch.randn_like(k_cache)
+    table = torch.arange(batch * width, device="cuda", dtype=torch.int32).view(
+        batch, width
+    )
+    requests = torch.arange(batch, device="cuda", dtype=torch.int32)
+    indptr = torch.tensor([0, 15, 22], device="cuda", dtype=torch.int32)
+    new_k = torch.randn(batch, kv_heads, dim, device="cuda", dtype=q.dtype)
+    new_v = torch.randn_like(new_k)
+    mask = torch.ones(1, width, device="cuda", dtype=torch.bool)
+    mask[:, 1::4] = False
+    output = torch.empty_like(q)
+
+    def call():
+        return attn_paged_decode(
+            q,
+            k_cache,
+            v_cache,
+            table,
+            requests,
+            indptr,
+            new_k=new_k,
+            new_v=new_v,
+            mask=mask,
+            is_causal=False,
+            out_buf=output,
+            scale=0.13,
+        )
+
+    warm = torch.cuda.Stream()
+    with torch.cuda.stream(warm):
+        warm.wait_stream(torch.cuda.current_stream())
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(warm)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    for lengths in [(15, 7), (9, 13)]:
+        indptr.copy_(
+            torch.tensor(
+                [0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32
+            )
+        )
+        new_k.normal_()
+        new_v.normal_()
+        graph.replay()
+        for b, length in enumerate(lengths):
+            slot = b * width + length - 1
+            torch.testing.assert_close(k_cache[slot], new_k[b], rtol=0, atol=0)
+            torch.testing.assert_close(v_cache[slot], new_v[b], rtol=0, atol=0)
+            expected = _reference(
+                q[b : b + 1, None],
+                k_cache[b * width : b * width + length][None],
+                v_cache[b * width : b * width + length][None],
+                mask=mask[:, :length],
+                scale=0.13,
+            )
+            torch.testing.assert_close(
+                captured[b], expected[0, 0], atol=0.02, rtol=0.02
+            )
+
+
+@skip_no_kernel
+def test_split_workspace_pair_is_required():
+    q, k, v, kc, vc, table, requests, indptr = _paged(torch.bfloat16)
+    workspace = torch.empty(2, N_HEADS, 32, D, device="cuda", dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="provided together"):
+        attn_paged_decode(q, kc, vc, table, requests, indptr, o_part_buf=workspace)
+
+
+@skip_no_kernel
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("inf"), float("nan")])
+def test_native_scale_never_silently_uses_default(scale):
+    q, k, v = _contig(torch.bfloat16)
+    with pytest.raises(RuntimeError, match="finite and positive"):
+        attn_prefill(q, k, v, scale=scale)
+
+
+@skip_no_kernel
+@pytest.mark.parametrize("rank", [2, 3, 4])
+@pytest.mark.parametrize("causal", [False, True])
+def test_prefill_mask_query_axis_broadcast(rank, causal):
+    torch.manual_seed(22)
+    q = torch.randn(2, 17, 6, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(2, 23, 2, 64, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    mask = torch.ones(1, 23, device="cuda", dtype=torch.bool)
+    mask[:, 2::3] = False
+    if rank == 3:
+        mask = mask[:, None, :]
+    elif rank == 4:
+        mask = mask[:, None, None, :]
+    out = attn_prefill(q, k, v, mask=mask, is_causal=causal)
+    expected = _reference(q, k, v, mask=mask, causal=causal)
+    torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)

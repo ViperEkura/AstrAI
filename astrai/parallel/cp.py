@@ -252,6 +252,10 @@ class CPStrategy:
         # CP shard. Re-yield through the wrapper instead.
         yield self.compute_loss_output(batch)
 
+    def training_updates(self, batch: Dict[str, Tensor], microbatch_prompts=None):
+        for output in self.training_steps(batch):
+            yield iter((output,))
+
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         return self.compute_loss_output(batch)["loss"]
 

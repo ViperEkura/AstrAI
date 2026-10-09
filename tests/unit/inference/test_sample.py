@@ -339,3 +339,20 @@ def test_nongreedy_temperature_is_not_greedy():
         [TemperatureStrategy(0.7), TopKStrategy(0), TopPStrategy(1.0)]
     )
     assert pipeline.is_greedy is False
+
+
+def test_seeded_sampling_is_independent_of_global_rng_and_order():
+    logits = torch.randn(4, 128)
+    seeds = [11, 22, 33, 44]
+    before = torch.get_rng_state()
+    tokens, logprobs = sample(logits.clone(), seeds=seeds, return_logprobs=True)
+    assert torch.equal(before, torch.get_rng_state())
+    torch.manual_seed(999)
+    order = [3, 1, 0, 2]
+    other, other_logprobs = sample(
+        logits[order].clone(), seeds=[seeds[i] for i in order], return_logprobs=True
+    )
+    assert torch.equal(other, tokens[order])
+    torch.testing.assert_close(other_logprobs, logprobs[order])
+    single = sample(logits[2:3].clone(), seeds=[33])
+    assert single.item() == tokens[2].item()

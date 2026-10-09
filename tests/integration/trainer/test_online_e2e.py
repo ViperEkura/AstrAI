@@ -2,6 +2,7 @@
 
 import os
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from astrai.config import TrainConfig
 from astrai.serialization import Checkpoint
 from astrai.trainer import train_context
 from astrai.trainer.rollout import BaseRewardModel
+from astrai.trainer.rollout.setup import configure_rollout
 from astrai.trainer.schedule import SchedulerFactory
 from astrai.trainer.trainer import Trainer
 from tests.support.tokenizers import CHAT_TEMPLATE
@@ -229,3 +231,68 @@ def test_rollout_val_overrides_drop_unset_fields():
         _minimal_online_config(rollout_val_top_p=0.0)
     with pytest.raises(ValueError, match="rollout_val_group_size"):
         _minimal_online_config(rollout_val_group_size=0)
+
+
+@pytest.mark.parametrize("worker_count", [1, 2, 3, 4])
+def test_async_round_accepts_distinct_worker_counts(worker_count):
+    devices = [f"cuda:{index}" for index in range(1, worker_count + 1)]
+    config = _minimal_online_config(
+        rollout_mode="async_round",
+        rollout_devices=devices,
+        rollout_interval=1,
+        rollout_max_policy_lag=1,
+    )
+    assert config.rollout_devices == devices
+
+
+@pytest.mark.parametrize(
+    "devices, message",
+    [
+        ([], "at least one rollout device"),
+        (["cuda:1", "cuda:01"], "distinct rollout_devices"),
+        (["cpu"], "indexed CUDA devices"),
+    ],
+)
+def test_async_round_rejects_invalid_worker_devices(devices, message):
+    with pytest.raises(ValueError, match=message):
+        _minimal_online_config(
+            rollout_mode="async_round",
+            rollout_devices=devices,
+            rollout_interval=1,
+            rollout_max_policy_lag=1,
+        )
+
+
+def test_async_round_rejects_moe_before_starting_workers():
+    config = _minimal_online_config(
+        rollout_mode="async_round",
+        rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
+        rollout_interval=1,
+        rollout_max_policy_lag=1,
+        device_type="cuda",
+        dp_mode="none",
+        grad_accum_steps=1,
+    )
+    model = torch.nn.Linear(2, 2)
+    inference_model = SimpleNamespace(
+        config=SimpleNamespace(ffn_type="moe", max_position_embeddings=8)
+    )
+    context = SimpleNamespace(
+        strategy=SimpleNamespace(supports_online=lambda: True),
+        executor=SimpleNamespace(model_for_inference=lambda _model: inference_model),
+        model=model,
+        checkpoint=None,
+        optimizer_step=0,
+    )
+    tokenizer_cls = SimpleNamespace(from_pretrained=lambda _path: object())
+    with pytest.raises(ValueError, match="dense models only"):
+        configure_rollout(
+            context,
+            config,
+            param_path="unused",
+            strategy_kwargs={"group_size": 2},
+            create_ref_model=lambda **_kwargs: None,
+            validate=lambda _executor: None,
+            scheduler_cls=object,
+            tokenizer_cls=tokenizer_cls,
+        )

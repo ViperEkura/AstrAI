@@ -41,6 +41,7 @@ from astrai.trainer.optional_extras import (
     restore_checkpoint_extras,
 )
 from astrai.trainer.rollout import RolloutEvaluator
+from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 from astrai.trainer.rollout.setup import configure_rollout
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 
@@ -70,6 +71,9 @@ class TrainContext:
     #: Online-strategy validation: reward-statistics evaluator under its
     #: own sampling params. ``None`` keeps the legacy validate_online path.
     val_evaluator: Optional["RolloutEvaluator"] = field(default=None)
+    async_rollout: Optional["AsyncRoundCoordinator"] = field(default=None)
+    optimizer_steps_completed: Optional[int] = field(default=None)
+    checkpoint_safe: bool = field(default=True)
 
     world_size: int = field(default=1)
     rank: int = field(default=0)
@@ -105,6 +109,8 @@ class TrainContext:
 
     @property
     def optimizer_step(self) -> int:
+        if self.optimizer_steps_completed is not None:
+            return self.optimizer_steps_completed
         return self.consumed_samples // (
             self.config.batch_per_device * self.dp_size * self.config.grad_accum_steps
         )
@@ -173,6 +179,10 @@ class TrainContextBuilder:
         return self
 
     def build(self) -> TrainContext:
+        if self.config.rollout_mode == "async_round" and get_world_size() != 1:
+            raise ValueError(
+                "async_round requires actual world_size=1; check torchrun and distributed state"
+            )
         # Resolve the (dp, cp, tp) rank layout before anything consumes it.
         self._topology = build_topology(
             cp_size=self.config.cp_size,
@@ -262,8 +272,13 @@ class TrainContextBuilder:
                         * self._topology.dp_size
                         * cfg.grad_accum_steps
                     )
+                    # Async GRPO commits even a short final round. Rounding
+                    # its cursor to a full batch would replay those samples
+                    # after resume despite the optimizer step being saved.
                     state.consumed_samples = (
-                        checkpoint.consumed_samples // per_step * per_step
+                        checkpoint.consumed_samples
+                        if cfg.rollout_mode == "async_round"
+                        else checkpoint.consumed_samples // per_step * per_step
                     )
                     state.checkpoint = checkpoint
         if not state.model_config:
@@ -412,7 +427,7 @@ class TrainContextBuilder:
         if self._topology is not None and self._topology.cp_size > 1:
             self._validate_cp(context)
             cp_state = CPState(self._topology)
-        kwargs = dict(cfg.strategy_kwargs)
+        kwargs = cfg._validate_strategy_kwargs(dict(cfg.strategy_kwargs))
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
         kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)

@@ -43,6 +43,7 @@ class SamplingParams:
     top_k: int = 50
     frequency_penalty: float = 0.0
     rep_window: int = 64
+    seed: Optional[int] = None
 
 
 @dataclass(frozen=True)

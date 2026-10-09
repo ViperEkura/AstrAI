@@ -691,12 +691,25 @@ class GPUModelRunner:
             padded_ids = None
             padded_mask = None
 
+        # Stateless per-request/per-position streams survive request reordering,
+        # worker repartitioning and scheduler compaction without touching global RNG.
+        seeds = [
+            None
+            if task.sampling.seed is None
+            else (task.sampling.seed + task.materialized_end * 0x9E3779B97F4A7C15)
+            & ((1 << 63) - 1)
+            for task in requests
+        ]
+        seed_kwargs = (
+            {"seeds": seeds} if any(seed is not None for seed in seeds) else {}
+        )
         result = (
             info.pipeline.sample(
                 logits,
                 input_ids=padded_ids,
                 input_mask=padded_mask,
                 return_logprobs=return_logprobs,
+                **seed_kwargs,
             )
             if info.pipeline is not None
             else sample(
@@ -708,6 +721,7 @@ class GPUModelRunner:
                 input_ids=padded_ids,
                 input_mask=padded_mask,
                 return_logprobs=return_logprobs,
+                **seed_kwargs,
                 meta=info.meta,
             )
         )

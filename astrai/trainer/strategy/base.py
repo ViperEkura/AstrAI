@@ -320,6 +320,18 @@ class BaseStrategy(ABC):
             for chunk in slices:
                 yield self.compute_loss_output(chunk)
 
+    def training_updates(
+        self, batch: Any, microbatch_prompts: Optional[int] = None
+    ) -> Iterator[Iterator[LossOutput]]:
+        """Group loss outputs by optimizer update.
+
+        The default keeps the existing one-loss-per-update contract.  A
+        strategy can yield several losses in one group when their gradients
+        must be accumulated before a single optimizer step.
+        """
+        for output in self.training_steps(batch):
+            yield iter((output,))
+
     def _split_rollout_batch(self, prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Slice one prepared rollout batch along the prompt dimension.
 

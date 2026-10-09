@@ -4,8 +4,8 @@ The builder supplies the reference-model factory and capability validator so
 this module owns rollout wiring without owning model restoration or topology.
 """
 
-from dataclasses import replace
-from typing import TYPE_CHECKING, Callable, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 import torch
 
@@ -18,9 +18,67 @@ from astrai.trainer.rollout import (
     RolloutRunner,
     SamplingParams,
 )
+from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 
 if TYPE_CHECKING:
     from astrai.trainer.train_context import TrainContext
+
+
+@dataclass(frozen=True)
+class ResolvedAsyncRolloutConfig:
+    learner_device: str
+    devices: Tuple[str, ...]
+    params: SamplingParams
+    max_seq_len: Optional[int]
+    max_prompts_per_worker: int
+    startup_timeout_s: float
+    generation_timeout_s: float
+    weight_timeout_s: float
+    max_policy_lag: int
+    random_seed: int
+    sample_cursor: int
+
+    @property
+    def max_batch_size(self) -> int:
+        return self.params.group_size * self.max_prompts_per_worker
+
+
+def resolve_async_rollout(
+    config: TrainConfig,
+    learner_device: torch.device,
+    params: SamplingParams,
+    max_seq_len: Optional[int],
+    sample_cursor: int,
+) -> ResolvedAsyncRolloutConfig:
+    devices = tuple(torch.device(name) for name in config.rollout_devices)
+    if not devices or any(d.type != "cuda" or d.index is None for d in devices):
+        raise ValueError("async_round requires indexed CUDA rollout devices")
+    if len(set(devices)) != len(devices):
+        raise ValueError("async_round requires distinct rollout_devices")
+    available = torch.cuda.device_count()
+    if any(d.index >= available for d in devices):
+        raise ValueError(f"rollout_devices exceed available CUDA devices ({available})")
+    if learner_device.type != "cuda" or learner_device.index is None:
+        raise ValueError("async_round learner must use an indexed CUDA device")
+    if learner_device in devices:
+        raise ValueError("rollout_devices must exclude the learner device")
+    if params.group_size < 2:
+        raise ValueError("online_grpo group_size must be >= 2")
+    return ResolvedAsyncRolloutConfig(
+        learner_device=str(learner_device),
+        devices=tuple(str(d) for d in devices),
+        params=params,
+        max_seq_len=max_seq_len,
+        max_prompts_per_worker=max(
+            1, (config.batch_per_device + len(devices) - 1) // len(devices)
+        ),
+        startup_timeout_s=config.rollout_startup_timeout_s,
+        generation_timeout_s=config.rollout_worker_timeout_s,
+        weight_timeout_s=config.rollout_weight_timeout_s,
+        max_policy_lag=config.rollout_max_policy_lag,
+        random_seed=config.random_seed,
+        sample_cursor=sample_cursor,
+    )
 
 
 def configure_rollout(
@@ -41,7 +99,9 @@ def configure_rollout(
     validate(context.executor)
     inference_model = context.executor.model_for_inference(context.model)
     tokenizer = tokenizer_cls.from_pretrained(param_path)
-    group_size = strategy_kwargs.get("group_size", 1)
+    group_size = getattr(
+        context.strategy, "group_size", strategy_kwargs.get("group_size", 1)
+    )
     policy_version = (
         context.checkpoint.meta.get("policy_version", context.optimizer_step)
         if context.checkpoint is not None
@@ -87,7 +147,9 @@ def configure_rollout(
             )
         )
 
-    def _replica(device: str, max_batch_size: int) -> ReplicaBackend:
+    def _replica(
+        device: str, max_batch_size: int, enable_cuda_graph: bool = True
+    ) -> ReplicaBackend:
         model = create_ref_model(
             model_fn=cfg.model_fn,
             executor=context.executor,
@@ -106,7 +168,51 @@ def configure_rollout(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             policy_version=policy_version,
+            enable_cuda_graph=enable_cuda_graph,
         )
+
+    if getattr(cfg, "rollout_mode", "sync") == "async_round":
+        if str(getattr(inference_model.config, "ffn_type", "mlp")) == "moe":
+            raise ValueError(
+                "async_round currently supports dense models only: MoE auxiliary "
+                "loss is not equivalent across learner microbatches"
+            )
+        params = SamplingParams(
+            max_tokens=cfg.rollout_max_tokens,
+            group_size=group_size,
+            temperature=cfg.rollout_temperature,
+            top_k=cfg.rollout_top_k,
+            top_p=cfg.rollout_top_p,
+        )
+        resolved = resolve_async_rollout(
+            cfg, train_device, params, max_seq_len, context.consumed_samples
+        )
+        context.async_rollout = AsyncRoundCoordinator(
+            source=inference_model,
+            model_fn=cfg.model_fn,
+            param_path=param_path,
+            devices=list(resolved.devices),
+            params=resolved.params,
+            reward_model=cfg.reward_model_fn(),
+            policy_version=policy_version,
+            max_batch_size=resolved.max_batch_size,
+            max_seq_len=resolved.max_seq_len,
+            model_dtype=next(context.model.parameters()).dtype,
+            max_policy_lag=resolved.max_policy_lag,
+            max_prompts_per_worker=resolved.max_prompts_per_worker,
+            worker_timeout_s=resolved.generation_timeout_s,
+            startup_timeout_s=resolved.startup_timeout_s,
+            weight_timeout_s=resolved.weight_timeout_s,
+            random_seed=resolved.random_seed,
+            sample_cursor=resolved.sample_cursor,
+        )
+        context.optimizer_steps_completed = (
+            context.checkpoint.meta.get("optimizer_step", context.optimizer_step)
+            if context.checkpoint is not None
+            else context.optimizer_step
+        )
+        context.strategy.set_rollout_runner(context.async_rollout)
+        return
 
     batch_capacity = group_size * max(1, cfg.batch_per_device)
     publishers: list = []

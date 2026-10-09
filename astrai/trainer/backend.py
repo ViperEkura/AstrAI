@@ -34,10 +34,9 @@ T = TypeVar("T")
 def _device_context(device):
     """Pin CUDA work to ``device``; a no-op on CPU.
 
-    CUDA graph capture/replay binds to the calling thread's current
-    device (``CUDAGraphRunner`` uses a bare ``torch.cuda.CUDAGraph()``),
-    so a scheduler living on a non-current device must be constructed
-    and driven under ``torch.cuda.device``.
+    CUDA graph replay and scheduler work use the calling thread's current
+    device, so a scheduler living on another GPU must be constructed and
+    driven under ``torch.cuda.device``.
     """
     if isinstance(device, torch.device) and device.type == "cuda":
         return torch.cuda.device(device)

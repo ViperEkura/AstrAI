@@ -4,7 +4,9 @@ reference-restore contract, and rollout finish-reason plumbing."""
 import os
 import random
 import shutil
+from contextlib import nullcontext
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -141,6 +143,105 @@ def test_offline_training_steps_yield_once():
     outputs = list(strategy.training_steps(batch))
     assert len(outputs) == 1
     assert torch.isfinite(outputs[0]["loss"])
+
+
+@pytest.mark.parametrize("aggregation", ["token", "sequence"])
+def test_async_grpo_microbatches_share_one_update_and_full_batch_gradient(
+    aggregation,
+):
+    result = _rollout_result(b=3)
+    result.response_mask[0, :, -1] = False
+    result.response_mask[1, 1, :] = False
+    full = _grpo_strategy(result, loss_aggregation=aggregation)
+    micro = _grpo_strategy(result, loss_aggregation=aggregation)
+
+    full_loss = full.compute_loss_output(full.prepare_from_rollout(result))["loss"]
+    full_loss.backward()
+    updates = list(micro.training_updates(result, microbatch_prompts=1))
+    assert len(updates) == 1
+    outputs = list(updates[0])
+    assert len(outputs) == 3
+    micro_loss = sum(output["loss"] for output in outputs)
+    micro_loss.backward()
+
+    torch.testing.assert_close(micro_loss, full_loss)
+    for full_param, micro_param in zip(
+        full.model.parameters(), micro.model.parameters()
+    ):
+        torch.testing.assert_close(micro_param.grad, full_param.grad)
+
+
+def test_default_training_updates_keep_ppo_update_count():
+    result = _rollout_result()
+    strategy = PPOStrategy(
+        StubLM(),
+        "cpu",
+        critic=StubCritic(),
+        critic_optimizer=None,
+        ref_model=None,
+        rl_update_epochs=2,
+        rl_minibatch_prompts=2,
+    )
+    strategy._rollout_runner = FakeRunner(result)
+    updates = [
+        list(update) for update in strategy.training_updates({"instruction": ["x"] * 4})
+    ]
+    assert len(updates) == 4
+    assert all(len(update) == 1 for update in updates)
+    assert strategy._rollout_runner.calls == 1
+
+
+def test_shared_train_batch_commits_async_round_once():
+    class Coordinator:
+        policy_version = 0
+
+        def apply_weight_update(self, _version, update):
+            result = update(self.policy_version + 1)
+            self.policy_version += 1
+            return result
+
+        def step(self):
+            pass
+
+    class Executor:
+        grad_accum_steps = 1
+        sync_gradients = True
+
+        def accumulate(self, _model):
+            return nullcontext()
+
+        def backward(self, loss):
+            loss.backward()
+
+    result = _rollout_result(b=3)
+    strategy = _grpo_strategy(result)
+    coordinator = Coordinator()
+    strategy._rollout_runner = coordinator
+    optimizer = torch.optim.SGD(strategy.model.parameters(), lr=0.01)
+    before = strategy.model.embed.weight.detach().clone()
+    context = SimpleNamespace(
+        model=strategy.model,
+        strategy=strategy,
+        executor=Executor(),
+        config=SimpleNamespace(async_train_microbatch_prompts=1),
+        async_rollout=coordinator,
+        optimizer=optimizer,
+        scheduler=None,
+        consumed_samples=0,
+        optimizer_steps_completed=0,
+        checkpoint_safe=True,
+        loss=0.0,
+        metrics={},
+    )
+    trainer = Trainer.__new__(Trainer)
+    trainer.callbacks = []
+    trainer._train_batch(context, result)
+
+    assert coordinator.policy_version == 1
+    assert context.optimizer_steps_completed == 1
+    assert context.consumed_samples == 3
+    assert context.checkpoint_safe
+    assert not torch.equal(before, strategy.model.embed.weight)
 
 
 def test_online_minibatch_and_epoch_step_counts():

@@ -1,5 +1,6 @@
 """One learner coordinating versioned online GRPO rollout rounds."""
 
+import hashlib
 import logging
 import multiprocessing as mp
 import os
@@ -23,7 +24,6 @@ from astrai.trainer.rollout.protocol import (
     send_message,
 )
 from astrai.trainer.rollout.runner import _score_rewards
-from astrai.trainer.rollout.seeding import response_seeds
 from astrai.trainer.rollout.types import (
     RolloutResult,
     RolloutVersionError,
@@ -32,6 +32,22 @@ from astrai.trainer.rollout.types import (
 from astrai.trainer.rollout.worker import RolloutWorkerSpec, run_rollout_worker
 
 logger = logging.getLogger(__name__)
+
+
+def _response_seeds(
+    base_seed: int, sample_cursor: int, prompts: int, group_size: int
+) -> List[int]:
+    return [
+        int.from_bytes(
+            hashlib.blake2b(
+                f"{base_seed}:{sample_cursor + i}:{g}".encode(), digest_size=8
+            ).digest(),
+            "little",
+        )
+        & ((1 << 63) - 1)
+        for i in range(prompts)
+        for g in range(group_size)
+    ]
 
 
 @dataclass
@@ -339,7 +355,7 @@ class AsyncRoundCoordinator:
             raise ValueError("async rollout round cannot be empty")
         fresh = seeds is None
         if fresh:
-            seeds = response_seeds(
+            seeds = _response_seeds(
                 self.random_seed, self._sample_cursor, total, self._group_size
             )
         if len(seeds) != total * self._group_size:

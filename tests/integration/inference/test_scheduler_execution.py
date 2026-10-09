@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from astrai.extension import CudaBackend, TorchNativeBackend, get_backend
@@ -439,3 +440,33 @@ def test_chunked_prefill_budget_caps_forward_tokens(device):
     assert seen, "no prefill forwards observed"
     assert max(seen) <= 4, seen
     assert len(seen) >= 3, f"expected multiple chunks, got {seen}"
+
+
+def test_scheduler_seeds_survive_batching_and_request_completion():
+    scheduler, _, _ = _make_real_scheduler("cpu")
+    prompts = [[1, 2], [3, 4, 5]]
+    first = scheduler.run_batch(
+        prompts, seeds=[11, 22], max_tokens=6, top_k=0, return_details=True
+    )
+    torch.manual_seed(999)
+    reordered = scheduler.run_batch(
+        list(reversed(prompts)),
+        seeds=[22, 11],
+        max_tokens=6,
+        top_k=0,
+        return_details=True,
+    )
+    individual = scheduler.run_batch(
+        [prompts[1]], seeds=[22], max_tokens=6, top_k=0, return_details=True
+    )
+    assert [r.token_ids for r in first] == [r.token_ids for r in reversed(reordered)]
+    assert individual[0].token_ids == first[1].token_ids
+    assert all(r.error_reason is None for r in first + reordered + individual)
+
+
+@pytest.mark.parametrize("seeds", [[], [True], [-1], [2**63]])
+def test_bad_request_seeds_fail_before_allocating_cache(seeds):
+    scheduler, _, _ = _make_real_scheduler("cpu")
+    with pytest.raises(ValueError, match="seeds"):
+        scheduler.run_batch([[1, 2]], seeds=seeds)
+    assert not scheduler._planned

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from astrai.trainer.callbacks.checkpoint import CheckpointCallback
-from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
+from astrai.trainer.rollout.async_round import AsyncRoundCoordinator, _response_seeds
 from astrai.trainer.rollout.protocol import (
     GenerationResult,
     MessageKind,
@@ -19,7 +19,6 @@ from astrai.trainer.rollout.protocol import (
     recv_message,
     send_message,
 )
-from astrai.trainer.rollout.seeding import response_seeds
 from astrai.trainer.rollout.types import RawRollout, RolloutVersionError, SamplingParams
 
 
@@ -399,4 +398,4 @@ def test_prefetch_resume_cursor_and_retry_keep_response_seeds():
     finally:
         pool.close()
 
-    assert next_round.seeds == response_seeds(pool.random_seed, 4, 2, 1)
+    assert next_round.seeds == _response_seeds(pool.random_seed, 4, 2, 1)

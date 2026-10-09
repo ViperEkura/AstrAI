@@ -142,7 +142,8 @@ requires at least 2 online), and rollout uses that same value.
 Before loading models, the builder checks the actual distributed world size:
 `async_round` requires one learner even under torchrun. Rollout setup resolves
 devices, sampling, capacities, timeouts and the committed sample cursor into
-an immutable `ResolvedAsyncRolloutConfig`. All CUDA indexes are logical indexes
+an immutable `ResolvedAsyncRolloutConfig` in `rollout/setup.py`. All CUDA indexes
+are logical indexes
 after `CUDA_VISIBLE_DEVICES`; worker devices must be distinct and exclude the
 learner. Startup logs include device assignments, GPU UUIDs, effective sampling,
 seed/cursor and the three independent deadlines:

@@ -1,12 +1,14 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAGraphsC10Utils.h>
 #include <torch/extension.h>
 
 #include <algorithm>
 #include <climits>
 #include <cmath>
 #include <tuple>
+#include <type_traits>
 
 namespace {
 constexpr int kThreads = 256;
@@ -105,8 +107,11 @@ __global__ void forward_rows_online(scalar_t* logits, const int64_t* targets, fl
         __syncthreads();
         for (int64_t col = threadIdx.x; col < vocab; col += kThreads) {
             const float probability = expf((float(values[col]) - maximum) - log_sum);
-            values[col] = scalar_t(probability - smoothing / float(vocab) -
-                                   (col == target ? 1.0f - smoothing : 0.0f));
+            // Raise FP16 subnormal gradients into its normal exponent range.
+            // A power of two is exact and 2^15 keeps gradients in [-1, 1] finite.
+            const float projection_scale = std::is_same<scalar_t, at::Half>::value ? 32768.0f : 1.0f;
+            values[col] = scalar_t((probability - smoothing / float(vocab) -
+                                   (col == target ? 1.0f - smoothing : 0.0f)) * projection_scale);
         }
     }
 }
@@ -194,19 +199,43 @@ linear_forward(const torch::Tensor& hidden, const torch::Tensor& weight,
                     hidden.size(0) <= INT_MAX && chunk_size <= INT_MAX,
                 "invalid GEMM dimensions or chunk_size");
     const c10::cuda::CUDAGuard guard(hidden.device());
-    const int64_t rows = hidden.size(0), chunk = std::min(chunk_size, rows);
     const auto options = hidden.options().dtype(at::kFloat);
+    auto selected_targets = targets;
+    torch::Tensor valid_rows;
+    // Large masked heads can avoid projecting ignored tokens. Dynamic nonzero
+    // synchronizes its row count, so graph capture keeps the fixed-shape path.
+    const double projection_work = double(hidden.size(0)) * hidden.size(1) * weight.size(0);
+    if (projection_work >= double(uint64_t(1) << 39) &&
+        c10::cuda::currentStreamCaptureStatusMayInitCtx() == c10::cuda::CaptureStatus::None) {
+        auto indices = torch::nonzero(targets.ne(ignore_index)).flatten();
+        if (indices.numel() < hidden.size(0)) {
+            valid_rows = indices;
+            selected_targets = targets.index_select(0, indices);
+        }
+    }
+    const int64_t rows = selected_targets.size(0), chunk = std::min(chunk_size, rows);
+    auto dx = need_hidden ? (valid_rows.defined() ? torch::zeros(hidden.sizes(), options)
+                                                 : torch::empty(hidden.sizes(), options))
+                          : torch::empty({0}, options);
+    auto dw = need_weight ? torch::empty(weight.sizes(), options) : torch::empty({0}, options);
+    if (rows == 0) {
+        if (need_weight) dw.zero_();
+        return {torch::zeros({}, options), dx, dw};
+    }
+    auto selected_dx = need_hidden && valid_rows.defined()
+                           ? torch::empty({chunk, hidden.size(1)}, options) : dx;
     auto logits = torch::empty({chunk, weight.size(0)}, hidden.options());
     auto maxima = torch::empty({rows}, options);
     auto log_sums = torch::empty_like(maxima);
     auto losses = torch::empty_like(maxima);
-    auto dx = need_hidden ? torch::empty(hidden.sizes(), options) : torch::empty({0}, options);
-    auto dw = need_weight ? torch::empty(weight.sizes(), options) : torch::empty({0}, options);
     for (int64_t start = 0; start < rows; start += chunk) {
         const int64_t count = std::min(chunk, rows - start);
-        auto x = hidden.narrow(0, start, count);
+        auto row_indices = valid_rows.defined() ? valid_rows.narrow(0, start, count)
+                                                : torch::Tensor();
+        auto x = row_indices.defined() ? hidden.index_select(0, row_indices)
+                                       : hidden.narrow(0, start, count);
         auto z = logits.narrow(0, 0, count);
-        auto y = targets.narrow(0, start, count);
+        auto y = selected_targets.narrow(0, start, count);
         auto l = losses.narrow(0, start, count);
         auto m = maxima.narrow(0, start, count);
         auto s = log_sums.narrow(0, start, count);
@@ -214,8 +243,11 @@ linear_forward(const torch::Tensor& hidden, const torch::Tensor& weight,
         launch_forward(z, y, m, s, l, ignore_index, smoothing, need_hidden || need_weight);
         if (need_hidden || need_weight) {
             if (need_hidden) {
-                auto dx_chunk = dx.narrow(0, start, count);
+                auto dx_chunk = selected_dx.narrow(0, valid_rows.defined() ? 0 : start, count);
                 accumulate_hidden(z, weight, dx_chunk, true);
+                if (row_indices.defined()) {
+                    dx.index_copy_(0, row_indices, dx_chunk);
+                }
             }
             if (need_weight) {
                 accumulate_weight(z, x, dw, start == 0);
@@ -228,7 +260,8 @@ linear_forward(const torch::Tensor& hidden, const torch::Tensor& weight,
 template <typename scalar_t>
 __global__ void scale_precomputed(const float* __restrict__ raw, const float* __restrict__ scale,
                                   scalar_t* __restrict__ output, int64_t elements) {
-    const float factor = scale[0];
+    const float projection_scale = std::is_same<scalar_t, at::Half>::value ? 32768.0f : 1.0f;
+    const float factor = scale[0] / projection_scale;
     for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; index < elements;
          index += int64_t(gridDim.x) * blockDim.x) {
         output[index] = scalar_t(raw[index] * factor);

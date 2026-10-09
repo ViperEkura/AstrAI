@@ -19,12 +19,22 @@ LM-head weight view returned by the model. The view keeps the head visible to
 DDP's forward-output traversal, including `find_unused_parameters=True`, while
 the model remains independent of targets and loss configuration. Forward
 generates logits one token chunk at a time, computes the loss, and replaces
-private logits scratch with unscaled logits gradients. Each chunk projects
+private logits scratch with logits gradients. Each chunk projects
 hidden and weight gradients into FP32 buffers during forward. Backward scales
 and casts these immutable saved buffers without recomputing logits. Frozen
 inputs omit their gradient buffer; inference only computes the loss.
+FP16 logits gradients are scaled by an exact power of two before projection
+to preserve small values; backward reverses this scale before casting outputs.
 GEMMs use ATen/cuBLAS; CE and gradient generation use native CUDA kernels.
 There is no Liger, Triton or CUTLASS runtime dependency.
+
+For large heads (at least `2^39` projected products,
+`tokens * hidden * vocab`), ordinary execution selects non-ignored token
+indices before projection. Hidden states are gathered one chunk at a time, and hidden gradients are scattered into a
+zero-initialized full buffer. An all-masked loss avoids GEMMs. Dynamic row
+selection synchronizes the valid-row count once; CUDA Graph capture keeps the
+fixed-shape path. Unmasked inputs retain the original GEMM shapes after the
+count check. The benefit depends on the fraction of ignored targets.
 
 ## Semantics and limits
 

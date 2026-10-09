@@ -57,6 +57,8 @@ set(KERNEL_MODULES
         attention/paged_prefill.cu attention/bindings.cu"
     "rotary_emb|rotary_emb.cu"
     "cross_entropy|cross_entropy.cu"
+    "newton_schulz|newton_schulz/entry.cu newton_schulz/kernels.cu
+        newton_schulz/bindings.cu"
     "gated_deltanet|gated_deltanet/gated_deltanet_fwd.cu
         gated_deltanet/gated_deltanet_bwd.cu gated_deltanet/bindings.cu"
     "quantize|quantize/bindings.cu quantize/entry.cu"

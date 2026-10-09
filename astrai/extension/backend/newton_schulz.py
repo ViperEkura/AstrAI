@@ -1,0 +1,387 @@
+"""Newton-Schulz matrix primitives, dispatch and recurrence."""
+
+import math
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import torch
+from torch import Tensor
+
+from astrai.extension.kernel import newton_schulz as cuda
+from astrai.extension.policy import newton_schulz as plan
+from astrai.extension.runtime.dispatch import (
+    ImplRecord,
+    Spec,
+    axis,
+    cache_token,
+    register_family,
+    resolve,
+)
+
+
+def _torch_syrk(
+    x: Tensor,
+    output: Tensor,
+    *,
+    addend: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    tile: Optional[str] = None,
+) -> None:
+    if beta == 0:
+        (torch.mm if x.ndim == 2 else torch.bmm)(x, x.transpose(-2, -1), out=output)
+        if alpha != 1:
+            output.mul_(alpha)
+    else:
+        (torch.addmm if x.ndim == 2 else torch.baddbmm)(
+            addend, x, x.transpose(-2, -1), alpha=alpha, beta=beta, out=output
+        )
+
+
+def _torch_symm(
+    symmetric: Tensor,
+    x: Tensor,
+    output: Tensor,
+    *,
+    addend: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    tile: Optional[str] = None,
+    raster: int = 1,
+) -> None:
+    if beta == 0:
+        (torch.mm if x.ndim == 2 else torch.bmm)(symmetric, x, out=output)
+        if alpha != 1:
+            output.mul_(alpha)
+    else:
+        (torch.addmm if x.ndim == 2 else torch.baddbmm)(
+            addend, symmetric, x, alpha=alpha, beta=beta, out=output
+        )
+
+
+def _axes(
+    operation: str,
+    *matrices: Tensor,
+    addend: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    tile: Optional[str] = None,
+    raster: int = 1,
+) -> Dict[str, Any]:
+    x = matrices[-2]
+    operands = matrices + ((addend,) if beta != 0 and addend is not None else ())
+    return {
+        "cuda": all(plan.supports(matrix) for matrix in operands)
+        and (
+            tile is None
+            or any(
+                candidate["name"] == tile
+                and plan.layout(x) in candidate["input_layouts"]
+                for candidate in cuda.tiles(operation)
+            )
+        ),
+        # Retain the registry axis name for existing dispatch overrides.
+        "measured": plan.probe(
+            operation, x, output=matrices[-1], addend=beta != 0
+        ).backend
+        == "cuda",
+    }
+
+
+def _records(operation: str) -> List[ImplRecord]:
+    cuda_op = cuda.syrk_out if operation == "syrk" else cuda.symm_out
+    torch_op = _torch_syrk if operation == "syrk" else _torch_symm
+    return [
+        ImplRecord(
+            operation,
+            "measured",
+            cuda_op,
+            axis("cuda").truthy() & axis("measured").truthy(),
+            priority=0,
+        ),
+        # Explicit selection exposes every legal tile/shape for the sweep.
+        ImplRecord(
+            operation,
+            "cuda",
+            cuda_op,
+            axis("cuda").truthy(),
+            priority=1,
+            faithful=False,
+        ),
+        ImplRecord(operation, "torch", torch_op, Spec.always(), priority=99),
+    ]
+
+
+for _operation in ("syrk", "symm"):
+    register_family(
+        _operation,
+        partial(_axes, _operation),
+        partial(_records, _operation),
+        lambda operation=_operation: _records(operation)[-1],
+    )
+
+
+_selection_cache: Dict[Tuple[Any, ...], Callable[..., None]] = {}
+
+
+def _selection_key(operation: str, matrices, kwargs) -> Optional[Tuple[Any, ...]]:
+    token = cache_token(operation)
+    if token is None:
+        return None
+    addend = kwargs.get("addend")
+    beta = kwargs.get("beta", 0) != 0
+    operands = matrices + ((addend,) if beta and addend is not None else ())
+    metadata = tuple(
+        (
+            tuple(x.shape),
+            x.stride(),
+            x.dtype,
+            x.device,
+            x.requires_grad,
+            x.data_ptr() % 16,
+        )
+        for x in operands
+    )
+    return (
+        token,
+        plan.revision(),
+        operation,
+        metadata,
+        beta,
+        kwargs.get("tile"),
+        kwargs.get("raster"),
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
+        torch.are_deterministic_algorithms_enabled(),
+    )
+
+
+def select(
+    operation: str, *matrices: Tensor, backend: Optional[str] = None, **kwargs: Any
+) -> Callable[..., None]:
+    """Resolve once; callers can reuse the selected function inside a recurrence."""
+    if operation not in ("syrk", "symm"):
+        raise ValueError("operation must be syrk or symm")
+    if backend == "torch":
+        return _torch_syrk if operation == "syrk" else _torch_symm
+    key = _selection_key(operation, matrices, kwargs) if backend is None else None
+    cached = _selection_cache.get(key) if key is not None else None
+    if cached is not None:
+        return cached
+    selected = resolve(operation, *matrices, explicit=backend, **kwargs).record.obj
+    decision = plan.probe(
+        operation, matrices[-2], output=matrices[-1], addend=kwargs.get("beta", 0) != 0
+    )
+    options = {"tile": kwargs.get("tile") or decision.tile}
+    if operation == "symm":
+        options["raster"] = kwargs.get("raster", decision.raster)
+    function = partial(selected, **options)
+    if key is not None:
+        if len(_selection_cache) >= 128:
+            _selection_cache.clear()
+        _selection_cache[key] = function
+    return function
+
+
+def _validate(
+    x: Tensor,
+    output: Tensor,
+    shape,
+    operands,
+    addend: Optional[Tensor],
+    alpha: float,
+    beta: float,
+) -> None:
+    if any(t.ndim != x.ndim for t in operands) or tuple(output.shape) != tuple(shape):
+        raise ValueError("matrix shape mismatch")
+    if not math.isfinite(alpha) or not math.isfinite(beta):
+        raise ValueError("coefficients must be finite")
+    if beta != 0 and addend is None:
+        raise ValueError("nonzero beta requires an addend")
+    if beta != 0:
+        if addend.shape != output.shape:
+            raise ValueError("addend shape mismatch")
+        operands = (*operands, addend)
+    for tensor in operands:
+        if tensor.device != output.device or tensor.dtype != output.dtype:
+            raise ValueError("matrix device or dtype mismatch")
+        if torch._C._is_alias_of(output, tensor):
+            raise ValueError("output must not alias inputs")
+
+
+def syrk_out(
+    x: Tensor,
+    output: Tensor,
+    *,
+    addend: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    backend: Optional[str] = None,
+    tile: Optional[str] = None,
+) -> None:
+    """Compute alpha * X X.T + beta * C into output."""
+    if x.ndim not in (2, 3):
+        raise ValueError("expected a matrix or matrix batch")
+    _validate(
+        x, output, (*x.shape[:-2], x.size(-2), x.size(-2)), (x,), addend, alpha, beta
+    )
+    select(
+        "syrk",
+        x,
+        output,
+        backend=backend,
+        addend=addend,
+        alpha=alpha,
+        beta=beta,
+        tile=tile,
+    )(x, output, addend=addend, alpha=alpha, beta=beta)
+
+
+def symm_out(
+    symmetric: Tensor,
+    x: Tensor,
+    output: Tensor,
+    *,
+    addend: Optional[Tensor] = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    backend: Optional[str] = None,
+    tile: Optional[str] = None,
+    raster: Optional[int] = None,
+) -> None:
+    """Compute alpha * S X + beta * C into output."""
+    _validate(x, output, x.shape, (symmetric, x), addend, alpha, beta)
+    if x.ndim not in (2, 3) or symmetric.shape != (
+        *x.shape[:-2],
+        x.size(-2),
+        x.size(-2),
+    ):
+        raise ValueError("symmetric matrix shape mismatch")
+    options = {"tile": tile}
+    if raster is not None:
+        options["raster"] = raster
+    select(
+        "symm",
+        symmetric,
+        x,
+        output,
+        backend=backend,
+        addend=addend,
+        alpha=alpha,
+        beta=beta,
+        **options,
+    )(symmetric, x, output, addend=addend, alpha=alpha, beta=beta)
+
+
+def _use_row_work(x: Tensor, steps: int, backend: str) -> bool:
+    if backend != "auto" or x.is_contiguous() or steps <= 1:
+        return False
+    return plan.probe("syrk", x, input_layout="row").backend == "cuda"
+
+
+def _choice(operation: str, selected) -> Optional[Tuple[bool, str, int]]:
+    if not isinstance(selected, partial):
+        return None
+    kernel_op = cuda.syrk_out if operation == "syrk" else cuda.symm_out
+    torch_op = _torch_syrk if operation == "syrk" else _torch_symm
+    if selected.func is kernel_op:
+        return True, selected.keywords["tile"], selected.keywords.get("raster", 1)
+    if selected.func is torch_op:
+        return False, "", 1
+    return None
+
+
+def newton_schulz(
+    matrix: Tensor,
+    coefficients: Tuple[float, float, float],
+    steps: int = 5,
+    eps: float = 1e-7,
+    *,
+    backend: str = "torch",
+) -> Tensor:
+    """Orthogonalize a matrix or independent matrix batch with BF16 NS.
+
+    backend="auto" uses symmetric dispatch plans; "torch" retains
+    Torch arithmetic. Coefficients and iteration count are caller supplied.
+    A rank-3 input has independent Frobenius normalization per matrix.
+    BF16 inputs are normalized in place, matching Torch Muon semantics, but
+    subsequent iterations never overwrite the normalized caller storage.
+    """
+    if matrix.ndim not in (2, 3) or len(coefficients) != 3 or not 0 <= steps < 100:
+        raise ValueError("invalid Newton-Schulz matrix, coefficients or steps")
+    if backend not in ("torch", "auto"):
+        raise ValueError("backend must be torch or auto")
+    a, b, c = coefficients
+    x = matrix.bfloat16()
+    tall = x.size(-2) > x.size(-1)
+    if tall:
+        x = x.transpose(-2, -1)
+    x.div_(
+        (x.norm() if x.ndim == 2 else x.norm(dim=(-2, -1), keepdim=True)).clamp(min=eps)
+    )
+    if steps == 0:
+        return x.transpose(-2, -1) if tall else x
+    gram = torch.empty(
+        (*x.shape[:-2], x.size(-2), x.size(-2)), dtype=x.dtype, device=x.device
+    )
+    polynomial = torch.empty_like(gram)
+    explicit = "torch" if backend == "torch" else None
+    # The first/last BLAS calls change layout directly when the selected Gram
+    # plan prefers row-major scratch; external tensors keep their orientation.
+    row_work = _use_row_work(x, steps, backend)
+    work = (
+        torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        if row_work
+        else torch.empty_like(x)
+    )
+    spare = torch.empty_like(work) if steps > 1 else work
+    final = torch.empty_like(x) if row_work else None
+    first_gram = select("syrk", x, gram, backend=explicit)
+    gram_op = select("syrk", work, gram, backend=explicit) if row_work else first_gram
+    polynomial_op = select(
+        "syrk", gram, polynomial, backend=explicit, addend=gram, alpha=c, beta=b
+    )
+    first_update = select(
+        "symm", polynomial, x, work, backend=explicit, addend=x, beta=a
+    )
+    update_op = (
+        select("symm", polynomial, work, spare, backend=explicit, addend=work, beta=a)
+        if row_work
+        else first_update
+    )
+    final_update = (
+        select("symm", polynomial, work, final, backend=explicit, addend=work, beta=a)
+        if final is not None
+        else update_op
+    )
+    if backend == "auto" and cuda.is_available():
+        choices = (
+            _choice("syrk", first_gram),
+            _choice("syrk", gram_op),
+            _choice("syrk", polynomial_op),
+            _choice("symm", first_update),
+            _choice("symm", update_op),
+            _choice("symm", final_update),
+        )
+        if all(choice is not None for choice in choices):
+            x = cuda.iterate(
+                x, gram, polynomial, work, spare, final, steps, a, b, c, choices
+            )
+            return x.transpose(-2, -1) if tall else x
+    for iteration in range(steps):
+        (first_gram if iteration == 0 else gram_op)(x, gram)
+        polynomial_op(gram, polynomial, addend=gram, alpha=c, beta=b)
+        output = (
+            final
+            if final is not None and iteration == steps - 1
+            else (work if iteration % 2 == 0 else spare)
+        )
+        operation = (
+            first_update
+            if iteration == 0
+            else final_update
+            if output is final
+            else update_op
+        )
+        operation(polynomial, x, output, addend=x, beta=a)
+        x = output
+    return x.transpose(-2, -1) if tall else x

@@ -16,7 +16,7 @@ astrai/inference/
 The dependency direction is **frontend → core → worker → model/KV ABI**.
 All layers may use the neutral data contracts. Worker code must not import
 core request-lifecycle types at runtime or retain mutable `Request` objects.
-`tests/inference/test_layering.py` checks the runtime import direction.
+`tests/unit/inference/test_layering.py` checks the runtime import direction.
 
 ## Documents
 

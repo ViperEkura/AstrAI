@@ -157,6 +157,7 @@ _ENV_ALIASES: Dict[str, str] = {}
 # rebuild and re-sort the list every call. register_family and loader-side
 # kernel imports invalidate.
 _family_records: Dict[str, List[ImplRecord]] = {}
+_cache_revision = 0
 
 _current_overrides: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
     "astrai_op_overrides", default={}
@@ -205,6 +206,8 @@ def unregister_impl(family: str, name: str) -> None:
 def invalidate(family: Optional[str] = None) -> None:
     """Drop the cached record lists — call when a provider's record set or
     a kernel module's availability changed (family=None drops all)."""
+    global _cache_revision
+    _cache_revision += 1
     if family is None:
         _family_records.clear()
     else:
@@ -448,6 +451,23 @@ def resolve(
         if record.faithful and _capable(record, ax):
             return Resolution(record, "chain")
     return _fallback(fam, ax, "fallback")
+
+
+def cache_token(family: str) -> Optional[int]:
+    """Revision for caching a builtin decision, or None for dynamic selections.
+
+    External implementations can have runtime predicates. Context and process
+    overrides must be resolved on each call. Builtin callers include their own
+    input metadata and mutable settings in the remaining cache key.
+    """
+    if (
+        _EXTERNAL.get(family)
+        or get_override(family) is not None
+        or env_selection(family) is not None
+        or env_overrides().get("profile") is not None
+    ):
+        return None
+    return _cache_revision
 
 
 def resolve_plan(calls: Mapping[str, Call]) -> Dict[str, Resolution]:

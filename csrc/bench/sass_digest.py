@@ -46,6 +46,9 @@ RES_USAGE_RE = re.compile(r"^\s*REG:(\d+)\s+STACK:(\d+)")
 # changes when an unrelated namespace block is inserted around the TU's
 # definitions, so both must normalize).
 ANON_NAMESPACE_RE = re.compile(r"_GLOBAL__N__[0-9a-f]+")
+# nvcc also encodes the translation-unit basename and its length in a
+# nested anonymous namespace. A file move changes both without changing SASS.
+ANON_TU_RE = re.compile(r"(_ZN)\d+_GLOBAL__N__[0-9a-f]+_\d+_[A-Za-z0-9_]+_cu_[0-9a-f]+")
 
 
 def find_cuobjdump() -> str:
@@ -185,6 +188,7 @@ def collect(cuobjdump: str, build_dir: Path) -> dict:
 
 
 def normalize_symbol(name: str) -> str:
+    name = ANON_TU_RE.sub(r"\1_GLOBAL__N___", name)
     name = ANON_NAMESPACE_RE.sub("_GLOBAL__N___", name)
     # The hash segment may also trail the _cu_ qualifier, glued to the
     # symbol name proper (a third nvcc spelling): strip a run of hex

@@ -1,0 +1,108 @@
+# Cross-entropy kernels
+
+`cuda_ce` keeps logits in the model dtype and reduces cross-entropy in FP32
+without materializing FP32 logits or log-softmax tensors. The optional
+`cuda_linear_ce` path computes a bias-free LM head and cross-entropy from
+hidden states in row chunks. User-facing selection and fallback behavior
+are documented in the [training guide](../../guides/training.md#cross-entropy-backends).
+
+## Contract
+
+For valid token positions `V`, both CUDA paths return the sum of
+cross-entropy terms, `sum(t in V, CE(logits[t], target[t]))`. The trainer
+handles valid-token normalization, accumulation, and distributed scaling.
+The linear path uses `logits[t] = hidden[t] @ weight.T` for a bias-free
+head. Label smoothing and `ignore_index=-100` follow the Torch path.
+
+## Implementation
+
+The strategy computes the head and CE from the model's hidden states and an
+LM-head weight view returned by the model. The view keeps the head visible to
+DDP's forward-output traversal, including `find_unused_parameters=True`, while
+the model remains independent of targets and loss configuration. Forward
+generates logits one row chunk at a time and saves only per-row normalization
+statistics. Backward recomputes vocabulary tiles, replaces each private tile with
+scaled logits gradients, and reduces all tokens in one GEMM per weight-gradient tile. This avoids a full
+FP32 head-gradient buffer and repeated BF16 accumulation across token chunks.
+The smaller hidden-gradient buffer accumulates across vocabulary tiles in FP32.
+GEMMs use ATen/cuBLAS; CE and gradient generation use native CUDA kernels.
+There is no Liger, Triton or CUTLASS runtime dependency.
+
+## Semantics and limits
+
+- Both kernels return a **sum**; the trainer retains responsibility for valid
+  token counts, gradient accumulation and distributed loss normalization.
+- SFT masks use `ignore_index=-100`. All-masked sums and gradients are zero.
+  Label smoothing in `[0, 1]` is supported.
+- FP32 reductions do not imply bitwise Torch parity. Chunked CE changes GEMM
+  tiling and summation order. Backward applies the upstream scale before casting
+  logits gradients to the model dtype, matching the Torch operation order.
+  Extra persistent statistics cost `8 * tokens` bytes; the FP32 hidden-gradient
+  accumulator costs `4 * tokens * hidden` bytes (12 MiB at 2048 x 1536).
+- Both kernels support first-order gradients only. Keep `loss_backend: torch`
+  for higher-order differentiation or debugging exact training trajectories.
+- Direct wrappers accept CUDA BF16/FP16/FP32 inputs. Autocast is supported for
+  the linear wrapper. Noncontiguous inputs are made contiguous.
+- DTensor weights in the chunked path and DTensor logits in the CE path retain
+  the Torch computation; these kernels do not operate on local vocabulary
+  shards. DDP and sequence context parallelism retain their collective and
+  normalization boundaries.
+- Inference remains unchanged and returns logits. The chunked strategy asks
+  the model for hidden states and an LM-head parameter view, then returns
+  `loss_sum` with `logits=None` from the strategy. The model does not receive
+  labels or loss configuration.
+- Chunked mode falls back to full Torch linear+CE on CPU, with a biased head,
+  or without the compiled extension. It does not silently choose another
+  chunk size or backend based on benchmark results.
+
+## Build, test and measure
+
+Build through the standard CUDA installation (`CSRC_KERNELS=true`) or the
+configured CMake `cross_entropy` target. The loader discovers the module; it
+is not registered as an attention implementation.
+
+```bash
+.venv/bin/python -m pytest tests/gpu/extension/test_cross_entropy.py tests/gpu/trainer/test_ce_backends.py -q
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
+  --mode head --warmup 20 --steps 100 --rounds 3 --out results/ce-head.json
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
+  --mode train --variants torch cuda_ce linear512 linear1024 \
+  --batch-sizes 1 2 --warmup 20 --steps 100 --rounds 3 \
+  --out results/ce-train.json
+```
+
+Use an idle GPU, lock clocks for the paired comparison and restore them after
+the run. The benchmark restarts from identical checkpoint weights and optimizer
+state for each variant, alternates variant order, and reports raw samples,
+median/mean/p95, tokens/s, allocated/reserved peaks, and all-parameter differences.
+It uses synthetic full-vocabulary tokens already resident on GPU; data loading,
+checkpoint IO and multi-GPU communication are not part of its step timing.
+
+Forward includes loss work; chunked backward includes logits recomputation.
+Compare complete steps, not the backward column alone. The speed
+gate is at most 1% median and 2% p95 regression plus reduced allocated peak.
+Numerical tests are a separate gate. Passing these short tests does not establish
+long-run convergence equivalence; both backends remain opt-in.
+
+For a separate numerical audit, pass `--deterministic`. It sets
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` and enables deterministic Torch algorithms.
+This can select slower model kernels; do not mix its timings with the default
+performance runs. Repeated ordinary Torch runs also report their parameter
+differences against the first Torch run to expose baseline nondeterminism.
+
+For the maximum micro-batch at a fixed sequence length, use a separate capacity
+probe. It completes forward, backward and optimizer steps (including state
+allocation), records the allocated/reserved peaks, and stops each backend at its
+first CUDA OOM. A passed short probe is not a long-run stability guarantee.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
+  --mode capacity --variants torch cuda_ce linear512 \
+  --batch-sizes 3 4 5 6 7 8 --seq-len 2048 --warmup 2 --steps 3 \
+  --memory-fraction 0.95 --out results/ce-capacity.json
+```
+
+The default 0.95 memory fraction leaves allocator headroom. Use 1.0 for a
+separate limit probe on an idle GPU. The limit is micro-batch per device, not
+the effective batch after gradient accumulation; changing sequence length,
+optimizer, dtype, checkpointing or model changes the result.

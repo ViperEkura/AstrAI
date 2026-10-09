@@ -1,7 +1,7 @@
 """Legacy Muon + AdamW combined optimizer."""
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn, optim
@@ -12,6 +12,7 @@ from torch.optim._muon import (
     _zeropower_via_newtonschulz,
 )
 
+from astrai.extension.backend.newton_schulz import newton_schulz
 from astrai.optim.composite import (
     OptimizerFactory,
     composite_state_dict,
@@ -25,56 +26,57 @@ def _scalar_lr(lr: Any) -> float:
     return lr.item() if isinstance(lr, Tensor) else lr
 
 
-def _zeropower_reuse_buffers(
-    grad: Tensor, ns_coefficients: tuple[float, float, float], ns_steps: int, eps: float
-) -> Tensor:
-    """Run torch Muon's NS recurrence with scratch tensors reused across steps."""
-    if ns_steps >= 100 or grad.ndim != 2 or len(ns_coefficients) != 3:
-        raise ValueError("invalid Muon Newton-Schulz input")
-    a, b, c = ns_coefficients
-    x = grad.bfloat16()
-    tall = grad.size(0) > grad.size(1)
-    if tall:
-        x = x.T
-    x.div_(x.norm().clamp(min=eps))
-    gram = torch.empty((x.size(0), x.size(0)), dtype=x.dtype, device=x.device)
-    gram_update = torch.empty_like(gram)
-    next_x = torch.empty_like(x)
-    for _ in range(ns_steps):
-        torch.mm(x, x.T, out=gram)
-        torch.addmm(gram, gram, gram, beta=b, alpha=c, out=gram_update)
-        torch.addmm(x, gram_update, x, beta=a, out=next_x)
-        x, next_x = next_x, x
-    return x.T if tall else x
-
-
 def _single_tensor_muon_reuse_buffers(
-    params: list[Tensor],
-    grads: list[Tensor],
-    bufs: list[Tensor],
+    params: List[Tensor],
+    grads: List[Tensor],
+    bufs: List[Tensor],
     *,
     lr: float,
     weight_decay: float,
     momentum: float,
     nesterov: bool,
-    ns_coefficients: tuple[float, float, float],
+    ns_coefficients: Tuple[float, float, float],
     ns_steps: int,
     eps: float,
-    adjust_lr_fn: str | None,
+    adjust_lr_fn: Optional[str],
     has_complex: bool,
+    use_ns_kernels: bool = False,
+    ns_batch_size: int = 4,
 ) -> None:
     if has_complex:
         raise ValueError("Complex parameters are not supported")
     lr = _scalar_lr(lr)
+    buckets: Dict[Tuple[Any, ...], List[Tuple[Tensor, Tensor, Tensor]]] = {}
     for param, grad, buf in zip(params, grads, bufs):
         if grad.ndim != 2:
             raise ValueError("Param gradient must be a 2D matrix")
-        buf.lerp_(grad, 1 - momentum)
-        update = grad.lerp(buf, momentum) if nesterov else buf
-        update = _zeropower_reuse_buffers(update, ns_coefficients, ns_steps, eps)
-        adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
-        param.mul_(1 - lr * weight_decay)
-        param.add_(update, alpha=-adjusted_lr)
+        key = (tuple(grad.shape), grad.device, grad.dtype, buf.dtype, param.dtype)
+        buckets.setdefault(key, []).append((param, grad, buf))
+    batch_size = ns_batch_size if use_ns_kernels else 1
+    for bucket in buckets.values():
+        for start in range(0, len(bucket), batch_size):
+            chunk = bucket[start : start + batch_size]
+            updates = []
+            for param, grad, buf in chunk:
+                buf.lerp_(grad, 1 - momentum)
+                updates.append(grad.lerp(buf, momentum) if nesterov else buf)
+            packed = torch.stack(updates) if len(chunk) > 1 else updates[0]
+            output = newton_schulz(
+                packed,
+                ns_coefficients,
+                ns_steps,
+                eps,
+                backend="auto" if use_ns_kernels else "torch",
+            )
+            for index, (param, grad, buf) in enumerate(chunk):
+                update = output[index] if len(chunk) > 1 else output
+                # BF16 non-Nesterov NS normalizes the momentum storage itself.
+                # Packing must preserve that state transition on each buffer.
+                if len(chunk) > 1 and not nesterov and buf.dtype == torch.bfloat16:
+                    buf.copy_(packed[index])
+                adjusted_lr = _adjust_lr(lr, adjust_lr_fn, param.shape)
+                param.mul_(1 - lr * weight_decay)
+                param.add_(update, alpha=-adjusted_lr)
 
 
 def _sharded_orthogonalize(update: Tensor, group: Mapping) -> Tensor:
@@ -110,9 +112,21 @@ class _ShardedMuon(optim.Muon):
     are DTensor-safe and run directly on the shards.
     """
 
-    def __init__(self, params, *, reuse_ns_buffers: bool = False, **kwargs):
+    def __init__(
+        self,
+        params,
+        *,
+        reuse_ns_buffers: bool = False,
+        use_ns_kernels: bool = False,
+        ns_batch_size: int = 4,
+        **kwargs,
+    ):
         super().__init__(params, **kwargs)
         self.reuse_ns_buffers = reuse_ns_buffers
+        self.use_ns_kernels = use_ns_kernels
+        if not isinstance(ns_batch_size, int) or ns_batch_size < 1:
+            raise ValueError("ns_batch_size must be a positive integer")
+        self.ns_batch_size = ns_batch_size
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -122,9 +136,9 @@ class _ShardedMuon(optim.Muon):
                 loss = closure()
 
         for group in self.param_groups:
-            params: list[Tensor] = []
-            grads: list[Tensor] = []
-            bufs: list[Tensor] = []
+            params: List[Tensor] = []
+            grads: List[Tensor] = []
+            bufs: List[Tensor] = []
             self._init_group(group, params, grads, bufs)
 
             plain, sharded = [], []
@@ -135,11 +149,15 @@ class _ShardedMuon(optim.Muon):
 
             if plain:
                 pp, gg, bb = (list(t) for t in zip(*plain))
-                step_plain = (
-                    _single_tensor_muon_reuse_buffers
-                    if self.reuse_ns_buffers
-                    else _single_tensor_muon
-                )
+                if self.reuse_ns_buffers or self.use_ns_kernels:
+                    step_plain = _single_tensor_muon_reuse_buffers
+                    extra_kwargs = {
+                        "use_ns_kernels": self.use_ns_kernels,
+                        "ns_batch_size": self.ns_batch_size,
+                    }
+                else:
+                    step_plain = _single_tensor_muon
+                    extra_kwargs = {}
                 step_plain(
                     pp,
                     gg,
@@ -153,6 +171,7 @@ class _ShardedMuon(optim.Muon):
                     eps=group["eps"],
                     adjust_lr_fn=group["adjust_lr_fn"],
                     has_complex=False,
+                    **extra_kwargs,
                 )
 
             lr = _scalar_lr(group["lr"])
@@ -182,6 +201,8 @@ class MuonAdamW(optim.Optimizer):
         ns_steps: int = 5,
         adjust_lr_fn: str = "match_rms_adamw",
         reuse_ns_buffers: bool = False,
+        use_ns_kernels: bool = False,
+        ns_batch_size: int = 4,
     ):
         defaults = {
             "lr": lr,
@@ -194,8 +215,8 @@ class MuonAdamW(optim.Optimizer):
         params = [param for param in model.parameters() if param.requires_grad]
         super().__init__(params, defaults)
 
-        matrix_params: list[Tensor] = []
-        other_params: list[Tensor] = []
+        matrix_params: List[Tensor] = []
+        other_params: List[Tensor] = []
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
@@ -219,6 +240,8 @@ class MuonAdamW(optim.Optimizer):
             ns_steps=ns_steps,
             adjust_lr_fn=adjust_lr_fn,
             reuse_ns_buffers=reuse_ns_buffers,
+            use_ns_kernels=use_ns_kernels,
+            ns_batch_size=ns_batch_size,
         )
         self.adamw = optim.AdamW(
             [{"params": other_params, "weight_decay": 0.0}],
@@ -236,10 +259,10 @@ class MuonAdamW(optim.Optimizer):
     def zero_grad(self, set_to_none: bool = True):
         composite_zero_grad([self.muon, self.adamw], set_to_none)
 
-    def state_dict(self) -> dict[str, Any]:
+    def state_dict(self) -> Dict[str, Any]:
         return composite_state_dict({"muon": self.muon, "adamw": self.adamw})
 
-    def load_state_dict(self, state_dict: dict[str, Any]):
+    def load_state_dict(self, state_dict: Dict[str, Any]):
         if "muon" not in state_dict or "adamw" not in state_dict:
             raise ValueError(
                 "Checkpoint optimizer state is not compatible with muon_adamw"

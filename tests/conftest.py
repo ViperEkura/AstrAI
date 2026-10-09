@@ -2,34 +2,11 @@ import json
 import os
 
 import pytest
-import torch
 
-from astrai.extension import KERNEL_NAMES, is_available
 from astrai.model.autoregressive_lm import AutoRegressiveLM
-from tests.helpers import (
-    TINY_CONFIG,
-    RandomTokenDataset,
-    build_test_tokenizer,
-    make_tiny_config,
-)
-
-CUDA_AVAIL = torch.cuda.is_available()
-KERNEL_AVAIL = CUDA_AVAIL and all(is_available(k) for k in KERNEL_NAMES)
-FP8_AVAIL = (
-    CUDA_AVAIL
-    and is_available("quantize")
-    and torch.cuda.get_device_capability() >= (8, 9)
-)
-skip_no_cuda = pytest.mark.skipif(not CUDA_AVAIL, reason="CUDA not available")
-skip_lt2_cuda = pytest.mark.skipif(
-    not CUDA_AVAIL or torch.cuda.device_count() < 2,
-    reason="two-rank spawn tests need two CUDA devices",
-)
-skip_no_kernel = pytest.mark.skipif(not KERNEL_AVAIL, reason="CUDA kernels not built")
-skip_no_fp8 = pytest.mark.skipif(
-    not FP8_AVAIL,
-    reason="fused FP8 MMA requires a built kernel and compute capability 8.9+",
-)
+from tests.support.models import TINY_CONFIG, make_tiny_config
+from tests.support.rollout import RandomTokenDataset
+from tests.support.tokenizers import build_test_tokenizer
 
 
 def pytest_configure(config):
@@ -40,19 +17,14 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session")
 def device():
-    """Session-scoped device string (``"cuda"`` if available, else ``"cpu"``)."""
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def create_test_tokenizer(vocab_size: int = 1000):
-    """Create a simple tokenizer for testing purposes."""
-    return build_test_tokenizer(vocab_size)
+    """CPU device for shared fixtures (``"cuda"`` ``"cpu"``)."""
+    return "cpu"
 
 
 @pytest.fixture(scope="session")
 def test_tokenizer():
     """Session-scoped tokenizer, created once for the entire test run."""
-    return create_test_tokenizer()
+    return build_test_tokenizer()
 
 
 @pytest.fixture

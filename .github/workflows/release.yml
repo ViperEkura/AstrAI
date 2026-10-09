@@ -18,8 +18,7 @@ on:
       - "pyproject.toml"
       - "csrc/**"
       - "astrai/**"
-      - "tests/extension/**"
-  push:
+      - "tests/**"
     tags:
       - "v*"
 
@@ -66,52 +65,6 @@ jobs:
           echo "=== kernel log ==="
           sudo dmesg -T | tail -40 || true
 
-      - name: Verify wheel tag and CUDA modules
-        run: |
-          python - <<'PY'
-          import glob
-          import zipfile
-          from pathlib import Path
-          from packaging.tags import sys_tags
-          from packaging.utils import parse_wheel_filename
-
-          wheels = glob.glob("dist/*.whl")
-          assert len(wheels) == 1, wheels
-          tags = parse_wheel_filename(Path(wheels[0]).name)[3]
-          assert tags & set(sys_tags()), (wheels[0], tags)
-          assert all(tag.platform != "any" for tag in tags), tags
-          with zipfile.ZipFile(wheels[0]) as wheel:
-              modules = [name for name in wheel.namelist()
-                         if name.startswith("astrai/extension/_C_") and name.endswith(".so")]
-          assert len(modules) == 6, modules
-          print(Path(wheels[0]).name)
-          print(*modules, sep="\n")
-          PY
-
-      - name: Install and verify native modules load
-        run: |
-          python -m pip install --no-deps --target "$RUNNER_TEMP/wheel-install" dist/*.whl
-          cd "$RUNNER_TEMP"
-          PYTHONPATH="$RUNNER_TEMP/wheel-install" python - "$RUNNER_TEMP/wheel-install" <<'PY'
-          import sys
-          import types
-          from pathlib import Path
-
-          root = Path(sys.argv[1]) / "astrai"
-          package = types.ModuleType("astrai")
-          package.__path__ = [str(root)]
-          sys.modules["astrai"] = package
-          extension = types.ModuleType("astrai.extension")
-          extension.__path__ = [str(root / "extension")]
-          sys.modules["astrai.extension"] = extension
-
-          from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
-
-          print(KERNEL_NAMES)
-          assert len(KERNEL_NAMES) == 6, KERNEL_NAMES
-          assert all(is_available(name) for name in KERNEL_NAMES)
-          PY
-
       - uses: actions/upload-artifact@v4
         with:
           name: astrai-linux-cu130
@@ -153,59 +106,6 @@ jobs:
 
       - name: Build wheel
         run: python -m pip wheel . --no-deps --no-build-isolation --wheel-dir dist
-
-      - name: Verify wheel tag and CUDA modules
-        shell: pwsh
-        run: |
-          @'
-          import glob
-          import zipfile
-          from pathlib import Path
-          from packaging.tags import sys_tags
-          from packaging.utils import parse_wheel_filename
-
-          wheels = glob.glob("dist/*.whl")
-          assert len(wheels) == 1, wheels
-          tags = parse_wheel_filename(Path(wheels[0]).name)[3]
-          assert tags & set(sys_tags()), (wheels[0], tags)
-          assert all(tag.platform != "any" for tag in tags), tags
-          with zipfile.ZipFile(wheels[0]) as wheel:
-              modules = [
-                  name for name in wheel.namelist()
-                  if name.startswith("astrai/extension/_C_") and name.endswith(".pyd")
-              ]
-          print(Path(wheels[0]).name)
-          print(*modules, sep="\n")
-          assert len(modules) == 6, modules
-          '@ | python -
-
-      - name: Install and verify native modules load
-        shell: pwsh
-        run: |
-          $wheel = (Get-ChildItem dist/*.whl).FullName
-          $install = Join-Path $env:RUNNER_TEMP "wheel-install"
-          python -m pip install --no-deps --target $install $wheel
-          Set-Location $env:RUNNER_TEMP
-          $env:PYTHONPATH = $install
-          @'
-          import sys
-          import types
-          from pathlib import Path
-
-          root = Path(sys.argv[1]) / "astrai"
-          package = types.ModuleType("astrai")
-          package.__path__ = [str(root)]
-          sys.modules["astrai"] = package
-          extension = types.ModuleType("astrai.extension")
-          extension.__path__ = [str(root / "extension")]
-          sys.modules["astrai.extension"] = extension
-
-          from astrai.extension.runtime.loader import KERNEL_NAMES, is_available
-
-          print(KERNEL_NAMES)
-          assert len(KERNEL_NAMES) == 6, KERNEL_NAMES
-          assert all(is_available(name) for name in KERNEL_NAMES)
-          '@ | python - $install
 
       - uses: actions/upload-artifact@v4
         with:

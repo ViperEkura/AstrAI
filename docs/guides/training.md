@@ -7,6 +7,7 @@
 - [Rotary Position Embedding (RoPE)](#rotary-position-embedding-rope)
 - [Training Loop](#training-loop)
 - [Strategies](#strategies) — SEQ, SFT, DPO, GRPO, online rollout
+- [Cross-entropy backends](#cross-entropy-backends) — SEQ/SFT loss selection
 - [LR Schedulers](#lr-schedulers)
 - [Gradient Checkpointing](#gradient-checkpointing)
 - [Checkpoint](#checkpoint)
@@ -119,6 +120,39 @@ L_{\text{SFT}} = -\frac{1}{L}\sum_{t=P+1}^{P+L} \log P(s_t \mid s_{\lt t}; \thet
 $$
 
 Keys: `input_ids`, `target_ids`, `loss_mask`, `position_ids`. Optional: `label_smoothing`.
+
+### Cross-entropy backends
+
+SEQ and SFT use Torch cross-entropy by default. Configure the optional CUDA
+backend through `TrainConfig.strategy_kwargs`:
+
+```yaml
+strategy_kwargs:
+  loss_backend: cuda_ce
+```
+
+`cuda_ce` keeps logits in the model dtype and performs cross-entropy reductions
+in FP32 without allocating full FP32 logits or log-softmax tensors. CPU runs
+and runs without the compiled extension use Torch.
+
+For a bias-free `AutoRegressiveLM` head, the experimental chunked option also
+avoids materializing full head logits:
+
+```yaml
+strategy_kwargs:
+  loss_backend: cuda_linear_ce
+  loss_chunk_size: 512
+```
+
+The chunked path falls back to Torch on CPU, with a biased head, or without
+the extension. Both CUDA paths return loss sums; the trainer normalizes by
+valid tokens across accumulation and distributed workers. SFT masking with
+`ignore_index=-100` and label smoothing are supported. Use the Torch backend
+for higher-order gradients or exact trajectory debugging. DTensor logits or
+weights continue to use the Torch computation.
+
+See [cross-entropy kernels](../developer/kernels/cross_entropy.md) for the
+implementation contract, numerical limits, and benchmark procedure.
 
 ### DPO (Direct Preference Optimization)
 

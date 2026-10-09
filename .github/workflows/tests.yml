@@ -27,5 +27,4 @@ jobs:
           pip install .[dev]
 
       - name: Run tests with pytest
-        run: |
-          python -m pytest tests/ -v
+        run: python -m pytest tests/ -v

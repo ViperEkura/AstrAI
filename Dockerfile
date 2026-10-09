@@ -31,6 +31,7 @@ COPY astrai/ ./astrai/
 COPY csrc/ ./csrc/
 COPY setup.py .
 COPY pyproject.toml .
+COPY README.md .
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir . \
     --extra-index-url "https://download.pytorch.org/whl/${CUDA_TAG}"

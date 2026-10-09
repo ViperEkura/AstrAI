@@ -28,7 +28,7 @@
 ## 📖 Table of Contents
 
 - [Overview](#overview)
-- [Getting Started](#getting-started)
+- [Quick Start](#quick-start)
 - [Demo](#demo)
 - [Documentation](#documentation)
 - [Contributing](#contributing)
@@ -54,7 +54,7 @@ AstrAI is an end-to-end Transformer framework for building, training, evaluating
 | **Evaluation** | Perplexity, MMLU, HumanEval, IFEval, IFD, ROUGE, and weight-analysis evaluation tools |
 | **Extensibility** | Factory and registry architecture for models, datasets, training strategies, callbacks, kernels, and protocol components |
 
-### Getting Started
+### Quick Start
 
 End-to-end walkthrough in 5 steps:
 
@@ -201,7 +201,7 @@ bash scripts/serve.sh up
 
 #### HTTP API Examples
 
-Additional request examples beyond the [Getting Started](#getting-started) flow:
+Additional request examples beyond the [Quick Start](#quick-start) flow:
 
 ```bash
 # OpenAI-compatible streaming
@@ -229,7 +229,7 @@ See [Inference Guide](docs/guides/inference.md) for SSE streaming format, error 
 
 | Document | Description |
 |----------|-------------|
-| [Get Started](./docs/get-started.md) | Installation and quickstart |
+| [Quick Start](./docs/quick-start.md) | Installation and quickstart |
 | [CLI Reference](./docs/guides/params.md) | Parameters for all CLI tools (train, server, generate, preprocess) |
 | [Preprocessing](./docs/guides/preprocessing.md) | Declarative JSON-driven data preprocessing |
 | [Training](./docs/guides/training.md) | Training loop, strategies & formulas |

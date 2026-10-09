@@ -16,15 +16,16 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import get_logprobs
-from tests.helpers import make_tiny_config
 
 DEV = "cuda:0"
 VOCAB = 100000
 torch.manual_seed(0)
 
-cfg = make_tiny_config(
+cfg = AutoRegressiveLMConfig(
+    rms_norm_eps=1e-5,
     vocab_size=VOCAB,
     hidden_size=1536,
     intermediate_size=6912,

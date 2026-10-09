@@ -232,7 +232,7 @@ SSE 流式格式、错误码和统计端点详见[推理文档](guides/inference
 
 | 文档 | 说明 |
 |------|------|
-| [快速上手](./get-started.md) | 安装与快速入门 |
+| [快速上手](./quick-start.md) | 安装与快速入门 |
 | [CLI 参考](./guides/params.md) | 所有 CLI 工具参数（训练、服务、生成、预处理） |
 | [数据预处理](./guides/preprocessing.md) | 声明式 JSON 驱动数据预处理 |
 | [训练文档](./guides/training.md) | 训练循环、策略与公式 |

@@ -51,17 +51,20 @@ def batch(device, all_masked=False):
 
 
 @skip_no_ce
-@pytest.mark.parametrize("backend", ["cuda_ce", "cuda_linear_ce"])
 @pytest.mark.parametrize("kind", [SEQStrategy, SFTStrategy])
 @pytest.mark.parametrize("tied", [False, True])
-def test_multistep_accumulation(backend, kind, tied):
+def test_multistep_accumulation(kind, tied):
     torch.manual_seed(123)
     ref = model("cuda", tied)
     fused = copy.deepcopy(ref)
     a, b = (
         kind(ref, "cuda", label_smoothing=0.1),
         kind(
-            fused, "cuda", label_smoothing=0.1, loss_backend=backend, loss_chunk_size=16
+            fused,
+            "cuda",
+            label_smoothing=0.1,
+            loss_backend="cuda_linear_ce",
+            loss_chunk_size=16,
         ),
     )
     oa, ob = (
@@ -96,9 +99,8 @@ def test_missing_kernel_fallback(monkeypatch):
     )
     m, data = model("cuda"), batch("cuda")
     ref = SEQStrategy(m, "cuda").compute_loss(data)
-    for backend in ("cuda_ce", "cuda_linear_ce"):
-        loss = SEQStrategy(m, "cuda", loss_backend=backend).compute_loss(data)
-        torch.testing.assert_close(loss, ref, rtol=0, atol=0)
+    loss = SEQStrategy(m, "cuda", loss_backend="cuda_linear_ce").compute_loss(data)
+    torch.testing.assert_close(loss, ref, rtol=0, atol=0)
 
 
 def _ddp_worker(rank, init_file):
@@ -117,21 +119,20 @@ def _ddp_worker(rank, init_file):
         )
         torch.manual_seed(123 + rank)
         data = batch("cuda:" + str(rank), all_masked=rank == 1)
-        for backend in ("cuda_ce", "cuda_linear_ce"):
-            ddp.zero_grad()
-            ref.zero_grad()
-            for net, mode in ((ddp, backend), (ref, "torch")):
-                strategy = SFTStrategy(
-                    net, "cuda:" + str(rank), loss_backend=mode, loss_chunk_size=16
-                )
-                result = strategy.forward_tokens(data)
-                tokens = strategy.reduce_loss(result, data)
-                count = tokens.token_count.clone()
-                dist.all_reduce(count)
-                # DDP averages gradients; global token mean needs world/count.
-                (tokens.loss_sum * (2 / count.clamp_min(1))).backward()
-            for x, y in zip(ddp.parameters(), ref.parameters()):
-                torch.testing.assert_close(x.grad, y.grad, rtol=0.04, atol=0.001)
+        ddp.zero_grad()
+        ref.zero_grad()
+        for net, mode in ((ddp, "cuda_linear_ce"), (ref, "torch")):
+            strategy = SFTStrategy(
+                net, "cuda:" + str(rank), loss_backend=mode, loss_chunk_size=16
+            )
+            result = strategy.forward_tokens(data)
+            tokens = strategy.reduce_loss(result, data)
+            count = tokens.token_count.clone()
+            dist.all_reduce(count)
+            # DDP averages gradients; global token mean needs world/count.
+            (tokens.loss_sum * (2 / count.clamp_min(1))).backward()
+        for x, y in zip(ddp.parameters(), ref.parameters()):
+            torch.testing.assert_close(x.grad, y.grad, rtol=0.04, atol=0.001)
         # Exercise the real context-parallel sharding/normalization protocol.
         topology = ParallelTopology(world_size=2, cp_size=2, device_type="cuda")
         torch.manual_seed(123)
@@ -144,29 +145,26 @@ def _ddp_worker(rank, init_file):
                 single, "cuda:" + str(rank), label_smoothing=0.1
             ).compute_loss(data)
             reference.backward()
-            for backend in ("cuda_ce", "cuda_linear_ce"):
-                sharded = copy.deepcopy(initial)
-                strategy = SFTStrategy(
-                    sharded,
-                    "cuda:" + str(rank),
-                    label_smoothing=0.1,
-                    loss_backend=backend,
-                    loss_chunk_size=8,
-                )
-                result = CPStrategy(strategy, CPState(topology))(copy.deepcopy(data))
-                torch.testing.assert_close(
-                    result["metrics"]["task_loss"],
-                    reference.item(),
-                    rtol=0.01,
-                    atol=0.01,
-                )
-                (result["loss"] / 2).backward()
-                for x, y in zip(sharded.parameters(), single.parameters()):
-                    grad = x.grad.float()
-                    dist.all_reduce(grad, group=topology.cp_group)
-                    torch.testing.assert_close(
-                        grad, y.grad.float(), rtol=0.05, atol=0.01
-                    )
+            sharded = copy.deepcopy(initial)
+            strategy = SFTStrategy(
+                sharded,
+                "cuda:" + str(rank),
+                label_smoothing=0.1,
+                loss_backend="cuda_linear_ce",
+                loss_chunk_size=8,
+            )
+            result = CPStrategy(strategy, CPState(topology))(copy.deepcopy(data))
+            torch.testing.assert_close(
+                result["metrics"]["task_loss"],
+                reference.item(),
+                rtol=0.01,
+                atol=0.01,
+            )
+            (result["loss"] / 2).backward()
+            for x, y in zip(sharded.parameters(), single.parameters()):
+                grad = x.grad.float()
+                dist.all_reduce(grad, group=topology.cp_group)
+                torch.testing.assert_close(grad, y.grad.float(), rtol=0.05, atol=0.01)
     finally:
         dist.destroy_process_group()
 

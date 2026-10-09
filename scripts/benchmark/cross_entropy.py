@@ -6,8 +6,8 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
 
 Synthetic full-vocabulary tokens, identical model/data/optimizer per variant.
 Times include zero_grad, forward/loss, backward and optimizer; exclude data IO.
-Chunked CE recomputes vocabulary tiles in backward; use the complete step
-for the speed gate.
+Chunked CE projects gradients in forward and scales them in backward; use
+the complete step for the speed gate.
 """
 
 import argparse
@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F
 
 from astrai.extension.kernel.cross_entropy import (
-    cross_entropy,
     is_available,
     linear_cross_entropy,
 )
@@ -158,7 +157,6 @@ def main():
         nargs="+",
         default=[
             "torch",
-            "cuda_ce",
             "linear128",
             "linear256",
             "linear512",
@@ -171,7 +169,6 @@ def main():
         parser.error("counts must be positive")
     if args.variants[0] != "torch" or set(args.variants) - {
         "torch",
-        "cuda_ce",
         "linear128",
         "linear256",
         "linear512",
@@ -326,8 +323,6 @@ def main():
                                 linear_cross_entropy(x, w, y, chunk_size=chunk)
                                 / y.numel()
                             )
-                        elif variant == "cuda_ce":
-                            loss = cross_entropy(F.linear(x, w), y) / y.numel()
                         else:
                             loss = F.cross_entropy(F.linear(x, w).float(), y)
                     events[1].record()

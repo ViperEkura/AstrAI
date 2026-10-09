@@ -14,8 +14,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
-from astrai.extension.kernel.cross_entropy import cross_entropy, linear_cross_entropy
 from astrai.extension.kernel.cross_entropy import is_available as ce_available
+from astrai.extension.kernel.cross_entropy import linear_cross_entropy
 from astrai.parallel.cp import LossReduction, TokenLoss
 from astrai.trainer.strategy.base import BaseStrategy
 from astrai.trainer.strategy.factory import StrategyFactory
@@ -39,8 +39,8 @@ class _CEStrategy(BaseStrategy):
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
-        if loss_backend not in ("torch", "cuda_ce", "cuda_linear_ce"):
-            raise ValueError("loss_backend must be torch, cuda_ce, or cuda_linear_ce")
+        if loss_backend not in ("torch", "cuda_linear_ce"):
+            raise ValueError("loss_backend must be torch or cuda_linear_ce")
         if (
             isinstance(loss_chunk_size, bool)
             or not isinstance(loss_chunk_size, int)
@@ -109,13 +109,6 @@ class _CEStrategy(BaseStrategy):
             return forward.loss_sum
         logits = forward.logits.flatten(0, 1)
         targets = targets.flatten()
-        if (
-            self.loss_backend == "cuda_ce"
-            and logits.is_cuda
-            and not isinstance(logits, DTensor)
-            and ce_available()
-        ):
-            return cross_entropy(logits, targets, label_smoothing=self.label_smoothing)
         return F.cross_entropy(
             logits.float(),
             targets,

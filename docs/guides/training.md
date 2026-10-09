@@ -123,20 +123,9 @@ Keys: `input_ids`, `target_ids`, `loss_mask`, `position_ids`. Optional: `label_s
 
 ### Cross-entropy backends
 
-SEQ and SFT use Torch cross-entropy by default. Configure the optional CUDA
-backend through `TrainConfig.strategy_kwargs`:
-
-```yaml
-strategy_kwargs:
-  loss_backend: cuda_ce
-```
-
-`cuda_ce` keeps logits in the model dtype and performs cross-entropy reductions
-in FP32 without allocating full FP32 logits or log-softmax tensors. CPU runs
-and runs without the compiled extension use Torch.
-
-For a bias-free `AutoRegressiveLM` head, the experimental chunked option also
-avoids materializing full head logits:
+SEQ and SFT use Torch cross-entropy by default. For a bias-free
+`AutoRegressiveLM` head, configure the experimental fused linear CE backend
+through `TrainConfig.strategy_kwargs` to avoid materializing full head logits:
 
 ```yaml
 strategy_kwargs:
@@ -145,11 +134,10 @@ strategy_kwargs:
 ```
 
 The chunked path falls back to Torch on CPU, with a biased head, or without
-the extension. Both CUDA paths return loss sums; the trainer normalizes by
+the extension. The CUDA path returns a loss sum; the trainer normalizes by
 valid tokens across accumulation and distributed workers. SFT masking with
 `ignore_index=-100` and label smoothing are supported. Use the Torch backend
-for higher-order gradients or exact trajectory debugging. DTensor logits or
-weights continue to use the Torch computation.
+for higher-order gradients or exact trajectory debugging. DTensor weights continue to use the Torch computation.
 
 See [cross-entropy kernels](../developer/kernels/cross_entropy.md) for the
 implementation contract, numerical limits, and benchmark procedure.

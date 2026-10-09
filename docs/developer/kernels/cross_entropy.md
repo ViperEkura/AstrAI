@@ -1,14 +1,12 @@
 # Cross-entropy kernels
 
-`cuda_ce` keeps logits in the model dtype and reduces cross-entropy in FP32
-without materializing FP32 logits or log-softmax tensors. The optional
-`cuda_linear_ce` path computes a bias-free LM head and cross-entropy from
-hidden states in row chunks. User-facing selection and fallback behavior
+The optional `cuda_linear_ce` path computes a bias-free LM head and
+cross-entropy from hidden states in row chunks. User-facing selection and fallback behavior
 are documented in the [training guide](../../guides/training.md#cross-entropy-backends).
 
 ## Contract
 
-For valid token positions `V`, both CUDA paths return the sum of
+For valid token positions `V`, the CUDA path returns the sum of
 cross-entropy terms, `sum(t in V, CE(logits[t], target[t]))`. The trainer
 handles valid-token normalization, accumulation, and distributed scaling.
 The linear path uses `logits[t] = hidden[t] @ weight.T` for a bias-free
@@ -20,32 +18,32 @@ The strategy computes the head and CE from the model's hidden states and an
 LM-head weight view returned by the model. The view keeps the head visible to
 DDP's forward-output traversal, including `find_unused_parameters=True`, while
 the model remains independent of targets and loss configuration. Forward
-generates logits one row chunk at a time and saves only per-row normalization
-statistics. Backward recomputes vocabulary tiles, replaces each private tile with
-scaled logits gradients, and reduces all tokens in one GEMM per weight-gradient tile. This avoids a full
-FP32 head-gradient buffer and repeated BF16 accumulation across token chunks.
-The smaller hidden-gradient buffer accumulates across vocabulary tiles in FP32.
+generates logits one token chunk at a time, computes the loss, and replaces
+private logits scratch with unscaled logits gradients. Each chunk projects
+hidden and weight gradients into FP32 buffers during forward. Backward scales
+and casts these immutable saved buffers without recomputing logits. Frozen
+inputs omit their gradient buffer; inference only computes the loss.
 GEMMs use ATen/cuBLAS; CE and gradient generation use native CUDA kernels.
 There is no Liger, Triton or CUTLASS runtime dependency.
 
 ## Semantics and limits
 
-- Both kernels return a **sum**; the trainer retains responsibility for valid
+- The kernel returns a **sum**; the trainer retains responsibility for valid
   token counts, gradient accumulation and distributed loss normalization.
 - SFT masks use `ignore_index=-100`. All-masked sums and gradients are zero.
   Label smoothing in `[0, 1]` is supported.
 - FP32 reductions do not imply bitwise Torch parity. Chunked CE changes GEMM
-  tiling and summation order. Backward applies the upstream scale before casting
-  logits gradients to the model dtype, matching the Torch operation order.
-  Extra persistent statistics cost `8 * tokens` bytes; the FP32 hidden-gradient
-  accumulator costs `4 * tokens * hidden` bytes (12 MiB at 2048 x 1536).
-- Both kernels support first-order gradients only. Keep `loss_backend: torch`
+  tiling and summation order. Backward scales projected FP32 gradients before
+  casting them to the model dtype. Saved gradients cost
+  `4 * (tokens * hidden + vocab * hidden)` bytes when both inputs require grad;
+  transient logits cost `chunk_size * vocab * sizeof(model_dtype)` bytes.
+  Repeated backward with different scalar upstream gradients is supported.
+- The kernel supports first-order gradients only. Keep `loss_backend: torch`
   for higher-order differentiation or debugging exact training trajectories.
-- Direct wrappers accept CUDA BF16/FP16/FP32 inputs. Autocast is supported for
+- The direct wrapper accepts CUDA BF16/FP16/FP32 inputs. Autocast is supported for
   the linear wrapper. Noncontiguous inputs are made contiguous.
-- DTensor weights in the chunked path and DTensor logits in the CE path retain
-  the Torch computation; these kernels do not operate on local vocabulary
-  shards. DDP and sequence context parallelism retain their collective and
+- DTensor weights retain the Torch computation; the kernel does not operate
+  on local vocabulary shards. DDP and sequence context parallelism retain their collective and
   normalization boundaries.
 - Inference remains unchanged and returns logits. The chunked strategy asks
   the model for hidden states and an LM-head parameter view, then returns
@@ -66,7 +64,7 @@ is not registered as an attention implementation.
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
   --mode head --warmup 20 --steps 100 --rounds 3 --out results/ce-head.json
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
-  --mode train --variants torch cuda_ce linear512 linear1024 \
+  --mode train --variants torch linear512 linear1024 \
   --batch-sizes 1 2 --warmup 20 --steps 100 --rounds 3 \
   --out results/ce-train.json
 ```
@@ -78,11 +76,11 @@ median/mean/p95, tokens/s, allocated/reserved peaks, and all-parameter differenc
 It uses synthetic full-vocabulary tokens already resident on GPU; data loading,
 checkpoint IO and multi-GPU communication are not part of its step timing.
 
-Forward includes loss work; chunked backward includes logits recomputation.
+Forward includes loss and gradient projection; backward scales saved gradients.
 Compare complete steps, not the backward column alone. The speed
 gate is at most 1% median and 2% p95 regression plus reduced allocated peak.
 Numerical tests are a separate gate. Passing these short tests does not establish
-long-run convergence equivalence; both backends remain opt-in.
+long-run convergence equivalence; the CUDA backend remains opt-in.
 
 For a separate numerical audit, pass `--deterministic`. It sets
 `CUBLAS_WORKSPACE_CONFIG=:4096:8` and enables deterministic Torch algorithms.
@@ -97,7 +95,7 @@ first CUDA OOM. A passed short probe is not a long-run stability guarantee.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
-  --mode capacity --variants torch cuda_ce linear512 \
+  --mode capacity --variants torch linear512 \
   --batch-sizes 3 4 5 6 7 8 --seq-len 2048 --warmup 2 --steps 3 \
   --memory-fraction 0.95 --out results/ce-capacity.json
 ```

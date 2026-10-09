@@ -1,8 +1,9 @@
-"""Opt-in CUDA cross entropy; no attention-dispatch registration.
+"""Opt-in CUDA linear cross entropy; no attention-dispatch registration.
 
-Both entry points return a sum. The trainer owns token/global normalization.
-Only first-order gradients are supported. Chunked linear CE recomputes logits
-in backward; GEMM tiling and reduction order can change rounding.
+The entry point returns a sum. The trainer owns token/global normalization.
+Only first-order gradients are supported. Chunked linear CE projects gradients
+in forward and scales them in backward;
+GEMM tiling and reduction order can change rounding.
 """
 
 import torch
@@ -34,82 +35,39 @@ def _check(logits, targets, label_smoothing):
         raise ValueError("label_smoothing must be in [0, 1]")
 
 
-class _CrossEntropy(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, logits, targets, ignore_index, smoothing):
-        loss, maxima, log_sums = get_module("cross_entropy").forward(
-            logits, targets, ignore_index, smoothing
-        )
-        ctx.save_for_backward(logits, targets, maxima, log_sums)
-        ctx.ignore_index, ctx.smoothing = ignore_index, smoothing
-        return loss
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, grad_loss):
-        logits, targets, maxima, log_sums = ctx.saved_tensors
-        grad = get_module("cross_entropy").backward(
-            logits,
-            targets,
-            maxima,
-            log_sums,
-            grad_loss.float().contiguous(),
-            ctx.ignore_index,
-            ctx.smoothing,
-        )
-        return grad, None, None, None
-
-
-def cross_entropy(
-    logits: Tensor,
-    targets: Tensor,
-    ignore_index: int = -100,
-    label_smoothing: float = 0.0,
-) -> Tensor:
-    """CUDA CE sum without a full FP32 logits/log-softmax allocation."""
-    _check(logits, targets, label_smoothing)
-    return _CrossEntropy.apply(
-        logits.contiguous(),
-        targets.contiguous(),
-        int(ignore_index),
-        float(label_smoothing),
-    )
-
-
 class _LinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, targets, ignore_index, smoothing, chunk_size):
-        loss, maxima, log_sums = get_module("cross_entropy").linear_forward(
+        loss, dx, dw = get_module("cross_entropy").linear_forward(
             hidden,
             weight,
             targets,
             ignore_index,
             smoothing,
             chunk_size,
+            ctx.needs_input_grad[0],
+            ctx.needs_input_grad[1],
         )
-        ctx.save_for_backward(hidden, weight, targets, maxima, log_sums)
-        ctx.ignore_index, ctx.smoothing = ignore_index, smoothing
+        # Keep version checks on the source tensors and immutable FP32 gradients.
+        # Scaling after projection avoids overflow/underflow before normalization.
+        ctx.save_for_backward(dx, dw, hidden, weight)
         return loss
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_loss):
-        hidden, weight, targets, maxima, log_sums = ctx.saved_tensors
+        dx_raw, dw_raw, hidden, weight = ctx.saved_tensors
         dx, dw = get_module("cross_entropy").linear_backward(
-            hidden,
-            weight,
-            targets,
-            maxima,
-            log_sums,
-            grad_loss.float().contiguous(),
-            ctx.ignore_index,
-            ctx.smoothing,
-            ctx.needs_input_grad[0],
-            ctx.needs_input_grad[1],
+            dx_raw, dw_raw, grad_loss.float().contiguous(), hidden, weight
         )
-        dx = dx if ctx.needs_input_grad[0] else None
-        dw = dw if ctx.needs_input_grad[1] else None
-        return dx, dw, None, None, None, None
+        return (
+            dx if ctx.needs_input_grad[0] else None,
+            dw if ctx.needs_input_grad[1] else None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def linear_cross_entropy(
@@ -122,9 +80,10 @@ def linear_cross_entropy(
 ) -> Tensor:
     """CUDA bias-free linear + CE sum, using bounded logits scratch storage.
 
-    ``hidden`` is [tokens, hidden], ``weight`` is [vocab, hidden]. Gradients
-    reduce all tokens per vocabulary tile in one GEMM, without a full FP32
-    weight-gradient buffer. No external kernel package.
+    ``hidden`` is [tokens, hidden], ``weight`` is [vocab, hidden]. Each chunk
+    computes logits, loss and projected gradients once.
+    FP32 gradient buffers are scaled and cast in backward without recomputing
+    logits or modifying the saved buffers. No external kernel package.
     """
     if torch.is_autocast_enabled("cuda"):
         dtype = torch.get_autocast_dtype("cuda")
@@ -143,6 +102,17 @@ def linear_cross_entropy(
         or chunk_size <= 0
     ):
         raise ValueError("chunk_size must be a positive integer")
+    if not torch.is_grad_enabled():
+        return get_module("cross_entropy").linear_forward(
+            hidden.contiguous(),
+            weight.contiguous(),
+            targets.contiguous(),
+            int(ignore_index),
+            float(label_smoothing),
+            chunk_size,
+            False,
+            False,
+        )[0]
     return _LinearCrossEntropy.apply(
         hidden.contiguous(),
         weight.contiguous(),
@@ -153,4 +123,4 @@ def linear_cross_entropy(
     )
 
 
-__all__ = ["cross_entropy", "linear_cross_entropy", "is_available"]
+__all__ = ["linear_cross_entropy", "is_available"]

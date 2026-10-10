@@ -51,6 +51,7 @@ struct SplitWorkspace {
 inline SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& o_part_buf,
                                              const c10::optional<torch::Tensor>& ml_part_buf,
                                              AttentionParams& p,
+                                             const DecodeLaunchPlan& plan,
                                              const torch::Tensor& q) {
     const bool has_o = o_part_buf.has_value() && o_part_buf->defined();
     const bool has_ml = ml_part_buf.has_value() && ml_part_buf->defined();
@@ -70,7 +71,7 @@ inline SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
         // The optional function arguments already retain these caller buffers.
         p.o_part = o_part_buf->data_ptr<float>();
         p.ml_part = ml_part_buf->data_ptr<float>();
-    } else if (!p.direct_output) {
+    } else if (!plan.direct_output) {
         const auto options = q.options().dtype(torch::kFloat32);
         workspace.o_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, p.head_dim}, options);
         workspace.ml_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, 2}, options);
@@ -91,19 +92,13 @@ struct DecodeCall {
 };
 
 template <typename KV> struct DecodeEntry {
-    template <int HEAD_DIM> static void run_dim(DecodeCall& call, cudaStream_t stream) {
-        auto& p = call.params;
-        dispatch_causal_mask<HEAD_DIM, DecodePlanner<KV>>(false, p.mask != nullptr, p, stream);
-        auto workspace = resolve_split_buffers(call.o_part, call.ml_part, p, call.q);
-        dispatch_decode_impl<KV, HEAD_DIM>(p, stream);
-    }
     static void run(DecodeCall& call, cudaStream_t stream) {
-        switch (call.params.head_dim) {
-#define ASTRAI_ENTRY_HEAD_DIM(D) case D: return run_dim<D>(call, stream);
-            ASTRAI_ATTN_HEAD_DIMS(ASTRAI_ENTRY_HEAD_DIM)
-#undef ASTRAI_ENTRY_HEAD_DIM
-        }
-        throw std::runtime_error(head_dim_error(call.params.head_dim));
+        auto& p = call.params;
+        with_decode_kernel<KV>(p, [&](auto kernel) {
+            const auto plan = kernel.plan(p);
+            auto workspace = resolve_split_buffers(call.o_part, call.ml_part, p, plan, call.q);
+            kernel.launch(p, plan, stream);
+        });
     }
 };
 template <typename T> using ContiguousDecodeEntry = DecodeEntry<ContigKV<T>>;
@@ -243,7 +238,8 @@ inline void pack_paged_common(torch::Tensor& q,
     TORCH_CHECK(k_cache.dim() == 3, "k_cache must be 3D [size, kv_head, head_dim]");
     TORCH_CHECK(q.dim() == 3, "q must be 3D");
 
-    for (const auto& metadata : {req_to_token, req_pool_indices, kv_indptr}) {
+    for (const auto* metadata_ptr : {&req_to_token, &req_pool_indices, &kv_indptr}) {
+        const auto& metadata = *metadata_ptr;
         TORCH_CHECK(metadata.device() == q.device() && metadata.is_contiguous(),
                     "paged metadata must be contiguous on Q's device");
     }
@@ -350,7 +346,8 @@ inline void attn_pack_paged_prefill_params(torch::Tensor q,
     check_int32(q_tile_to_batch, "q_tile_to_batch");
     check_int32(q_tile_to_index, "q_tile_to_index");
     pack_paged_common(q, k_cache, v_cache, req_to_token, req_pool_indices, kv_indptr, p);
-    for (const auto& metadata : {qo_indptr, q_tile_to_batch, q_tile_to_index}) {
+    for (const auto* metadata_ptr : {&qo_indptr, &q_tile_to_batch, &q_tile_to_index}) {
+        const auto& metadata = *metadata_ptr;
         TORCH_CHECK(metadata.device() == q.device() && metadata.is_contiguous(),
                     "prefill metadata must be contiguous on Q's device");
     }

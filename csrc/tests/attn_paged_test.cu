@@ -736,6 +736,7 @@ int main() {
     fail += run_prefill_mask_test<128>(32, 4, 512, 40);
     fail += run_prefill_mask_test<128>(32, 4, 1024, 41);
     fail += run_prefill_mask_test<64>(4, 2, 256, 42);
+    fail += run_prefill_mask_test<256>(4, 2, 257, 43);
 
     if (fail) {
         printf("\nFAILED prefill tests\n");

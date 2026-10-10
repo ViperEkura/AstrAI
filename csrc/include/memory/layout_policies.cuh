@@ -25,6 +25,17 @@ template <int LeadingDim> struct SharedTileLayout {
 };
 
 template <typename Traits> struct KVTileLoader {
+    // Keep the uncommon scalar path out of the unrolled asynchronous loader.
+    static __device__ __noinline__ void load_unaligned(
+        typename Traits::Elem* dst_k, typename Traits::Elem* dst_v,
+        const typename Traits::Elem* src_k, const typename Traits::Elem* src_v, bool valid) {
+#pragma unroll
+        for (int j = 0; j < Traits::VEC; ++j) {
+            dst_k[j] = valid ? src_k[j] : ElemTrait<typename Traits::Elem>::from_float(0.0f);
+            dst_v[j] = valid ? src_v[j] : ElemTrait<typename Traits::Elem>::from_float(0.0f);
+        }
+    }
+
     template <typename AddrFn>
     static __device__ inline void load(typename Traits::Elem* sK, // ring bases (STAGES * BC * LD each)
                                         typename Traits::Elem* sV,
@@ -43,8 +54,14 @@ template <typename Traits> struct KVTileLoader {
             bool valid = kc < seq_len;
             auto a = addr(kc, d, valid);
             int off = r * Traits::LD + Traits::SharedLayout::column(d, r);
-            astrai::cp_async_16(&dK[off], a.k, a.valid);
-            astrai::cp_async_16(&dV[off], a.v, a.valid);
+            if (a.vector_aligned) {
+                astrai::cp_async_16(&dK[off], a.k, a.valid);
+                astrai::cp_async_16(&dV[off], a.v, a.valid);
+            } else {
+                load_unaligned(&dK[off], &dV[off],
+                               static_cast<const typename Traits::Elem*>(a.k),
+                               static_cast<const typename Traits::Elem*>(a.v), a.valid);
+            }
         }
         astrai::cp_async_commit_group();
     }
@@ -54,12 +71,12 @@ template <typename Traits> struct KVTileLoader {
 struct MaskView {
     const bool* __restrict__ mask;
     int b_stride, h_stride, l_stride;
+    int k_len, q_len;
     int batch, head0, head1;
     int qrow0, qrow1;
-    int kv_len, q_len;
 };
 
-template <bool HasMask> struct AttentionMask {
+template <bool HasMask, bool MaskCoversShape = false> struct AttentionMask {
     const bool* __restrict__ mask;
     int base0, base1, max_key0, max_key1;
     bool valid0, valid1;
@@ -67,10 +84,12 @@ template <bool HasMask> struct AttentionMask {
         : mask(view.mask),
           base0(view.batch * view.b_stride + view.head0 * view.h_stride + view.qrow0 * view.l_stride),
           base1(view.batch * view.b_stride + view.head1 * view.h_stride + view.qrow1 * view.l_stride),
-          max_key0(HasMask ? min(max0, view.kv_len) : max0),
-          max_key1(HasMask ? min(max1, view.kv_len) : max1),
-          valid0(row0 && (!HasMask || view.q_len == 1 || view.qrow0 < view.q_len)),
-          valid1(row1 && (!HasMask || view.q_len == 1 || view.qrow1 < view.q_len)) {}
+          max_key0(HasMask && !MaskCoversShape ? min(max0, view.k_len) : max0),
+          max_key1(HasMask && !MaskCoversShape ? min(max1, view.k_len) : max1),
+          valid0(row0 && (!HasMask || MaskCoversShape || view.q_len == 1 ||
+                         view.qrow0 < view.q_len)),
+          valid1(row1 && (!HasMask || MaskCoversShape || view.q_len == 1 ||
+                         view.qrow1 < view.q_len)) {}
 
     DEVICE_FORCEINLINE bool is_masked(int row, int key) const {
         return !(row ? valid1 : valid0) || key >= (row ? max_key1 : max_key0) ||
@@ -188,6 +207,7 @@ struct KVAddr {
     const void* k;
     const void* v;
     bool valid;
+    bool vector_aligned = true;
 };
 
 // Contiguous K/V
@@ -241,14 +261,14 @@ template <typename T> struct ContigKV {
 
     template <int VEC>
     static DEVICE_FORCEINLINE KVAddr decode_addr(
-        const AttentionParams& p, const KVContext& c, int, int, int kc, int d, bool valid, bool) {
+        const AttentionParams& p, const KVContext& c, int, int, int, int kc, int d, bool valid, bool) {
         int token = resolve_token(p, c, kc, valid);
         return kv_addr_from_token(p, c, token, d);
     }
 };
 
 // Paged K/V backed by an SGLang-style flat pool
-template <typename T> struct PagedKV {
+template <typename T, bool AlignedNewKV = true> struct PagedKV {
     using Elem = T;
     static constexpr bool kPaged = true;
 
@@ -266,6 +286,20 @@ template <typename T> struct PagedKV {
     }
 
     static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) { return p.max_context_len; }
+
+    // Check both ends of the new-token copy without reading device metadata.
+    static HOST_FORCEINLINE bool new_kv_aligned(const AttentionParams& p) {
+        if (!p.new_k_ptr)
+            return true;
+        const uintptr_t addresses =
+            reinterpret_cast<uintptr_t>(p.k_ptr) | reinterpret_cast<uintptr_t>(p.v_ptr) |
+            reinterpret_cast<uintptr_t>(p.new_k_ptr) | reinterpret_cast<uintptr_t>(p.new_v_ptr);
+        const uintptr_t batch_stride =
+            p.batch > 1 ? static_cast<uintptr_t>(p.new_kv_b_stride) * sizeof(T) : 0;
+        const uintptr_t head_stride =
+            p.kv_head > 1 ? static_cast<uintptr_t>(p.new_kv_h_stride) * sizeof(T) : 0;
+        return ((addresses | batch_stride | head_stride) & 15) == 0;
+    }
 
     // decode: Q is [batch, q_head, head_dim], so batch is the outer row
     static DEVICE_FORCEINLINE int q_decode_base(const AttentionParams& p, int batch, int q_head) {
@@ -309,17 +343,31 @@ template <typename T> struct PagedKV {
             (int64_t)batch * p.new_kv_b_stride + (int64_t)kv_head * p.new_kv_h_stride + d;
         const T* __restrict__ nk = new_kptr(p);
         const T* __restrict__ nv = new_vptr(p);
-        return {&nk[off], &nv[off], true};
+        return {&nk[off], &nv[off], true, AlignedNewKV};
     }
 
+    template <int VEC>
     static DEVICE_FORCEINLINE void store_new_kv(
-        const AttentionParams& p, const KVContext& c, int seq_len, int d, const KVAddr& src) {
-        int slot = resolve_token(p, c, seq_len - 1, true);
+        const AttentionParams& p, const KVContext& c, int kc, int d, const KVAddr& src) {
+        const int slot = resolve_token(p, c, kc, true);
+        if (slot < 0)
+            return;
         const int64_t off = (int64_t)slot * c.pool_stride + c.head_off + d;
-        T* __restrict__ k = const_cast<T*>(kptr(p));
-        T* __restrict__ v = const_cast<T*>(vptr(p));
-        k[off] = *reinterpret_cast<const T*>(src.k);
-        v[off] = *reinterpret_cast<const T*>(src.v);
+        T* __restrict__ k = const_cast<T*>(kptr(p)) + off;
+        T* __restrict__ v = const_cast<T*>(vptr(p)) + off;
+        const T* __restrict__ nk = static_cast<const T*>(src.k);
+        const T* __restrict__ nv = static_cast<const T*>(src.v);
+        if constexpr (AlignedNewKV && VEC * sizeof(T) == 16) {
+            // The host checks source and pool alignment before selecting this policy.
+            *reinterpret_cast<uint4*>(k) = *reinterpret_cast<const uint4*>(nk);
+            *reinterpret_cast<uint4*>(v) = *reinterpret_cast<const uint4*>(nv);
+            return;
+        }
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            k[j] = nk[j];
+            v[j] = nv[j];
+        }
     }
 
     template <int VEC>
@@ -327,19 +375,15 @@ template <typename T> struct PagedKV {
                                                  const KVContext& c,
                                                  int batch,
                                                  int kv_head,
+                                                 int seq_len,
                                                  int kc,
                                                  int d,
                                                  bool valid,
                                                  bool persist) {
-        if (p.new_k_ptr && valid && kc == kv_len(p, batch) - 1) {
+        if (p.new_k_ptr && valid && kc == seq_len - 1) {
             KVAddr src = new_kv_addr(p, batch, kv_head, d);
-            if (persist) {
-#pragma unroll
-                for (int j = 0; j < VEC; j++) {
-                    KVAddr value = new_kv_addr(p, batch, kv_head, d + j);
-                    store_new_kv(p, c, kc + 1, d + j, value);
-                }
-            }
+            if (persist)
+                store_new_kv<VEC>(p, c, kc, d, src);
             return src;
         }
         int token = resolve_token(p, c, kc, valid);

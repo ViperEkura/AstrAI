@@ -88,8 +88,8 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
 
     // Visibility is fixed for these query rows across all K/V tiles.
     const MaskView mask_view{p.mask, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                             batch, q_head0 + gid, q_head0 + gid + 8, 0, 0,
-                             p.mask_k_len, p.mask_q_len};
+                             p.mask_k_len, p.mask_q_len, batch,
+                             q_head0 + gid, q_head0 + gid + 8, 0, 0};
     const AttentionMask<HasMask> mask{mask_view, seq_len, seq_len, va, vb};
 
     const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
@@ -103,8 +103,8 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
      */
     auto load_tile = [&](int ti, int buf) {
         KVTileLoader<Traits>::load(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
-            return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, kc, d, valid,
-                                                         pass == 0);
+            return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, seq_len,
+                                                         kc, d, valid, pass == 0);
         });
     };
 
@@ -222,34 +222,68 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
 template <typename KV> __global__ void attn_decode_combine_kernel(const AttentionParams p) {
     using T = typename KV::Elem;
 
-    int bh = blockIdx.x;
-    int d = threadIdx.x;
-    if (d >= p.head_dim)
-        return;
+    const int bh = blockIdx.x;
+    const int d = threadIdx.x;
+    const int batch = bh / p.q_head;
+    const int q_head = bh % p.q_head;
 
-    int batch = bh / p.q_head;
-    int q_head = bh % p.q_head;
-
-    size_t split_base = (size_t)bh * MAX_SPLITS;
+    const size_t split_base = (size_t)bh * MAX_SPLITS;
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
-
-    SoftmaxState st;
-    float acc = 0.0f;
     const float scale_log2 = p.scale * LOG2E;
-    for (int s = 0; s < p.num_splits; s++) {
-        float mi = mlp[s * 2];
-        if (mi <= -FLT_MAX)
-            continue;
-        float li = mlp[s * 2 + 1];
-        float corr, e;
-        softmax_step(st, mi, li, corr, e, scale_log2);
-        acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
+
+    // Avoid the block reduction for the smallest merge.
+    if (p.num_splits <= 2) {
+        if (d >= p.head_dim)
+            return;
+        SoftmaxState st;
+        float acc = 0.0f;
+        for (int s = 0; s < p.num_splits; s++) {
+            const float mi = mlp[s * 2];
+            if (mi <= -FLT_MAX)
+                continue;
+            const float li = mlp[s * 2 + 1];
+            float corr, e;
+            softmax_step(st, mi, li, corr, e, scale_log2);
+            acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
+        }
+        const float inv = st.l > 1e-20f ? 1.0f / st.l : 0.0f;
+        const int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
+        static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
+        return;
     }
 
-    float inv = (st.l > 1e-20f) ? (1.0f / st.l) : 0.0f;
-    int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
-    static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
+    // One warp computes the split weights shared by every output dimension.
+    __shared__ float weights[MAX_SPLITS];
+    __shared__ float inv_sum;
+    if (d < 32) {
+        const bool valid = d < p.num_splits;
+        const float mi = valid ? mlp[d * 2] : -FLT_MAX;
+        const float li = valid ? mlp[d * 2 + 1] : 0.0f;
+        float max_m = mi;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            max_m = fmaxf(max_m, __shfl_xor_sync(0xFFFFFFFF, max_m, offset));
+        const float weight =
+            mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
+        if (valid)
+            weights[d] = weight;
+        float sum_l = li * weight;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            sum_l += __shfl_xor_sync(0xFFFFFFFF, sum_l, offset);
+        if (d == 0)
+            inv_sum = sum_l > 1e-20f ? 1.0f / sum_l : 0.0f;
+    }
+    __syncthreads();
+
+    if (d < p.head_dim) {
+        float acc = 0.0f;
+        for (int s = 0; s < p.num_splits; s++)
+            acc = fmaf(op[s * p.head_dim + d], weights[s], acc);
+        const int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
+        static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);
+    }
 }
 
 } // namespace attention

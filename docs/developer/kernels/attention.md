@@ -101,7 +101,53 @@ kernel. Compile-time checks reject incompatible element widths, instruction
 shapes and incomplete tiles. No runtime virtual dispatch or heap allocations
 are introduced in the device path. These tools remain in existing headers.
 
+## Native launch dispatch
+
+Attention follows the same typed query, plan, and launch structure as GEMM,
+in the existing `launcher/attention.cuh`:
+
+1. `with_prefill_kernel` / `with_decode_kernel` select the head dimension
+   and mask specialization once. Prefill also selects causality. Paged
+   prefill selects a mask-coverage specialization: full masks omit redundant
+   extent checks, while partial masks retain them. Cache capacity and total
+   query rows provide conservative bounds without device reads. Dense prefill
+   retains the checked mask kernel for stable compiler code generation.
+2. The selected kernel type builds a plan from host metadata. Decode uses a
+   `DecodePlanQuery` containing grid dimensions, KV tile count and cached
+   occupancy. `make_decode_plan` is a pure split policy.
+3. The torch entry validates or allocates scratch using that plan, then the
+   same kernel type launches it. Native harnesses use the same visitor and
+   planner without depending on torch.
+
+Plans contain launch geometry and output mode, never tensor addresses or
+device sequence lengths. Every call plans from its current shape; residual
+split fields in `AttentionParams` do not bypass planning. Paged decode uses
+the host cache capacity, so device lengths can change during graph replay.
+The existing tile recipes, occupancy reference and split limits are retained.
+Scratch still uses the kernel's `MAX_SPLITS` stride, and caller-supplied
+buffers are validated even when direct output needs no scratch.
+
+Paged decode selects aligned or unaligned new-token loads from host pointer
+and stride metadata. The aligned kernel copies new K/V fragments in 16-byte
+units; the other kernel uses scalar loads and stores for new K/V, retaining
+arbitrary outer source strides. The last token's page slot is resolved once
+per fragment. Only the
+first GQA pass writes the cache; every pass reads new K/V directly, so no
+cross-block write/read dependency is introduced.
+
+Split merges with at most two parts retain the online recurrence. Larger
+merges compute the common maximum, denominator and split weights once per
+head with one warp; output dimensions reuse these weights for FP32
+accumulation. Empty splits contribute zero, including fully masked rows.
+
 ## Parameter boundaries
+
+The native parameter struct groups pointers first, then shapes, strides and
+control values, using natural alignment. Mask metadata stays directly in
+`AttentionParams`: `mask_b_stride`, `mask_h_stride` and `mask_l_stride`
+follow the tensor stride names (`l` is the query sequence axis), while
+`mask_k_len` and `mask_q_len` bound the key and query axes. Separate bounds
+preserve partial paged masks and singleton query broadcast.
 
 - Callers choose `is_causal`, `mask` and `scale`. Dense alignment comes from
   Q/K lengths; packed alignment comes from each request's device metadata.

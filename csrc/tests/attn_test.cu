@@ -10,10 +10,120 @@ nvcc -I csrc/include -arch=sm_89 -O3 \
 #include "test_utils.cuh"
 #include <launcher/attention.cuh>
 
+#include <cstring>
+
 using namespace astrai::attention;
 
 /* Dispatch resolves head_dim from the element type, keeping the harness torch-free. */
 using bf16 = astrai::bf16;
+
+// Plan checks exercise the public dispatcher without allocating or launching kernels.
+static bool same_decode_plan(const DecodeLaunchPlan& a, const DecodeLaunchPlan& b) {
+    return a.grid.x == b.grid.x && a.grid.y == b.grid.y && a.grid.z == b.grid.z &&
+           a.direct_output == b.direct_output;
+}
+
+template <int D, typename KV, bool HasMask>
+static bool decode_type_matches(DecodeKernel<D, KV, HasMask>, int dim, bool has_mask) {
+    return D == dim && HasMask == has_mask;
+}
+
+template <typename KV>
+static int check_decode_query(bool paged, int dim, bool has_mask, bool causal) {
+    bool mask = true;
+    AttentionParams p{};
+    p.batch = 3;
+    p.q_head = 66; // 33 query heads per KV head requires three passes.
+    p.kv_head = 2;
+    p.head_dim = dim;
+    p.q_len = 1;
+    p.kv_len = 17;
+    p.max_context_len = 513;
+    p.is_causal = causal;
+    p.mask = has_mask ? &mask : nullptr;
+    // Planning must neither trust the prior split count nor modify caller state.
+    p.num_splits = MAX_SPLITS + 7;
+    unsigned char before[sizeof(p)];
+    std::memcpy(before, &p, sizeof(p));
+    bool pass = false;
+    with_decode_kernel<KV>(p, [&](auto kernel) {
+        const auto query = kernel.query(p);
+        const auto first = kernel.plan(p);
+        pass = decode_type_matches(kernel, dim, has_mask) &&
+               query.batch == 3 && query.q_heads == 66 && query.kv_heads == 2 &&
+               query.head_dim == dim && query.kv_tiles == (paged ? 33 : 2) &&
+               query.wave_capacity > 0 && first.grid.x == 6 && first.grid.y == 3 &&
+               std::memcmp(before, &p, sizeof(p)) == 0;
+        p.num_splits = 0;
+        std::memcpy(before, &p, sizeof(p));
+        const auto second = kernel.plan(p);
+        pass = pass && same_decode_plan(first, second) &&
+               std::memcmp(before, &p, sizeof(p)) == 0;
+        // Reusing the parameter object for shorter KV must produce a fresh plan.
+        p.kv_len = 1;
+        p.max_context_len = 1;
+        p.num_splits = MAX_SPLITS;
+    });
+    const auto shorter = with_decode_kernel<KV>(p, [&](auto kernel) { return kernel.plan(p); });
+    pass = pass && shorter.grid.z == 1 && shorter.direct_output == (dim <= 128);
+    if (!pass)
+        printf("FAILED decode query: paged=%d D=%d mask=%d causal=%d\n",
+               paged, dim, has_mask, causal);
+    return pass ? 0 : 1;
+}
+
+static int run_plan_tests() {
+    struct Case {
+        DecodePlanQuery query;
+        unsigned int x, y, splits;
+        bool direct;
+    };
+    const Case cases[] = {
+        {{1, 8, 1, 32, 0, 128}, 1, 1, 1, true},   // Empty KV is still one block.
+        {{1, 8, 1, 64, 3, 128}, 1, 1, 1, true},   // Need two KV tiles per split.
+        {{1, 8, 1, 128, 4, 128}, 1, 1, 2, false},
+        {{1, 8, 1, 256, 2, 128}, 1, 1, 1, false}, // D256 retains the combine pass.
+        {{1, 8, 1, 128, 65, 1024}, 1, 1, MAX_SPLITS, false},
+        {{64, 32, 4, 128, 256, 128}, 4, 64, 1, true}, // Already exceeds one wave.
+        {{2, 64, 2, 128, 256, 128}, 4, 2, 16, false}, // Exactly 32 heads per KV.
+        {{2, 66, 2, 128, 256, 128}, 6, 2, 10, false}, // 33 heads needs third pass.
+        {{1, 64, 4, 128, 256, 7}, 4, 1, 1, true}, // Do not cross a wave boundary.
+        {{1, 64, 4, 128, 256, 8}, 4, 1, 2, false},
+    };
+    int fail = 0;
+    for (int i = 0; i < static_cast<int>(sizeof(cases) / sizeof(cases[0])); ++i) {
+        const auto& c = cases[i];
+        const auto plan = make_decode_plan(c.query);
+        if (plan.grid.x != c.x || plan.grid.y != c.y || plan.grid.z != c.splits ||
+            plan.direct_output != c.direct) {
+            printf("FAILED decode split policy case %d\n", i);
+            ++fail;
+        }
+    }
+
+    for (int dim : {32, 64, 128, 256}) {
+        for (bool mask : {false, true}) {
+            for (bool causal : {false, true}) {
+                fail += check_decode_query<ContigKV<bf16>>(false, dim, mask, causal);
+                fail += check_decode_query<PagedKV<bf16>>(true, dim, mask, causal);
+            }
+        }
+    }
+    AttentionParams unsupported{};
+    unsupported.head_dim = 96;
+    bool rejected = false;
+    try {
+        with_decode_kernel<ContigKV<bf16>>(unsupported, [](auto) {});
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).find("96") != std::string::npos;
+    }
+    if (!rejected) {
+        printf("FAILED unsupported decode head dimension\n");
+        ++fail;
+    }
+    printf("Attention plan tests: %s\n", fail ? "FAILED" : "passed");
+    return fail;
+}
 
 // Split-K scratch (torch-free)
 struct DecodeScratch {
@@ -95,7 +205,7 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int cau
     cudaMemcpy(hOut, dO, nQ * 2, cudaMemcpyDeviceToHost);
 
     float* ref = new float[nQ];
-    cpu_attention_ref(hQ, hK, hV, nullptr, ref, B, Hq, Hk, ql, kl, D, causal ? 0 : -1);
+    cpu_attention_ref(hQ, hK, hV, nullptr, ref, B, Hq, Hk, ql, kl, D, causal);
 
     float max_abs_err = 0, max_rel_err = 0;
     bool pass = true;
@@ -107,7 +217,8 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int cau
         float rel = err / fmaxf(fabsf(ref[i]), 1e-4f);
         if (rel > max_rel_err)
             max_rel_err = rel;
-        if (err > atol + rtol * fabsf(ref[i]))
+        if (!std::isfinite(bf2f(hOut[i])) || !std::isfinite(ref[i]) ||
+            err > atol + rtol * fabsf(ref[i]))
             pass = false;
     }
     char cfg[64];
@@ -194,7 +305,9 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causa
 }
 
 int main() {
-    int fail = 0;
+    int fail = run_plan_tests();
+    if (fail)
+        return fail;
 
     // DECODE
     {
@@ -238,6 +351,8 @@ int main() {
             {1, 2, 1, 64, 128, 32, 0},    // smallest head_dim D=32
             {1, 4, 2, 256, 256, 32, 1},   // causal D=32 dispatch
             {1, 2, 1, 64, 128, 64, 0},    // tiny: B,Hq,Hk,q,kv,D,causal
+            {1, 2, 1, 64, 128, 64, 1},    // Causal queries align to the KV tail.
+            {1, 2, 1, 128, 64, 64, 1},    // Leading query rows have no visible keys.
             {1, 4, 2, 256, 256, 64, 1},   // causal D=64 dispatch
             {1, 32, 4, 512, 512, 128, 0}, // standard
             {1, 32, 4, 128, 256, 128, 0}, // medium

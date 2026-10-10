@@ -28,7 +28,8 @@ namespace attention {
  * compile-time bools — dead branches eliminated in the compute loop.
  * Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2, Elem>.
  */
-template <typename Traits, typename QSchedule, typename KV, bool IsCausal, bool HasMask>
+template <typename Traits, typename QSchedule, typename KV, bool IsCausal, bool HasMask,
+          bool MaskCoversShape = false>
 __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
     using T = typename Traits::Elem;
     using Mma = AttentionMma<Traits>;
@@ -111,9 +112,9 @@ __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
     const int maxc0 = IsCausal ? min(seq_len, query_start + mra + 1) : seq_len;
     const int maxc1 = IsCausal ? min(seq_len, query_start + mrb + 1) : seq_len;
     const MaskView mask_view{p.mask, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                             batch, kv_head * G + h0, kv_head * G + h1, mra, mrb,
-                             p.mask_k_len, p.mask_q_len};
-    const AttentionMask<HasMask> mask{mask_view, maxc0, maxc1, va, vb};
+                             p.mask_k_len, p.mask_q_len, batch,
+                             kv_head * G + h0, kv_head * G + h1, mra, mrb};
+    const AttentionMask<HasMask, MaskCoversShape> mask{mask_view, maxc0, maxc1, va, vb};
 
     const int tiles = (seq_len + Traits::BC - 1) / Traits::BC;
 

@@ -54,8 +54,9 @@ __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
      */
     const float scale_log2 = p.scale * LOG2E;
 
+    const int q_block = QSchedule::template order_work<IsCausal>(p, blockIdx.x, gridDim.x);
     int batch, packed0;
-    QSchedule::map_packed_block(p, BLOCK_M, batch, packed0);
+    QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
 
     /*
      * Warp w folds packed rows [warp*BR, (warp+1)*BR) of the block; each mma
@@ -73,8 +74,13 @@ __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
     // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
     const int seq_len = KV::kv_len(p, batch);
     const int q_len = QSchedule::q_len(p, batch);
+    if constexpr (KV::kPaged) {
+        // The host tile map pads the last query tile of each request.
+        if (packed0 >= G * q_len)
+            return;
+    }
     const int query_start = seq_len - q_len;
-    const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
+    const auto kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
 
     /*
      * Static shared memory: double-buffered K/V (Q goes straight to

@@ -241,6 +241,86 @@ def test_paged_decode_graph_replays_split_append(dim, width):
 
 
 @skip_no_kernel
+@pytest.mark.parametrize("dim", [64, 128, 256])
+def test_paged_decode_large_graph_reuses_shorter_lengths(dim):
+    torch.manual_seed(26)
+    batch, heads, kv_heads, width = 2, 6, 2, 8192
+    length_cases = ((8191, 1), (17, 33), (1, 513), (0, 2048))
+    q = torch.randn(batch, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.randn(batch * width, kv_heads, dim, device="cuda", dtype=q.dtype)
+    v_cache = torch.randn_like(k_cache)
+    table = torch.arange(batch * width, device="cuda", dtype=torch.int32).view(
+        batch, width
+    )
+    requests = torch.arange(batch, device="cuda", dtype=torch.int32)
+    indptr = torch.tensor([0, 4095, 4096], device="cuda", dtype=torch.int32)
+    new_k = torch.randn(batch, kv_heads, dim, device="cuda", dtype=q.dtype)
+    new_v = torch.randn_like(new_k)
+    mask = torch.ones(batch, heads, 1, width, device="cuda", dtype=torch.bool)
+    mask[..., 3::7] = False
+    mask[0, 0] = False
+    scratch = torch.empty(batch, heads, 32, dim, device="cuda", dtype=torch.float32)
+    ml = torch.empty(batch, heads, 32, 2, device="cuda", dtype=torch.float32)
+    output = torch.empty_like(q)
+
+    def call():
+        return attn_paged_decode(
+            q,
+            k_cache,
+            v_cache,
+            table,
+            requests,
+            indptr,
+            new_k=new_k,
+            new_v=new_v,
+            mask=mask,
+            scale=0.13,
+            o_part_buf=scratch,
+            ml_part_buf=ml,
+            out_buf=output,
+        )
+
+    warm = torch.cuda.Stream()
+    with torch.cuda.stream(warm):
+        warm.wait_stream(torch.cuda.current_stream())
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(warm)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    for lengths in length_cases:
+        indptr.copy_(
+            torch.tensor(
+                [0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32
+            )
+        )
+        new_k.normal_()
+        new_v.normal_()
+        # Old partials must not affect a replay with fewer active splits.
+        scratch.fill_(float("nan"))
+        ml.fill_(float("nan"))
+        graph.replay()
+        for b, length in enumerate(lengths):
+            if length == 0:
+                assert torch.count_nonzero(captured[b]) == 0
+                continue
+            slot = b * width + length - 1
+            torch.testing.assert_close(k_cache[slot], new_k[b], rtol=0, atol=0)
+            torch.testing.assert_close(v_cache[slot], new_v[b], rtol=0, atol=0)
+            expected = _reference(
+                q[b : b + 1, None],
+                k_cache[None, b * width : b * width + length],
+                v_cache[None, b * width : b * width + length],
+                mask=mask[b : b + 1, :, :, :length],
+                scale=0.13,
+            )
+            torch.testing.assert_close(
+                captured[b], expected[0, 0], atol=0.02, rtol=0.02
+            )
+
+
+@skip_no_kernel
 @pytest.mark.parametrize("dim,length,masked", [(64, 13, False), (256, 193, True)])
 @pytest.mark.parametrize("layout", ["aligned", "k_offset", "v_offset", "outer_strides"])
 def test_paged_decode_append_strided_sources(dim, length, masked, layout):
@@ -447,6 +527,64 @@ def test_prefill_mask_query_axis_broadcast(rank, causal):
     out = attn_prefill(q, k, v, mask=mask, is_causal=causal)
     expected = _reference(q, k, v, mask=mask, causal=causal)
     torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
+
+
+@skip_no_kernel
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "q_lens,kv_lens", [((1, 65), (129, 192)), ((1, 1025), (129, 1152))]
+)
+def test_paged_prefill_ragged_tile_boundary(causal, q_lens, kv_lens):
+    torch.manual_seed(27)
+    batch, width, heads, kv_heads, dim = 2, max(kv_lens), 6, 1, 64
+    q = torch.randn(sum(q_lens), heads, dim, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.randn(batch * width, kv_heads, dim, device="cuda", dtype=q.dtype)
+    v_cache = torch.randn_like(k_cache)
+    table = torch.arange(batch * width, device="cuda", dtype=torch.int32).view(
+        batch, width
+    )
+    requests = torch.arange(batch, device="cuda", dtype=torch.int32)
+    kv_indptr = torch.tensor(
+        [0, kv_lens[0], sum(kv_lens)], device="cuda", dtype=torch.int32
+    )
+    qo_indptr = torch.tensor(
+        [0, q_lens[0], sum(q_lens)], device="cuda", dtype=torch.int32
+    )
+    q_tiles = [(length + 63) // 64 for length in q_lens]
+    tile_batches = torch.tensor(
+        [b for b, count in enumerate(q_tiles) for _ in range(count)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    tile_indices = torch.tensor(
+        [tile for count in q_tiles for tile in range(count)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    out = attn_paged_prefill(
+        q,
+        k_cache,
+        v_cache,
+        table,
+        requests,
+        kv_indptr,
+        qo_indptr,
+        tile_batches,
+        tile_indices,
+        is_causal=causal,
+    )
+    start = 0
+    for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+        expected = _reference(
+            q[None, start : start + q_len],
+            k_cache[None, b * width : b * width + kv_len],
+            v_cache[None, b * width : b * width + kv_len],
+            causal=causal,
+        )
+        torch.testing.assert_close(
+            out[start : start + q_len], expected[0], atol=0.02, rtol=0.02
+        )
+        start += q_len
 
 
 @skip_no_kernel

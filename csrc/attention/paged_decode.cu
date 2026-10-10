@@ -43,7 +43,7 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
         TORCH_CHECK(out_buf->size(1) == q.size(1), "out_buf heads must match q");
         TORCH_CHECK(out_buf->size(2) == q.size(2), "out_buf head_dim must match q");
         TORCH_CHECK(q.is_contiguous(), "q must be contiguous when out_buf is provided");
-        O = out_buf.value().slice(0, 0, q.size(0));
+        O = out_buf->size(0) == q.size(0) ? *out_buf : out_buf->slice(0, 0, q.size(0));
     } else {
         O = torch::empty_strided(q.sizes(), q.strides(), q.options());
     }
@@ -51,7 +51,6 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
 
     DecodeCall call{p, q, o_part_buf, ml_part_buf};
     attn_dtype_dispatch<PagedDecodeEntry>(q.scalar_type(), call, stream);
-    C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }
 

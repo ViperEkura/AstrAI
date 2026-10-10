@@ -289,8 +289,6 @@ inline void attn_pack_paged_decode_params(torch::Tensor q,
                                           c10::optional<double> scale,
                                           AttentionParams& p,
                                           bool is_causal) {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
-
     pack_paged_common(q, k_cache, v_cache, req_to_token, req_pool_indices, kv_indptr, p);
     p.batch = (int)q.size(0);
     p.q_len = 1;

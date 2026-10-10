@@ -11,6 +11,15 @@
 namespace astrai {
 namespace attention {
 
+// Keep the extra split bookkeeping on large graph capacities only. The device
+// skips partials when the replayed request uses under one eighth of the table.
+constexpr int SKIP_EMPTY_SPLITS_MIN_CAPACITY = 8192;
+constexpr int SKIP_EMPTY_SPLITS_CAPACITY_RATIO = 8;
+
+DEVICE_FORCEINLINE bool skip_empty_decode_splits(const AttentionParams& p, int seq_len) {
+    return seq_len < p.max_context_len / SKIP_EMPTY_SPLITS_CAPACITY_RATIO;
+}
+
 /*
  * Split-K (FlashDecoding) tensor-core decode, unified across contiguous
  * and paged K/V via the KV template parameter. Decode has q_len == 1, so
@@ -22,7 +31,11 @@ namespace attention {
  * KV = ContigKV or PagedKV; HasMask is compile-time. Traits =
  * KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
  */
-template <typename Traits, typename KV, bool HasMask, bool DirectOutput = false>
+template <typename Traits,
+          typename KV,
+          bool HasMask,
+          bool DirectOutput = false,
+          bool SkipEmptySplits = false>
 __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
     using T = typename Traits::Elem;
     using Mma = AttentionMma<Traits>;
@@ -45,7 +58,7 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
 
     // Per-request seq_len (paged reads kv_indptr; contig uses p.kv_len).
     const int seq_len = KV::kv_len(p, batch);
-    const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
+    const auto kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
     /*
      * scale * log2(e): the exp2 base-change factor folded into every
      * softmax exponent (see arith/softmax.cuh). The partials this kernel
@@ -97,6 +110,11 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
     const int ti_begin = split * tiles_per_split;
     const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
+    if constexpr (SkipEmptySplits && KV::kPaged) {
+        // Skip empty splits only when a graph reuses much less than its capacity.
+        if (skip_empty_decode_splits(p, seq_len) && split > 0 && ti_begin >= tiles_total)
+            return;
+    }
 
     /*
      * ---- Load tile lambda: predicated cp.async (addressing via KV policy;
@@ -220,7 +238,8 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
  * Split-combine: merges the per-split partials (o_part/ml_part) into the
  * final normalised O (KV selects the O addressing and element type).
  */
-template <typename KV> __global__ void attn_decode_combine_kernel(const AttentionParams p) {
+template <typename KV, int TileK, bool SkipEmptySplits = false>
+__global__ void attn_decode_combine_kernel(const AttentionParams p) {
     using T = typename KV::Elem;
 
     const int bh = blockIdx.x;
@@ -232,14 +251,24 @@ template <typename KV> __global__ void attn_decode_combine_kernel(const Attentio
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
     const float scale_log2 = p.scale * LOG2E;
+    int active_splits = p.num_splits;
+    if constexpr (SkipEmptySplits && KV::kPaged) {
+        const int seq_len = KV::kv_len(p, batch);
+        if (skip_empty_decode_splits(p, seq_len)) {
+            const int tiles_total = (seq_len + TileK - 1) / TileK;
+            const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
+            active_splits =
+                tiles_per_split ? (tiles_total + tiles_per_split - 1) / tiles_per_split : 1;
+        }
+    }
 
     // Avoid the block reduction for the smallest merge.
-    if (p.num_splits <= 2) {
+    if (active_splits <= 2) {
         if (d >= p.head_dim)
             return;
         SoftmaxState st;
         float acc = 0.0f;
-        for (int s = 0; s < p.num_splits; s++) {
+        for (int s = 0; s < active_splits; s++) {
             const float mi = mlp[s * 2];
             if (mi <= -FLT_MAX)
                 continue;
@@ -258,7 +287,7 @@ template <typename KV> __global__ void attn_decode_combine_kernel(const Attentio
     __shared__ float weights[MAX_SPLITS];
     __shared__ float inv_sum;
     if (d < 32) {
-        const bool valid = d < p.num_splits;
+        const bool valid = d < active_splits;
         const float mi = valid ? mlp[d * 2] : -FLT_MAX;
         const float li = valid ? mlp[d * 2 + 1] : 0.0f;
         float max_m = mi;
@@ -279,7 +308,7 @@ template <typename KV> __global__ void attn_decode_combine_kernel(const Attentio
 
     if (d < p.head_dim) {
         float acc = 0.0f;
-        for (int s = 0; s < p.num_splits; s++)
+        for (int s = 0; s < active_splits; s++)
             acc = fmaf(op[s * p.head_dim + d], weights[s], acc);
         const int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
         static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);

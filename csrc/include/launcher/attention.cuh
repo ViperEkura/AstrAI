@@ -93,30 +93,12 @@ template <auto Kernel, int Threads> inline int decode_wave_capacity() {
     return capacity;
 }
 
-template <int BC_> struct PrefillKernelConfig {
-    static constexpr int BC = BC_;
+// Tile shape is a compile-time property of the prefill specialization.
+template <int HEAD_DIM, bool IsCausal> struct PrefillConfig {
+    static_assert(HEAD_DIM == 32 || HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
+    static constexpr int BC = HEAD_DIM == 256 ? 16 : (IsCausal && HEAD_DIM <= 64 ? 64 : 32);
     static constexpr int WARPS = 4;
     static constexpr int STAGES = 2;
-};
-
-/*
- * Prefill tile-config map (BC by head_dim × causal), shared by the
- * contiguous and paged entries. Unsupported head dims have no mapping.
- */
-template <int HEAD_DIM, bool IsCausal> struct PrefillConfigMap;
-
-template <> struct PrefillConfigMap<32, false> : PrefillKernelConfig<32> {};
-template <> struct PrefillConfigMap<32, true> : PrefillKernelConfig<64> {};
-template <> struct PrefillConfigMap<64, false> : PrefillKernelConfig<32> {};
-template <> struct PrefillConfigMap<64, true> : PrefillKernelConfig<64> {};
-template <> struct PrefillConfigMap<128, false> : PrefillKernelConfig<32> {};
-template <> struct PrefillConfigMap<128, true> : PrefillKernelConfig<32> {};
-template <> struct PrefillConfigMap<256, false> : PrefillKernelConfig<16> {};
-template <> struct PrefillConfigMap<256, true> : PrefillKernelConfig<16> {};
-
-// Plans contain host launch metadata only; tensor addresses stay in AttentionParams.
-struct PrefillLaunchPlan {
-    dim3 grid;
 };
 
 struct DecodePlanQuery {
@@ -150,26 +132,26 @@ template <int HEAD_DIM,
           bool HasMask,
           bool MaskCoversShape = false>
 struct PrefillKernel {
-    using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
+    using Config = PrefillConfig<HEAD_DIM, IsCausal>;
     using Traits =
         KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES, typename KV::Elem>;
 
-    static PrefillLaunchPlan plan(const AttentionParams& p) {
+    static dim3 plan(const AttentionParams& p) {
         // Each block owns BLOCK_M packed (head, row) rows; grid.y selects the KV head.
         constexpr int BLOCK_M = Traits::BR * Config::WARPS;
-        return {dim3(QSchedule::packed_grid_x(p, BLOCK_M, BLOCK_M), p.kv_head,
-                     QSchedule::host_grid_batch(p))};
+        return dim3(QSchedule::packed_grid_x(p, BLOCK_M, BLOCK_M), p.kv_head,
+                    QSchedule::host_grid_batch(p));
     }
 
-    static void
-    launch(const AttentionParams& p, const PrefillLaunchPlan& plan, cudaStream_t stream) {
+    static void launch(const AttentionParams& p, dim3 grid, cudaStream_t stream) {
         attn_prefill_split_q_mma_kernel<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape>
-            <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
+            <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
 };
 
-template <int HEAD_DIM, typename KV, bool HasMask> struct DecodeKernel {
+template <int HEAD_DIM, typename KV, bool HasMask, bool SkipEmptySplits = false>
+struct DecodeKernel {
     // BC=16 retains the existing shared-memory/register footprint and occupancy.
     using Traits = KernelTraits<HEAD_DIM, 16, 1, 2, typename KV::Elem>;
 
@@ -181,8 +163,9 @@ template <int HEAD_DIM, typename KV, bool HasMask> struct DecodeKernel {
                 p.kv_head,
                 HEAD_DIM,
                 (kv_len + Traits::BC - 1) / Traits::BC,
-                decode_wave_capacity<attn_decode_split_kv_mma_kernel<Traits, KV, HasMask>,
-                                     Traits::NUM_THREADS>()};
+                decode_wave_capacity<
+                    attn_decode_split_kv_mma_kernel<Traits, KV, HasMask, false, SkipEmptySplits>,
+                    Traits::NUM_THREADS>()};
     }
 
     static DecodeLaunchPlan plan(const AttentionParams& p) { return make_decode_plan(query(p)); }
@@ -197,10 +180,11 @@ template <int HEAD_DIM, typename KV, bool HasMask> struct DecodeKernel {
                 return;
             }
         }
-        attn_decode_split_kv_mma_kernel<Traits, KV, HasMask>
+        attn_decode_split_kv_mma_kernel<Traits, KV, HasMask, false, SkipEmptySplits>
             <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
-        attn_decode_combine_kernel<KV><<<p.batch * p.q_head, HEAD_DIM, 0, stream>>>(p);
+        attn_decode_combine_kernel<KV, Traits::BC, SkipEmptySplits>
+            <<<p.batch * p.q_head, HEAD_DIM, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
 };
@@ -246,6 +230,20 @@ inline auto with_prefill_kernel(const AttentionParams& p, Fn&& fn) {
     });
 }
 
+template <int D, typename KV, typename Fn>
+inline auto with_decode_variant(const AttentionParams& p, Fn&& fn) {
+    if constexpr (KV::kPaged) {
+        if (p.max_context_len >= SKIP_EMPTY_SPLITS_MIN_CAPACITY) {
+            if (p.mask)
+                return fn(DecodeKernel<D, KV, true, true>{});
+            return fn(DecodeKernel<D, KV, false, true>{});
+        }
+    }
+    if (p.mask)
+        return fn(DecodeKernel<D, KV, true>{});
+    return fn(DecodeKernel<D, KV, false>{});
+}
+
 template <typename KV, typename Fn>
 inline auto with_decode_kernel(const AttentionParams& p, Fn&& fn) {
     return with_head_dim(p.head_dim, [&](auto dim) {
@@ -254,15 +252,11 @@ inline auto with_decode_kernel(const AttentionParams& p, Fn&& fn) {
         if constexpr (KV::kPaged) {
             if (!KV::new_kv_aligned(p)) {
                 using UnalignedKV = PagedKV<typename KV::Elem, false>;
-                if (p.mask)
-                    return fn(DecodeKernel<D, UnalignedKV, true>{});
-                return fn(DecodeKernel<D, UnalignedKV, false>{});
+                return with_decode_variant<D, UnalignedKV>(p, fn);
             }
         }
         // A single right-aligned query needs no independent causal specialization.
-        if (p.mask)
-            return fn(DecodeKernel<D, KV, true>{});
-        return fn(DecodeKernel<D, KV, false>{});
+        return with_decode_variant<D, KV>(p, fn);
     });
 }
 

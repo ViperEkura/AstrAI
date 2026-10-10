@@ -110,11 +110,6 @@ template <bool HasMask, bool MaskCoversShape = false> struct AttentionMask {
 struct DenseQSchedule {
     static HOST_FORCEINLINE int host_grid_batch(const AttentionParams& p) { return p.batch; }
 
-    static DEVICE_FORCEINLINE void map_block(const AttentionParams&, int& batch, int& q_tile) {
-        batch = blockIdx.z;
-        q_tile = blockIdx.x;
-    }
-
     /*
      * PackGQA-folded prefill mapping: the block's row space is the packed
      * (head, row) space of the request — G heads folded, h = idx % G,
@@ -127,10 +122,15 @@ struct DenseQSchedule {
         return (p.q_len * G + block_m - 1) / block_m;
     }
 
+    template <bool IsCausal>
+    static DEVICE_FORCEINLINE int order_work(const AttentionParams&, int physical, int) {
+        return physical;
+    }
+
     static DEVICE_FORCEINLINE void
-    map_packed_block(const AttentionParams&, int block_m, int& batch, int& packed0) {
+    map_packed_block(const AttentionParams&, int block_m, int q_block, int& batch, int& packed0) {
         batch = blockIdx.z;
-        packed0 = blockIdx.x * block_m;
+        packed0 = q_block * block_m;
     }
 
     static DEVICE_FORCEINLINE int q_len(const AttentionParams& p, int) { return p.q_len; }
@@ -141,16 +141,7 @@ struct DenseQSchedule {
 };
 
 struct PackedQSchedule {
-    static HOST_FORCEINLINE int host_q_blocks(const AttentionParams& p, int) {
-        return p.num_q_tiles;
-    }
-
     static HOST_FORCEINLINE int host_grid_batch(const AttentionParams&) { return 1; }
-
-    static DEVICE_FORCEINLINE void map_block(const AttentionParams& p, int& batch, int& q_tile) {
-        batch = p.q_tile_to_batch[blockIdx.x];
-        q_tile = p.q_tile_to_index[blockIdx.x];
-    }
 
     /*
      * PackGQA-folded prefill mapping: the host tile maps are built in
@@ -166,13 +157,26 @@ struct PackedQSchedule {
         return p.num_q_tiles * blocks_per_host_tile;
     }
 
+    static constexpr int MIN_REVERSE_Q_TILES = 16;
+
+    template <bool IsCausal>
+    static DEVICE_FORCEINLINE int
+    order_work(const AttentionParams& p, int physical, int work_count) {
+        if constexpr (IsCausal) {
+            // Long causal tiles read more K/V; launch the tail before the first tile.
+            if (p.num_q_tiles >= MIN_REVERSE_Q_TILES)
+                return work_count - 1 - physical;
+        }
+        return physical;
+    }
+
     static DEVICE_FORCEINLINE void
-    map_packed_block(const AttentionParams& p, int block_m, int& batch, int& packed0) {
+    map_packed_block(const AttentionParams& p, int block_m, int q_block, int& batch, int& packed0) {
         const int G = p.q_head / p.kv_head;
         const int blocks_per_host_tile = G * HOST_Q_TILE_ROWS / block_m;
-        const int host_tile = blockIdx.x / blocks_per_host_tile;
+        const int host_tile = q_block / blocks_per_host_tile;
         batch = p.q_tile_to_batch[host_tile];
-        const int in_tile = blockIdx.x - host_tile * blocks_per_host_tile;
+        const int in_tile = q_block - host_tile * blocks_per_host_tile;
         packed0 = p.q_tile_to_index[host_tile] * HOST_Q_TILE_ROWS * G + in_tile * block_m;
     }
 
@@ -183,15 +187,6 @@ struct PackedQSchedule {
     static DEVICE_FORCEINLINE int q_base(const AttentionParams& p, int batch, int q_head) {
         return p.qo_indptr[batch] * p.q_l_stride + q_head * p.q_h_stride;
     }
-};
-
-// Hoisted per-(batch, kv_head) addressing context.
-struct KVContext {
-    int kv_base;         // contig: batch*kv_b_stride + kv_head*kv_h_stride
-    int req_idx;         // paged: req_pool_indices[batch]
-    int64_t rtt_stride;  // paged: max_context_len
-    int64_t pool_stride; // paged: kv_head * HEAD_DIM
-    int64_t head_off;    // paged: kv_head * HEAD_DIM
 };
 
 /*
@@ -214,6 +209,9 @@ struct KVAddr {
 template <typename T> struct ContigKV {
     using Elem = T;
     static constexpr bool kPaged = false;
+    struct Context {
+        int kv_base;
+    };
 
     /*
      * Typed views of the params' dtype-agnostic pointers. The restrict
@@ -237,17 +235,15 @@ template <typename T> struct ContigKV {
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int) { return p.kv_len; }
 
     template <int HEAD_DIM>
-    static DEVICE_FORCEINLINE KVContext make_ctx(const AttentionParams& p, int batch, int kv_head) {
-        KVContext c = {};
-        c.kv_base = batch * p.kv_b_stride + kv_head * p.kv_h_stride;
-        return c;
+    static DEVICE_FORCEINLINE Context make_ctx(const AttentionParams& p, int batch, int kv_head) {
+        return {batch * p.kv_b_stride + kv_head * p.kv_h_stride};
     }
     static DEVICE_FORCEINLINE int
-    resolve_token(const AttentionParams& p, const KVContext& c, int kc, bool valid) {
+    resolve_token(const AttentionParams& p, const Context& c, int kc, bool valid) {
         return valid ? kc : -1;
     }
     static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(const AttentionParams& p,
-                                                        const KVContext& c,
+                                                        const Context& c,
                                                         int token,
                                                         int d) {
         const bool valid = token >= 0;
@@ -261,7 +257,7 @@ template <typename T> struct ContigKV {
 
     template <int VEC>
     static DEVICE_FORCEINLINE KVAddr decode_addr(const AttentionParams& p,
-                                                 const KVContext& c,
+                                                 const Context& c,
                                                  int,
                                                  int,
                                                  int,
@@ -278,6 +274,12 @@ template <typename T> struct ContigKV {
 template <typename T, bool AlignedNewKV = true> struct PagedKV {
     using Elem = T;
     static constexpr bool kPaged = true;
+    struct Context {
+        int req_idx;
+        int64_t rtt_stride;
+        int64_t pool_stride;
+        int64_t head_off;
+    };
 
     static DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
         return static_cast<const T*>(p.k_ptr);
@@ -318,20 +320,16 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
     }
 
     template <int HEAD_DIM>
-    static DEVICE_FORCEINLINE KVContext make_ctx(const AttentionParams& p, int batch, int kv_head) {
-        KVContext c = {};
-        c.req_idx = p.req_pool_indices[batch];
-        c.rtt_stride = (int64_t)p.max_context_len;
-        c.pool_stride = (int64_t)p.kv_head * HEAD_DIM;
-        c.head_off = (int64_t)kv_head * HEAD_DIM;
-        return c;
+    static DEVICE_FORCEINLINE Context make_ctx(const AttentionParams& p, int batch, int kv_head) {
+        return {p.req_pool_indices[batch], (int64_t)p.max_context_len,
+                (int64_t)p.kv_head * HEAD_DIM, (int64_t)kv_head * HEAD_DIM};
     }
     static DEVICE_FORCEINLINE int
-    resolve_token(const AttentionParams& p, const KVContext& c, int kc, bool valid) {
+    resolve_token(const AttentionParams& p, const Context& c, int kc, bool valid) {
         return valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : -1;
     }
     static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(const AttentionParams& p,
-                                                        const KVContext& c,
+                                                        const Context& c,
                                                         int slot,
                                                         int d) {
         const bool valid = slot >= 0;
@@ -355,7 +353,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
 
     template <int VEC>
     static DEVICE_FORCEINLINE void
-    store_new_kv(const AttentionParams& p, const KVContext& c, int kc, int d, const KVAddr& src) {
+    store_new_kv(const AttentionParams& p, const Context& c, int kc, int d, const KVAddr& src) {
         const int slot = resolve_token(p, c, kc, true);
         if (slot < 0)
             return;
@@ -379,7 +377,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
 
     template <int VEC>
     static DEVICE_FORCEINLINE KVAddr decode_addr(const AttentionParams& p,
-                                                 const KVContext& c,
+                                                 const Context& c,
                                                  int batch,
                                                  int kv_head,
                                                  int seq_len,

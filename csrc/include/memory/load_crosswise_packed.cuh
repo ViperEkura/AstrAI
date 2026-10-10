@@ -187,6 +187,5 @@ DEVICE_FORCEINLINE void load_crosswise_paired(Tensor<PtrEngine<ElemT>, SmemLayou
     carry.commit(tile, operand, rows, contract, ld, tid, k_base, block_row);
 }
 
-
 } // namespace gemm
 } // namespace astrai

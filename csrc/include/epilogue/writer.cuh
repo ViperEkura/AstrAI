@@ -86,9 +86,7 @@ template <typename Policy> struct GemmCollectiveEpilogue {
      * and row length trade places. Both row-chunk counts are powers of
      * two, keeping the XOR swizzle well-defined.
      */
-    DEVICE_FORCEINLINE OutT* out_chunk(int r, int c) const {
-        return out_tile(r, c << kChunkShift);
-    }
+    DEVICE_FORCEINLINE OutT* out_chunk(int r, int c) const { return out_tile(r, c << kChunkShift); }
     DEVICE_FORCEINLINE OutT* out_elem(int r, int v) const { return out_tile(r, v); }
 
     /*
@@ -200,8 +198,7 @@ template <typename Policy> struct GemmCollectiveEpilogue {
             if (row >= rows_total)
                 break; // rows are consecutive: nothing left
             auto* dst = out + row * row_stride + col;
-            if (col + kChunkElems <= row_stride &&
-                (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
+            if (col + kChunkElems <= row_stride && (reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
                 if constexpr (Policy::kStoreWriteThrough) {
                     /*
                      * Streaming write-through: the output is read-once (no

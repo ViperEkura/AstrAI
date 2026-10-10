@@ -5,8 +5,8 @@
 
 #include <api/attention_common.h>
 #include <arith/softmax.cuh>
-#include <memory/layout_policies.cuh>
 #include <kernel/attention/mma.cuh>
+#include <memory/layout_policies.cuh>
 
 namespace astrai {
 namespace attention {
@@ -28,7 +28,11 @@ namespace attention {
  * compile-time bools — dead branches eliminated in the compute loop.
  * Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2, Elem>.
  */
-template <typename Traits, typename QSchedule, typename KV, bool IsCausal, bool HasMask,
+template <typename Traits,
+          typename QSchedule,
+          typename KV,
+          bool IsCausal,
+          bool HasMask,
           bool MaskCoversShape = false>
 __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
     using T = typename Traits::Elem;
@@ -37,7 +41,7 @@ __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
 
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int gid = Layout::row(lane); // 0..7
+    const int gid = Layout::row(lane);         // 0..7
     const int tid4 = Layout::column(lane) / 2; // 0..3
 
     constexpr int BLOCK_M = Traits::BR * Traits::WARPS; // packed rows per block
@@ -90,15 +94,8 @@ __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
     const T* qb = (h1 == h0) ? q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0)
                              : q_gmem + QSchedule::q_base(p, batch, kv_head * G + h1);
     typename Traits::QueryFragment Qa;
-    Mma::load_query(q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0),
-                                 qb,
-                                 p.q_d_stride,
-                                 mra * p.q_l_stride,
-                                 mrb * p.q_l_stride,
-                                 va,
-                                 vb,
-                                 tid4,
-                                 Qa);
+    Mma::load_query(q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0), qb, p.q_d_stride,
+                    mra * p.q_l_stride, mrb * p.q_l_stride, va, vb, tid4, Qa);
 
     typename Traits::OutputFragment Oacc;
     Mma::clear(Oacc);
@@ -111,9 +108,10 @@ __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
     // Causal and explicit-mask bounds are fixed for the warp's query rows.
     const int maxc0 = IsCausal ? min(seq_len, query_start + mra + 1) : seq_len;
     const int maxc1 = IsCausal ? min(seq_len, query_start + mrb + 1) : seq_len;
-    const MaskView mask_view{p.mask, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                             p.mask_k_len, p.mask_q_len, batch,
-                             kv_head * G + h0, kv_head * G + h1, mra, mrb};
+    const MaskView mask_view{
+        p.mask,       p.mask_b_stride, p.mask_h_stride,  p.mask_l_stride,  p.mask_k_len,
+        p.mask_q_len, batch,           kv_head * G + h0, kv_head * G + h1, mra,
+        mrb};
     const AttentionMask<HasMask, MaskCoversShape> mask{mask_view, maxc0, maxc1, va, vb};
 
     const int tiles = (seq_len + Traits::BC - 1) / Traits::BC;
@@ -142,7 +140,8 @@ __global__ void attn_prefill_split_q_mma_kernel(const AttentionParams p) {
     };
 
     // Prologue: issue first tile load
-    if (t_end >= 0) load_tile(0, 0);
+    if (t_end >= 0)
+        load_tile(0, 0);
 
     for (int ti = 0; ti <= t_end; ti++) {
         int buf = ti & 1;

@@ -30,16 +30,17 @@ inline int geometry_raster(const PlanQuery& q, int bm, int bn) {
 
 // Five work proxies ranked in log space, not an execution-time estimate.
 // Callers supply the actual grid and epilogue traffic (e.g. triangular SYRK).
-inline double geometry_cost(const GemmRecipe& r, const PlanQuery& q,
-                            int resident_ctas, double blocks, double output_bytes) {
-    if (resident_ctas <= 0 || q.dev.sms <= 0 || q.k <= 0 ||
-        blocks <= 0 || output_bytes <= 0)
+inline double geometry_cost(const GemmRecipe& r,
+                            const PlanQuery& q,
+                            int resident_ctas,
+                            double blocks,
+                            double output_bytes) {
+    if (resident_ctas <= 0 || q.dev.sms <= 0 || q.k <= 0 || blocks <= 0 || output_bytes <= 0)
         return std::numeric_limits<double>::infinity();
     // Integer ceil without n+d-1 overflow; cast before multiplying grid axes.
     auto ceil_div = [](std::int64_t n, int d) { return n / d + (n % d != 0); };
     const double steps = (double)ceil_div(q.k, r.k_tile);
-    const double resident = std::min((double)resident_ctas,
-                                     std::ceil(blocks / q.dev.sms));
+    const double resident = std::min((double)resident_ctas, std::ceil(blocks / q.dev.sms));
     const double waves = std::ceil(blocks / (q.dev.sms * resident));
     const double warps = r.threads / 32.0;
     const double copy = (double)r.k_tile * (r.bm * q.ba + r.bn * q.bb) / 512.0;

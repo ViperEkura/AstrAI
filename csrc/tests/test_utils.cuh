@@ -18,13 +18,13 @@ inline double now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-#define CUDA_CHECK(call)                                                                        \
-    do {                                                                                        \
-        cudaError_t _e = (call);                                                                \
-        if (_e != cudaSuccess) {                                                                \
-            printf("CUDA error %s at %s:%d\n", cudaGetErrorString(_e), __FILE__, __LINE__);     \
-            exit(1);                                                                            \
-        }                                                                                       \
+#define CUDA_CHECK(call)                                                                           \
+    do {                                                                                           \
+        cudaError_t _e = (call);                                                                   \
+        if (_e != cudaSuccess) {                                                                   \
+            printf("CUDA error %s at %s:%d\n", cudaGetErrorString(_e), __FILE__, __LINE__);        \
+            exit(1);                                                                               \
+        }                                                                                          \
     } while (0)
 
 struct BenchResult {

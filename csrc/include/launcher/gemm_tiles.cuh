@@ -80,9 +80,14 @@ struct TileLauncher {
     }
 };
 
-
-template <bool UseTma, typename ElemA, typename ElemB, typename LayoutA,
-          typename LayoutB, typename LayoutOut, typename OutT, typename Schedule>
+template <bool UseTma,
+          typename ElemA,
+          typename ElemB,
+          typename LayoutA,
+          typename LayoutB,
+          typename LayoutOut,
+          typename OutT,
+          typename Schedule>
 struct ResourceResolver {
     const PlanQuery& q;
     KernelResources& result;
@@ -108,32 +113,43 @@ struct ResourceResolver {
         } else {
             result = kernel_resources<gemm_kernel<Policy>, Policy>(q);
         }
-        result.effective = {
-            static_cast<int>(tile_class<TileT>()), TileT::kStages, TileT::kTile,
-            TileT::CtaShape::kM, TileT::CtaShape::kN,
-            TileT::WarpShape::kM, TileT::WarpShape::kN,
-            Policy::Traits::kCtaThreads, Policy::kSmemBytes};
+        result.effective = {static_cast<int>(tile_class<TileT>()),
+                            TileT::kStages,
+                            TileT::kTile,
+                            TileT::CtaShape::kM,
+                            TileT::CtaShape::kN,
+                            TileT::WarpShape::kM,
+                            TileT::WarpShape::kN,
+                            Policy::Traits::kCtaThreads,
+                            Policy::kSmemBytes};
         return true;
     }
 };
 
-template <typename ElemA, typename ElemB, typename LayoutA, typename LayoutB,
-          typename LayoutOut, typename OutT, typename Schedule>
+template <typename ElemA,
+          typename ElemB,
+          typename LayoutA,
+          typename LayoutB,
+          typename LayoutOut,
+          typename OutT,
+          typename Schedule>
 KernelResources resources_for(const GemmRecipe& r, const PlanQuery& q) {
     KernelResources result{};
     const PlanDecision decision{r, 0, "resources"};
-    if constexpr (Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 &&
-                  sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
+    if constexpr (Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 && sizeof(ElemA) <= 2 &&
+                  sizeof(ElemB) <= 2) {
         if (q.tma) {
             dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
-                decision, ResourceResolver<true, ElemA, ElemB, RowMajor, ColMajor,
-                                           LayoutOut, OutT, Schedule>{q, result});
+                decision,
+                ResourceResolver<true, ElemA, ElemB, RowMajor, ColMajor, LayoutOut, OutT, Schedule>{
+                    q, result});
             return result;
         }
     }
     dispatch_tile<manifest_for<ElemA, ElemB, LayoutA, LayoutB>>(
-        decision, ResourceResolver<false, ElemA, ElemB, LayoutA, LayoutB,
-                                   LayoutOut, OutT, Schedule>{q, result});
+        decision,
+        ResourceResolver<false, ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT, Schedule>{q,
+                                                                                           result});
     return result;
 }
 
@@ -160,7 +176,8 @@ void launch_plan(GemmParams p, const LaunchPlan& selected, cudaStream_t stream) 
     constexpr bool kCongruous = crosswise_of<LayoutA, LayoutB>() == 0;
     /* The query resolved staging gates; descriptor encode may still reject TMA. */
     if constexpr (Schedule::kTma && kCongruous && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
-        if (selected.tma && dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
+        if (selected.tma &&
+            dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
                 d, TileLauncher<true, ElemA, ElemB, RowMajor, ColMajor, LayoutOut, OutT, Schedule>{
                        p, stream}))
             return;

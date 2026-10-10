@@ -22,9 +22,8 @@ constexpr int kQuarters = 4;  // norm reduction is split kQuarters ways
  * keep the stores scalar to avoid bank conflicts.
  */
 constexpr int kPitch = kTile + 2;
-constexpr int kQkvSharedBytes =
-    3 * kHeadDim * kPitch * sizeof(__nv_bfloat16) +
-    (2 * kQuarters * kTile + 2 * kTile) * sizeof(float);
+constexpr int kQkvSharedBytes = 3 * kHeadDim * kPitch * sizeof(__nv_bfloat16) +
+                                (2 * kQuarters * kTile + 2 * kTile) * sizeof(float);
 
 // One block per (b, h, token tile).
 __global__ void gated_deltanet_fwd_qkv_kernel(const __nv_bfloat16* __restrict__ q,
@@ -244,14 +243,13 @@ std::vector<torch::Tensor> gated_deltanet_fwd(torch::Tensor q,
     const int tiles = (seq + kTile - 1) / kTile;
     static bool configured = false;
     if (!configured) {
-        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(
-            gated_deltanet_fwd_qkv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            kQkvSharedBytes));
+        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(gated_deltanet_fwd_qkv_kernel,
+                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               kQkvSharedBytes));
         configured = true;
     }
 
-    gated_deltanet_fwd_qkv_kernel<<<batch * heads * tiles, kThreads, kQkvSharedBytes,
-                                      stream>>>(
+    gated_deltanet_fwd_qkv_kernel<<<batch * heads * tiles, kThreads, kQkvSharedBytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),

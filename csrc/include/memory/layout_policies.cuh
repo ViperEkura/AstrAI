@@ -1,9 +1,9 @@
 #pragma once
-#include <cuda_bf16.h>
 #include <api/attention_common.h>
-#include <utils/define.cuh>
+#include <cuda_bf16.h>
 #include <datatype/element.cuh>
 #include <memory/pipeline.cuh>
+#include <utils/define.cuh>
 
 /*
  * Q scheduling is independent of K/V storage. DenseQSchedule/PackedQSchedule
@@ -26,9 +26,11 @@ template <int LeadingDim> struct SharedTileLayout {
 
 template <typename Traits> struct KVTileLoader {
     // Keep the uncommon scalar path out of the unrolled asynchronous loader.
-    static __device__ __noinline__ void load_unaligned(
-        typename Traits::Elem* dst_k, typename Traits::Elem* dst_v,
-        const typename Traits::Elem* src_k, const typename Traits::Elem* src_v, bool valid) {
+    static __device__ __noinline__ void load_unaligned(typename Traits::Elem* dst_k,
+                                                       typename Traits::Elem* dst_v,
+                                                       const typename Traits::Elem* src_k,
+                                                       const typename Traits::Elem* src_v,
+                                                       bool valid) {
 #pragma unroll
         for (int j = 0; j < Traits::VEC; ++j) {
             dst_k[j] = valid ? src_k[j] : ElemTrait<typename Traits::Elem>::from_float(0.0f);
@@ -37,12 +39,13 @@ template <typename Traits> struct KVTileLoader {
     }
 
     template <typename AddrFn>
-    static __device__ inline void load(typename Traits::Elem* sK, // ring bases (STAGES * BC * LD each)
-                                        typename Traits::Elem* sV,
-                                        int ti,
-                                        int buf, // tile index, ring slot
-                                        int seq_len,
-                                        const AddrFn& addr) {
+    static __device__ inline void
+    load(typename Traits::Elem* sK, // ring bases (STAGES * BC * LD each)
+         typename Traits::Elem* sV,
+         int ti,
+         int buf, // tile index, ring slot
+         int seq_len,
+         const AddrFn& addr) {
         int kv0 = ti * Traits::BC;
         typename Traits::Elem* dK = sK + buf * Traits::BC * Traits::LD;
         typename Traits::Elem* dV = sV + buf * Traits::BC * Traits::LD;
@@ -58,14 +61,12 @@ template <typename Traits> struct KVTileLoader {
                 astrai::cp_async_16(&dK[off], a.k, a.valid);
                 astrai::cp_async_16(&dV[off], a.v, a.valid);
             } else {
-                load_unaligned(&dK[off], &dV[off],
-                               static_cast<const typename Traits::Elem*>(a.k),
+                load_unaligned(&dK[off], &dV[off], static_cast<const typename Traits::Elem*>(a.k),
                                static_cast<const typename Traits::Elem*>(a.v), a.valid);
             }
         }
         astrai::cp_async_commit_group();
     }
-
 };
 
 struct MaskView {
@@ -81,15 +82,16 @@ template <bool HasMask, bool MaskCoversShape = false> struct AttentionMask {
     int base0, base1, max_key0, max_key1;
     bool valid0, valid1;
     DEVICE_FORCEINLINE AttentionMask(MaskView view, int max0, int max1, bool row0, bool row1)
-        : mask(view.mask),
-          base0(view.batch * view.b_stride + view.head0 * view.h_stride + view.qrow0 * view.l_stride),
-          base1(view.batch * view.b_stride + view.head1 * view.h_stride + view.qrow1 * view.l_stride),
+        : mask(view.mask), base0(view.batch * view.b_stride + view.head0 * view.h_stride +
+                                 view.qrow0 * view.l_stride),
+          base1(view.batch * view.b_stride + view.head1 * view.h_stride +
+                view.qrow1 * view.l_stride),
           max_key0(HasMask && !MaskCoversShape ? min(max0, view.k_len) : max0),
           max_key1(HasMask && !MaskCoversShape ? min(max1, view.k_len) : max1),
-          valid0(row0 && (!HasMask || MaskCoversShape || view.q_len == 1 ||
-                         view.qrow0 < view.q_len)),
-          valid1(row1 && (!HasMask || MaskCoversShape || view.q_len == 1 ||
-                         view.qrow1 < view.q_len)) {}
+          valid0(row0 &&
+                 (!HasMask || MaskCoversShape || view.q_len == 1 || view.qrow0 < view.q_len)),
+          valid1(row1 &&
+                 (!HasMask || MaskCoversShape || view.q_len == 1 || view.qrow1 < view.q_len)) {}
 
     DEVICE_FORCEINLINE bool is_masked(int row, int key) const {
         return !(row ? valid1 : valid0) || key >= (row ? max_key1 : max_key0) ||
@@ -120,8 +122,7 @@ struct DenseQSchedule {
      * shift the head phase when block_m % G != 0). Dense tensors tile the
      * packed space G*q_len directly.
      */
-    static HOST_FORCEINLINE int
-    packed_grid_x(const AttentionParams& p, int, int block_m) {
+    static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int, int block_m) {
         const int G = p.q_head / p.kv_head;
         return (p.q_len * G + block_m - 1) / block_m;
     }
@@ -160,8 +161,7 @@ struct PackedQSchedule {
      * qo_indptr is a device pointer — the host grid derives from the tile
      * count alone (a request's last tile is padded up by the host builder).
      */
-    static HOST_FORCEINLINE int
-    packed_grid_x(const AttentionParams& p, int, int block_m) {
+    static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int, int block_m) {
         const int blocks_per_host_tile = (p.q_head / p.kv_head) * HOST_Q_TILE_ROWS / block_m;
         return p.num_q_tiles * blocks_per_host_tile;
     }
@@ -260,8 +260,15 @@ template <typename T> struct ContigKV {
     }
 
     template <int VEC>
-    static DEVICE_FORCEINLINE KVAddr decode_addr(
-        const AttentionParams& p, const KVContext& c, int, int, int, int kc, int d, bool valid, bool) {
+    static DEVICE_FORCEINLINE KVAddr decode_addr(const AttentionParams& p,
+                                                 const KVContext& c,
+                                                 int,
+                                                 int,
+                                                 int,
+                                                 int kc,
+                                                 int d,
+                                                 bool valid,
+                                                 bool) {
         int token = resolve_token(p, c, kc, valid);
         return kv_addr_from_token(p, c, token, d);
     }
@@ -347,8 +354,8 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
     }
 
     template <int VEC>
-    static DEVICE_FORCEINLINE void store_new_kv(
-        const AttentionParams& p, const KVContext& c, int kc, int d, const KVAddr& src) {
+    static DEVICE_FORCEINLINE void
+    store_new_kv(const AttentionParams& p, const KVContext& c, int kc, int d, const KVAddr& src) {
         const int slot = resolve_token(p, c, kc, true);
         if (slot < 0)
             return;

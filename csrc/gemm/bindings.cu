@@ -132,8 +132,8 @@ void patch_planner(GemmConfigPatch& patch, const py::object& value) {
         }
         int mode = -1;
         if (!parse_planner_mode(name, mode))
-            throw std::invalid_argument("planner must be 'table', 'hybrid', 'model' or 'heuristic', got '" +
-                                        name + "'");
+            throw std::invalid_argument(
+                "planner must be 'table', 'hybrid', 'model' or 'heuristic', got '" + name + "'");
         patch.planner_mode = mode;
         return;
     }
@@ -258,16 +258,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "The TileClass spellings, in enum order");
     m.def("tile_vocabulary", &astrai::gemm::tile_vocabulary,
           "Every ladder's recipes as rows, in dispatch order");
-    m.def("capabilities", [] {
-        const auto c = astrai::gemm::capabilities();
-        py::dict d;
-        d["cc"] = c.cc;
-        d["targets"] = c.targets;
-        d["mma"] = c.mma;
-        d["fp8"] = c.fp8;
-        d["tma"] = c.tma;
-        d["mx"] = c.mx;
-        return d;
-    }, "Compiled GEMM implementations available on the current device");
+    m.def(
+        "capabilities",
+        [] {
+            const auto c = astrai::gemm::capabilities();
+            py::dict d;
+            d["cc"] = c.cc;
+            d["targets"] = c.targets;
+            d["mma"] = c.mma;
+            d["fp8"] = c.fp8;
+            d["tma"] = c.tma;
+            d["mx"] = c.mx;
+            return d;
+        },
+        "Compiled GEMM implementations available on the current device");
     m.def("device_facts_info", &astrai::gemm::facts_dict, "The DeviceFacts geometry, as a dict");
 }

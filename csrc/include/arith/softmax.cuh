@@ -49,10 +49,12 @@ template <typename Traits> struct WarpSoftmax {
     using Layout = typename Traits::FragmentLayout;
     SoftmaxState rows[2];
     template <typename Mask>
-    __device__ inline void update(int kv0, float scale_log2,
-                                    typename Traits::ScoreFragment& Sacc,
-                                    typename Traits::OutputFragment& Oacc,
-                                    int lane, const Mask& mask) {
+    __device__ inline void update(int kv0,
+                                  float scale_log2,
+                                  typename Traits::ScoreFragment& Sacc,
+                                  typename Traits::OutputFragment& Oacc,
+                                  int lane,
+                                  const Mask& mask) {
         float& m0 = rows[0].m;
         float& m1 = rows[1].m;
         float& l0 = rows[0].l;

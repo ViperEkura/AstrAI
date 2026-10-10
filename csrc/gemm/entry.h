@@ -78,7 +78,9 @@ struct QuantScale {
     int n = 0;
 };
 
-QuantScale resolve_quant_scale(const torch::Tensor& s, int64_t extent, const char* name,
+QuantScale resolve_quant_scale(const torch::Tensor& s,
+                               int64_t extent,
+                               const char* name,
                                const c10::Device& device) {
     TORCH_CHECK(s.defined(), name, " is required");
     TORCH_CHECK(s.is_cuda() && s.scalar_type() == torch::kFloat32 && s.is_contiguous(), name,
@@ -131,8 +133,7 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     const int64_t m = trans_a ? a.size(-1) : a.size(-2);
     const int64_t n = trans_b ? b.size(-2) : b.size(-1);
     const int64_t k = trans_a ? a.size(-2) : a.size(-1);
-    TORCH_CHECK(m > 0 && n > 0 && k > 0,
-                "quant_gemm: M, N and K must be greater than zero (got ",
+    TORCH_CHECK(m > 0 && n > 0 && k > 0, "quant_gemm: M, N and K must be greater than zero (got ",
                 m, ", ", n, ", ", k, ")");
     auto opt_scale = [&](const c10::optional<torch::Tensor>& s, int64_t extent, const char* name,
                          bool i8_side, bool bf16_side) -> QuantScale {

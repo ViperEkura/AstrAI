@@ -236,6 +236,5 @@ struct ActivationCache {
     }
 };
 
-
 } // namespace fp8
 } // namespace astrai

@@ -116,6 +116,5 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     Epilogue(smem, p, blk.x, blk.y, threadIdx.x).run(acc, out);
 }
 
-
 } // namespace gemm
 } // namespace astrai

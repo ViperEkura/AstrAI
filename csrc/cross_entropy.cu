@@ -1,7 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAGraphsC10Utils.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <algorithm>
@@ -45,9 +45,14 @@ template <bool Maximum> __device__ float reduce(float value) {
 }
 
 template <typename scalar_t, bool ComputeGradient = false>
-__global__ void forward_rows_online(scalar_t* logits, const int64_t* targets, float* maxima,
-                                    float* log_sums, float* losses, int64_t vocab,
-                                    int64_t ignore_index, float smoothing) {
+__global__ void forward_rows_online(scalar_t* logits,
+                                    const int64_t* targets,
+                                    float* maxima,
+                                    float* log_sums,
+                                    float* losses,
+                                    int64_t vocab,
+                                    int64_t ignore_index,
+                                    float smoothing) {
     const int64_t row = blockIdx.x;
     const int64_t target = targets[row];
     CUDA_KERNEL_ASSERT(target == ignore_index || (target >= 0 && target < vocab));
@@ -109,9 +114,11 @@ __global__ void forward_rows_online(scalar_t* logits, const int64_t* targets, fl
             const float probability = expf((float(values[col]) - maximum) - log_sum);
             // Raise FP16 subnormal gradients into its normal exponent range.
             // A power of two is exact and 2^15 keeps gradients in [-1, 1] finite.
-            const float projection_scale = std::is_same<scalar_t, at::Half>::value ? 32768.0f : 1.0f;
+            const float projection_scale =
+                std::is_same<scalar_t, at::Half>::value ? 32768.0f : 1.0f;
             values[col] = scalar_t((probability - smoothing / float(vocab) -
-                                   (col == target ? 1.0f - smoothing : 0.0f)) * projection_scale);
+                                    (col == target ? 1.0f - smoothing : 0.0f)) *
+                                   projection_scale);
         }
     }
 }
@@ -131,9 +138,14 @@ void check_inputs(const torch::Tensor& logits, const torch::Tensor& targets, dou
                 "label_smoothing must be in [0, 1]");
 }
 
-void launch_forward(const torch::Tensor& logits, const torch::Tensor& targets,
-                    torch::Tensor& maxima, torch::Tensor& log_sums, torch::Tensor& losses,
-                    int64_t ignore_index, double smoothing, bool compute_gradient = false) {
+void launch_forward(const torch::Tensor& logits,
+                    const torch::Tensor& targets,
+                    torch::Tensor& maxima,
+                    torch::Tensor& log_sums,
+                    torch::Tensor& losses,
+                    int64_t ignore_index,
+                    double smoothing,
+                    bool compute_gradient = false) {
     const auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int64_t rows = logits.size(0);
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -153,7 +165,9 @@ void launch_forward(const torch::Tensor& logits, const torch::Tensor& targets,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void accumulate_hidden(const torch::Tensor& dz, const torch::Tensor& weight, torch::Tensor& dx,
+void accumulate_hidden(const torch::Tensor& dz,
+                       const torch::Tensor& weight,
+                       torch::Tensor& dx,
                        bool first) {
     auto handle = at::cuda::getCurrentCUDABlasHandle();
     const auto dtype = weight.scalar_type() == at::kBFloat16 ? CUDA_R_16BF
@@ -169,7 +183,9 @@ void accumulate_hidden(const torch::Tensor& dz, const torch::Tensor& weight, tor
     TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CE hidden-gradient GEMM failed: ", int(status));
 }
 
-void accumulate_weight(const torch::Tensor& dz, const torch::Tensor& hidden, torch::Tensor& dw,
+void accumulate_weight(const torch::Tensor& dz,
+                       const torch::Tensor& hidden,
+                       torch::Tensor& dw,
                        bool first) {
     auto handle = at::cuda::getCurrentCUDABlasHandle();
     const auto dtype = hidden.scalar_type() == at::kBFloat16 ? CUDA_R_16BF
@@ -185,10 +201,14 @@ void accumulate_weight(const torch::Tensor& dz, const torch::Tensor& hidden, tor
     TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "CE weight-gradient GEMM failed: ", int(status));
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-linear_forward(const torch::Tensor& hidden, const torch::Tensor& weight,
-                           const torch::Tensor& targets, int64_t ignore_index, double smoothing,
-                           int64_t chunk_size, bool need_hidden, bool need_weight) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> linear_forward(const torch::Tensor& hidden,
+                                                                       const torch::Tensor& weight,
+                                                                       const torch::Tensor& targets,
+                                                                       int64_t ignore_index,
+                                                                       double smoothing,
+                                                                       int64_t chunk_size,
+                                                                       bool need_hidden,
+                                                                       bool need_weight) {
     check_inputs(hidden, targets, smoothing);
     TORCH_CHECK(weight.device() == hidden.device() &&
                     weight.scalar_type() == hidden.scalar_type() && weight.dim() == 2 &&
@@ -215,23 +235,24 @@ linear_forward(const torch::Tensor& hidden, const torch::Tensor& weight,
     }
     const int64_t rows = selected_targets.size(0), chunk = std::min(chunk_size, rows);
     auto dx = need_hidden ? (valid_rows.defined() ? torch::zeros(hidden.sizes(), options)
-                                                 : torch::empty(hidden.sizes(), options))
+                                                  : torch::empty(hidden.sizes(), options))
                           : torch::empty({0}, options);
     auto dw = need_weight ? torch::empty(weight.sizes(), options) : torch::empty({0}, options);
     if (rows == 0) {
-        if (need_weight) dw.zero_();
+        if (need_weight)
+            dw.zero_();
         return {torch::zeros({}, options), dx, dw};
     }
-    auto selected_dx = need_hidden && valid_rows.defined()
-                           ? torch::empty({chunk, hidden.size(1)}, options) : dx;
+    auto selected_dx =
+        need_hidden && valid_rows.defined() ? torch::empty({chunk, hidden.size(1)}, options) : dx;
     auto logits = torch::empty({chunk, weight.size(0)}, hidden.options());
     auto maxima = torch::empty({rows}, options);
     auto log_sums = torch::empty_like(maxima);
     auto losses = torch::empty_like(maxima);
     for (int64_t start = 0; start < rows; start += chunk) {
         const int64_t count = std::min(chunk, rows - start);
-        auto row_indices = valid_rows.defined() ? valid_rows.narrow(0, start, count)
-                                                : torch::Tensor();
+        auto row_indices =
+            valid_rows.defined() ? valid_rows.narrow(0, start, count) : torch::Tensor();
         auto x = row_indices.defined() ? hidden.index_select(0, row_indices)
                                        : hidden.narrow(0, start, count);
         auto z = logits.narrow(0, 0, count);
@@ -258,8 +279,10 @@ linear_forward(const torch::Tensor& hidden, const torch::Tensor& weight,
 }
 
 template <typename scalar_t>
-__global__ void scale_precomputed(const float* __restrict__ raw, const float* __restrict__ scale,
-                                  scalar_t* __restrict__ output, int64_t elements) {
+__global__ void scale_precomputed(const float* __restrict__ raw,
+                                  const float* __restrict__ scale,
+                                  scalar_t* __restrict__ output,
+                                  int64_t elements) {
     const float projection_scale = std::is_same<scalar_t, at::Half>::value ? 32768.0f : 1.0f;
     const float factor = scale[0] / projection_scale;
     for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; index < elements;
@@ -269,10 +292,10 @@ __global__ void scale_precomputed(const float* __restrict__ raw, const float* __
 }
 
 std::tuple<torch::Tensor, torch::Tensor> linear_backward(const torch::Tensor& dx_raw,
-                                                                     const torch::Tensor& dw_raw,
-                                                                     const torch::Tensor& scale,
-                                                                     const torch::Tensor& hidden,
-                                                                     const torch::Tensor& weight) {
+                                                         const torch::Tensor& dw_raw,
+                                                         const torch::Tensor& scale,
+                                                         const torch::Tensor& hidden,
+                                                         const torch::Tensor& weight) {
     const c10::cuda::CUDAGuard guard(hidden.device());
     TORCH_CHECK(scale.device() == hidden.device() && scale.scalar_type() == at::kFloat &&
                     scale.is_contiguous() && scale.numel() == 1,

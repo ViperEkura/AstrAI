@@ -3,12 +3,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <datatype/element.cuh>
 #include <memory/layout_policies.cuh>
 #include <mma/ldmatrix.cuh>
 #include <mma/mma.cuh>
 #include <utils/define.cuh>
-#include <datatype/element.cuh>
-
 
 namespace astrai {
 namespace attention {
@@ -36,10 +35,10 @@ template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> s
     /* Derived MMA tile counts use the shared mma_shape. Unsupported element
      * types fail at MmaShapeFor because they have no tensor-core cell.
      */
-    static constexpr int KD = HEAD_DIM / Atom::Shape::kK; // Q/K k-slides
-    static constexpr int NC8 = BC / Atom::Shape::kN;         // S n-tiles (N=8)
-    static constexpr int KT2 = BC / Atom::Shape::kK;      // P k-tiles (K=16)
-    static constexpr int DN8 = HEAD_DIM / Atom::Shape::kN;   // O n-tiles (N=8)
+    static constexpr int KD = HEAD_DIM / Atom::Shape::kK;  // Q/K k-slides
+    static constexpr int NC8 = BC / Atom::Shape::kN;       // S n-tiles (N=8)
+    static constexpr int KT2 = BC / Atom::Shape::kK;       // P k-tiles (K=16)
+    static constexpr int DN8 = HEAD_DIM / Atom::Shape::kN; // O n-tiles (N=8)
 
     static constexpr int LD = HEAD_DIM; // smem leading dim
 
@@ -66,14 +65,14 @@ template <typename Traits> struct AttentionMma {
     }
 
     static __device__ inline void load_query(const T* __restrict__ qa,
-                                              const T* __restrict__ qb,
-                                              int stride_d,
-                                              int off_a,
-                                              int off_b,
-                                              bool va,
-                                              bool vb,
-                                              int tid4,
-                                              QueryFragment& Qa) {
+                                             const T* __restrict__ qb,
+                                             int stride_d,
+                                             int off_a,
+                                             int off_b,
+                                             bool va,
+                                             bool vb,
+                                             int tid4,
+                                             QueryFragment& Qa) {
 #pragma unroll
         for (int kt = 0; kt < Traits::KD; kt++) {
             int c = kt * Atom::Shape::kK + tid4 * 2;
@@ -87,9 +86,9 @@ template <typename Traits> struct AttentionMma {
     }
 
     static __device__ inline void scores(const QueryFragment& Qa,
-                                          const typename Traits::Elem* __restrict__ sK,
-                                          int lane,
-                                          ScoreFragment& Sacc) {
+                                         const typename Traits::Elem* __restrict__ sK,
+                                         int lane,
+                                         ScoreFragment& Sacc) {
 #pragma unroll
         for (int n8 = 0; n8 < Traits::NC8; n8++) {
             Sacc[n8][0] = Sacc[n8][1] = Sacc[n8][2] = Sacc[n8][3] = 0.0f;
@@ -99,17 +98,17 @@ template <typename Traits> struct AttentionMma {
             for (int kt = 0; kt < Traits::KD; kt++) {
                 unsigned b[Atom::kBRegs];
                 astrai::ldmatrix_x2<typename Traits::Elem>(
-                    b,
-                    &sK[krow_l * Traits::LD + Traits::SharedLayout::column(kt * Atom::Shape::kK + kcol_h, krow_l)]);
+                    b, &sK[krow_l * Traits::LD +
+                           Traits::SharedLayout::column(kt * Atom::Shape::kK + kcol_h, krow_l)]);
                 Atom::fma(Sacc[n8], Qa[kt], b, Sacc[n8]);
             }
         }
     }
 
     static __device__ inline void values(const ScoreFragment& Sacc,
-                                          const typename Traits::Elem* __restrict__ sV,
-                                          int lane,
-                                          OutputFragment& Oacc) {
+                                         const typename Traits::Elem* __restrict__ sV,
+                                         int lane,
+                                         OutputFragment& Oacc) {
 #pragma unroll
         for (int kt2 = 0; kt2 < Traits::KT2; kt2++) {
             unsigned Pa[Atom::kARegs];
@@ -122,12 +121,12 @@ template <typename Traits> struct AttentionMma {
             for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
                 unsigned b[Atom::kBRegs];
                 astrai::ldmatrix_x2<typename Traits::Elem, true>(
-                    b, &sV[vrow_l * Traits::LD + Traits::SharedLayout::column(dn8 * Atom::Shape::kN, vrow_l)]);
+                    b, &sV[vrow_l * Traits::LD +
+                           Traits::SharedLayout::column(dn8 * Atom::Shape::kN, vrow_l)]);
                 Atom::fma(Oacc[dn8], Pa, b, Oacc[dn8]);
             }
         }
     }
-
 };
 
 } // namespace attention

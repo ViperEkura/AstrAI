@@ -19,8 +19,7 @@ constexpr bool supports(CudaTarget target, int cc) {
     return true;
 }
 
-template <std::size_t N>
-constexpr bool supports(const CudaTarget (&targets)[N], int cc) {
+template <std::size_t N> constexpr bool supports(const CudaTarget (&targets)[N], int cc) {
     for (CudaTarget target : targets)
         if (supports(target, cc))
             return true;

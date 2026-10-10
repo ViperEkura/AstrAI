@@ -1,8 +1,8 @@
 #pragma once
 
+#include <mma/sm120.cuh>
 #include <mma/sm80.cuh>
 #include <mma/sm89.cuh>
-#include <mma/sm120.cuh>
 #include <utils/tensor.cuh>
 
 namespace astrai {
@@ -57,8 +57,7 @@ template <typename T> struct MmaOpImpl {
 };
 
 template <typename A, typename B, typename ShapeT> struct MmaOp;
-template <typename T>
-struct MmaOp<T, T, typename MmaShapeFor<T>::type> : MmaOpImpl<T> {};
+template <typename T> struct MmaOp<T, T, typename MmaShapeFor<T>::type> : MmaOpImpl<T> {};
 
 template <typename T> struct MxMmaOp : MmaOpImpl<T> {
     using Base = MmaOpImpl<T>;
@@ -68,8 +67,7 @@ template <typename T> struct MxMmaOp : MmaOpImpl<T> {
     static constexpr int kMinArch = 1200;
 
     template <int Arch = kMmaDeviceArch>
-    static DEVICE_FORCEINLINE void
-    fma(CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {
+    static DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {
         fma<Arch>(d.storage, a.storage, b.storage, c.storage);
     }
 

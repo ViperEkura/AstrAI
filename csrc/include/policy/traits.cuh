@@ -133,6 +133,5 @@ template <typename Traits, typename LayoutA, typename LayoutB> struct GemmSmem {
     static constexpr int kMinCtas = min_ctas_for_ring(kBytes);
 };
 
-
 } // namespace gemm
 } // namespace astrai

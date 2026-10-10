@@ -3,8 +3,8 @@
 #include <cstdio>
 #include <type_traits>
 
-#include <launcher/plan_types.h>
 #include <kernel/gemm/kernel.cuh>
+#include <launcher/plan_types.h>
 #include <utils/device.cuh>
 #include <utils/launch.cuh>
 
@@ -149,7 +149,6 @@ template <typename Policy> bool launch_policy_tma(const GemmParams& p, cudaStrea
         launch_rank(std::false_type{}, std::false_type{});
     return true;
 }
-
 
 } // namespace gemm
 } // namespace astrai

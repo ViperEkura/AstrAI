@@ -20,7 +20,8 @@ torch::Tensor attn_decode(torch::Tensor q,
                           c10::optional<double> scale,
                           int64_t layout,
                           c10::optional<torch::Tensor> o_part_buf,
-                          c10::optional<torch::Tensor> ml_part_buf, bool is_causal) {
+                          c10::optional<torch::Tensor> ml_part_buf,
+                          bool is_causal) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 

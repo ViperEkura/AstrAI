@@ -16,8 +16,7 @@
 
 namespace astrai::system {
 
-template <typename Function>
-inline Function resolve_cuda_driver_symbol(const char* name) {
+template <typename Function> inline Function resolve_cuda_driver_symbol(const char* name) {
 #ifdef _WIN32
     HMODULE handle = GetModuleHandleA("nvcuda.dll");
     if (handle == nullptr)
@@ -31,4 +30,4 @@ inline Function resolve_cuda_driver_symbol(const char* name) {
 #endif
 }
 
-}  // namespace astrai::system
+} // namespace astrai::system

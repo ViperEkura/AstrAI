@@ -49,16 +49,14 @@ static int check_decode_query(bool paged, int dim, bool has_mask, bool causal) {
     with_decode_kernel<KV>(p, [&](auto kernel) {
         const auto query = kernel.query(p);
         const auto first = kernel.plan(p);
-        pass = decode_type_matches(kernel, dim, has_mask) &&
-               query.batch == 3 && query.q_heads == 66 && query.kv_heads == 2 &&
-               query.head_dim == dim && query.kv_tiles == (paged ? 33 : 2) &&
-               query.wave_capacity > 0 && first.grid.x == 6 && first.grid.y == 3 &&
-               std::memcmp(before, &p, sizeof(p)) == 0;
+        pass = decode_type_matches(kernel, dim, has_mask) && query.batch == 3 &&
+               query.q_heads == 66 && query.kv_heads == 2 && query.head_dim == dim &&
+               query.kv_tiles == (paged ? 33 : 2) && query.wave_capacity > 0 && first.grid.x == 6 &&
+               first.grid.y == 3 && std::memcmp(before, &p, sizeof(p)) == 0;
         p.num_splits = 0;
         std::memcpy(before, &p, sizeof(p));
         const auto second = kernel.plan(p);
-        pass = pass && same_decode_plan(first, second) &&
-               std::memcmp(before, &p, sizeof(p)) == 0;
+        pass = pass && same_decode_plan(first, second) && std::memcmp(before, &p, sizeof(p)) == 0;
         // Reusing the parameter object for shorter KV must produce a fresh plan.
         p.kv_len = 1;
         p.max_context_len = 1;
@@ -67,8 +65,8 @@ static int check_decode_query(bool paged, int dim, bool has_mask, bool causal) {
     const auto shorter = with_decode_kernel<KV>(p, [&](auto kernel) { return kernel.plan(p); });
     pass = pass && shorter.grid.z == 1 && shorter.direct_output == (dim <= 128);
     if (!pass)
-        printf("FAILED decode query: paged=%d D=%d mask=%d causal=%d\n",
-               paged, dim, has_mask, causal);
+        printf("FAILED decode query: paged=%d D=%d mask=%d causal=%d\n", paged, dim, has_mask,
+               causal);
     return pass ? 0 : 1;
 }
 
@@ -79,15 +77,15 @@ static int run_plan_tests() {
         bool direct;
     };
     const Case cases[] = {
-        {{1, 8, 1, 32, 0, 128}, 1, 1, 1, true},   // Empty KV is still one block.
-        {{1, 8, 1, 64, 3, 128}, 1, 1, 1, true},   // Need two KV tiles per split.
+        {{1, 8, 1, 32, 0, 128}, 1, 1, 1, true}, // Empty KV is still one block.
+        {{1, 8, 1, 64, 3, 128}, 1, 1, 1, true}, // Need two KV tiles per split.
         {{1, 8, 1, 128, 4, 128}, 1, 1, 2, false},
         {{1, 8, 1, 256, 2, 128}, 1, 1, 1, false}, // D256 retains the combine pass.
         {{1, 8, 1, 128, 65, 1024}, 1, 1, MAX_SPLITS, false},
         {{64, 32, 4, 128, 256, 128}, 4, 64, 1, true}, // Already exceeds one wave.
         {{2, 64, 2, 128, 256, 128}, 4, 2, 16, false}, // Exactly 32 heads per KV.
         {{2, 66, 2, 128, 256, 128}, 6, 2, 10, false}, // 33 heads needs third pass.
-        {{1, 64, 4, 128, 256, 7}, 4, 1, 1, true}, // Do not cross a wave boundary.
+        {{1, 64, 4, 128, 256, 7}, 4, 1, 1, true},     // Do not cross a wave boundary.
         {{1, 64, 4, 128, 256, 8}, 4, 1, 2, false},
     };
     int fail = 0;
@@ -287,9 +285,9 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causa
     double flops = 4.0 * B * Hq * (double)ql * kl * D;
     if (causal)
         flops *= 0.5;
-    BenchResult r =
-        decode ? bench_kernel([&] { AttnDispatchDecode<bf16>::run(p, 0); }, 3, 10, flops)
-               : bench_kernel([&] { AttnDispatchPrefill<bf16>::run(p, 0); }, 3, 10, flops);
+    BenchResult r = decode
+                        ? bench_kernel([&] { AttnDispatchDecode<bf16>::run(p, 0); }, 3, 10, flops)
+                        : bench_kernel([&] { AttnDispatchPrefill<bf16>::run(p, 0); }, 3, 10, flops);
 
     char cfg[64];
     snprintf(cfg, sizeof(cfg), "B=%2d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d causal=%d", B, Hq, Hk, ql, kl,

@@ -192,10 +192,9 @@ using TileManifest = tuple_cat_t<TileManifestCross,
  * mis-picked it on unseen bands. S3's 32KB ring reclaims its output; S2's
  * 24KB ring requires direct-store epilogue. 16-warp small remains resolver-only.
  */
-using TileManifestByte =
-    tuple_cat_t<TileManifestCross,
-                std::tuple<Tile_128x256x64_W64x32_S2, Tile_128x128x128_W64x32_S2,
-                           Tile_128x128x32_W64x32_S3>>;
+using TileManifestByte = tuple_cat_t<
+    TileManifestCross,
+    std::tuple<Tile_128x256x64_W64x32_S2, Tile_128x128x128_W64x32_S2, Tile_128x128x32_W64x32_S3>>;
 
 /*
  * How many operands take that direct path (0 = dual-congruous NT). The
@@ -246,7 +245,6 @@ using manifest_for = std::conditional_t<
     std::conditional_t<manifest_kind_of<ElemA, ElemB, LayoutA, LayoutB>() == ManifestKind::kByte,
                        TileManifestByte,
                        TileManifestCross>>;
-
 
 } // namespace gemm
 } // namespace astrai

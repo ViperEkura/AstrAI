@@ -30,10 +30,10 @@ struct GemmRecipe {
     int cta;      // TileClass ordinal — the row-file serialization key
     int k_stages; // prefetched K tiles; ring has one extra slot
     int k_tile;   // K elements held in one pipeline stage
-    int bm, bn;  // CTA geometry
-    int wm, wn;  // warp tiling (the recipe name's W<x>x<y>)
-    int threads; // the manifest entry's warp tiling (first match wins)
-    int smem;    // ring bytes at this staging pair's operand widths
+    int bm, bn;   // CTA geometry
+    int wm, wn;   // warp tiling (the recipe name's W<x>x<y>)
+    int threads;  // the manifest entry's warp tiling (first match wins)
+    int smem;     // ring bytes at this staging pair's operand widths
 };
 
 struct KernelResources {
@@ -53,7 +53,7 @@ struct PlanQuery {
     int ba = 2;          // operand element bytes
     int bb = 2;
     int out_elem_bytes = 2; // bf16 output by default
-    int mma_k = 16;        // promoted MMA instruction K extent
+    int mma_k = 16;         // promoted MMA instruction K extent
     bool tma = true;        // effective staging selected for this launch
     DeviceFacts dev{};
     bool rank3a = false, rank3b = false;

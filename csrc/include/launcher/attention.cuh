@@ -137,14 +137,17 @@ struct DecodeLaunchPlan {
 inline DecodeLaunchPlan make_decode_plan(const DecodePlanQuery& query) {
     const int passes = (query.q_heads / query.kv_heads + 15) / 16;
     const int blocks_per_batch = query.kv_heads * passes;
-    const int splits = compute_num_splits(
-        query.batch * blocks_per_batch, query.kv_tiles, query.wave_capacity, 2);
+    const int splits =
+        compute_num_splits(query.batch * blocks_per_batch, query.kv_tiles, query.wave_capacity, 2);
     // Wider direct-output kernels lose graph latency; retain the combine path.
-    return {dim3(blocks_per_batch, query.batch, splits),
-            splits == 1 && query.head_dim <= 128};
+    return {dim3(blocks_per_batch, query.batch, splits), splits == 1 && query.head_dim <= 128};
 }
 
-template <int HEAD_DIM, typename QSchedule, typename KV, bool IsCausal, bool HasMask,
+template <int HEAD_DIM,
+          typename QSchedule,
+          typename KV,
+          bool IsCausal,
+          bool HasMask,
           bool MaskCoversShape = false>
 struct PrefillKernel {
     using Config = PrefillConfigMap<HEAD_DIM, IsCausal>;
@@ -158,8 +161,8 @@ struct PrefillKernel {
                      QSchedule::host_grid_batch(p))};
     }
 
-    static void launch(const AttentionParams& p, const PrefillLaunchPlan& plan,
-                       cudaStream_t stream) {
+    static void
+    launch(const AttentionParams& p, const PrefillLaunchPlan& plan, cudaStream_t stream) {
         attn_prefill_split_q_mma_kernel<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape>
             <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
@@ -173,14 +176,16 @@ template <int HEAD_DIM, typename KV, bool HasMask> struct DecodeKernel {
     static DecodePlanQuery query(const AttentionParams& p) {
         const int kv_len = KV::host_kv_len(p);
         // Keep the partial-output kernel as the occupancy reference for both modes.
-        return {p.batch, p.q_head, p.kv_head, HEAD_DIM, (kv_len + Traits::BC - 1) / Traits::BC,
+        return {p.batch,
+                p.q_head,
+                p.kv_head,
+                HEAD_DIM,
+                (kv_len + Traits::BC - 1) / Traits::BC,
                 decode_wave_capacity<attn_decode_split_kv_mma_kernel<Traits, KV, HasMask>,
                                      Traits::NUM_THREADS>()};
     }
 
-    static DecodeLaunchPlan plan(const AttentionParams& p) {
-        return make_decode_plan(query(p));
-    }
+    static DecodeLaunchPlan plan(const AttentionParams& p) { return make_decode_plan(query(p)); }
 
     static void launch(AttentionParams& p, const DecodeLaunchPlan& plan, cudaStream_t stream) {
         p.num_splits = static_cast<int>(plan.grid.z);
@@ -203,7 +208,9 @@ template <int HEAD_DIM, typename KV, bool HasMask> struct DecodeKernel {
 // One head-dimension switch serves torch entries, native launches and plan inspection.
 template <typename Fn> inline auto with_head_dim(int head_dim, Fn&& fn) {
     switch (head_dim) {
-#define ASTRAI_HEAD_DIM_CASE(D) case D: return fn(std::integral_constant<int, D>{});
+#define ASTRAI_HEAD_DIM_CASE(D)                                                                    \
+    case D:                                                                                        \
+        return fn(std::integral_constant<int, D>{});
         ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
 #undef ASTRAI_HEAD_DIM_CASE
     }
@@ -214,9 +221,8 @@ template <typename QSchedule, typename KV, typename Fn>
 inline auto with_prefill_kernel(const AttentionParams& p, Fn&& fn) {
     // Paged partial masks need extent checks; full coverage can omit them.
     // Dense keeps its checked kernel to avoid redundant compiler-generated comparisons.
-    const bool mask_covers_shape =
-        KV::kPaged && p.mask && p.mask_k_len >= KV::host_kv_len(p) &&
-        (p.mask_q_len == 1 || p.mask_q_len >= p.q_len);
+    const bool mask_covers_shape = KV::kPaged && p.mask && p.mask_k_len >= KV::host_kv_len(p) &&
+                                   (p.mask_q_len == 1 || p.mask_q_len >= p.q_len);
     return with_head_dim(p.head_dim, [&](auto dim) {
         constexpr int D = decltype(dim)::value;
         if (p.is_causal) {

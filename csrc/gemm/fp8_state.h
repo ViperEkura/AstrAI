@@ -302,6 +302,5 @@ inline std::shared_ptr<Fp8Meta> get_meta(const Tensor& w,
     return meta;
 }
 
-
 } // namespace fp8
 } // namespace astrai

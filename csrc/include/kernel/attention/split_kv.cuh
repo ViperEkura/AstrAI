@@ -5,8 +5,8 @@
 
 #include <api/attention_common.h>
 #include <arith/softmax.cuh>
-#include <memory/layout_policies.cuh>
 #include <kernel/attention/mma.cuh>
+#include <memory/layout_policies.cuh>
 
 namespace astrai {
 namespace attention {
@@ -68,15 +68,8 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
     typename Traits::QueryFragment Qa;
-    Mma::load_query(q_gmem + q_base,
-                                 q_gmem + q_base,
-                                 p.q_d_stride,
-                                 qra * p.q_h_stride,
-                                 qrb * p.q_h_stride,
-                                 va,
-                                 vb,
-                                 tid4,
-                                 Qa);
+    Mma::load_query(q_gmem + q_base, q_gmem + q_base, p.q_d_stride, qra * p.q_h_stride,
+                    qrb * p.q_h_stride, va, vb, tid4, Qa);
 
     typename Traits::OutputFragment Oacc;
     Mma::clear(Oacc);
@@ -87,9 +80,17 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
     const float& l1 = softmax.rows[1].l;
 
     // Visibility is fixed for these query rows across all K/V tiles.
-    const MaskView mask_view{p.mask, p.mask_b_stride, p.mask_h_stride, p.mask_l_stride,
-                             p.mask_k_len, p.mask_q_len, batch,
-                             q_head0 + gid, q_head0 + gid + 8, 0, 0};
+    const MaskView mask_view{p.mask,
+                             p.mask_b_stride,
+                             p.mask_h_stride,
+                             p.mask_l_stride,
+                             p.mask_k_len,
+                             p.mask_q_len,
+                             batch,
+                             q_head0 + gid,
+                             q_head0 + gid + 8,
+                             0,
+                             0};
     const AttentionMask<HasMask> mask{mask_view, seq_len, seq_len, va, vb};
 
     const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
@@ -103,8 +104,8 @@ __global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
      */
     auto load_tile = [&](int ti, int buf) {
         KVTileLoader<Traits>::load(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
-            return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, seq_len,
-                                                         kc, d, valid, pass == 0);
+            return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, seq_len, kc, d,
+                                                         valid, pass == 0);
         });
     };
 
@@ -264,8 +265,7 @@ template <typename KV> __global__ void attn_decode_combine_kernel(const Attentio
 #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2)
             max_m = fmaxf(max_m, __shfl_xor_sync(0xFFFFFFFF, max_m, offset));
-        const float weight =
-            mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
+        const float weight = mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
         if (valid)
             weights[d] = weight;
         float sum_l = li * weight;

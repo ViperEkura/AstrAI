@@ -6,9 +6,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <stdexcept>
-#include <limits>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -21,9 +21,7 @@
 namespace astrai {
 namespace gemm {
 
-int plan_raster(const PlanQuery& q, int bm, int bn) {
-    return geometry_raster(q, bm, bn);
-}
+int plan_raster(const PlanQuery& q, int bm, int bn) { return geometry_raster(q, bm, bn); }
 
 // Build the same recipe for introspection and model scans.
 namespace {
@@ -58,8 +56,7 @@ template <typename Manifest> constexpr bool unique_recipe_keys() {
     return true;
 }
 
-template <typename Manifest, typename F>
-inline void for_each_recipe(int ba, int bb, F&& fn) {
+template <typename Manifest, typename F> inline void for_each_recipe(int ba, int bb, F&& fn) {
     static_assert(unique_recipe_keys<Manifest>(), "manifest dispatch keys must be unique");
     std::apply([&](auto... tiles) { (fn(recipe_for_tile<decltype(tiles)>(ba, bb)), ...); },
                Manifest{});
@@ -122,17 +119,16 @@ inline void log_dispatch(const PlanQuery& q, const PlanDecision& d) {
 }
 
 // Validate table recipes against the compiled manifest and device limits.
-std::optional<PlanDecision> row_plan(const PlanQuery& q, std::optional<TableRow> row,
-                                     const char* source) {
+std::optional<PlanDecision>
+row_plan(const PlanQuery& q, std::optional<TableRow> row, const char* source) {
     if (!row)
         return std::nullopt;
-    const auto recipe = recipe_of((int)row->cta, row->k_stages, row->k_tile,
-                                  q.crosswise > 0, q.ba, q.bb);
+    const auto recipe =
+        recipe_of((int)row->cta, row->k_stages, row->k_tile, q.crosswise > 0, q.ba, q.bb);
     if (!recipe || plan_resident_ctas(row->cta, row->k_stages, row->k_tile, q) <= 0)
         return std::nullopt;
-    return PlanDecision{*recipe,
-                        row->raster != 0 ? row->raster : plan_raster(q, recipe->bm, recipe->bn),
-                        source};
+    return PlanDecision{
+        *recipe, row->raster != 0 ? row->raster : plan_raster(q, recipe->bm, recipe->bn), source};
 }
 
 // RTX 5090 fitted mainloop and MMA costs in equivalent bytes, not TMA instruction counts.
@@ -150,8 +146,8 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
                                            (std::int64_t)((q.n + r.bn - 1) / r.bn));
     if (!q.tma) {
         // Price complete K tiles and divide waves by resident CTA capacity.
-        const std::int64_t operand =
-            ((q.k + r.k_tile - 1) / r.k_tile) * (std::int64_t)r.k_tile * (r.bm * q.ba + r.bn * q.bb);
+        const std::int64_t operand = ((q.k + r.k_tile - 1) / r.k_tile) * (std::int64_t)r.k_tile *
+                                     (r.bm * q.ba + r.bn * q.bb);
         const std::int64_t mu = q.dev.smem_per_sm / r.smem;
         const std::int64_t slots = (std::int64_t)q.dev.sms * mu;
         const std::int64_t waves = slots > 0 ? (blocks + slots - 1) / slots : 1;
@@ -163,8 +159,7 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
     const std::int64_t k_tiles = (q.k + r.k_tile - 1) / r.k_tile;
     const std::int64_t loop_penalty =
         byte_pair ? 0 : kMainloopBytesPerCellTile * (std::int64_t)r.bm * r.bn * k_tiles;
-    const std::int64_t mma_instructions =
-        k_tiles * (r.k_tile / q.mma_k) * (r.bm / 16) * (r.bn / 8);
+    const std::int64_t mma_instructions = k_tiles * (r.k_tile / q.mma_k) * (r.bm / 16) * (r.bn / 8);
     const std::int64_t mma_arm = kMmaArmBytesPerInstr * mma_instructions;
     const std::int64_t per_cta = std::max(operand + output + loop_penalty, mma_arm);
     const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
@@ -193,23 +188,22 @@ double heuristic_cost(const GemmRecipe& named, const PlanQuery& q, int fallback_
         return std::numeric_limits<double>::infinity();
     const auto& r = resource.effective;
     auto ceil_div = [](int64_t n, int d) { return n / d + (n % d != 0); };
-    const double blocks = (double)q.batch * (double)ceil_div(q.m, r.bm) *
-                          (double)ceil_div(q.n, r.bn);
-    return geometry_cost(r, q, resource.resident, blocks,
-                         (double)q.out_elem_bytes * r.bm * r.bn);
+    const double blocks =
+        (double)q.batch * (double)ceil_div(q.m, r.bm) * (double)ceil_div(q.n, r.bn);
+    return geometry_cost(r, q, resource.resident, blocks, (double)q.out_elem_bytes * r.bm * r.bn);
 }
 
 bool same_model_query(const PlanQuery& a, const PlanQuery& b) {
     const auto& x = a.dev;
     const auto& y = b.dev;
     return a.m == b.m && a.n == b.n && a.k == b.k && a.batch == b.batch &&
-           a.perf_class == b.perf_class && a.crosswise == b.crosswise &&
-           a.ba == b.ba && a.bb == b.bb && a.out_elem_bytes == b.out_elem_bytes &&
-           a.mma_k == b.mma_k && a.tma == b.tma && a.resources == b.resources &&
-           a.rank3a == b.rank3a && a.rank3b == b.rank3b && a.contiguous == b.contiguous &&
-           x.threads_per_sm == y.threads_per_sm && x.ordinal == y.ordinal && x.sms == y.sms && x.smem_max == y.smem_max &&
-           x.smem_per_sm == y.smem_per_sm && x.regs_per_sm == y.regs_per_sm &&
-           x.l2_bytes == y.l2_bytes && x.cc == y.cc;
+           a.perf_class == b.perf_class && a.crosswise == b.crosswise && a.ba == b.ba &&
+           a.bb == b.bb && a.out_elem_bytes == b.out_elem_bytes && a.mma_k == b.mma_k &&
+           a.tma == b.tma && a.resources == b.resources && a.rank3a == b.rank3a &&
+           a.rank3b == b.rank3b && a.contiguous == b.contiguous &&
+           x.threads_per_sm == y.threads_per_sm && x.ordinal == y.ordinal && x.sms == y.sms &&
+           x.smem_max == y.smem_max && x.smem_per_sm == y.smem_per_sm &&
+           x.regs_per_sm == y.regs_per_sm && x.l2_bytes == y.l2_bytes && x.cc == y.cc;
 }
 
 std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = false) {
@@ -256,15 +250,16 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = fals
     // its prologue and ring footprint may outweigh the shorter K-tile. Limit this
     // measured RTX 5090 BF16 correction to the contiguous NT, batch-one domain;
     // other devices and paths retain the legacy ranking until they have sweeps.
-    if (!heuristic && q.dev.cc == 120 && q.dev.sms == 170 &&
-        q.dev.smem_per_sm == 100 * 1024 && q.tma && q.contiguous && q.batch == 1 &&
-        q.ba == 2 && q.bb == 2 && q.out_elem_bytes == 2 && q.m >= 128 && q.n >= 128 &&
-        q.k >= 128 && short_k_best && shallow_k_stages != std::numeric_limits<int>::max() &&
+    if (!heuristic && q.dev.cc == 120 && q.dev.sms == 170 && q.dev.smem_per_sm == 100 * 1024 &&
+        q.tma && q.contiguous && q.batch == 1 && q.ba == 2 && q.bb == 2 && q.out_elem_bytes == 2 &&
+        q.m >= 128 && q.n >= 128 && q.k >= 128 && short_k_best &&
+        shallow_k_stages != std::numeric_limits<int>::max() &&
         q.k <= (std::int64_t)shallow_k_stages * best->k_tile)
         best = short_k_best;
     last = {q,
             {*best, plan_raster(q, best->bm, best->bn), heuristic ? "heuristic" : "model"},
-            heuristic, true};
+            heuristic,
+            true};
     return last.decision;
 }
 
@@ -286,7 +281,6 @@ PlanDecision select_plan(const PlanQuery& q) {
 
     throw std::runtime_error(
         "GEMM planner: no eligible recipe for the selected mode, shape and device");
-
 }
 
 } // namespace
@@ -305,8 +299,8 @@ std::vector<std::vector<int>> tile_vocabulary() {
         for (const auto& [ba, bb] : widths)
             with_manifest(crosswise != 0, ba, bb, [&](auto manifest) {
                 for_each_recipe<decltype(manifest)>(ba, bb, [&](const GemmRecipe& r) {
-                    out.push_back({crosswise, ba, bb, r.cta, r.k_stages, r.k_tile, r.bm, r.bn,
-                                   r.wm, r.wn, r.threads, r.smem});
+                    out.push_back({crosswise, ba, bb, r.cta, r.k_stages, r.k_tile, r.bm, r.bn, r.wm,
+                                   r.wn, r.threads, r.smem});
                 });
             });
     return out;

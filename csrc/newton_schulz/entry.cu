@@ -1,10 +1,10 @@
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/ops/addmm.h>
 #include <ATen/ops/baddbmm.h>
 #include <ATen/ops/bmm.h>
 #include <ATen/ops/mm.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include "entry.h"
 
@@ -15,18 +15,24 @@
 namespace astrai::newton_schulz {
 namespace {
 
-void syrk(const Choice& choice, const torch::Tensor& x, torch::Tensor& output,
+void syrk(const Choice& choice,
+          const torch::Tensor& x,
+          torch::Tensor& output,
           const c10::optional<torch::Tensor>& addend = c10::nullopt,
-          float alpha = 1.0f, float beta = 0.0f) {
+          float alpha = 1.0f,
+          float beta = 0.0f) {
     if (std::get<0>(choice)) {
         symmetric::syrk_out(x, output, addend, alpha, beta, std::get<1>(choice));
         return;
     }
     const auto transposed = x.transpose(-2, -1);
     if (beta == 0.0f) {
-        if (x.dim() == 2) at::mm_out(output, x, transposed);
-        else at::bmm_out(output, x, transposed);
-        if (alpha != 1.0f) output.mul_(alpha);
+        if (x.dim() == 2)
+            at::mm_out(output, x, transposed);
+        else
+            at::bmm_out(output, x, transposed);
+        if (alpha != 1.0f)
+            output.mul_(alpha);
     } else if (x.dim() == 2) {
         at::addmm_out(output, *addend, x, transposed, beta, alpha);
     } else {
@@ -34,11 +40,14 @@ void syrk(const Choice& choice, const torch::Tensor& x, torch::Tensor& output,
     }
 }
 
-void symm(const Choice& choice, const torch::Tensor& symmetric_matrix,
-          const torch::Tensor& x, torch::Tensor& output, float beta) {
+void symm(const Choice& choice,
+          const torch::Tensor& symmetric_matrix,
+          const torch::Tensor& x,
+          torch::Tensor& output,
+          float beta) {
     if (std::get<0>(choice)) {
-        symmetric::symm_out(symmetric_matrix, x, output, x, 1.0f, beta,
-                            std::get<1>(choice), std::get<2>(choice));
+        symmetric::symm_out(symmetric_matrix, x, output, x, 1.0f, beta, std::get<1>(choice),
+                            std::get<2>(choice));
     } else if (x.dim() == 2) {
         at::addmm_out(output, x, symmetric_matrix, x, beta, 1.0f);
     } else {
@@ -48,10 +57,17 @@ void symm(const Choice& choice, const torch::Tensor& symmetric_matrix,
 
 } // namespace
 
-torch::Tensor iterate(
-    torch::Tensor x, torch::Tensor gram, torch::Tensor polynomial,
-    torch::Tensor work, torch::Tensor spare, c10::optional<torch::Tensor> final,
-    int steps, float a, float b, float c, std::vector<Choice> choices) {
+torch::Tensor iterate(torch::Tensor x,
+                      torch::Tensor gram,
+                      torch::Tensor polynomial,
+                      torch::Tensor work,
+                      torch::Tensor spare,
+                      c10::optional<torch::Tensor> final,
+                      int steps,
+                      float a,
+                      float b,
+                      float c,
+                      std::vector<Choice> choices) {
     TORCH_CHECK(steps > 0 && steps < 100 && choices.size() == 6,
                 "invalid Newton-Schulz iteration plan");
     TORCH_CHECK(std::isfinite(a) && std::isfinite(b) && std::isfinite(c),
@@ -59,13 +75,12 @@ torch::Tensor iterate(
     for (int iteration = 0; iteration < steps; ++iteration) {
         syrk(choices[iteration == 0 ? 0 : 1], x, gram);
         syrk(choices[2], gram, polynomial, gram, c, b);
-        auto output = final.has_value() && iteration == steps - 1
-                          ? *final
-                          : iteration % 2 == 0 ? work : spare;
-        const auto& choice = choices[iteration == 0 ? 3 : final.has_value() &&
-                                                           iteration == steps - 1
-                                                       ? 5
-                                                       : 4];
+        auto output = final.has_value() && iteration == steps - 1 ? *final
+                      : iteration % 2 == 0                        ? work
+                                                                  : spare;
+        const auto& choice = choices[iteration == 0                                ? 3
+                                     : final.has_value() && iteration == steps - 1 ? 5
+                                                                                   : 4];
         symm(choice, polynomial, x, output, a);
         x = output;
     }
@@ -78,9 +93,11 @@ namespace astrai::newton_schulz::symmetric {
 namespace {
 
 bool dense_matrix(const torch::Tensor& x) {
-    if (x.dim() != 2 && x.dim() != 3) return false;
-    if (x.dim() == 3 && (x.size(0) < 1 || x.size(0) > 65535 ||
-                        x.stride(0) != x.size(-2) * x.size(-1))) return false;
+    if (x.dim() != 2 && x.dim() != 3)
+        return false;
+    if (x.dim() == 3 &&
+        (x.size(0) < 1 || x.size(0) > 65535 || x.stride(0) != x.size(-2) * x.size(-1)))
+        return false;
     return x.stride(-1) == 1 && x.stride(-2) == x.size(-1) ||
            x.stride(-2) == 1 && x.stride(-1) == x.size(-2);
 }
@@ -99,7 +116,8 @@ void check_buffers(const torch::Tensor& x, const torch::Tensor& output) {
                 "matrix dimensions must be positive multiples of 64");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
                 "input must be 16-byte aligned");
-    TORCH_CHECK(dense_matrix(x) && dense_matrix(output), "x and output must be dense row/column-major");
+    TORCH_CHECK(dense_matrix(x) && dense_matrix(output),
+                "x and output must be dense row/column-major");
     TORCH_CHECK(output.size(-2) == rows && output.size(-1) == rows,
                 "output must have matching square matrix shape");
     TORCH_CHECK(!x.is_alias_of(output), "input and output must not alias");
@@ -108,83 +126,107 @@ void check_buffers(const torch::Tensor& x, const torch::Tensor& output) {
                 "matrix dimensions exceed the kernel limit");
 }
 
-
-void check_addend(const torch::Tensor& output, const c10::optional<torch::Tensor>& addend,
-                  float alpha, float beta) {
+void check_addend(const torch::Tensor& output,
+                  const c10::optional<torch::Tensor>& addend,
+                  float alpha,
+                  float beta) {
     TORCH_CHECK(std::isfinite(alpha) && std::isfinite(beta), "coefficients must be finite");
     TORCH_CHECK(beta == 0.0f || addend.has_value(), "nonzero beta requires an addend");
-    if (!addend.has_value() || beta == 0.0f) return;
+    if (!addend.has_value() || beta == 0.0f)
+        return;
     TORCH_CHECK(addend->device() == output.device() &&
-                addend->scalar_type() == output.scalar_type() &&
-                addend->sizes() == output.sizes() && dense_matrix(*addend),
+                    addend->scalar_type() == output.scalar_type() &&
+                    addend->sizes() == output.sizes() && dense_matrix(*addend),
                 "addend must match output device, dtype, shape and layout");
     TORCH_CHECK(!output.is_alias_of(*addend), "output must not alias addend");
 }
 
 } // namespace
 
-void syrk_out(torch::Tensor x, torch::Tensor output,
-              c10::optional<torch::Tensor> addend, float alpha, float beta,
+void syrk_out(torch::Tensor x,
+              torch::Tensor output,
+              c10::optional<torch::Tensor> addend,
+              float alpha,
+              float beta,
               std::string tile) {
     check_buffers(x, output);
     check_addend(output, addend, alpha, beta);
     const at::cuda::OptionalCUDAGuard guard(device_of(x));
     TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major >= 8, "BF16 tensor cores required");
     gemm::GemmParams p{};
-    p.a_ptr = x.data_ptr(); p.b_ptr = x.data_ptr(); p.out_ptr = output.data_ptr();
-    p.m = x.size(-2); p.n = x.size(-2); p.k = x.size(-1);
+    p.a_ptr = x.data_ptr();
+    p.b_ptr = x.data_ptr();
+    p.out_ptr = output.data_ptr();
+    p.m = x.size(-2);
+    p.n = x.size(-2);
+    p.k = x.size(-1);
     p.batch = x.dim() == 3 ? x.size(0) : 1;
     p.a_batch_stride = p.b_batch_stride = x.size(-2) * x.size(-1);
     p.out_batch_stride = x.size(-2) * x.size(-2);
     p.a_ld = x.stride(-1) == 1 ? x.size(-1) : x.size(-2);
-    p.b_ld = p.a_ld; p.out_ld = x.size(-2);
+    p.b_ld = p.a_ld;
+    p.out_ld = x.size(-2);
     launch_syrk(p, addend, alpha, beta, tile, !x.is_contiguous(),
                 at::cuda::getCurrentCUDAStream().stream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void symm_out(torch::Tensor symmetric, torch::Tensor x, torch::Tensor output,
-              c10::optional<torch::Tensor> addend, float alpha, float beta,
-              std::string tile, int raster) {
+void symm_out(torch::Tensor symmetric,
+              torch::Tensor x,
+              torch::Tensor output,
+              c10::optional<torch::Tensor> addend,
+              float alpha,
+              float beta,
+              std::string tile,
+              int raster) {
     TORCH_CHECK(symmetric.is_cuda() && x.is_cuda() && output.is_cuda(), "all tensors must be CUDA");
-    TORCH_CHECK(symmetric.device() == x.device() && x.device() == output.device(), "device mismatch");
+    TORCH_CHECK(symmetric.device() == x.device() && x.device() == output.device(),
+                "device mismatch");
     TORCH_CHECK(symmetric.scalar_type() == at::kBFloat16 && x.scalar_type() == at::kBFloat16 &&
-                output.scalar_type() == at::kBFloat16, "all tensors must be bfloat16");
-    TORCH_CHECK((x.dim() == 2 || x.dim() == 3) &&
-                symmetric.dim() == x.dim() && output.dim() == x.dim(),
+                    output.scalar_type() == at::kBFloat16,
+                "all tensors must be bfloat16");
+    TORCH_CHECK((x.dim() == 2 || x.dim() == 3) && symmetric.dim() == x.dim() &&
+                    output.dim() == x.dim(),
                 "expected matrices or matrix batches");
     TORCH_CHECK(x.dim() == 2 || symmetric.size(0) == x.size(0), "batch size mismatch");
     const auto rows = x.size(-2), cols = x.size(-1);
     TORCH_CHECK(symmetric.size(-2) == rows && symmetric.size(-1) == rows &&
-                output.sizes() == x.sizes(), "matrix shape mismatch");
+                    output.sizes() == x.sizes(),
+                "matrix shape mismatch");
     TORCH_CHECK(rows >= 64 && cols >= 64 && rows % 64 == 0 && cols % 64 == 0,
                 "matrix dimensions must be positive multiples of 64");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
-                reinterpret_cast<uintptr_t>(symmetric.data_ptr()) % 16 == 0,
+                    reinterpret_cast<uintptr_t>(symmetric.data_ptr()) % 16 == 0,
                 "inputs must be 16-byte aligned");
     TORCH_CHECK(dense_matrix(symmetric) && dense_matrix(x) && dense_matrix(output),
                 "all tensors must be dense row/column-major");
     TORCH_CHECK(!output.is_alias_of(x) && !output.is_alias_of(symmetric),
                 "output must not alias inputs");
     TORCH_CHECK(rows * cols <= std::numeric_limits<int>::max() &&
-                rows * rows <= std::numeric_limits<int>::max(), "matrix exceeds kernel limit");
+                    rows * rows <= std::numeric_limits<int>::max(),
+                "matrix exceeds kernel limit");
     TORCH_CHECK(raster >= -32 && raster <= 32, "raster must be in [-32, 32]");
     check_addend(output, addend, alpha, beta);
     const at::cuda::OptionalCUDAGuard guard(device_of(x));
     TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->major >= 8, "BF16 tensor cores required");
     gemm::GemmParams p{};
     // (S X)^T = X^T S: no materialized transpose, epilogue restores orientation.
-    p.a_ptr = x.data_ptr(); p.b_ptr = symmetric.data_ptr(); p.out_ptr = output.data_ptr();
-    p.m = cols; p.n = rows; p.k = rows;
+    p.a_ptr = x.data_ptr();
+    p.b_ptr = symmetric.data_ptr();
+    p.out_ptr = output.data_ptr();
+    p.m = cols;
+    p.n = rows;
+    p.k = rows;
     p.batch = x.dim() == 3 ? x.size(0) : 1;
     p.a_batch_stride = p.out_batch_stride = rows * cols;
     p.b_batch_stride = rows * rows;
     p.a_ld = x.is_contiguous() ? cols : rows;
-    p.b_ld = rows; p.out_ld = output.is_contiguous() ? cols : rows; p.raster = raster;
-    launch_symm(p, addend, alpha, beta, tile, !x.is_contiguous(),
-                !output.is_contiguous(), at::cuda::getCurrentCUDAStream().stream());
+    p.b_ld = rows;
+    p.out_ld = output.is_contiguous() ? cols : rows;
+    p.raster = raster;
+    launch_symm(p, addend, alpha, beta, tile, !x.is_contiguous(), !output.is_contiguous(),
+                at::cuda::getCurrentCUDAStream().stream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-
 
 } // namespace astrai::newton_schulz::symmetric

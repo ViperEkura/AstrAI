@@ -240,12 +240,12 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
             }
         }
     } else {
-        x8 = run_quant(x, meta->x->scale_recip(), quant::QuantLayout::RowMajor, fmt_a,
-                       c10::nullopt, c10::nullopt, 0, cfg)
+        x8 = run_quant(x, meta->x->scale_recip(), quant::QuantLayout::RowMajor, fmt_a, c10::nullopt,
+                       c10::nullopt, 0, cfg)
                  .out;
     }
-    res.out = run_gemm(x8.reshape({-1, x8.size(-1)}), w8, res.sx, res.sw, bias, true)
-                  .reshape(out_shape);
+    res.out =
+        run_gemm(x8.reshape({-1, x8.size(-1)}), w8, res.sx, res.sw, bias, true).reshape(out_shape);
     return res;
 }
 

@@ -67,9 +67,8 @@ PlanQuery plan_query(const GemmParams& p, const DeviceFacts& dev) {
     q.mma_k = MmaShape::kK;
     // Match the descriptor's alignment check before pricing TMA residency.
     // Driver encode can still reject a map; the launcher then falls back.
-    q.tma = Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 &&
-            sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2 && dev.cc >= 90 &&
-            !gemm_tma_staging_disabled() &&
+    q.tma = Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 && sizeof(ElemA) <= 2 &&
+            sizeof(ElemB) <= 2 && dev.cc >= 90 && !gemm_tma_staging_disabled() &&
             astrai::tma_aligned16(p.a_ptr, p.a_ld * sizeof(ElemA),
                                   (p.batch > 1 ? p.a_batch_stride : 0) * sizeof(ElemA)) &&
             astrai::tma_aligned16(p.b_ptr, p.b_ld * sizeof(ElemB),
@@ -95,8 +94,8 @@ template <typename ElemA,
           typename Schedule = MmaSync,
           typename LayoutOut = RowMajor>
 LaunchPlan plan_dispatch_for(const GemmParams& p) {
-    const PlanQuery q = plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT, Schedule, LayoutOut>(
-        p, device_facts());
+    const PlanQuery q =
+        plan_query<ElemA, ElemB, LayoutA, LayoutB, OutT, Schedule, LayoutOut>(p, device_facts());
     return {plan_dispatch(q), q.tma};
 }
 
@@ -178,7 +177,9 @@ auto with_layout_tags(bool trans_a, bool trans_b, bool swapped, F&& fn) {
  * instantiates the dual-row-major shape directly (A congruous, B
  * crosswise).
  */
-template <typename ElemA, typename ElemB = ElemA, typename OutT = __nv_bfloat16,
+template <typename ElemA,
+          typename ElemB = ElemA,
+          typename OutT = __nv_bfloat16,
           typename Schedule = MmaSync>
 void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b) {
     constexpr bool kSymmetric = std::is_same_v<ElemA, ElemB>;
@@ -195,7 +196,8 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
     const auto launch = [&](auto la, auto lb, auto lout) {
         launch_plan<ElemA, ElemB, decltype(la), decltype(lb), decltype(lout), OutT, Schedule>(
             p,
-            plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT, Schedule, decltype(lout)>(p),
+            plan_dispatch_for<ElemA, ElemB, decltype(la), decltype(lb), OutT, Schedule,
+                              decltype(lout)>(p),
             stream);
     };
     with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, launch);
@@ -209,10 +211,10 @@ void gemm_dispatch(GemmParams p, cudaStream_t stream, bool trans_a, bool trans_b
 #define ASTRAI_GEMM_SCHEDULE MmaSync
 #endif
 
-#define ASTRAI_GEMM_INSTANTIATE(W, A)                                                          \
-    template void gemm_dispatch<W, A, __nv_bfloat16, ASTRAI_GEMM_SCHEDULE>(                    \
-        GemmParams, cudaStream_t, bool, bool);                                              \
-    template std::pair<PlanDecision, PlanQuery> plan_probe_for<W, A, ASTRAI_GEMM_SCHEDULE>( \
+#define ASTRAI_GEMM_INSTANTIATE(W, A)                                                              \
+    template void gemm_dispatch<W, A, __nv_bfloat16, ASTRAI_GEMM_SCHEDULE>(                        \
+        GemmParams, cudaStream_t, bool, bool);                                                     \
+    template std::pair<PlanDecision, PlanQuery> plan_probe_for<W, A, ASTRAI_GEMM_SCHEDULE>(        \
         int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&)
 
 /*
@@ -245,11 +247,12 @@ std::pair<PlanDecision, PlanQuery> plan_probe_for(int64_t m,
         swapped = !trans_a && !trans_b;
         canonicalize_gemm(p, trans_a, trans_b); // symmetric NN -> transposed TT
     }
-    return with_layout_tags<ElemA, ElemB>(trans_a, trans_b, swapped, [&](auto la, auto lb, auto lo) {
-        PlanQuery q =
-            plan_query<ElemA, ElemB, decltype(la), decltype(lb), __nv_bfloat16, Schedule, decltype(lo)>(p, dev);
-        return std::make_pair(plan_dispatch(q), std::move(q));
-    });
+    return with_layout_tags<ElemA, ElemB>(
+        trans_a, trans_b, swapped, [&](auto la, auto lb, auto lo) {
+            PlanQuery q = plan_query<ElemA, ElemB, decltype(la), decltype(lb), __nv_bfloat16,
+                                     Schedule, decltype(lo)>(p, dev);
+            return std::make_pair(plan_dispatch(q), std::move(q));
+        });
 }
 
 } // namespace gemm

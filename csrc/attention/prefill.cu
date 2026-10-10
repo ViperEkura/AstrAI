@@ -18,7 +18,8 @@ torch::Tensor attn_prefill(torch::Tensor q,
                            torch::Tensor v,
                            c10::optional<torch::Tensor> mask,
                            c10::optional<double> scale,
-                           int64_t layout, bool is_causal) {
+                           int64_t layout,
+                           bool is_causal) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 

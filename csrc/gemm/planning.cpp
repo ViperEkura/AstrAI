@@ -215,9 +215,15 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = fals
         bool heuristic = false;
         bool valid = false;
     };
-    static thread_local LastModelPlan last;
-    if (last.valid && last.heuristic == heuristic && same_model_query(last.query, q))
-        return last.decision;
+    // A layer alternates among several GEMM shapes; retain their exact queries.
+    struct ModelPlanCache {
+        std::array<LastModelPlan, 8> entries{};
+        std::size_t next = 0;
+    };
+    static thread_local ModelPlanCache cache;
+    for (const auto& entry : cache.entries)
+        if (entry.valid && entry.heuristic == heuristic && same_model_query(entry.query, q))
+            return entry.decision;
     std::optional<GemmRecipe> best;
     std::optional<GemmRecipe> short_k_best;
     double best_cost = 0;
@@ -256,11 +262,11 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = fals
         shallow_k_stages != std::numeric_limits<int>::max() &&
         q.k <= (std::int64_t)shallow_k_stages * best->k_tile)
         best = short_k_best;
-    last = {q,
-            {*best, plan_raster(q, best->bm, best->bn), heuristic ? "heuristic" : "model"},
-            heuristic,
-            true};
-    return last.decision;
+    const PlanDecision decision{*best, plan_raster(q, best->bm, best->bn),
+                                heuristic ? "heuristic" : "model"};
+    cache.entries[cache.next] = {q, decision, heuristic, true};
+    cache.next = (cache.next + 1) % cache.entries.size();
+    return decision;
 }
 
 PlanDecision select_plan(const PlanQuery& q) {

@@ -15,12 +15,12 @@ namespace gemm {
  * and launches.
  */
 template <typename Manifest, typename Resolver>
-bool dispatch_tile(const PlanDecision& d, const Resolver& resolve) {
+bool dispatch_tile(const GemmRecipe& recipe, const Resolver& resolve) {
     return std::apply(
-        [&d, &resolve](auto... tiles) {
-            return (... || (tile_class<decltype(tiles)>() == static_cast<TileClass>(d.recipe.cta) &&
-                            decltype(tiles)::kStages == d.recipe.k_stages &&
-                            (int)decltype(tiles)::kTile == d.recipe.k_tile &&
+        [&recipe, &resolve](auto... tiles) {
+            return (... || (tile_class<decltype(tiles)>() == static_cast<TileClass>(recipe.cta) &&
+                            decltype(tiles)::kStages == recipe.k_stages &&
+                            (int)decltype(tiles)::kTile == recipe.k_tile &&
                             resolve.template run<decltype(tiles)>()));
         },
         Manifest{});
@@ -53,139 +53,106 @@ using reclaim_fallback_t = std::conditional_t<
                        narrow_fallback_t<Tile>,
                        Tile_64x64x64_W16x32_S2>>;
 
-/* Resolve each manifest tile to one policy. TMA can reject a descriptor and fall back. */
-template <bool UseTma,
-          typename ElemA,
+template <typename Schedule, typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
+inline constexpr bool tma_eligible_v =
+    Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 && sizeof(ElemA) <= 2 &&
+    sizeof(ElemB) <= 2;
+
+/* Bind operand types, layouts, and schedule once; a recipe selects the concrete policy. */
+template <typename ElemA,
           typename ElemB,
           typename LayoutA,
           typename LayoutB,
           typename LayoutOut,
           typename OutT,
           typename Schedule>
-struct TileLauncher {
-    const GemmParams& p;
-    cudaStream_t stream;
+struct GemmTileDispatch {
+    template <bool UseTma>
+    using StagingA = std::conditional_t<UseTma, RowMajor, LayoutA>;
+    template <bool UseTma>
+    using StagingB = std::conditional_t<UseTma, ColMajor, LayoutB>;
+    template <bool UseTma>
+    using Manifest = manifest_for<ElemA, ElemB, StagingA<UseTma>, StagingB<UseTma>>;
+    template <typename Tile>
+    using ResolvedTile =
+        reclaim_fallback_t<warp_widened_t<ElemA, ElemB, Tile>, ElemA, ElemB, OutT>;
+    template <bool UseTma, typename Tile>
+    using Policy = GemmPolicy<ElemA, ElemB, StagingA<UseTma>, StagingB<UseTma>,
+                              ResolvedTile<Tile>, LayoutOut, OutT,
+                              PlannedGemmOptions<Schedule, UseTma>>;
 
-    template <typename Tile> bool run() const {
-        using Widened = warp_widened_t<ElemA, ElemB, Tile>;
-        using TileT = reclaim_fallback_t<Widened, ElemA, ElemB, OutT>;
-        using Options = PlannedGemmOptions<Schedule, UseTma>;
-        using Policy = GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT, LayoutOut, OutT, Options>;
-        if constexpr (UseTma)
-            return launch_policy_tma<Policy>(p, stream);
-        else {
-            launch_policy<Policy>(p, stream);
+    template <bool UseTma>
+    struct Launcher {
+        const GemmParams& p;
+        cudaStream_t stream;
+        int smem_max;
+
+        template <typename Tile> bool run() const {
+            using P = Policy<UseTma, Tile>;
+            if constexpr (UseTma) {
+                return launch_policy_tma<P>(p, stream, smem_max);
+            } else {
+                launch_policy<P>(p, stream);
+                return true;
+            }
+        }
+    };
+
+    template <bool UseTma>
+    struct ResourceQuery {
+        const PlanQuery& q;
+        KernelResources& result;
+
+        template <typename Tile> bool run() const {
+            using P = Policy<UseTma, Tile>;
+            using T = typename P::Tile;
+            if constexpr (UseTma) {
+                result = with_tma_ranks(q.rank3a, q.rank3b, [&](auto a, auto b) {
+                    return kernel_resources<
+                        gemm_kernel_tma<P, decltype(a)::value, decltype(b)::value>, P>(q);
+                });
+            } else {
+                result = kernel_resources<gemm_kernel<P>, P>(q);
+            }
+            result.effective = {static_cast<int>(tile_class<T>()),
+                                T::kStages,
+                                T::kTile,
+                                T::CtaShape::kM,
+                                T::CtaShape::kN,
+                                T::WarpShape::kM,
+                                T::WarpShape::kN,
+                                P::Traits::kCtaThreads,
+                                P::kSmemBytes};
             return true;
         }
+    };
+
+    static KernelResources resources(const GemmRecipe& recipe, const PlanQuery& q) {
+        KernelResources result{};
+        if constexpr (tma_eligible_v<Schedule, ElemA, ElemB, LayoutA, LayoutB>) {
+            if (q.tma) {
+                dispatch_tile<Manifest<true>>(recipe, ResourceQuery<true>{q, result});
+                return result;
+            }
+        }
+        dispatch_tile<Manifest<false>>(recipe, ResourceQuery<false>{q, result});
+        return result;
+    }
+
+    static void launch(GemmParams p, const LaunchPlan& selected, cudaStream_t stream,
+                       const DeviceFacts& dev) {
+        const PlanDecision& decision = selected.decision;
+        p.raster = decision.raster;
+        // Descriptor rejection falls through to the cp.async policy.
+        if constexpr (tma_eligible_v<Schedule, ElemA, ElemB, LayoutA, LayoutB>) {
+            if (selected.tma &&
+                dispatch_tile<Manifest<true>>(
+                    decision.recipe, Launcher<true>{p, stream, dev.smem_max}))
+                return;
+        }
+        dispatch_tile<Manifest<false>>(decision.recipe, Launcher<false>{p, stream, dev.smem_max});
     }
 };
-
-template <bool UseTma,
-          typename ElemA,
-          typename ElemB,
-          typename LayoutA,
-          typename LayoutB,
-          typename LayoutOut,
-          typename OutT,
-          typename Schedule>
-struct ResourceResolver {
-    const PlanQuery& q;
-    KernelResources& result;
-
-    template <typename Tile> bool run() const {
-        using Widened = warp_widened_t<ElemA, ElemB, Tile>;
-        using TileT = reclaim_fallback_t<Widened, ElemA, ElemB, OutT>;
-        using Policy = GemmPolicy<ElemA, ElemB, LayoutA, LayoutB, TileT, LayoutOut, OutT,
-                                  PlannedGemmOptions<Schedule, UseTma>>;
-        if constexpr (UseTma) {
-            auto query_rank = [&](auto a, auto b) {
-                return kernel_resources<
-                    gemm_kernel_tma<Policy, decltype(a)::value, decltype(b)::value>, Policy>(q);
-            };
-            if (q.rank3a && q.rank3b)
-                result = query_rank(std::true_type{}, std::true_type{});
-            else if (q.rank3a)
-                result = query_rank(std::true_type{}, std::false_type{});
-            else if (q.rank3b)
-                result = query_rank(std::false_type{}, std::true_type{});
-            else
-                result = query_rank(std::false_type{}, std::false_type{});
-        } else {
-            result = kernel_resources<gemm_kernel<Policy>, Policy>(q);
-        }
-        result.effective = {static_cast<int>(tile_class<TileT>()),
-                            TileT::kStages,
-                            TileT::kTile,
-                            TileT::CtaShape::kM,
-                            TileT::CtaShape::kN,
-                            TileT::WarpShape::kM,
-                            TileT::WarpShape::kN,
-                            Policy::Traits::kCtaThreads,
-                            Policy::kSmemBytes};
-        return true;
-    }
-};
-
-template <typename ElemA,
-          typename ElemB,
-          typename LayoutA,
-          typename LayoutB,
-          typename LayoutOut,
-          typename OutT,
-          typename Schedule>
-KernelResources resources_for(const GemmRecipe& r, const PlanQuery& q) {
-    KernelResources result{};
-    const PlanDecision decision{r, 0, "resources"};
-    if constexpr (Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 && sizeof(ElemA) <= 2 &&
-                  sizeof(ElemB) <= 2) {
-        if (q.tma) {
-            dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
-                decision,
-                ResourceResolver<true, ElemA, ElemB, RowMajor, ColMajor, LayoutOut, OutT, Schedule>{
-                    q, result});
-            return result;
-        }
-    }
-    dispatch_tile<manifest_for<ElemA, ElemB, LayoutA, LayoutB>>(
-        decision,
-        ResourceResolver<false, ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT, Schedule>{q,
-                                                                                           result});
-    return result;
-}
-
-/*
- * Plan -> Policy: dispatch_tile picks the manifest entry, the launcher
- * applies the ladder's substitutions; k_stages >= 3 selects the deep-ring
- * sibling. Params by value — the raster decision lands in the copy the
- * kernel receives. The schedule selects the MMA cell.
- */
-template <typename ElemA,
-          typename ElemB,
-          typename LayoutA,
-          typename LayoutB,
-          typename LayoutOut = RowMajor,
-          typename OutT = __nv_bfloat16,
-          typename Schedule = MmaSync>
-void launch_plan(GemmParams p, const LaunchPlan& selected, cudaStream_t stream) {
-    const PlanDecision& d = selected.decision;
-    p.raster = d.raster;
-    /*
-     * Dual-congruous (crosswise 0): the only layout pair TMA can describe —
-     * both operands staged as-is, so the descriptors are encodable.
-     */
-    constexpr bool kCongruous = crosswise_of<LayoutA, LayoutB>() == 0;
-    /* The query resolved staging gates; descriptor encode may still reject TMA. */
-    if constexpr (Schedule::kTma && kCongruous && sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2) {
-        if (selected.tma &&
-            dispatch_tile<manifest_for<ElemA, ElemB, RowMajor, ColMajor>>(
-                d, TileLauncher<true, ElemA, ElemB, RowMajor, ColMajor, LayoutOut, OutT, Schedule>{
-                       p, stream}))
-            return;
-    }
-    dispatch_tile<manifest_for<ElemA, ElemB, LayoutA, LayoutB>>(
-        d,
-        TileLauncher<false, ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT, Schedule>{p, stream});
-}
 
 } // namespace gemm
 } // namespace astrai

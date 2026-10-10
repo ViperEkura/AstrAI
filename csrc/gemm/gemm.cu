@@ -31,34 +31,31 @@ namespace gemm {
 #endif
 #define ASTRAI_GEMM_PAIRS(X) ASTRAI_GEMM_BASE_PAIRS(X) ASTRAI_GEMM_FP8_PAIRS(X)
 
-#define GEMM_EXTERN(TA, TB)                                                                        \
-    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, MmaSync>(GemmParams, cudaStream_t,   \
-                                                                       bool, bool);                \
-    extern template std::pair<PlanDecision, PlanQuery> plan_probe_for<TA, TB, MmaSync>(            \
+#define GEMM_EXTERN_FOR(TA, TB, SCHEDULE)                                                          \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, SCHEDULE>(                           \
+        GemmParams, cudaStream_t, bool, bool, const DeviceFacts&);                                 \
+    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, SCHEDULE>(                           \
+        GemmParams, cudaStream_t, bool, bool);                                                     \
+    extern template std::pair<PlanDecision, PlanQuery> plan_probe_for<TA, TB, SCHEDULE>(           \
         int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
-ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
-#undef GEMM_EXTERN
+
+#define GEMM_EXTERN_BASE(TA, TB) GEMM_EXTERN_FOR(TA, TB, MmaSync)
+ASTRAI_GEMM_PAIRS(GEMM_EXTERN_BASE)
+#undef GEMM_EXTERN_BASE
 #if ASTRAI_BUILD_TMA
-#define GEMM_EXTERN(TA, TB)                                                                        \
-    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, TmaMma>(GemmParams, cudaStream_t,    \
-                                                                      bool, bool);                 \
-    extern template std::pair<PlanDecision, PlanQuery> plan_probe_for<TA, TB, TmaMma>(             \
-        int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
-ASTRAI_GEMM_PAIRS(GEMM_EXTERN)
-#undef GEMM_EXTERN
+#define GEMM_EXTERN_TMA(TA, TB) GEMM_EXTERN_FOR(TA, TB, TmaMma)
+ASTRAI_GEMM_PAIRS(GEMM_EXTERN_TMA)
+#undef GEMM_EXTERN_TMA
 #endif
 #if ASTRAI_BUILD_MX
-#define GEMM_EXTERN(TA, TB)                                                                        \
-    extern template void gemm_dispatch<TA, TB, __nv_bfloat16, Sm120Mma>(GemmParams, cudaStream_t,  \
-                                                                        bool, bool);               \
-    extern template std::pair<PlanDecision, PlanQuery> plan_probe_for<TA, TB, Sm120Mma>(           \
-        int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
-ASTRAI_GEMM_FP8_PAIRS(GEMM_EXTERN)
-#undef GEMM_EXTERN
+#define GEMM_EXTERN_MX(TA, TB) GEMM_EXTERN_FOR(TA, TB, Sm120Mma)
+ASTRAI_GEMM_FP8_PAIRS(GEMM_EXTERN_MX)
+#undef GEMM_EXTERN_MX
 #endif
+#undef GEMM_EXTERN_FOR
 
-GemmCapabilities capabilities() {
-    const int cc = device_facts().cc;
+static GemmCapabilities capabilities_for(const DeviceFacts& dev) {
+    const int cc = dev.cc;
     return {cc,
             supports(build::kBase, cc),
             supports(build::kFp8, cc),
@@ -66,6 +63,8 @@ GemmCapabilities capabilities() {
             supports(build::kMx, cc),
             build::kTargets};
 }
+
+GemmCapabilities capabilities() { return capabilities_for(device_facts()); }
 
 namespace {
 
@@ -76,7 +75,7 @@ namespace {
  * unsupported pair raises with the actual operand dtypes in the message
  * instead of a hardcoded list that can drift.
  */
-using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool);
+using GemmDispatchFn = void (*)(GemmParams, cudaStream_t, bool, bool, const DeviceFacts&);
 
 constexpr uint16_t pack_dtypes(c10::ScalarType a, c10::ScalarType b) {
     return static_cast<uint16_t>(static_cast<uint8_t>(a)) << 8 | static_cast<uint8_t>(b);
@@ -112,9 +111,10 @@ template <typename F> auto visit_gemm_pair(c10::ScalarType a, c10::ScalarType b,
 }
 
 /* All kernel variants have distinct schedule types and architecture images. */
-template <typename A, typename B, typename F> auto with_schedule(F&& fn) {
+template <typename A, typename B, typename F>
+auto with_schedule(const DeviceFacts& dev, F&& fn) {
     constexpr bool fp8 = sizeof(A) == 1 && !std::is_same_v<A, int8_t>;
-    const GemmCapabilities caps = capabilities();
+    const GemmCapabilities caps = capabilities_for(dev);
     TORCH_CHECK(fp8 ? caps.fp8 : caps.mma, "GEMM kernels were not built for this device/dtype (SM",
                 caps.cc, ", compiled targets: ", caps.targets, ")");
 #if ASTRAI_BUILD_MX
@@ -130,14 +130,22 @@ template <typename A, typename B, typename F> auto with_schedule(F&& fn) {
     return fn(MmaSync{});
 }
 
-GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
-    return visit_gemm_pair(a, b, [](auto pair) {
+template <typename F>
+auto with_gemm_variant(c10::ScalarType a, c10::ScalarType b, const DeviceFacts& dev, F&& fn) {
+    return visit_gemm_pair(a, b, [&](auto pair) {
         using Pair = decltype(pair);
         return with_schedule<typename Pair::A, typename Pair::B>(
-            [](auto schedule) -> GemmDispatchFn {
-                return &gemm_dispatch<typename Pair::A, typename Pair::B, __nv_bfloat16,
-                                      decltype(schedule)>;
-            });
+            dev, [&](auto schedule) { return fn(pair, schedule); });
+    });
+}
+
+GemmDispatchFn find_gemm_dispatch(c10::ScalarType a,
+                                  c10::ScalarType b,
+                                  const DeviceFacts& dev) {
+    return with_gemm_variant(a, b, dev, [](auto pair, auto schedule) -> GemmDispatchFn {
+        using Pair = decltype(pair);
+        return &gemm_dispatch<typename Pair::A, typename Pair::B, __nv_bfloat16,
+                              decltype(schedule)>;
     });
 }
 
@@ -148,12 +156,12 @@ GemmDispatchFn find_gemm_dispatch(c10::ScalarType a, c10::ScalarType b) {
 using GemmProbeFn = std::pair<PlanDecision, PlanQuery> (*)(
     int64_t, int64_t, int64_t, int64_t, bool, bool, const DeviceFacts&);
 
-GemmProbeFn find_gemm_probe(c10::ScalarType a, c10::ScalarType b) {
-    return visit_gemm_pair(a, b, [](auto pair) {
+GemmProbeFn find_gemm_probe(c10::ScalarType a,
+                            c10::ScalarType b,
+                            const DeviceFacts& dev) {
+    return with_gemm_variant(a, b, dev, [](auto pair, auto schedule) -> GemmProbeFn {
         using Pair = decltype(pair);
-        return with_schedule<typename Pair::A, typename Pair::B>([](auto schedule) -> GemmProbeFn {
-            return &plan_probe_for<typename Pair::A, typename Pair::B, decltype(schedule)>;
-        });
+        return &plan_probe_for<typename Pair::A, typename Pair::B, decltype(schedule)>;
     });
 }
 
@@ -176,8 +184,9 @@ PlanProbe plan_probe(int64_t m,
                      int64_t batch) {
     TORCH_CHECK(m > 0 && n > 0 && k > 0, "GEMM probe: M, N and K must be greater than zero (got ",
                 m, ", ", n, ", ", k, ")");
+    const DeviceFacts dev = device_facts();
     const auto [decision, query] =
-        find_gemm_probe(dt_a, dt_b)(m, n, k, batch, trans_a, trans_b, astrai::device_facts());
+        find_gemm_probe(dt_a, dt_b, dev)(m, n, k, batch, trans_a, trans_b, dev);
     PlanProbe r;
     r.source = decision.source;
     r.cta = decision.recipe.cta;

@@ -37,6 +37,7 @@
 
 #include <api/fp8_checks.h>
 #include <api/gemm.h>
+#include <utils/device.cuh>
 
 namespace astrai {
 namespace gemm {
@@ -202,7 +203,8 @@ torch::Tensor quant_gemm_ladder(torch::Tensor a,
     p.out_batch_stride = m * n;
     p.out_ld = static_cast<int>(n);
 
-    Lookup(dt_a, dt_b)(p, stream.stream(), tag_a, tag_b);
+    const DeviceFacts dev = device_facts();
+    Lookup(dt_a, dt_b, dev)(p, stream.stream(), tag_a, tag_b, dev);
     C10_CUDA_CHECK(cudaGetLastError());
     return output;
 }

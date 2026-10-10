@@ -44,8 +44,27 @@ automatic CUDA selection to those rows unless `heuristic=True` is supplied; a
 matching Torch row always wins. A scoped `override` restores both its previous
 table and heuristic setting, including after an exception. The separate
 `reuse_ns_buffers` option enables only scratch reuse. Kernel selection and
-scratch reuse preserve checkpoint keys. Sharded DTensor updates
-retain the existing gather/orthogonalize/scatter path.
+scratch reuse preserve checkpoint keys. Sharded DTensor updates now pass
+these same backend options to the gathered full logical matrix, then restore
+the original placement. NS never runs independently on each local shard.
+The supported scope is a 2D matrix on a one-dimensional mesh with `Shard(0)`,
+`Shard(1)` or `Replicate`; other meshes/placements and packed 3D experts are
+rejected. DTensor matrices are processed one at a time, so `ns_batch_size`
+continues to control plain parameters only.
+
+Gather breaks BF16 non-Nesterov momentum aliasing. After NS normalizes its
+full input, the optimizer writes that normalized momentum back to the
+shards. This preserves Torch's multi-step state transition and adds a
+distribution of the normalized input for this case. FP32 and Nesterov
+momentum do not take that writeback. Gather, NS scratch and distribution
+remain full-matrix costs; owner-only or pipelined collectives are separate
+work.
+
+CPU/Gloo tests compare parameters and exact momentum over five updates,
+including zero/tiny gradients and state restore, at 2/4/8 ranks. They observe
+full-matrix shape and backend arguments, not actual CUDA launches. Native
+CUDA dispatch, peak memory and complete RL cost require the assigned GPU
+test pool; enabling `auto` alone is not evidence of a kernel speedup.
 
 BF16 inputs are normalized in place, matching Torch Muon semantics. Later
 iterations use separate buffers, preserving the normalized caller input and

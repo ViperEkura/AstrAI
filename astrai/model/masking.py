@@ -53,9 +53,12 @@ def prepare_decoder_masks(
     result: dict[str, LayerAttentionMask] = {}
     full_attention = kinds & {"gqa", "mla"}
     if full_attention:
+        # Keep a 2-D padding mask on its key axis. The attention backend applies
+        # causality using each request's query position, including cached chunks.
+        key_padding = input_mask is not None and input_mask.ndim == 2
         full = LayerAttentionMask(
-            process_attention_mask(input_mask, causal=True),
-            is_causal=input_mask is None,
+            process_attention_mask(input_mask),
+            is_causal=input_mask is None or key_padding,
         )
         for kind in full_attention:
             result[kind] = full

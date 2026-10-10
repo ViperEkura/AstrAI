@@ -191,8 +191,11 @@ def attn_paged_prefill(
         qo_indptr: [batch+1] (int32) — prefix sum of per-request q_lens
         q_tile_to_batch: [num_q_tiles] (int32) — request index per Q tile
         q_tile_to_index: [num_q_tiles] (int32) — local Q tile index per request
-        mask: 4D [batch, 1, q_len, kv_len] (bool, True=keep) or None
-        is_causal: apply causal mask
+        mask: 2D [batch, key], 3D [batch, query, key], or 4D
+            [batch, head, query, key] (bool, True=keep). Query rows are
+            request-local to this chunk; key columns are absolute cache positions.
+            Missing query rows or key columns are masked out.
+        is_causal: apply causal mask using each request's KV and Q lengths
 
     Returns:
         [total_q, n_heads, head_dim] (bf16, 3D)

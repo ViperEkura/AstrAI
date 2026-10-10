@@ -6,6 +6,7 @@ selection share the generic operator dispatcher. Inputs use BLHD layout.
 
 import enum
 import functools
+import inspect
 import logging
 import math
 from abc import ABC, abstractmethod
@@ -279,6 +280,18 @@ def attention(
     return resolution.record.obj.forward(*args, scale=scale)
 
 
+@functools.cache
+def _supports_call_accepts_scale(backend_cls: type) -> bool:
+    """Preserve legacy five-argument probes while forwarding supported scale."""
+    parameters = inspect.signature(backend_cls.supports_call).parameters
+    scale = parameters.get("scale")
+    return (
+        scale is not None
+        and scale.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ) or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
 class AttentionBackend(ABC):
     """Register subclasses with ``AttentionBackendFactory.register(name)``.
 
@@ -293,8 +306,13 @@ class AttentionBackend(ABC):
     @classmethod
     def supports_axes(cls, ax: Axes) -> bool:
         """Default adapter for third-party backends using supports_call."""
-        if ax.get("scale") is not None and not cls.supports_scale:
+        scale = ax.get("scale")
+        if scale is None:
+            return _instance(cls).supports_call(*ax["_call"])
+        if not cls.supports_scale:
             return False
+        if _supports_call_accepts_scale(cls):
+            return _instance(cls).supports_call(*ax["_call"], scale=scale)
         return _instance(cls).supports_call(*ax["_call"])
 
     def __enter__(self) -> "AttentionBackend":

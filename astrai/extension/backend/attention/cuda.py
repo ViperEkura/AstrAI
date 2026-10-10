@@ -15,6 +15,28 @@ if TYPE_CHECKING:
     from astrai.model.kv_cache import KVCache
 
 
+def _validate_paged_mask(
+    q: Tensor, kv_cache: "KVCache", mask: Tensor, fwd: Optional[str]
+) -> None:
+    """Check host-visible mask metadata before writing the KV cache."""
+    if mask.ndim not in (2, 3, 4):
+        raise ValueError("paged mask must be 2D, 3D or 4D")
+    if mask.device != q.device or mask.dtype != torch.bool:
+        raise ValueError("paged mask must be boolean on Q's device")
+    if mask.stride(-1) != 1:
+        raise ValueError("paged mask key axis must be contiguous")
+    if mask.size(0) not in (1, kv_cache.req_pool_indices.numel()):
+        raise ValueError("paged mask batch mismatch")
+    if mask.ndim == 4 and mask.size(1) not in (1, q.size(1)):
+        raise ValueError("paged mask head mismatch")
+    if not 0 < mask.size(-1) <= kv_cache.req_to_token.size(1):
+        raise ValueError("paged mask key axis exceeds cache capacity")
+    if mask.ndim >= 3:
+        max_rows = 1 if fwd == "decode" else q.size(0)
+        if not 0 < mask.size(-2) <= max_rows:
+            raise ValueError("paged mask query axis must use request-local rows")
+
+
 @AttentionBackendFactory.register(ATTN_BACKEND.CUDA.value)
 class CudaBackend(AttentionBackend):
     """CUDA kernel backend with direct KV cache access.
@@ -98,6 +120,8 @@ class CudaBackend(AttentionBackend):
         self._check_fwd(fwd)
         if kv_cache is None:
             raise RuntimeError("CudaBackend does not support training (kv_cache=None)")
+        if attn_mask is not None:
+            _validate_paged_mask(q, kv_cache, attn_mask, fwd)
         if fwd == "decode":
             return self._decode(
                 q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale

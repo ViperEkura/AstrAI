@@ -41,6 +41,21 @@ def _combine_mask(allowed: Tensor, mask: Optional[Tensor]) -> Tensor:
     return mask.masked_fill(~allowed, float("-inf"))
 
 
+def _packed_mask(mask: Optional[Tensor], allowed: Tensor, max_q: int) -> Tensor:
+    """Apply the paged mask's broadcast and out-of-extent rules."""
+    if mask is None:
+        return allowed
+    max_kv = allowed.size(-1)
+    missing = False if mask.dtype == torch.bool else float("-inf")
+    mask_rows = mask.size(-2)
+    mask = mask[..., :max_q, :max_kv]
+    if mask_rows != 1 and mask.size(-2) < max_q:
+        mask = F.pad(mask, (0, 0, 0, max_q - mask.size(-2)), value=missing)
+    if mask.size(-1) < max_kv:
+        mask = F.pad(mask, (0, max_kv - mask.size(-1)), value=missing)
+    return _combine_mask(allowed, mask)
+
+
 @AttentionBackendFactory.register(ATTN_BACKEND.TORCH_NATIVE.value)
 class TorchNativeBackend(AttentionBackend):
     """Reference backend using torch SDPA with indirect KV cache indexing.
@@ -116,6 +131,19 @@ class TorchNativeBackend(AttentionBackend):
 
         if kv_cache is None or kv_cache.qo_indptr is None:
             raise ValueError("packed attention requires KV cache metadata")
+        mask_view = _mask_view(attn_mask)
+        if mask_view is not None:
+            if mask_view.device != q.device:
+                raise ValueError("packed mask must be on Q's device")
+            if mask_view.size(0) not in (1, kv_cache.seq_lens.size(0)):
+                raise ValueError("packed mask batch mismatch")
+            if mask_view.size(1) not in (1, q.size(1)):
+                raise ValueError("packed mask head mismatch")
+            max_mask_rows = 1 if fwd == "decode" else q.size(0)
+            if mask_view.size(-2) < 1 or mask_view.size(-2) > max_mask_rows:
+                raise ValueError("packed mask query axis must use request-local rows")
+            if not 0 < mask_view.size(-1) <= kv_cache.req_to_token.size(1):
+                raise ValueError("packed mask key axis exceeds cache capacity")
         kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
         kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
 
@@ -152,12 +180,7 @@ class TorchNativeBackend(AttentionBackend):
         allowed = kv_valid[:, None, None, :]
         if is_causal:
             allowed = allowed & causal.unsqueeze(1)
-        mask = _mask_view(attn_mask)
-        if mask is not None:
-            mask = mask[..., :max_q, :max_kv]
-            if mask.size(-1) < max_kv or (mask.size(-2) != 1 and mask.size(-2) < max_q):
-                raise ValueError("packed mask must cover all query and key positions")
-        mask = _combine_mask(allowed, mask)
+        mask = _packed_mask(mask_view, allowed, max_q)
 
         out = F.scaled_dot_product_attention(
             q[q_index].permute(0, 2, 1, 3),

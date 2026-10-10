@@ -4,6 +4,7 @@ Covers training forward, inference prefill, inference decode (mixed
 seq_lens with padding mask), and end-to-end scheduler.run_batch.
 """
 
+import pytest
 import torch
 
 from astrai.extension import ATTN_BACKEND, attn_backend
@@ -118,6 +119,52 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
         )
         assert d == 0.0, f"Prefill diff for sample {i}: {d}"
         offset += len(p)
+
+
+@skip_no_kernel
+@pytest.mark.parametrize("mask_len", [4, 6])
+def test_masked_cached_chunk_prefill_matches_torch(cuda_model, mask_len):
+    model, _ = cuda_model
+    device = "cuda"
+    prompt_ids = [1, 2, 3, 4, 5, 6]
+    ids = torch.tensor(prompt_ids, device=device)
+    key_mask = torch.tensor([[True, False, True, True, False, True]], device=device)[
+        :, :mask_len
+    ]
+
+    def run(backend):
+        pool = BlockPool(
+            n_layers=2,
+            n_kv_heads=1,
+            head_dim=D,
+            max_batch_size=1,
+            max_seq_len=64,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        task_cache = _mk_task_cache(pool)
+        workspace = _ws(pool)
+        assert task_cache.alloc_slots("t", prompt_ids)
+        with attn_backend(backend), torch.inference_mode():
+            model(
+                ids[:3],
+                input_mask=key_mask[:, :3],
+                position_ids=torch.arange(3, device=device),
+                kv_cache=task_cache.bind(["t"], workspace, start_pos=0, seq_ends=[3]),
+                fwd="prefill",
+            )
+            chunk = model(
+                ids[3:],
+                input_mask=key_mask,
+                position_ids=torch.arange(3, 6, device=device),
+                kv_cache=task_cache.bind(["t"], workspace, start_pos=3, seq_ends=[6]),
+                fwd="prefill",
+            )
+        return chunk["logits"]
+
+    torch_out = run(ATTN_BACKEND.TORCH_NATIVE)
+    cuda_out = run(ATTN_BACKEND.CUDA)
+    torch.testing.assert_close(cuda_out, torch_out, atol=0.05, rtol=0.05)
 
 
 @skip_no_kernel

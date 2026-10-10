@@ -171,11 +171,14 @@ preserve partial paged masks and singleton query broadcast.
   for unequal lengths instead of relying on SDPA's upper-left alignment.
 - Boolean masks mean `True=keep`. Layouts are `[batch, key]`,
   `[batch, query, key]`, or `[batch, head, query, key]`; singleton batch,
-  head and query axes broadcast. Torch also supports additive floating masks.
-  FlashAttention rejects custom masks before updating the cache. Native
-  masked loads are bounded by the supplied mask extents. Absent masks have
-  zero extents; a query extent of one broadcasts. The mask pointer is the
-  single source of truth for selecting masked kernels.
+  head and query axes broadcast. In packed inference, query rows are local to
+  the current request chunk, while key columns index absolute cache positions.
+  Missing rows or columns in a short mask are invisible. A two-dimensional
+  model padding mask stays on the key axis and uses `is_causal=True`, so each
+  cached chunk gets the correct causal offset. Torch also supports additive
+  floating masks. FlashAttention rejects custom masks before updating the
+  cache. The mask pointer is the single source of truth for selecting native
+  masked kernels.
 - `scale` is forwarded unchanged through backend selection and execution.
   Unsupported native scales are rejected explicitly, never replaced by the
   default. Existing external backends receive their original arguments when

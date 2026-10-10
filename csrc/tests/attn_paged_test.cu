@@ -396,7 +396,7 @@ static int run_decode_test(int B,
                          0, B, Hq, Hkv, HEAD_DIM, rig.max_ctx, ref);
 
     AttentionParams p = rig.base_params();
-    p.causal_offset = causal ? 0 : -1;
+    p.is_causal = causal;
     AttnDispatchPagedDecode<bf16>::run(p, 0);
     cudaDeviceSynchronize();
 
@@ -444,10 +444,11 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq, int seed) {
                          rig.h_mask, rig.max_sl, B, Hq, Hkv, HEAD_DIM, rig.max_ctx, ref);
 
     AttentionParams p = rig.base_params();
-    p.causal_offset = -1;
-    p.use_mask = 1;
+    p.is_causal = false;
     p.mask = rig.d_mask;
     p.mask_b_stride = rig.max_sl;
+    p.mask_k_len = rig.max_sl;
+    p.mask_q_len = 1;
     AttnDispatchPagedDecode<bf16>::run(p, 0);
     cudaDeviceSynchronize();
 
@@ -492,7 +493,7 @@ static int run_prefill_test(int B,
     int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
     AttentionParams p = rig.base_params();
-    p.causal_offset = causal ? 0 : -1;
+    p.is_causal = causal;
     p.q_tile_to_batch = d_qtb;
     p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
@@ -543,11 +544,12 @@ template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_
     int num_q_tiles = make_q_tile_mapping(ql, &d_qtb, &d_qti);
 
     AttentionParams p = rig.base_params();
-    p.causal_offset = -1;
-    p.use_mask = 1;
+    p.is_causal = false;
     p.mask = rig.d_mask;
     p.mask_b_stride = q_len * q_len;
     p.mask_l_stride = q_len;
+    p.mask_k_len = q_len;
+    p.mask_q_len = q_len;
     p.q_tile_to_batch = d_qtb;
     p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
@@ -577,7 +579,7 @@ template <int HEAD_DIM> static void bench_decode(int B, int Hq, int Hkv, int seq
     rig.fill_indices();
 
     AttentionParams p = rig.base_params();
-    p.causal_offset = 0;
+    p.is_causal = true;
     auto launch = [&]() { AttnDispatchPagedDecode<bf16>::run(p, 0); };
     /*
      * Decode: q_len=1, query is the last token → attends to all [0, seq_len).
@@ -605,7 +607,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
     AttentionParams p = rig.base_params();
-    p.causal_offset = causal ? 0 : -1;
+    p.is_causal = causal;
     p.q_tile_to_batch = d_qtb;
     p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
@@ -734,6 +736,7 @@ int main() {
     fail += run_prefill_mask_test<128>(32, 4, 512, 40);
     fail += run_prefill_mask_test<128>(32, 4, 1024, 41);
     fail += run_prefill_mask_test<64>(4, 2, 256, 42);
+    fail += run_prefill_mask_test<256>(4, 2, 257, 43);
 
     if (fail) {
         printf("\nFAILED prefill tests\n");

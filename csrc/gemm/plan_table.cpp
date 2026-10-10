@@ -39,7 +39,9 @@ static constexpr int kMaxPerfClass = 3;
  * The k-tile depths the manifests carry; any other depth matches no tile
  * and launches nothing, so it is rejected.
  */
-inline constexpr bool row_k_supported(int k_tile) { return k_tile == 32 || k_tile == 64 || k_tile == 128; }
+inline constexpr bool row_k_supported(int k_tile) {
+    return k_tile == 32 || k_tile == 64 || k_tile == 128;
+}
 
 /*
  * Pipeline depths a row may name. Enumerated, not a range, so a gap cannot pass
@@ -138,8 +140,6 @@ inline const TableRow* plan_row_for(const TableRow* rows, int count, const PlanQ
     return nullptr;
 }
 
-
-
 /*
  * Row file format: one row per line, whitespace-separated
  *   m_min m_max n_min n_max perf_class crosswise cta k_stages raster
@@ -227,8 +227,8 @@ parse_plan_table_line(char* line, const char* label, int lineno, std::vector<Tab
     int min_wave_permille = 0;
     const int got =
         std::sscanf(line, " %lld %lld %lld %lld %d %d %d %d %d %d %lld %lld %d %d", &m_min, &m_max,
-                    &n_min, &n_max, &perf_class, &crosswise, &cta, &k_stages, &raster, &k_tile, &k_min,
-                    &k_max, &min_ctas_per_sm, &min_wave_permille);
+                    &n_min, &n_max, &perf_class, &crosswise, &cta, &k_stages, &raster, &k_tile,
+                    &k_min, &k_max, &min_ctas_per_sm, &min_wave_permille);
     if (got == EOF)
         return; // blank or comment-only line
     if (got < kRowFieldsLegacyK) {
@@ -306,7 +306,6 @@ parse_plan_table_text(const std::string& text, const char* label, std::vector<Ta
     return (int)rows.size() - before;
 }
 
-
 // Row tiers copy lookup results under a mutex; installs replace the whole table.
 class RowSource {
   public:
@@ -357,8 +356,7 @@ inline RowSource& plan_table_injected_source() {
  * and config_state() returns for GemmConfig::planner.
  */
 inline constexpr const char* kPlannerModeNames[] = {"table", "hybrid", "model", "heuristic"};
-inline constexpr int kPlannerModeCount =
-    sizeof(kPlannerModeNames) / sizeof(kPlannerModeNames[0]);
+inline constexpr int kPlannerModeCount = sizeof(kPlannerModeNames) / sizeof(kPlannerModeNames[0]);
 bool parse_planner_mode(const std::string& name, int& out) {
     for (int i = 0; i < kPlannerModeCount; ++i)
         if (name == kPlannerModeNames[i]) {
@@ -501,8 +499,6 @@ std::optional<TableRow> plan_builtin_row(const PlanQuery& q) {
     const TableRow* row = rows ? plan_row_for(rows, count, q) : nullptr;
     return row ? std::optional<TableRow>(*row) : std::nullopt;
 }
-
-
 
 } // namespace gemm
 } // namespace astrai

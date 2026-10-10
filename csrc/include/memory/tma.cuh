@@ -143,9 +143,7 @@ struct TmaMapSpec {
     uint64_t batch_stride = 0; // bytes; 0 broadcasts (rank 2, shared coords)
     int swizzle_bits = 0;      // 3 = SWIZZLE_128B (2B elems), 2 = SWIZZLE_64B (1B)
 
-    bool aligned16() const {
-        return tma_aligned16(ptr, stride1, batch > 1 ? batch_stride : 0);
-    }
+    bool aligned16() const { return tma_aligned16(ptr, stride1, batch > 1 ? batch_stride : 0); }
 };
 
 /*

@@ -27,6 +27,28 @@ constexpr float LOG2E = 1.44269504088896340736f;
  * zero-init, memcpy packing, and by-value kernel arguments.
  */
 struct AttentionParams {
+    // Group input/output and workspace pointers before scalar metadata.
+    const void* __restrict__ q_ptr = nullptr;
+    void* __restrict__ o_ptr = nullptr;
+
+    const void* __restrict__ k_ptr = nullptr;
+    const void* __restrict__ v_ptr = nullptr;
+    const void* __restrict__ new_k_ptr = nullptr;
+    const void* __restrict__ new_v_ptr = nullptr;
+
+    // Decode split-KV workspace (FP32 online-softmax accumulators).
+    float* __restrict__ o_part = nullptr;
+    float* __restrict__ ml_part = nullptr;
+
+    // Paged KV addressing, lengths, and packed query work map.
+    const int* __restrict__ req_to_token = nullptr;     // [num_reqs, max_context_len]
+    const int* __restrict__ req_pool_indices = nullptr; // [batch]
+    const int* __restrict__ kv_indptr = nullptr;        // [batch + 1]
+    const int* __restrict__ qo_indptr = nullptr;        // [batch + 1] or nullptr for decode
+    const int* __restrict__ q_tile_to_batch = nullptr;  // [num_q_tiles], prefill only
+    const int* __restrict__ q_tile_to_index = nullptr;  // [num_q_tiles], prefill only
+    const bool* __restrict__ mask = nullptr;
+
     // Shape
     int batch;
     int q_head;
@@ -35,54 +57,30 @@ struct AttentionParams {
     int q_len;  // Per-request in contiguous mode; total_q in paged mode.
     int kv_len; // Contiguous mode; paged mode uses kv_indptr.
 
-    // Attention behavior
-    float scale;
-    // -1 = non-causal; >=0 = absolute position of first Q token
-    int causal_offset = -1;
-    int use_mask = 0;
-
-    // pointers (element type = the kernel's element-type parameter)
-    const void* __restrict__ q_ptr = nullptr;
-    const void* __restrict__ k_ptr = nullptr;
-    const void* __restrict__ v_ptr = nullptr;
-    const bool* __restrict__ mask = nullptr;
-    void* __restrict__ o_ptr = nullptr;
-
-    const void* __restrict__ new_k_ptr = nullptr;
-    const void* __restrict__ new_v_ptr = nullptr;
-
-    // strides
+    // Tensor and mask strides.
     int q_b_stride;
     int q_h_stride;
     int q_l_stride;
     int q_d_stride;
-
     int kv_b_stride;
     int kv_h_stride;
     int kv_l_stride;
     int kv_d_stride;
-
     int new_kv_b_stride;
     int new_kv_h_stride;
+    // Mask key elements are contiguous; zero strides represent broadcast axes.
+    int mask_b_stride = 0;
+    int mask_h_stride = 0;
+    int mask_l_stride = 0; // Query sequence axis, matching q_l_stride.
+    int mask_k_len = 0;
+    int mask_q_len = 0; // A singleton query axis broadcasts to all query rows.
 
-    int mask_b_stride;
-    int mask_h_stride;
-    int mask_l_stride;
-
-    // Paged K/V addressing
-    const int* __restrict__ req_to_token = nullptr;     // [num_reqs, max_context_len]
-    const int* __restrict__ req_pool_indices = nullptr; // [batch]
-    const int* __restrict__ kv_indptr = nullptr;        // [batch + 1]
-    const int* __restrict__ qo_indptr = nullptr;        // [batch + 1] or nullptr for decode
-    const int* __restrict__ q_tile_to_batch = nullptr;  // [num_q_tiles], prefill only
-    const int* __restrict__ q_tile_to_index = nullptr;  // [num_q_tiles], prefill only
+    // Launch metadata and attention behavior; the boolean stays last to avoid padding.
     int num_q_tiles;
     int max_context_len; // req_to_token stride (dim 1)
-
-    // Decode split-KV workspace (fp32 online-softmax accumulators, always)
-    int num_splits;
-    float* __restrict__ o_part = nullptr;
-    float* __restrict__ ml_part = nullptr;
+    int num_splits = 0;
+    float scale;
+    bool is_causal = false;
 };
 
 } // namespace attention

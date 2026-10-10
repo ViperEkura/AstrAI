@@ -4,11 +4,21 @@
 #include <cuda_bf16.h>
 
 #include <api/attention_common.h>
-#include <memory/layout_policies.cuh>
+#include <arith/softmax.cuh>
 #include <kernel/attention/mma.cuh>
+#include <memory/layout_policies.cuh>
 
 namespace astrai {
 namespace attention {
+
+// Keep the extra split bookkeeping on large graph capacities only. The device
+// skips partials when the replayed request uses under one eighth of the table.
+constexpr int SKIP_EMPTY_SPLITS_MIN_CAPACITY = 8192;
+constexpr int SKIP_EMPTY_SPLITS_CAPACITY_RATIO = 8;
+
+DEVICE_FORCEINLINE bool skip_empty_decode_splits(const AttentionParams& p, int seq_len) {
+    return seq_len < p.max_context_len / SKIP_EMPTY_SPLITS_CAPACITY_RATIO;
+}
 
 /*
  * Split-K (FlashDecoding) tensor-core decode, unified across contiguous
@@ -18,16 +28,22 @@ namespace attention {
  * each K/V tile across all G heads (head-packing details in the prefill
  * kernel header).
  *
- * KV = ContigKV or PagedKV; IsCausal/HasMask compile-time. Traits =
+ * KV = ContigKV or PagedKV; HasMask is compile-time. Traits =
  * KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
  */
-template <typename Traits, typename KV, bool IsCausal, bool HasMask>
-__global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
+template <typename Traits,
+          typename KV,
+          bool HasMask,
+          bool DirectOutput = false,
+          bool SkipEmptySplits = false>
+__global__ void attn_decode_split_kv_mma_kernel(const AttentionParams p) {
     using T = typename Traits::Elem;
+    using Mma = AttentionMma<Traits>;
+    using Layout = typename Traits::FragmentLayout;
 
     const int lane = threadIdx.x;
-    const int gid = lane >> 2;
-    const int tid4 = lane & 3;
+    const int gid = Layout::row(lane);
+    const int tid4 = Layout::column(lane) / 2;
 
     const int pass = blockIdx.x / p.kv_head;
     const int kv_head = blockIdx.x % p.kv_head;
@@ -42,7 +58,7 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
 
     // Per-request seq_len (paged reads kv_indptr; contig uses p.kv_len).
     const int seq_len = KV::kv_len(p, batch);
-    const KVContext kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
+    const auto kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
     /*
      * scale * log2(e): the exp2 base-change factor folded into every
      * softmax exponent (see arith/softmax.cuh). The partials this kernel
@@ -64,36 +80,50 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
     const int qra = gid;
     const int qrb = gid + 8;
     const bool va = qra < G, vb = qrb < G;
-    unsigned Qa[Traits::KD][4];
-    load_q_mma_frags<Traits::KD>(q_gmem + q_base,
-                                 q_gmem + q_base,
-                                 p.q_d_stride,
-                                 qra * p.q_h_stride,
-                                 qrb * p.q_h_stride,
-                                 va,
-                                 vb,
-                                 tid4,
-                                 Qa);
+    typename Traits::QueryFragment Qa;
+    Mma::load_query(q_gmem + q_base, q_gmem + q_base, p.q_d_stride, qra * p.q_h_stride,
+                    qrb * p.q_h_stride, va, vb, tid4, Qa);
 
-    float Oacc[Traits::DN8][4];
-#pragma unroll
-    for (int j = 0; j < Traits::DN8; j++)
-        Oacc[j][0] = Oacc[j][1] = Oacc[j][2] = Oacc[j][3] = 0.0f;
-    float m0 = -FLT_MAX, m1 = -FLT_MAX, l0 = 0.0f, l1 = 0.0f;
+    typename Traits::OutputFragment Oacc;
+    Mma::clear(Oacc);
+    WarpSoftmax<Traits> softmax;
+    const float& m0 = softmax.rows[0].m;
+    const float& m1 = softmax.rows[1].m;
+    const float& l0 = softmax.rows[0].l;
+    const float& l1 = softmax.rows[1].l;
+
+    // Visibility is fixed for these query rows across all K/V tiles.
+    const MaskView mask_view{p.mask,
+                             p.mask_b_stride,
+                             p.mask_h_stride,
+                             p.mask_l_stride,
+                             p.mask_k_len,
+                             p.mask_q_len,
+                             batch,
+                             q_head0 + gid,
+                             q_head0 + gid + 8,
+                             0,
+                             0};
+    const AttentionMask<HasMask> mask{mask_view, seq_len, seq_len, va, vb};
 
     const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
     const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
     const int ti_begin = split * tiles_per_split;
     const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
+    if constexpr (SkipEmptySplits && KV::kPaged) {
+        // Skip empty splits only when a graph reuses much less than its capacity.
+        if (skip_empty_decode_splits(p, seq_len) && split > 0 && ti_begin >= tiles_total)
+            return;
+    }
 
     /*
      * ---- Load tile lambda: predicated cp.async (addressing via KV policy;
      * only the first GQA pass persists new K/V to the pool) ----
      */
     auto load_tile = [&](int ti, int buf) {
-        load_kv_tile<Traits>(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
-            return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, kc, d, valid,
-                                                         pass == 0);
+        KVTileLoader<Traits>::load(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
+            return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, seq_len, kc, d,
+                                                         valid, pass == 0);
         });
     };
 
@@ -110,21 +140,12 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         const T* bV = sV + buf * Traits::BC * Traits::LD;
         int kv0 = (ti_begin + it) * Traits::BC;
 
-        float Sacc[Traits::NC8][4];
-        mma_compute_scores<Traits>(Qa, bK, lane, Sacc);
+        typename Traits::ScoreFragment Sacc;
+        Mma::scores(Qa, bK, lane, Sacc);
 
-        /*
-         * Decode: q_len=1 so qrow0=qrow1=0. Paged treats [0, seq_len) as
-         * the causal range; contig clips to the causal_offset bound.
-         */
-        int maxc = IsCausal ? KV::decode_attend_len(p, batch) : seq_len;
-        MaskView mv{p.mask, p.mask_b_stride, p.mask_h_stride,   p.mask_l_stride,
-                    batch,  q_head0 + gid,   q_head0 + gid + 8, 0,
-                    0};
-        mma_softmax_tile<Traits, HasMask>(kv0, maxc, maxc, mv, va, vb, scale_log2, Sacc, Oacc, m0,
-                                          m1, l0, l1, lane);
+        softmax.update(kv0, scale_log2, Sacc, Oacc, lane, mask);
 
-        mma_pv_accumulate<Traits>(Sacc, bV, lane, Oacc);
+        Mma::values(Sacc, bV, lane, Oacc);
     };
 
     if (ntiles >= STAGES) {
@@ -151,6 +172,27 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
         __syncwarp();
         for (int it = 0; it < ntiles; it++)
             process_tile(it, it);
+    }
+
+    if constexpr (DirectOutput) {
+        T* output = static_cast<T*>(p.o_ptr);
+        const float inv0 = l0 > 1e-20f ? 1.0f / l0 : 0.0f;
+        const float inv1 = l1 > 1e-20f ? 1.0f / l1 : 0.0f;
+#pragma unroll
+        for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
+            const int d = dn8 * 8 + 2 * tid4;
+            if (va) {
+                const int off = KV::q_decode_base(p, batch, q_head0 + gid) + d * p.q_d_stride;
+                output[off] = ElemTrait<T>::from_float(Oacc[dn8][0] * inv0);
+                output[off + p.q_d_stride] = ElemTrait<T>::from_float(Oacc[dn8][1] * inv0);
+            }
+            if (vb) {
+                const int off = KV::q_decode_base(p, batch, q_head0 + gid + 8) + d * p.q_d_stride;
+                output[off] = ElemTrait<T>::from_float(Oacc[dn8][2] * inv1);
+                output[off + p.q_d_stride] = ElemTrait<T>::from_float(Oacc[dn8][3] * inv1);
+            }
+        }
+        return;
     }
 
     // Write unnormalized partials for this split
@@ -196,37 +238,81 @@ __global__ void attn_decode_split_kv_mma_kernel(AttentionParams p) {
  * Split-combine: merges the per-split partials (o_part/ml_part) into the
  * final normalised O (KV selects the O addressing and element type).
  */
-template <typename KV> __global__ void attn_decode_combine_kernel(AttentionParams p) {
+template <typename KV, int TileK, bool SkipEmptySplits = false>
+__global__ void attn_decode_combine_kernel(const AttentionParams p) {
     using T = typename KV::Elem;
 
-    int bh = blockIdx.x;
-    int d = threadIdx.x;
-    if (d >= p.head_dim)
-        return;
+    const int bh = blockIdx.x;
+    const int d = threadIdx.x;
+    const int batch = bh / p.q_head;
+    const int q_head = bh % p.q_head;
 
-    int batch = bh / p.q_head;
-    int q_head = bh % p.q_head;
-
-    size_t split_base = (size_t)bh * MAX_SPLITS;
+    const size_t split_base = (size_t)bh * MAX_SPLITS;
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
-
-    SoftmaxState st;
-    float acc = 0.0f;
     const float scale_log2 = p.scale * LOG2E;
-    for (int s = 0; s < p.num_splits; s++) {
-        float mi = mlp[s * 2];
-        if (mi <= -FLT_MAX)
-            continue;
-        float li = mlp[s * 2 + 1];
-        float corr, e;
-        softmax_step(st, mi, li, corr, e, scale_log2);
-        acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
+    int active_splits = p.num_splits;
+    if constexpr (SkipEmptySplits && KV::kPaged) {
+        const int seq_len = KV::kv_len(p, batch);
+        if (skip_empty_decode_splits(p, seq_len)) {
+            const int tiles_total = (seq_len + TileK - 1) / TileK;
+            const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
+            active_splits =
+                tiles_per_split ? (tiles_total + tiles_per_split - 1) / tiles_per_split : 1;
+        }
     }
 
-    float inv = (st.l > 1e-20f) ? (1.0f / st.l) : 0.0f;
-    int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
-    static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
+    // Avoid the block reduction for the smallest merge.
+    if (active_splits <= 2) {
+        if (d >= p.head_dim)
+            return;
+        SoftmaxState st;
+        float acc = 0.0f;
+        for (int s = 0; s < active_splits; s++) {
+            const float mi = mlp[s * 2];
+            if (mi <= -FLT_MAX)
+                continue;
+            const float li = mlp[s * 2 + 1];
+            float corr, e;
+            softmax_step(st, mi, li, corr, e, scale_log2);
+            acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
+        }
+        const float inv = st.l > 1e-20f ? 1.0f / st.l : 0.0f;
+        const int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
+        static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
+        return;
+    }
+
+    // One warp computes the split weights shared by every output dimension.
+    __shared__ float weights[MAX_SPLITS];
+    __shared__ float inv_sum;
+    if (d < 32) {
+        const bool valid = d < active_splits;
+        const float mi = valid ? mlp[d * 2] : -FLT_MAX;
+        const float li = valid ? mlp[d * 2 + 1] : 0.0f;
+        float max_m = mi;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            max_m = fmaxf(max_m, __shfl_xor_sync(0xFFFFFFFF, max_m, offset));
+        const float weight = mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
+        if (valid)
+            weights[d] = weight;
+        float sum_l = li * weight;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            sum_l += __shfl_xor_sync(0xFFFFFFFF, sum_l, offset);
+        if (d == 0)
+            inv_sum = sum_l > 1e-20f ? 1.0f / sum_l : 0.0f;
+    }
+    __syncthreads();
+
+    if (d < p.head_dim) {
+        float acc = 0.0f;
+        for (int s = 0; s < active_splits; s++)
+            acc = fmaf(op[s * p.head_dim + d], weights[s], acc);
+        const int o_off = KV::q_decode_base(p, batch, q_head) + d * p.q_d_stride;
+        static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);
+    }
 }
 
 } // namespace attention

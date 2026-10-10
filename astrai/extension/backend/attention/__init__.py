@@ -6,7 +6,9 @@ selection share the generic operator dispatcher. Inputs use BLHD layout.
 
 import enum
 import functools
+import inspect
 import logging
+import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
@@ -229,6 +231,7 @@ def _axes(
     attn_mask: Optional[Tensor],
     is_causal: bool,
     fwd: Optional[str],
+    scale: Optional[float] = None,
 ) -> Axes:
     """Snapshot the axes the attention decision table depends on."""
     return tensor_axes(
@@ -239,6 +242,7 @@ def _axes(
         head_dim=q.size(-1) if q.dim() >= 1 else None,
         has_cache=kv_cache is not None,
         has_mask=attn_mask is not None,
+        scale=scale,
         _call=(q, kv_cache, attn_mask, is_causal, fwd),
     )
 
@@ -253,15 +257,39 @@ def attention(
     is_causal: bool = False,
     fwd: Optional[str] = None,
     backend: Optional[Union[str, ATTN_BACKEND, "AttentionBackend", type]] = None,
+    *,
+    scale: Optional[float] = None,
 ) -> Tensor:
     """Select a capable backend and run attention on projected BLHD tensors."""
+    if scale is not None and not math.isfinite(scale):
+        raise ValueError("attention scale must be finite")
     explicit = _resolve_backend(backend) if backend is not None else None
     resolution = _dispatch_resolve(
-        "attention", q, kv_cache, attn_mask, is_causal, fwd, explicit=explicit
+        "attention",
+        q,
+        kv_cache,
+        attn_mask,
+        is_causal,
+        fwd,
+        explicit=explicit,
+        **({"scale": scale} if scale is not None else {}),
     )
-    return resolution.record.obj.forward(
-        q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd
-    )
+    args = (q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd)
+    if scale is None:
+        return resolution.record.obj.forward(*args)
+    return resolution.record.obj.forward(*args, scale=scale)
+
+
+@functools.cache
+def _supports_call_accepts_scale(backend_cls: type) -> bool:
+    """Preserve legacy five-argument probes while forwarding supported scale."""
+    parameters = inspect.signature(backend_cls.supports_call).parameters
+    scale = parameters.get("scale")
+    return (
+        scale is not None
+        and scale.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ) or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
 
 
 class AttentionBackend(ABC):
@@ -272,11 +300,19 @@ class AttentionBackend(ABC):
     """
 
     priority = 50
+    supports_scale = False
     modes = frozenset(("train", "infer"))
 
     @classmethod
     def supports_axes(cls, ax: Axes) -> bool:
         """Default adapter for third-party backends using supports_call."""
+        scale = ax.get("scale")
+        if scale is None:
+            return _instance(cls).supports_call(*ax["_call"])
+        if not cls.supports_scale:
+            return False
+        if _supports_call_accepts_scale(cls):
+            return _instance(cls).supports_call(*ax["_call"], scale=scale)
         return _instance(cls).supports_call(*ax["_call"])
 
     def __enter__(self) -> "AttentionBackend":

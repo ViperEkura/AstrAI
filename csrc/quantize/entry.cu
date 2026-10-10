@@ -35,9 +35,9 @@ namespace quant {
  * Supported input element types; ScalarTypeOf<T> supplies the PyTorch
  * boundary value. The refusal and dispatch use these same rows.
  */
-#define ASTRAI_QUANT_IN_DTYPES(X)                                                              \
-    X(bf16)                                                                                    \
-    X(fp16)                                                                                    \
+#define ASTRAI_QUANT_IN_DTYPES(X)                                                                  \
+    X(bf16)                                                                                        \
+    X(fp16)                                                                                        \
     X(float)
 
 namespace {
@@ -48,9 +48,8 @@ namespace {
  */
 std::string unsupported_quant_input_message(at::ScalarType st) {
     std::string instantiated;
-#define ASTRAI_QUANT_NAME_ROW(T)                                                               \
-    instantiated += std::string(instantiated.empty() ? "" : ", ") +                            \
-                    toString(scalar_type_v<T>);
+#define ASTRAI_QUANT_NAME_ROW(T)                                                                   \
+    instantiated += std::string(instantiated.empty() ? "" : ", ") + toString(scalar_type_v<T>);
     ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_NAME_ROW)
 #undef ASTRAI_QUANT_NAME_ROW
     return std::string("quantize has no kernel for ") + toString(st) +
@@ -64,10 +63,10 @@ std::string unsupported_quant_input_message(at::ScalarType st) {
 template <typename Fp8TA, typename Fp8TB>
 void launch_for_dtype(const torch::Tensor& x, const QuantParams& p, cudaStream_t stream) {
     switch (x.scalar_type()) {
-#define ASTRAI_QUANT_CASE(T)                                                                   \
-    case scalar_type_v<T>:                                                                     \
+#define ASTRAI_QUANT_CASE(T)                                                                       \
+    case scalar_type_v<T>:                                                                         \
         return launch_fp8_quantize<Fp8TA, T, Fp8TB>(p, stream);
-    ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_CASE)
+        ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_CASE)
 #undef ASTRAI_QUANT_CASE
     }
     throw std::runtime_error(unsupported_quant_input_message(x.scalar_type()));
@@ -164,8 +163,7 @@ QuantizeOutputs run_quantize(torch::Tensor x,
     TORCH_CHECK(x.is_cuda(), "CUDA tensors required");
     {
         bool supported = false;
-#define ASTRAI_QUANT_SUPPORTED_ROW(T)                                                          \
-    supported = supported || x.scalar_type() == scalar_type_v<T>;
+#define ASTRAI_QUANT_SUPPORTED_ROW(T) supported = supported || x.scalar_type() == scalar_type_v<T>;
         ASTRAI_QUANT_IN_DTYPES(ASTRAI_QUANT_SUPPORTED_ROW)
 #undef ASTRAI_QUANT_SUPPORTED_ROW
         if (!supported)

@@ -16,20 +16,20 @@
 #include <cuda_runtime.h>
 
 #ifndef ASTRAI_LAUNCH_FAIL
-#define ASTRAI_LAUNCH_FAIL(err, what)                                                           \
-    do {                                                                                        \
-        std::fprintf(stderr, "ASTRAI: %s failed: %s (%s:%d)\n", what, cudaGetErrorString(err),  \
-                     __FILE__, __LINE__);                                                       \
-        std::exit(EXIT_FAILURE);                                                                \
+#define ASTRAI_LAUNCH_FAIL(err, what)                                                              \
+    do {                                                                                           \
+        std::fprintf(stderr, "ASTRAI: %s failed: %s (%s:%d)\n", what, cudaGetErrorString(err),     \
+                     __FILE__, __LINE__);                                                          \
+        std::exit(EXIT_FAILURE);                                                                   \
     } while (0)
 #endif
 
-#define ASTRAI_CUDA_CHECK(expr)                                                                 \
-    do {                                                                                        \
-        cudaError_t astrai_err_ = (expr);                                                       \
-        if (astrai_err_ != cudaSuccess) {                                                       \
-            ASTRAI_LAUNCH_FAIL(astrai_err_, #expr);                                             \
-        }                                                                                       \
+#define ASTRAI_CUDA_CHECK(expr)                                                                    \
+    do {                                                                                           \
+        cudaError_t astrai_err_ = (expr);                                                          \
+        if (astrai_err_ != cudaSuccess) {                                                          \
+            ASTRAI_LAUNCH_FAIL(astrai_err_, #expr);                                                \
+        }                                                                                          \
     } while (0)
 
 /*

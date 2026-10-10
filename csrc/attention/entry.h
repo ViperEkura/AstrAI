@@ -1,11 +1,13 @@
 #pragma once
 /* Shared by attention entry TUs for tensor checks, partial allocation, and packing. */
+#include <cmath>
 #include <float.h>
 
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <api/attention_common.h>
+#include <launcher/attention.cuh>
 
 namespace astrai {
 namespace attention {
@@ -19,67 +21,92 @@ inline void check_int32(const torch::Tensor& t, const char* name) {
 inline void
 check_qkv_dtype(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "Q/K/V must be CUDA tensors");
+    TORCH_CHECK(q.device() == k.device() && q.device() == v.device(),
+                "Q/K/V must be on the same CUDA device");
+    TORCH_CHECK(k.strides() == v.strides(), "K/V must have identical strides");
     TORCH_CHECK(k.scalar_type() == q.scalar_type(), "K dtype must match Q (", q.scalar_type(),
                 "), got ", k.scalar_type());
     TORCH_CHECK(v.scalar_type() == q.scalar_type(), "V dtype must match Q (", q.scalar_type(),
                 "), got ", v.scalar_type());
 }
 
-/* Shared causal and mask flags; an undefined optional mask counts as absent. */
-inline void
-start_pack(const c10::optional<torch::Tensor>& mask, int64_t causal_offset, AttentionParams& p) {
-    p.causal_offset = (int)causal_offset;
-    p.use_mask = (mask.has_value() && mask.value().defined()) ? 1 : 0;
-}
-
 /* Resolve the default scale; the entry fills output pointers after packing. */
-inline void finish_pack(double scale, AttentionParams& p) {
-    p.scale = (scale > 0.0) ? (float)scale : 1.0f / sqrtf((float)p.head_dim);
+inline void finish_pack(c10::optional<double> scale, AttentionParams& p) {
+    const double value = scale.value_or(1.0 / std::sqrt((double)p.head_dim));
+    TORCH_CHECK(std::isfinite(value) && value > 0.0 && std::isfinite((float)value) &&
+                    (float)value > 0.0f,
+                "native attention scale must be finite and positive");
+    p.scale = (float)value;
     p.o_ptr = nullptr;
     p.o_part = nullptr;
     p.ml_part = nullptr;
 }
 
-/* Empty split slots store m=-FLT_MAX; all slots are written, so torch::empty needs no clearing. */
-inline void alloc_split_partials(AttentionParams& p) {
-    auto fopt = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto o_part = torch::empty(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, p.head_dim}, fopt);
-    auto ml_part = torch::empty(at::IntArrayRef{p.batch, p.q_head, MAX_SPLITS, 2}, fopt);
-    p.o_part = (float*)o_part.data_ptr();
-    p.ml_part = (float*)ml_part.data_ptr();
+/* Tensor owners are retained by the entry until both kernels are launched. */
+struct SplitWorkspace {
+    torch::Tensor o_part;
+    torch::Tensor ml_part;
+};
+
+inline SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& o_part_buf,
+                                            const c10::optional<torch::Tensor>& ml_part_buf,
+                                            AttentionParams& p,
+                                            const DecodeLaunchPlan& plan,
+                                            const torch::Tensor& q) {
+    const bool has_o = o_part_buf.has_value() && o_part_buf->defined();
+    const bool has_ml = ml_part_buf.has_value() && ml_part_buf->defined();
+    TORCH_CHECK(has_o == has_ml, "split buffers must be provided together");
+    SplitWorkspace workspace;
+    const int64_t o_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * p.head_dim;
+    const int64_t ml_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * 2;
+    if (has_o) {
+        for (const auto* buffer_ptr : {&*o_part_buf, &*ml_part_buf}) {
+            const auto& buffer = *buffer_ptr;
+            TORCH_CHECK(buffer.device() == q.device(), "split buffers must be on Q's device");
+            TORCH_CHECK(buffer.scalar_type() == torch::kFloat32 && buffer.is_contiguous(),
+                        "split buffers must be contiguous f32 tensors");
+        }
+        TORCH_CHECK(o_part_buf->numel() >= o_needed, "o_part_buf too small");
+        TORCH_CHECK(ml_part_buf->numel() >= ml_needed, "ml_part_buf too small");
+        // The optional function arguments already retain these caller buffers.
+        p.o_part = o_part_buf->data_ptr<float>();
+        p.ml_part = ml_part_buf->data_ptr<float>();
+    } else if (!plan.direct_output) {
+        const auto options = q.options().dtype(torch::kFloat32);
+        workspace.o_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, p.head_dim}, options);
+        workspace.ml_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, 2}, options);
+    }
+    if (workspace.o_part.defined()) {
+        p.o_part = workspace.o_part.data_ptr<float>();
+        p.ml_part = workspace.ml_part.data_ptr<float>();
+    }
+    return workspace;
 }
 
-/*
- * Split partials: validate caller-provided buffers or allocate fresh ones.
- * Always fp32: they are online-softmax accumulators, independent of the
- * precision the Q/K/V buffers carry.
- */
-inline void resolve_split_buffers(const c10::optional<torch::Tensor>& o_part_buf,
-                                  const c10::optional<torch::Tensor>& ml_part_buf,
-                                  AttentionParams& p) {
-    if (o_part_buf.has_value() && ml_part_buf.has_value() && o_part_buf->defined() &&
-        ml_part_buf->defined()) {
-        TORCH_CHECK(o_part_buf->scalar_type() == torch::kFloat32, "o_part_buf must be f32");
-        TORCH_CHECK(ml_part_buf->scalar_type() == torch::kFloat32, "ml_part_buf must be f32");
-        int64_t o_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * p.head_dim;
-        int64_t ml_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * 2;
-        TORCH_CHECK(o_part_buf->numel() >= o_needed, "o_part_buf too small: need ", o_needed,
-                    " got ", o_part_buf->numel());
-        TORCH_CHECK(ml_part_buf->numel() >= ml_needed, "ml_part_buf too small: need ", ml_needed,
-                    " got ", ml_part_buf->numel());
-        TORCH_CHECK(o_part_buf->is_cuda() && ml_part_buf->is_cuda(),
-                    "split buffers must be CUDA tensors");
-        TORCH_CHECK(o_part_buf->is_contiguous() && ml_part_buf->is_contiguous(),
-                    "split buffers must be contiguous");
-        p.o_part = (float*)o_part_buf->data_ptr();
-        p.ml_part = (float*)ml_part_buf->data_ptr();
-    } else {
-        alloc_split_partials(p);
+/* One dtype/head dispatch owns planning, scratch lifetime, and execution. */
+struct DecodeCall {
+    AttentionParams& params;
+    const torch::Tensor& q;
+    const c10::optional<torch::Tensor>& o_part;
+    const c10::optional<torch::Tensor>& ml_part;
+};
+
+template <typename KV> struct DecodeEntry {
+    static void run(DecodeCall& call, cudaStream_t stream) {
+        auto& p = call.params;
+        with_decode_kernel<KV>(p, [&](auto kernel) {
+            const auto plan = kernel.plan(p);
+            auto workspace = resolve_split_buffers(call.o_part, call.ml_part, p, plan, call.q);
+            kernel.launch(p, plan, stream);
+        });
     }
-}
+};
+template <typename T> using ContiguousDecodeEntry = DecodeEntry<ContigKV<T>>;
+template <typename T> using PagedDecodeEntry = DecodeEntry<PagedKV<T>>;
 
 // Shared Q dimensions and stride extraction
 inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout, AttentionParams& p) {
+    TORCH_CHECK(layout == BHLD || layout == BLHD, "unknown attention tensor layout");
     if (layout == BLHD)
         q = q.transpose(1, 2);
     p.batch = (int)q.size(0);
@@ -104,47 +131,49 @@ inline int bc_stride(const torch::Tensor& m, int dim) {
     return (m.size(dim) == 1) ? 0 : (int)m.stride(dim);
 }
 
-// 2D masks: batch stride only, head/q strides broadcast away.
-inline void set_mask_2d(const torch::Tensor& m, AttentionParams& p) {
-    p.mask_b_stride = (int)m.stride(0);
-    p.mask_h_stride = 0;
-    p.mask_l_stride = 0;
-    p.mask = m.data_ptr<bool>();
-}
-
 inline void set_mask_null(AttentionParams& p) {
     p.mask = nullptr;
     p.mask_b_stride = 0;
     p.mask_h_stride = 0;
     p.mask_l_stride = 0;
+    p.mask_k_len = 0;
+    p.mask_q_len = 0;
 }
 
-inline void pack_mask(const c10::optional<torch::Tensor>& mask, AttentionParams& p) {
-    if (p.use_mask) {
-        auto m = mask.value();
-        TORCH_CHECK(m.is_cuda(), "mask must be on CUDA");
-        TORCH_CHECK(m.dtype() == torch::kBool, "mask must be bool");
-        TORCH_CHECK(m.size(0) == p.batch, "mask batch mismatch");
-        TORCH_CHECK(m.size(m.dim() - 1) == p.kv_len, "mask kv_len mismatch");
-        if (m.dim() == 2) {
-            set_mask_2d(m, p);
-        } else if (m.dim() == 3) {
-            TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_len, "mask q_len mismatch");
-            p.mask_b_stride = (int)m.stride(0);
-            p.mask_h_stride = 0;
-            p.mask_l_stride = bc_stride(m, 1);
-            p.mask = m.data_ptr<bool>();
-        } else if (m.dim() == 4) {
-            TORCH_CHECK(m.size(2) == 1 || m.size(2) == p.q_len, "mask q_len mismatch");
-            p.mask_b_stride = (int)m.stride(0);
-            p.mask_h_stride = bc_stride(m, 1);
-            p.mask_l_stride = bc_stride(m, 2);
-            p.mask = m.data_ptr<bool>();
-        } else {
-            TORCH_CHECK(false, "mask must be 2D, 3D, or 4D");
-        }
-    } else {
+inline void pack_mask(const c10::optional<torch::Tensor>& mask,
+                      AttentionParams& p,
+                      const torch::Device& device,
+                      bool paged = false) {
+    if (!mask.has_value() || !mask->defined()) {
         set_mask_null(p);
+        return;
+    }
+    const auto& m = mask.value();
+    TORCH_CHECK(m.device() == device && m.dtype() == torch::kBool,
+                "mask must be bool on Q's device");
+    TORCH_CHECK(m.dim() >= 2 && m.dim() <= 4, "mask must be 2D, 3D, or 4D");
+    TORCH_CHECK(m.size(0) == 1 || m.size(0) == p.batch, "mask batch mismatch");
+    TORCH_CHECK(m.stride(-1) == 1, "mask key dimension must be contiguous");
+    const int limit = paged ? p.max_context_len : p.kv_len;
+    TORCH_CHECK(paged ? (m.size(-1) > 0 && m.size(-1) <= limit) : m.size(-1) == limit,
+                "mask kv_len mismatch");
+    p.mask = m.data_ptr<bool>();
+    p.mask_b_stride = bc_stride(m, 0);
+    p.mask_h_stride = 0;
+    p.mask_l_stride = 0;
+    p.mask_k_len = (int)m.size(-1);
+    p.mask_q_len = 1;
+    if (m.dim() == 4) {
+        TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_head, "mask head mismatch");
+        p.mask_h_stride = bc_stride(m, 1);
+    }
+    if (m.dim() >= 3) {
+        const int q_dim = (int)m.dim() - 2;
+        TORCH_CHECK(m.size(q_dim) == 1 || (paged ? (m.size(q_dim) > 0 && m.size(q_dim) <= p.q_len)
+                                                 : m.size(q_dim) == p.q_len),
+                    "mask q_len mismatch");
+        p.mask_l_stride = bc_stride(m, q_dim);
+        p.mask_q_len = (int)m.size(q_dim);
     }
 }
 
@@ -153,10 +182,10 @@ inline void attn_pack_params(torch::Tensor q,
                              torch::Tensor k,
                              torch::Tensor v,
                              c10::optional<torch::Tensor> mask,
-                             int64_t causal_offset,
-                             double scale,
+                             c10::optional<double> scale,
                              int64_t layout,
-                             AttentionParams& p) {
+                             AttentionParams& p,
+                             bool is_causal) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 
     check_qkv_dtype(q, k, v);
@@ -167,9 +196,11 @@ inline void attn_pack_params(torch::Tensor q,
     if (layout == BLHD)
         k = k.transpose(1, 2), v = v.transpose(1, 2);
 
+    TORCH_CHECK(k.size(0) == p.batch, "K/V batch must match Q");
     p.kv_head = (int)k.size(1);
     p.kv_len = (int)k.size(2);
-    TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
+    TORCH_CHECK(p.kv_head > 0 && p.q_head > 0 && p.q_head % p.kv_head == 0,
+                "q_head must be divisible by kv_head");
     TORCH_CHECK(k.size(3) == p.head_dim, "K/V head_dim must match Q");
     TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
                 "Q/K/V head_dim must be contiguous");
@@ -179,7 +210,7 @@ inline void attn_pack_params(torch::Tensor q,
     p.kv_l_stride = (int)k.stride(2);
     p.kv_d_stride = (int)k.stride(3);
 
-    start_pack(mask, causal_offset, p);
+    p.is_causal = is_causal;
 
     p.q_ptr = q.data_ptr();
     p.k_ptr = k.data_ptr();
@@ -188,7 +219,7 @@ inline void attn_pack_params(torch::Tensor q,
     p.new_v_ptr = nullptr;
     finish_pack(scale, p);
 
-    pack_mask(mask, p);
+    pack_mask(mask, p, q.device());
 }
 
 /*
@@ -212,13 +243,21 @@ inline void pack_paged_common(torch::Tensor& q,
     TORCH_CHECK(k_cache.dim() == 3, "k_cache must be 3D [size, kv_head, head_dim]");
     TORCH_CHECK(q.dim() == 3, "q must be 3D");
 
+    for (const auto* metadata_ptr : {&req_to_token, &req_pool_indices, &kv_indptr}) {
+        const auto& metadata = *metadata_ptr;
+        TORCH_CHECK(metadata.device() == q.device() && metadata.is_contiguous(),
+                    "paged metadata must be contiguous on Q's device");
+    }
+    TORCH_CHECK(req_to_token.dim() == 2 && req_pool_indices.dim() == 1 && kv_indptr.dim() == 1,
+                "invalid paged metadata rank");
     p.q_head = (int)q.size(1);
     p.head_dim = (int)q.size(2);
     p.kv_head = (int)k_cache.size(1);
     TORCH_CHECK(k_cache.size(2) == p.head_dim, "k_cache head_dim mismatch");
     TORCH_CHECK(q.stride(2) == 1 && k_cache.stride(2) == 1 && v_cache.stride(2) == 1,
                 "Q/K/V head_dim must be contiguous");
-    TORCH_CHECK(p.q_head % p.kv_head == 0, "q_head must be divisible by kv_head");
+    TORCH_CHECK(p.kv_head > 0 && p.q_head > 0 && p.q_head % p.kv_head == 0,
+                "q_head must be divisible by kv_head");
 
     p.q_l_stride = (int)q.stride(0);
     p.q_h_stride = (int)q.stride(1);
@@ -247,13 +286,14 @@ inline void attn_pack_paged_decode_params(torch::Tensor q,
                                           const c10::optional<torch::Tensor>& new_k,
                                           const c10::optional<torch::Tensor>& new_v,
                                           c10::optional<torch::Tensor> mask,
-                                          int64_t causal_offset,
-                                          double scale,
-                                          AttentionParams& p) {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
-
+                                          c10::optional<double> scale,
+                                          AttentionParams& p,
+                                          bool is_causal) {
     pack_paged_common(q, k_cache, v_cache, req_to_token, req_pool_indices, kv_indptr, p);
     p.batch = (int)q.size(0);
+    p.q_len = 1;
+    TORCH_CHECK(req_pool_indices.size(0) == p.batch && kv_indptr.size(0) == p.batch + 1,
+                "decode metadata batch mismatch");
     TORCH_CHECK(p.head_dim % 32 == 0, "head_dim must be multiple of 32");
     p.qo_indptr = nullptr;
 
@@ -262,7 +302,8 @@ inline void attn_pack_paged_decode_params(torch::Tensor q,
     if (new_k.has_value()) {
         auto nk = new_k.value();
         auto nv = new_v.value();
-        TORCH_CHECK(nk.is_cuda() && nv.is_cuda(), "new K/V must be CUDA tensors");
+        TORCH_CHECK(nk.device() == q.device() && nv.device() == q.device(),
+                    "new K/V must be CUDA tensors");
         TORCH_CHECK(nk.scalar_type() == q.scalar_type() && nv.scalar_type() == q.scalar_type(),
                     "new K/V dtype must match Q");
         TORCH_CHECK(nk.dim() == 3 && nv.dim() == 3,
@@ -282,16 +323,9 @@ inline void attn_pack_paged_decode_params(torch::Tensor q,
         p.new_kv_b_stride = p.new_kv_h_stride = 0;
     }
 
-    start_pack(mask, causal_offset, p);
+    p.is_causal = is_causal;
 
-    if (p.use_mask) {
-        auto m = mask.value();
-        TORCH_CHECK(m.is_cuda() && m.dtype() == torch::kBool, "mask must be bool CUDA");
-        TORCH_CHECK(m.size(0) == p.batch, "mask batch mismatch");
-        set_mask_2d(m, p);
-    } else {
-        set_mask_null(p);
-    }
+    pack_mask(mask, p, q.device(), true);
     finish_pack(scale, p);
 }
 
@@ -310,15 +344,20 @@ inline void attn_pack_paged_prefill_params(torch::Tensor q,
                                            torch::Tensor q_tile_to_batch,
                                            torch::Tensor q_tile_to_index,
                                            c10::optional<torch::Tensor> mask,
-                                           int64_t causal_offset,
-                                           double scale,
-                                           AttentionParams& p) {
+                                           c10::optional<double> scale,
+                                           AttentionParams& p,
+                                           bool is_causal) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
 
     check_int32(qo_indptr, "qo_indptr");
     check_int32(q_tile_to_batch, "q_tile_to_batch");
     check_int32(q_tile_to_index, "q_tile_to_index");
     pack_paged_common(q, k_cache, v_cache, req_to_token, req_pool_indices, kv_indptr, p);
+    for (const auto* metadata_ptr : {&qo_indptr, &q_tile_to_batch, &q_tile_to_index}) {
+        const auto& metadata = *metadata_ptr;
+        TORCH_CHECK(metadata.device() == q.device() && metadata.is_contiguous(),
+                    "prefill metadata must be contiguous on Q's device");
+    }
 
     p.q_len = (int)q.size(0);
     p.batch = (int)req_pool_indices.size(0);
@@ -337,28 +376,8 @@ inline void attn_pack_paged_prefill_params(torch::Tensor q,
     p.q_tile_to_index = q_tile_to_index.data_ptr<int>();
     p.num_q_tiles = (int)q_tile_to_batch.size(0);
 
-    start_pack(mask, causal_offset, p);
-    if (p.use_mask) {
-        auto m = mask.value();
-        TORCH_CHECK(m.is_cuda() && m.dtype() == torch::kBool, "mask must be bool CUDA");
-        TORCH_CHECK(m.size(0) == p.batch, "mask batch mismatch");
-        if (m.dim() == 2) {
-            TORCH_CHECK(m.size(1) <= p.max_context_len, "mask kv_len mismatch");
-            set_mask_2d(m, p);
-        } else if (m.dim() == 4) {
-            TORCH_CHECK(m.size(1) == 1 || m.size(1) == p.q_head, "mask head mismatch");
-            TORCH_CHECK(m.size(2) > 0 && m.size(2) <= p.q_len, "mask q_len mismatch");
-            TORCH_CHECK(m.size(3) <= p.max_context_len, "mask kv_len mismatch");
-            p.mask_b_stride = (int)m.stride(0);
-            p.mask_h_stride = bc_stride(m, 1);
-            p.mask_l_stride = bc_stride(m, 2);
-            p.mask = m.data_ptr<bool>();
-        } else {
-            TORCH_CHECK(false, "mask must be 2D or 4D");
-        }
-    } else {
-        set_mask_null(p);
-    }
+    p.is_causal = is_causal;
+    pack_mask(mask, p, q.device(), true);
     finish_pack(scale, p);
 }
 

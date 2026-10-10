@@ -18,13 +18,13 @@ inline double now_ms() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-#define CUDA_CHECK(call)                                                                        \
-    do {                                                                                        \
-        cudaError_t _e = (call);                                                                \
-        if (_e != cudaSuccess) {                                                                \
-            printf("CUDA error %s at %s:%d\n", cudaGetErrorString(_e), __FILE__, __LINE__);     \
-            exit(1);                                                                            \
-        }                                                                                       \
+#define CUDA_CHECK(call)                                                                           \
+    do {                                                                                           \
+        cudaError_t _e = (call);                                                                   \
+        if (_e != cudaSuccess) {                                                                   \
+            printf("CUDA error %s at %s:%d\n", cudaGetErrorString(_e), __FILE__, __LINE__);        \
+            exit(1);                                                                               \
+        }                                                                                          \
     } while (0)
 
 struct BenchResult {
@@ -134,7 +134,7 @@ static void cpu_attention_ref(const float* Q,
                               int q_len,
                               int kv_len,
                               int D,
-                              int causal_offset) {
+                              bool is_causal) {
     float scale = 1.0f / sqrtf((float)D);
     int n_rep = Hq / Hk;
     for (int b = 0; b < B; b++) {
@@ -145,9 +145,9 @@ static void cpu_attention_ref(const float* Q,
                 float mv = -INFINITY, sv = 0.0f;
                 float accum[256] = {0.0f};
                 int lim = kv_len;
-                if (causal_offset >= 0) {
-                    int c = qi + causal_offset + 1;
-                    lim = (c < kv_len) ? c : kv_len;
+                if (is_causal) {
+                    const int end = kv_len - q_len + qi + 1;
+                    lim = end < 0 ? 0 : (end < kv_len ? end : kv_len);
                 }
                 for (int kj = 0; kj < lim; kj++) {
                     if (mask != nullptr && q_len == 1) {
@@ -168,7 +168,7 @@ static void cpu_attention_ref(const float* Q,
                         accum[d] = accum[d] * a + V[kv_idx * D + d] * b_exp;
                     mv = nm;
                 }
-                float inv = 1.0f / sv;
+                float inv = sv > 0.0f ? 1.0f / sv : 0.0f;
                 size_t o_idx = ((size_t)b * Hq + h) * q_len + qi;
                 for (int d = 0; d < D; d++)
                     O[o_idx * D + d] = accum[d] * inv;

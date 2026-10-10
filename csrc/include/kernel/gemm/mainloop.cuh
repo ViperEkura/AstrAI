@@ -86,8 +86,8 @@ template <typename Policy> struct GemmCollectiveMainloop {
      * kMt x kNt m16n8k{kMmaK} MMAs. Rings rotate kStages+1 buffers (see
      * GemmSmem) — one __syncthreads per k-tile.
      */
-    static constexpr int kMt = Traits::kMt;          // 16-row MMA tiles per warp
-    static constexpr int kNt = Traits::kNt;          // 8-col MMA tiles per warp
+    static constexpr int kMt = Traits::kMt;             // 16-row MMA tiles per warp
+    static constexpr int kNt = Traits::kNt;             // 8-col MMA tiles per warp
     static constexpr int kSegs = kTile / Traits::kMmaK; // mma-sized k segments
     static constexpr int kARing = Smem::kRingDepth;
     static constexpr int kBRing = Smem::kRingDepth;

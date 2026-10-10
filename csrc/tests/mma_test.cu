@@ -16,8 +16,7 @@ static_assert(!supports(CudaTarget{120, 'f'}, 130));
 static_assert(!supports(CudaTarget{121, 'f'}, 120));
 static_assert(!supports(CudaTarget{0, 0}, 120));
 
-template <typename Op, unsigned Packed, int K>
-__device__ void check_atom(int* failures) {
+template <typename Op, unsigned Packed, int K> __device__ void check_atom(int* failures) {
     typename Op::AFrag a;
     typename Op::BFrag b;
     typename Op::CFrag c, d;
@@ -45,7 +44,7 @@ __global__ void check_atoms(int* failures) {
     check_atom<MmaOpImpl<__nv_fp8_e4m3>, 0x38383838, 32>(failures);
     check_atom<MmaOpImpl<__nv_fp8_e5m2>, 0x3c3c3c3c, 32>(failures);
 #endif
-#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || \
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) ||                                                         \
     (defined(__CUDA_ARCH_FAMILY_SPECIFIC__) && __CUDA_ARCH_FAMILY_SPECIFIC__ == 1200)
     check_atom<MxMmaOp<__nv_fp8_e4m3>, 0x38383838, 32>(failures);
     check_atom<MxMmaOp<__nv_fp8_e5m2>, 0x3c3c3c3c, 32>(failures);

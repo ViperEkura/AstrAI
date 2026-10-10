@@ -10,8 +10,7 @@ namespace gemm {
 
 // Kernel metadata is queried once per typed kernel and device. No launch or
 // timing is involved; CUDA accounts for registers and allocation granularity.
-template <auto Kernel, typename Policy>
-KernelResources kernel_resources(const PlanQuery& q) {
+template <auto Kernel, typename Policy> KernelResources kernel_resources(const PlanQuery& q) {
     using T = typename Policy::Traits;
     static thread_local std::map<int, KernelResources> cache;
     const auto found = cache.find(q.dev.ordinal);
@@ -21,8 +20,8 @@ KernelResources kernel_resources(const PlanQuery& q) {
     if (Policy::kSmemBytes > q.dev.smem_max)
         return result;
     if (Policy::kSmemBytes > 48 * 1024)
-        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(
-            Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Policy::kSmemBytes));
+        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               Policy::kSmemBytes));
     cudaFuncAttributes attributes{};
     ASTRAI_CUDA_CHECK(cudaFuncGetAttributes(&attributes, Kernel));
     ASTRAI_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(

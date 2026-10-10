@@ -114,6 +114,53 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
         )
 
 
+def test_cached_prefill_key_mask_matches_dense_attention():
+    torch.manual_seed(13)
+    config = AutoRegressiveLMConfig(**TINY_CONFIG)
+    model = AutoRegressiveLM(config).eval()
+    ids = torch.tensor([[1, 2, 3, 4]])
+    key_mask = torch.tensor([[True, False, True, True]])
+
+    pool = BlockPool(
+        n_layers=config.num_hidden_layers,
+        n_kv_heads=config.num_key_value_heads,
+        head_dim=config.hidden_size // config.num_attention_heads,
+        max_batch_size=1,
+        max_seq_len=config.max_position_embeddings,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    cache = KVCacheManager(pool)
+    workspace = InferenceWorkspace(
+        1,
+        config.max_position_embeddings,
+        config.num_attention_heads,
+        config.hidden_size // config.num_attention_heads,
+        torch.device("cpu"),
+        torch.float32,
+    )
+    assert cache.alloc_slots("t", [1, 2, 3, 4])
+
+    with torch.inference_mode():
+        dense = model(ids, input_mask=key_mask)["logits"][:, 2:]
+        model(
+            ids[0, :2],
+            input_mask=key_mask[:, :2],
+            position_ids=torch.arange(2),
+            kv_cache=cache.bind(["t"], workspace, start_pos=0, seq_ends=[2]),
+            fwd="prefill",
+        )
+        chunk = model(
+            ids[0, 2:],
+            input_mask=key_mask,
+            position_ids=torch.arange(2, 4),
+            kv_cache=cache.bind(["t"], workspace, start_pos=2),
+            fwd="prefill",
+        )["logits"]
+
+    torch.testing.assert_close(chunk, dense[0])
+
+
 def test_forward_logits_positions_projects_only_requested_rows():
     """logits_positions gathers packed rows before the lm_head projection."""
     config = AutoRegressiveLMConfig(**TINY_CONFIG)

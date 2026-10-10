@@ -387,9 +387,9 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
         row.index = index;
         row.prod = Space<EA, EB>::template is_prod<Tile>();
 
-        constexpr int kRing = ring_smem_bytes((int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN,
-                                              (int)Tile::kTile, (int)Tile::kStages,
-                                              (int)sizeof(EA), (int)sizeof(EB));
+        constexpr int kRing =
+            ring_smem_bytes((int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN, (int)Tile::kTile,
+                            (int)Tile::kStages, (int)sizeof(EA), (int)sizeof(EB));
         /*
          * The epilogue reclaims the operand rings for the output tile; a
          * configuration that cannot is not a candidate (its kernel would not
@@ -406,8 +406,7 @@ sweep_shape(int m, int n, int k, bool use_scale, int warmup, int iters, const ch
         if constexpr (!kReclaim) {
             row.why = "output exceeds the reclaimed ring";
         } else {
-            using Policy =
-                GemmPolicy<EA, EB, RowMajor, ColMajor, Tile, RowMajor, OutT>;
+            using Policy = GemmPolicy<EA, EB, RowMajor, ColMajor, Tile, RowMajor, OutT>;
             if (Policy::kSmemBytes > dev.smem_max) {
                 row.why = "ring over the smem opt-in ceiling";
             } else {
@@ -595,9 +594,9 @@ template <typename EA, typename EB> void list_space(const char* tag) {
     for_each_candidate(Tiles{}, [&]<typename Tile>(int) {
         constexpr int kThreads = (Tile::CtaShape::kM / Tile::WarpShape::kM) *
                                  (Tile::CtaShape::kN / Tile::WarpShape::kN) * 32;
-        constexpr int kRing = ring_smem_bytes((int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN,
-                                              (int)Tile::kTile, (int)Tile::kStages,
-                                              (int)sizeof(EA), (int)sizeof(EB));
+        constexpr int kRing =
+            ring_smem_bytes((int)Tile::CtaShape::kM, (int)Tile::CtaShape::kN, (int)Tile::kTile,
+                            (int)Tile::kStages, (int)sizeof(EA), (int)sizeof(EB));
         std::printf("%s,%s,%d,%d,%d\n", tag, tile_name<Tile>().c_str(),
                     Space<EA, EB>::template is_prod<Tile>() ? 1 : 0, kThreads, kRing);
     });

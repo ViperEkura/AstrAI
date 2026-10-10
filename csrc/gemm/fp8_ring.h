@@ -25,7 +25,7 @@ inline float fp8_max_of(at::ScalarType fmt) {
     TORCH_CHECK(fmt == scalar_type_v<fp8_e4m3> || fmt == scalar_type_v<fp8_e5m2>,
                 "fp8 linear: format must be float8_e4m3fn or float8_e5m2");
     return fmt == scalar_type_v<fp8_e4m3> ? ElemTrait<fp8_e4m3>::kFiniteMax
-                                         : ElemTrait<fp8_e5m2>::kFiniteMax;
+                                          : ElemTrait<fp8_e5m2>::kFiniteMax;
 }
 
 inline bool is_fp8(at::ScalarType dt) {
@@ -105,7 +105,6 @@ struct ScaleRing {
         initialized = true;
     }
 };
-
 
 } // namespace fp8
 } // namespace astrai

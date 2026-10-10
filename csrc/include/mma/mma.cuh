@@ -1,8 +1,8 @@
 #pragma once
 
+#include <mma/sm120.cuh>
 #include <mma/sm80.cuh>
 #include <mma/sm89.cuh>
-#include <mma/sm120.cuh>
 #include <utils/tensor.cuh>
 
 namespace astrai {
@@ -17,11 +17,28 @@ template <typename T> struct MmaShapeFor : mma::WarpMma<T> {
     using type = typename mma::WarpMma<T>::Shape;
 };
 
+/* Accumulator mapping for the warp-wide m16n8 instruction family. */
+struct Mma16x8Layout {
+    static constexpr int kM = 16, kN = 8;
+    static constexpr int kARegs = 4, kBRegs = 2, kCRegs = 4;
+    static constexpr int kRowGroup = 8, kLaneGroup = 4;
+    static DEVICE_FORCEINLINE int row(int lane, int half = 0) {
+        return (lane >> log2_const<kLaneGroup>::value) + half * kRowGroup;
+    }
+    static DEVICE_FORCEINLINE int column(int lane, int pair = 0) {
+        return (lane & (kLaneGroup - 1)) * 2 + pair;
+    }
+};
+
 /* The warp MMA register contract shared by GEMM and attention. */
 template <typename T> struct MmaOpImpl {
     using Traits = mma::WarpMma<T>;
     using AccT = typename Traits::AccT;
-    static constexpr int kARegs = 4, kBRegs = 2, kCRegs = 4;
+    using Shape = typename Traits::Shape;
+    using Layout = Mma16x8Layout;
+    static_assert(Shape::kM == Layout::kM && Shape::kN == Layout::kN,
+                  "MMA atom requires a compatible fragment layout");
+    static constexpr int kARegs = Layout::kARegs, kBRegs = Layout::kBRegs, kCRegs = Layout::kCRegs;
     using AFrag = ArrayEngine<unsigned, kARegs>;
     using BFrag = ArrayEngine<unsigned, kBRegs>;
     using CFrag = ArrayEngine<AccT, kCRegs>;
@@ -40,8 +57,7 @@ template <typename T> struct MmaOpImpl {
 };
 
 template <typename A, typename B, typename ShapeT> struct MmaOp;
-template <typename T>
-struct MmaOp<T, T, typename MmaShapeFor<T>::type> : MmaOpImpl<T> {};
+template <typename T> struct MmaOp<T, T, typename MmaShapeFor<T>::type> : MmaOpImpl<T> {};
 
 template <typename T> struct MxMmaOp : MmaOpImpl<T> {
     using Base = MmaOpImpl<T>;
@@ -51,8 +67,7 @@ template <typename T> struct MxMmaOp : MmaOpImpl<T> {
     static constexpr int kMinArch = 1200;
 
     template <int Arch = kMmaDeviceArch>
-    static DEVICE_FORCEINLINE void
-    fma(CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {
+    static DEVICE_FORCEINLINE void fma(CFrag& d, const AFrag& a, const BFrag& b, const CFrag& c) {
         fma<Arch>(d.storage, a.storage, b.storage, c.storage);
     }
 

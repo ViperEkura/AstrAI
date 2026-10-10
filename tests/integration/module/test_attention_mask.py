@@ -108,8 +108,8 @@ def test_hybrid_mask_plan_keeps_recurrent_padding_2d(device):
     assert masks["gdn"].tensor is padding
     assert masks["gdn"].is_causal
     assert masks["gqa"] is masks["mla"]
-    assert masks["gqa"].tensor.shape == (1, 1, 3, 3)
-    assert not masks["gqa"].is_causal
+    assert masks["gqa"].tensor.shape == (1, 1, 1, 3)
+    assert masks["gqa"].is_causal
 
 
 def test_hybrid_gqa_mla_use_their_own_rope_dimensions(device):

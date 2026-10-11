@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn, optim
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.optim._muon import (
     _adjust_lr,
     _single_tensor_muon,
@@ -79,7 +79,24 @@ def _single_tensor_muon_reuse_buffers(
                 param.add_(update, alpha=-adjusted_lr)
 
 
-def _sharded_orthogonalize(update: Tensor, group: Mapping) -> Tensor:
+def _validate_sharded_matrix(param: DTensor) -> None:
+    if param.ndim != 2 or param.device_mesh.ndim != 1 or len(param.placements) != 1:
+        raise ValueError("sharded Muon requires a 2D logical matrix on a 1D mesh")
+    placement = param.placements[0]
+    if not isinstance(placement, (Shard, Replicate)) or (
+        isinstance(placement, Shard) and placement.dim not in (0, 1)
+    ):
+        raise ValueError("sharded Muon supports only Shard(0), Shard(1) or Replicate")
+
+
+def _sharded_orthogonalize(
+    update: DTensor,
+    group: Mapping,
+    *,
+    reuse_ns_buffers: bool = False,
+    use_ns_kernels: bool = False,
+    preserve_input_mutation: bool = False,
+) -> Tensor:
     """Newton-Schulz for a sharded DTensor momentum update.
 
     NS needs global matmuls, so gather the update to the full matrix,
@@ -88,9 +105,23 @@ def _sharded_orthogonalize(update: Tensor, group: Mapping) -> Tensor:
     every rank, so the scatter is a uniform collective.
     """
     full = update.full_tensor()
-    ortho = _zeropower_via_newtonschulz(
-        full, group["ns_coefficients"], group["ns_steps"], group["eps"]
-    )
+    if reuse_ns_buffers or use_ns_kernels:
+        ortho = newton_schulz(
+            full,
+            group["ns_coefficients"],
+            group["ns_steps"],
+            group["eps"],
+            backend="auto" if use_ns_kernels else "torch",
+        )
+    else:
+        ortho = _zeropower_via_newtonschulz(
+            full, group["ns_coefficients"], group["ns_steps"], group["eps"]
+        )
+    if preserve_input_mutation and full.dtype == torch.bfloat16:
+        # Full-matrix BF16 normalization mutates the caller storage. A
+        # gather breaks the non-Nesterov momentum alias, so restore this
+        # state transition on each shard before the next optimizer update.
+        update.copy_(distribute_tensor(full, update.device_mesh, update.placements))
     return distribute_tensor(ortho, update.device_mesh, update.placements)
 
 
@@ -147,6 +178,9 @@ class _ShardedMuon(optim.Muon):
                     (param, grad, buf)
                 )
 
+            for param, _, _ in sharded:
+                _validate_sharded_matrix(param)
+
             if plain:
                 pp, gg, bb = (list(t) for t in zip(*plain))
                 if self.reuse_ns_buffers or self.use_ns_kernels:
@@ -180,8 +214,15 @@ class _ShardedMuon(optim.Muon):
                 update = grad.lerp(buf, group["momentum"]) if group["nesterov"] else buf
 
                 adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], param.shape)
+                ortho = _sharded_orthogonalize(
+                    update,
+                    group,
+                    reuse_ns_buffers=self.reuse_ns_buffers,
+                    use_ns_kernels=self.use_ns_kernels,
+                    preserve_input_mutation=not group["nesterov"],
+                )
                 param.mul_(1 - lr * group["weight_decay"])
-                param.add_(_sharded_orthogonalize(update, group), alpha=-adjusted_lr)
+                param.add_(ortho, alpha=-adjusted_lr)
         return loss
 
 

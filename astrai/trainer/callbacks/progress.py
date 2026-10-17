@@ -30,16 +30,19 @@ class ProgressBarCallback(TrainCallback):
 
     @only_on_rank(0)
     def on_epoch_begin(self, context: TrainContext):
-        total_steps = len(context.dataloader) // context.executor.grad_accum_steps
+        remaining_steps = (
+            len(context.dataloader) + context.executor.accumulated_steps
+        ) // context.executor.grad_accum_steps
         self.progress_bar = tqdm(
-            total=total_steps,
+            total=context.optimizer_step + remaining_steps,
+            initial=context.optimizer_step,
             desc=f"Epoch {context.epoch + 1}/{self.num_epoch}",
             dynamic_ncols=True,
             file=self.file or sys.stdout,
         )
 
     @only_on_rank(0)
-    def before_optimizer_step(self, context: TrainContext):
+    def after_optimizer_step(self, context: TrainContext):
         postfix = {
             "step": f"{context.optimizer_step:d}",
             "loss": f"{context.loss:.4f}",

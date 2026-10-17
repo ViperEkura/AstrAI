@@ -105,7 +105,9 @@ def build_scheduler_component(
 
     samples_per_replica = ceil_div(dataset_len, cfg.dp_size)
     batches_per_replica = ceil_div(samples_per_replica, cfg.batch_per_device)
-    total_steps = (batches_per_replica // cfg.grad_accum_steps) * cfg.n_epoch
+    # Accumulation continues across epoch boundaries; only the final
+    # incomplete accumulation is discarded.
+    total_steps = batches_per_replica * cfg.n_epoch // cfg.grad_accum_steps
     warmup_steps = min(int(warmup_ratio * total_steps), total_steps)
     remaining = total_steps - warmup_steps
     values = {

@@ -98,8 +98,11 @@ class CheckpointCallback(TrainCallback):
         self.last_ckpt_step = context.optimizer_step
         self._saved = True
 
-    def after_optimizer_step(self, context: TrainContext):
-        if context.optimizer_step - self.last_ckpt_step >= self.interval:
+    def on_batch_end(self, context: TrainContext):
+        if (
+            context.checkpoint_safe
+            and context.optimizer_step - self.last_ckpt_step >= self.interval
+        ):
             self._save_checkpoint(context)
 
     def on_train_end(self, context: TrainContext):

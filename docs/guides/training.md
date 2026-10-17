@@ -51,35 +51,74 @@ to a fused CUDA kernel when available.
 
 ## Training Loop
 
-Two-level loop: **epoch** → **batch**. Optimizer step fires every `grad_accum_steps` batches.
+Two-level loop: **epoch** → **batch**. Gradient accumulation continues across
+epoch boundaries; the final incomplete accumulation is not applied.
 
-```
+The optimizer step is an explicit count of completed updates. The data cursor
+(`consumed_samples`) waits until all learner updates for the input batch and its
+accumulation finish. Uncommitted records remain in `pending_samples` and are
+replayed after resume because their gradients are not checkpointed.
+
+~~~text
 on_train_begin
   model.train()
   on_epoch_begin
     for batch in dataloader:
+      pending_samples += strategy.batch_size(batch) * dp_size
       with executor.accumulate(model):
         on_batch_begin
-        loss_output = strategy(batch)
-        context.loss = loss_output["loss"].item()
-        context.metrics = loss_output["metrics"]
-        stand_loss = loss_output["loss"] / executor.grad_accum_steps
-        executor.backward(stand_loss)
-        context.consumed_samples += (
-            context.config.batch_per_device * context.world_size
-        )
-        on_batch_end
-
-        if executor.sync_gradients:
-          before_optimizer_step
-          strategy.optimizer_step(optimizer)
-          optimizer.zero_grad()
-          if scheduler:
+        for update in strategy.training_updates(batch):
+          forward / backward
+          if executor.sync_gradients:
+            before_optimizer_step       # gradient statistics and clipping
+            checkpoint_safe = False
+            strategy.optimizer_step(optimizer)
+            optimizer.zero_grad()
             scheduler.step()
-          after_optimizer_step
+            context.commit_update()     # increment optimizer_step only
+            after_optimizer_step        # metrics and progress
+        if executor.sync_gradients:
+          context.commit_samples()      # commit input cursor; safe to save
+        on_batch_end                    # checkpoint, then metric flush
     on_epoch_end
 on_train_end
-```
+~~~
+
+Responsibilities stay within the existing components:
+
+- The strategy defines batch shape and executes each optimizer update.
+- The trainer orders backward, optimizer, scheduler, progress and callbacks.
+- `TrainContext.commit_update()` records a completed optimizer update.
+- `TrainContext.commit_samples()` advances the data cursor after all updates
+  for the batch finish.
+- `restore_training_progress()` validates and restores persisted progress.
+- Checkpoint callbacks save only at a complete input/accumulation boundary.
+
+One input batch may produce multiple learner updates. A periodic checkpoint is
+deferred until all of them finish, so its data cursor never skips unfinished
+work. If any update or publication fails, the partial in-memory state is not
+saved; resume uses the last complete checkpoint.
+
+Batch size comes from defined sample fields such as `input_ids`, `chosen`,
+`prompts` or `instruction`. Recognized sample dimensions must agree. Metadata
+order is ignored; custom batch layouts override `strategy.batch_size()`.
+
+Runtime and checkpoint metadata use one `optimizer_step` counter and a separate
+committed data cursor, without a version marker or duplicate counter field.
+Normal resume does not silently round or repair the cursor. Recognizable old
+periodic offsets and ambiguous partial cursors are rejected before training.
+
+For a **confirmed legacy checkpoint**, make a repaired copy explicitly:
+
+~~~bash
+CUDA_VISIBLE_DEVICES="" .venv/bin/python -m scripts.tools.checkpoint \
+  ./checkpoints/legacy ./checkpoints/repaired
+~~~
+
+The command loads and copies checkpoint weights and component states, updates
+only progress metadata, and preserves tokenizer files. It leaves the source
+unchanged and requires a new output directory. Inspect ambiguous progress before
+using this legacy-only repair; then resume from the repaired copy.
 
 ### Callback Lifecycle
 
@@ -88,9 +127,9 @@ on_train_end
 | `on_train_begin` | Before training starts | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 | `on_epoch_begin` | Start of each epoch | `ProgressBarCallback` |
 | `on_batch_begin` | Every batch | — |
-| `before_optimizer_step` | Every accumulation window, before `optimizer.step()` | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
-| `on_batch_end` | Every batch | — |
-| `after_optimizer_step` | Every accumulation window, after `optimizer.step()` and `scheduler.step()` | `CheckpointCallback` |
+| `before_optimizer_step` | Every accumulation window, before `optimizer.step()` | `MetricCallback`, `GradientClippingCallback` |
+| `on_batch_end` | Every batch; checkpoint only at safe boundaries | `CheckpointCallback`, `MetricCallback` |
+| `after_optimizer_step` | After each complete optimizer/scheduler update | `MetricCallback`, `ProgressBarCallback` |
 | `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
 | `on_error` | On exception during training | `CheckpointCallback`, `MetricCallback` |
 | `on_train_end` | Training exits after `on_train_begin` completes (via `finally`) | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |

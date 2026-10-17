@@ -272,6 +272,10 @@ class BaseExecutor:
     def grad_accum_steps(self) -> int:
         return self.gradient_state.num_steps
 
+    @property
+    def accumulated_steps(self) -> int:
+        return self.gradient_state._step % self.grad_accum_steps
+
     def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
         total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         if isinstance(total_norm, torch.Tensor):

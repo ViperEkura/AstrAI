@@ -213,17 +213,16 @@ def test_shared_train_batch_commits_async_round_once():
     strategy._rollout_runner = coordinator
     optimizer = torch.optim.SGD(strategy.model.parameters(), lr=0.01)
     before = strategy.model.embed.weight.detach().clone()
-    context = SimpleNamespace(
+    context = TrainContext(
         model=strategy.model,
         strategy=strategy,
         executor=Executor(),
         config=SimpleNamespace(async_train_microbatch_prompts=1),
         async_rollout=coordinator,
-        dp_size=1,
         optimizer=optimizer,
         scheduler=None,
         consumed_samples=0,
-        optimizer_steps_completed=0,
+        optimizer_step=0,
         checkpoint_safe=True,
         loss=0.0,
         metrics={},
@@ -233,7 +232,7 @@ def test_shared_train_batch_commits_async_round_once():
     trainer._train_batch(context, result)
 
     assert coordinator.policy_version == 1
-    assert context.optimizer_steps_completed == 1
+    assert context.optimizer_step == 1
     assert context.consumed_samples == 3
     assert context.checkpoint_safe
     assert not torch.equal(before, strategy.model.embed.weight)
@@ -571,10 +570,11 @@ def test_online_minibatch_round_publication_and_reference_resume(base_test_env):
     config = _online_config(base_test_env, rl_update_epochs=2, rl_minibatch_prompts=1)
     Trainer(config).train(param_path=test_dir)
 
-    checkpoint_dir = os.path.join(test_dir, "ckpt", "epoch_0_step_2")
+    checkpoint_dir = os.path.join(test_dir, "ckpt", "epoch_0_step_8")
     checkpoint = Checkpoint.load(checkpoint_dir)
     # 2 batches × (2 minibatches × 2 epochs) publications.
     assert checkpoint.meta["policy_version"] == 8
+    assert checkpoint.meta["optimizer_step"] == 8
     assert "reference_model" in checkpoint.extra
     assert "rng_state" in checkpoint.extra
     ref_keys = set(checkpoint.extra["reference_model"])

@@ -1,6 +1,7 @@
 """Common training strategy lifecycle and interfaces."""
 
 from abc import ABC
+from collections.abc import Mapping
 from typing import (
     Any,
     Callable,
@@ -246,6 +247,38 @@ class BaseStrategy(ABC):
                 "online training must call strategy.optimizer_step(optimizer) "
                 "so weight mutation and policy-version publication are atomic"
             )
+
+    @staticmethod
+    def batch_size(batch: Any) -> int:
+        """Count records from defined sample fields, never metadata order."""
+        if isinstance(batch, RolloutResult):
+            return batch.prompts.shape[0]
+        if not isinstance(batch, Mapping):
+            raise ValueError("Custom batch layouts must override strategy.batch_size()")
+        sizes = []
+        for name in (
+            "input_ids",
+            "target_ids",
+            "chosen",
+            "rejected",
+            "prompts",
+            "instruction",
+        ):
+            if name not in batch:
+                continue
+            value = batch[name]
+            if not isinstance(value, (Tensor, list, tuple)) or (
+                isinstance(value, Tensor) and value.ndim == 0
+            ):
+                raise ValueError(
+                    f"Batch field {name!r} needs a leading sample dimension"
+                )
+            sizes.append(len(value))
+        if not sizes:
+            raise ValueError("Custom batch layouts must override strategy.batch_size()")
+        if sizes[0] < 1 or any(size != sizes[0] for size in sizes):
+            raise ValueError("Batch sample dimensions must be nonempty and agree")
+        return sizes[0]
 
     def optimizer_step(self, optimizer: Optimizer):
         """Step the optimizer at an atomic online-rollout version boundary."""

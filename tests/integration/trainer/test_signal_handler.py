@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 
 from astrai.config import ComponentSpec, TrainConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
-from astrai.signal_handler import register_signal_handlers
+from astrai.signal_handler import register_signal_handlers, unregister_signal_handlers
 from astrai.trainer import Trainer
 from astrai.trainer.train_context import TrainContext
 from tests.support.checkpoint import load_checkpoint_meta
@@ -119,9 +119,12 @@ def test_context_stop_flag():
 def test_register_signal_handlers():
     ctx = TrainContext()
     register_signal_handlers(ctx)
-    assert not ctx.stop_requested
-    os.kill(os.getpid(), signal.SIGTERM)
-    assert ctx.stop_requested
+    try:
+        assert not ctx.stop_requested
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert ctx.stop_requested
+    finally:
+        unregister_signal_handlers()
 
 
 @pytest.mark.slow

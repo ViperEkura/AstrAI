@@ -45,6 +45,7 @@ class MetricCallback(TrainCallback):
         self.val_step = val_step
         self.grad_snr_interval = grad_snr_interval
         self._next_val_step = 0
+        self._step_metrics = None
 
         self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else Path.cwd() / "checkpoint"
 
@@ -192,10 +193,19 @@ class MetricCallback(TrainCallback):
                 self._append("validation", context, val_loss=context.val_loss)
 
         step_metrics = [m for m in self.metrics if m != "val_loss"]
-        self._append("step", context, **self._metrics(context, step_metrics))
+        # Capture gradient statistics and the learning rate used for this update.
+        self._step_metrics = self._metrics(context, step_metrics)
 
     def after_optimizer_step(self, context):
-        if context.optimizer_step - self.last_log_flush_step >= self.save_interval:
+        if self._step_metrics is not None:
+            self._append("step", context, **self._step_metrics)
+            self._step_metrics = None
+
+    def on_batch_end(self, context):
+        if (
+            context.checkpoint_safe
+            and context.optimizer_step - self.last_log_flush_step >= self.save_interval
+        ):
             self._flush(context.epoch, context.optimizer_step)
             self.last_log_flush_step = context.optimizer_step
 

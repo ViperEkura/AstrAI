@@ -4,13 +4,18 @@ from pathlib import Path
 
 import pytest
 import torch
+from click.testing import CliRunner
 
 from astrai.config import ComponentSpec, TrainConfig
 from astrai.optimization.optimizer import OptimizerFactory
 from astrai.serialization import Checkpoint
 from astrai.serialization import checkpoint as checkpoint_module
 from astrai.trainer.components import load_optimizer_state_dict
-from astrai.trainer.train_context import TrainContextBuilder
+from astrai.trainer.train_context import (
+    TrainContextBuilder,
+    repair_legacy_training_progress,
+)
+from scripts.tools.checkpoint import repair_progress_command
 from tests.support.models import make_model
 
 
@@ -199,3 +204,100 @@ def test_muon_adamw_reuses_both_histories_with_new_stage_lr():
     new.step()
     scheduler.step()
     assert all(group["lr"] == pytest.approx(0.016) for group in new.param_groups)
+
+
+@pytest.mark.parametrize(
+    "legacy,step,cursor,batch,accum,expected_step,expected_cursor",
+    [
+        (True, 2, 5, 1, 2, 3, 6),
+        (True, 3, 7, 1, 2, 3, 6),
+        (False, 3, 5, 2, 2, 3, 5),
+    ],
+)
+def test_resume_progress_formats(
+    tmp_path,
+    monkeypatch,
+    legacy,
+    step,
+    cursor,
+    batch,
+    accum,
+    expected_step,
+    expected_cursor,
+):
+    checkpoint = _save_checkpoint(tmp_path)
+    checkpoint.consumed_samples = cursor
+    checkpoint.meta.update(
+        optimizer_step=step,
+        batch_per_device=batch,
+        dp_size=1,
+        grad_accum_steps=accum,
+    )
+    if legacy:
+        repaired_step, repaired_cursor = repair_legacy_training_progress(checkpoint)
+        checkpoint.meta["optimizer_step"] = repaired_step
+        checkpoint.consumed_samples = repaired_cursor
+    checkpoint.save(tmp_path)
+    monkeypatch.setenv("LOCAL_DEVICE", "cpu")
+    context = (
+        TrainContextBuilder(_config(batch_per_device=batch, grad_accum_steps=accum))
+        .with_param_path(str(tmp_path), resume=True)
+        .build()
+    )
+    assert context.optimizer_step == expected_step
+    assert context.consumed_samples == expected_cursor
+    assert context.pending_samples == 0
+    assert context.scheduler.state_dict()["last_epoch"] == 3
+
+
+@pytest.mark.parametrize(
+    "step,cursor,batch,accum", [(2, 5, 1, 2), (3, 7, 1, 2), (2, 4, 2, 1)]
+)
+def test_raw_legacy_checkpoint_is_rejected_before_resume(
+    tmp_path, monkeypatch, step, cursor, batch, accum
+):
+    checkpoint = _save_checkpoint(tmp_path)
+    checkpoint.consumed_samples = cursor
+    checkpoint.meta.update(
+        optimizer_step=step, batch_per_device=batch, dp_size=1, grad_accum_steps=accum
+    )
+    checkpoint.save(tmp_path)
+    monkeypatch.setenv("LOCAL_DEVICE", "cpu")
+    with pytest.raises(ValueError, match="scripts.tools.checkpoint"):
+        (
+            TrainContextBuilder(_config(batch_per_device=batch, grad_accum_steps=accum))
+            .with_param_path(str(tmp_path), resume=True)
+            .build()
+        )
+
+
+def test_checkpoint_repair_command_writes_resumable_copy(tmp_path, monkeypatch):
+    source, output = tmp_path / "source", tmp_path / "repaired"
+    checkpoint = _save_checkpoint(source)
+    checkpoint.consumed_samples = 5
+    checkpoint.meta.update(
+        optimizer_step=2, batch_per_device=1, dp_size=1, grad_accum_steps=2
+    )
+    checkpoint.save(source)
+    (source / "tokenizer.json").write_text("{}")
+    before = (source / "meta.json").read_bytes()
+    result = CliRunner().invoke(repair_progress_command, [str(source), str(output)])
+    assert result.exit_code == 0, result.output
+    assert (source / "meta.json").read_bytes() == before
+    assert (output / "tokenizer.json").read_text() == "{}"
+    repaired = Checkpoint.load(output, verify_checksums=True)
+    assert repaired.meta["optimizer_step"] == 3
+    assert repaired.consumed_samples == 6
+    for name, value in checkpoint.state_dict.items():
+        torch.testing.assert_close(repaired.state_dict[name], value, rtol=0, atol=0)
+    monkeypatch.setenv("LOCAL_DEVICE", "cpu")
+    context = (
+        TrainContextBuilder(_config(batch_per_device=1, grad_accum_steps=2))
+        .with_param_path(str(output), resume=True)
+        .build()
+    )
+    assert context.optimizer_step == 3
+    assert context.consumed_samples == 6
+    assert context.scheduler.state_dict()["last_epoch"] == 3
+    result = CliRunner().invoke(repair_progress_command, [str(source), str(output)])
+    assert result.exit_code != 0

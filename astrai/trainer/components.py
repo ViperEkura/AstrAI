@@ -30,7 +30,7 @@ from astrai.parallel.executor import (
 )
 from astrai.parallel.setup import follow_parent
 from astrai.parallel.topology import ParallelTopology
-from astrai.trainer.step_plan import ceil_div, global_epoch_steps, legacy_epoch_steps
+from astrai.trainer.step_plan import ceil_div, global_epoch_steps
 from astrai.trainer.strategy import StrategyFactory
 
 logger = logging.getLogger(__name__)
@@ -111,8 +111,6 @@ def build_scheduler_component(
     optimizer,
     dataset_len: int,
     cfg: TrainConfig,
-    *,
-    global_cursor: bool = True,
 ):
     params = dict(spec.params)
     warmup_ratio = params.pop("warmup_ratio", 0.0)
@@ -122,13 +120,6 @@ def build_scheduler_component(
         samples_per_replica = ceil_div(dataset_len, cfg.dp_size)
         batches_per_replica = ceil_div(samples_per_replica, cfg.batch_per_device)
         steps_per_epoch = ceil_div(batches_per_replica, cfg.grad_accum_steps)
-    elif not global_cursor and not online:
-        steps_per_epoch = legacy_epoch_steps(
-            ceil_div(dataset_len, cfg.dp_size),
-            cfg.batch_per_device,
-            cfg.grad_accum_steps,
-            cfg.epoch_tail_policy,
-        )
     else:
         global_batch = cfg.dp_size * cfg.batch_per_device * cfg.grad_accum_steps
         steps_per_epoch = global_epoch_steps(
@@ -292,7 +283,7 @@ def build_dataloader(
     epoch: int,
     start_iter: int,
     shuffle: bool = True,
-    global_cursor: bool = False,
+    training: bool = False,
 ) -> DataLoader:
     kwargs = dict(
         dataset=dataset,
@@ -300,7 +291,7 @@ def build_dataloader(
         pin_memory=config.pin_memory,
         collate_fn=resolve_collate(spec),
     )
-    if global_cursor:
+    if training and config.rollout_mode != "async_round":
         kwargs["batch_sampler"] = GlobalBatchSampler(
             dataset,
             dp_size=topology.dp_size,

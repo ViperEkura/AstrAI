@@ -30,6 +30,8 @@ from typing import Dict
 import click
 import torch
 
+from astrai.extension import kernel, plan
+
 _TUNE = Path(__file__).resolve().parent / "tune_plan_table.py"
 
 
@@ -133,8 +135,6 @@ def priced(
 
 
 def attach_resources(ctx, combo, m, n, k, batch, tma):
-    from astrai.extension import kernel, plan
-
     da, db = tpt.COMBOS[combo]
     with plan.override(planner="heuristic", tma=tma, mx=False):
         info = kernel.gemm.probe(m, n, k, da, db, batch=batch)
@@ -355,8 +355,6 @@ def main(results_json, rule, class_filter, check, staging):
         order = tpt.order_for(perf_class)[:-1]
         picks = {name: choose(table[name], feats, ctx, order) for name in names}
         if check:
-            from astrai.extension import kernel, plan
-
             da, db = tpt.COMBOS[combo]
             with plan.override(
                 planner="heuristic" if rule == "geom_cta" else "model",

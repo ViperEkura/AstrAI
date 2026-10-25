@@ -221,6 +221,7 @@ def test_shared_train_batch_commits_async_round_once():
         optimizer=optimizer,
         scheduler=None,
         consumed_samples=0,
+        epoch_sample_offset=0,
         optimizer_steps_completed=0,
         loss=0.0,
         metrics={},

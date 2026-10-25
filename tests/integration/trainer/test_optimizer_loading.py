@@ -12,6 +12,7 @@ from astrai.serialization import checkpoint as checkpoint_module
 from astrai.trainer.components import load_optimizer_state_dict
 from astrai.trainer.context import TrainContextBuilder
 from tests.support.models import make_model
+from tests.support.trainer import make_resume_metadata
 
 
 def _config(**overrides):
@@ -59,7 +60,7 @@ def _save_checkpoint(path, *, with_optimizer=True):
         config=config.to_dict(),
         epoch=0,
         consumed_samples=6,
-        meta={"optimizer": {"type": "torch.optim:AdamW"}},
+        meta=make_resume_metadata(_config(), 16, offset=6, step=3),
         extra=extras,
     )
     checkpoint.save(path)

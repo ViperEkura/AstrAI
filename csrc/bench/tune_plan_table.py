@@ -38,7 +38,7 @@ import click
 import torch
 
 from astrai.extension import is_available, kernel
-from astrai.extension.kernel.gemm import quant_gemm
+from astrai.extension.kernel.gemm import facts, quant_gemm
 from astrai.extension.policy.gemm.plan import Tile, device_signature
 from astrai.extension.runtime.loader import get_module
 
@@ -118,7 +118,6 @@ def _binding_vocabulary():
     """(ladders in dispatch order, geometry -> TileClass ordinal) from the
     extension binding — the same rows the extension's own planner ranks,
     so the vocabulary cannot drift from the compiled manifests."""
-    from astrai.extension import kernel  # host-only: no kernel, no device
 
     ladders: Dict[str, List[str]] = {
         "TileManifestCross": [],
@@ -1304,7 +1303,6 @@ def _device_facts() -> Dict:
     binding (the cache key cannot drift from the autotuner's)."""
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA is required")
-    from astrai.extension.kernel.gemm import facts
 
     return facts()
 

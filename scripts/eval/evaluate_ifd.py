@@ -25,6 +25,7 @@ import argparse
 import glob
 import json
 import os
+import random
 import statistics
 from typing import List
 
@@ -253,8 +254,6 @@ def process_file(
     data = _load_items(input_file)
 
     if max_samples and len(data) > max_samples:
-        import random
-
         data = random.sample(data, max_samples)
 
     results = []

@@ -65,15 +65,12 @@ class TrainContextBuilder:
     def _instantiate_optimizer(self, model: nn.Module):
         return build_optimizer_component(self.config.optimizer, model)
 
-    def _instantiate_scheduler(
-        self, optimizer, dataset_len: int, *, global_cursor: bool = True
-    ):
+    def _instantiate_scheduler(self, optimizer, dataset_len: int):
         return build_scheduler_component(
             self.config.scheduler,
             optimizer,
             dataset_len,
             self.config,
-            global_cursor=global_cursor,
         )
 
     def with_param_path(self, param_path: Optional[str], resume: bool = False) -> Self:
@@ -111,17 +108,9 @@ class TrainContextBuilder:
         executor = self._create_executor()
         self._validate_rollout_configuration(executor)
         context = self._create_context(preloaded_state, executor)
-        if self.config.rollout_mode == "async_round" or (
-            not self._resume and self.config.start_samples > 0
-        ):
-            context.global_cursor = False
         try:
             self._create_datasets(context)
-            if (
-                self._resume
-                and context.global_cursor
-                and context.checkpoint is not None
-            ):
+            if self._resume and context.checkpoint is not None:
                 saved_len = context.checkpoint.meta["dataset_len"]
                 if context.dataset_len != saved_len:
                     raise ValueError(
@@ -186,7 +175,6 @@ class TrainContextBuilder:
             epoch=state.epoch,
             consumed_samples=state.consumed_samples,
             epoch_sample_offset=state.epoch_sample_offset,
-            global_cursor=state.global_cursor,
             optimizer_steps_completed=state.optimizer_steps_completed,
             checkpoint=state.checkpoint,
             param_path=self._param_path,
@@ -234,9 +222,7 @@ class TrainContextBuilder:
             return model
 
         def scheduler_for_context(optimizer):
-            return self._instantiate_scheduler(
-                optimizer, context.dataset_len, global_cursor=context.global_cursor
-            )
+            return self._instantiate_scheduler(optimizer, context.dataset_len)
 
         context.model, context.optimizer, context.scheduler = executor.prepare(
             lambda: self._instantiate_model(context.model_config),
@@ -254,15 +240,14 @@ class TrainContextBuilder:
     def _create_dataloaders(
         self, context: TrainContext, train_dataset, val_dataset
     ) -> None:
-        sampler_offset = (
-            context.epoch_sample_offset
-            if context.global_cursor
-            else context.consumed_samples // context.dp_size
-        )
-        if not context.global_cursor and self._resume and sampler_offset > 0:
-            samples_per_replica = self._topology.samples_per_replica(len(train_dataset))
-            if samples_per_replica > 0:
-                context.epoch = sampler_offset // samples_per_replica
+        sampler_offset = context.epoch_sample_offset
+        if self.config.rollout_mode == "async_round":
+            sampler_offset //= context.dp_size
+            extent = self._topology.samples_per_replica(len(train_dataset))
+            if sampler_offset == extent:
+                context.epoch += 1
+                context.epoch_sample_offset = 0
+                sampler_offset = 0
         context.dataloader = build_dataloader(
             train_dataset,
             self.config.dataset,
@@ -270,7 +255,7 @@ class TrainContextBuilder:
             self._topology,
             context.epoch,
             sampler_offset,
-            global_cursor=context.global_cursor,
+            training=True,
         )
         if val_dataset is not None:
             context.val_dataloader = build_dataloader(

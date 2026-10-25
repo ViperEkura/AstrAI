@@ -21,6 +21,7 @@ from astrai.trainer.trainer import Trainer
 from tests.support.models import make_frozen, make_model, make_rollout_config
 from tests.support.rollout import FakeExecutor
 from tests.support.tokenizers import build_test_tokenizer
+from tests.support.trainer import make_resume_metadata
 
 
 class _StubRewardModel(BaseRewardModel):
@@ -185,7 +186,7 @@ def test_builder_resumes_critic_from_checkpoint(device, temp_dir, monkeypatch):
                 key: value.clone() for key, value in model.state_dict().items()
             },
         },
-        meta={"policy_version": 3},
+        meta={**make_resume_metadata(_ppo_config(device), 2), "policy_version": 3},
     )
     checkpoint.save(temp_dir)
     build_test_tokenizer(vocab_size=200).save_pretrained(temp_dir)

@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import warnings
 from pathlib import Path
 
@@ -40,14 +41,10 @@ def _torch_prefix():
 
 
 def _python_include():
-    import sysconfig
-
     return sysconfig.get_path("include")
 
 
 def _python_soabi():
-    import sysconfig
-
     ext = sysconfig.get_config_var("EXT_SUFFIX") or ""
     for suffix in (".so", ".pyd"):
         if ext.endswith(suffix):
@@ -183,8 +180,6 @@ def _find_nvcc():
 
 
 def _cuda_toolkit_version():
-    import subprocess
-
     nvcc = _find_nvcc()
     if nvcc is None:
         return None

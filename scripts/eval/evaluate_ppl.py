@@ -2,6 +2,7 @@ import argparse
 import glob
 import json
 import os
+import random
 import statistics
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
@@ -227,8 +228,6 @@ def process_file(
     and log_probs are written as JSONL alongside the summary.
     """
     if max_samples and len(items) > max_samples:
-        import random
-
         items = random.sample(items, max_samples)
 
     texts = [item[text_key] for item in items if text_key in item]

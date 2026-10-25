@@ -72,13 +72,6 @@ class Trainer:
             if method:
                 method(context)
 
-    def _commit_update(self, context: TrainContext, batch, new_data: bool = True):
-        if context.async_rollout is not None:
-            self._commit_online_update(context, batch, new_data)
-        else:
-            self._commit_offline_update(context, new_data)
-        self._after_commit(context, agree_stop=context.async_rollout is None)
-
     def _after_commit(self, context: TrainContext, *, agree_stop: bool) -> None:
         self._call_callbacks("after_optimizer_step", context)
         if agree_stop:
@@ -126,37 +119,19 @@ class Trainer:
                     context.scheduler.step()
                 context.optimizer_steps_completed += 1
                 if new_data:
-                    context.consumed_samples += batch.prompts.shape[0] * context.dp_size
+                    count = batch.prompts.shape[0] * context.dp_size
+                    context.consumed_samples += count
+                    context.epoch_sample_offset += count
+                context.checkpoint_safe = True
 
-    def _train_batch(
-        self,
-        context: TrainContext,
-        batch,
-        force_sync: bool = False,
-        batch_samples: Optional[int] = None,
-    ) -> None:
+    def _train_batch(self, context: TrainContext, batch) -> None:
+        context.checkpoint_safe = False
         executor = context.executor
-        accumulation = (
-            executor.accumulate(context.model, force_sync=True)
-            if force_sync
-            else executor.accumulate(context.model)
-        )
-        with accumulation:
-            if context.async_rollout is None:
-                if batch_samples is None:
-                    batch_samples = context.config.batch_per_device * context.dp_size
-                context.pending_samples += batch_samples
+        with executor.accumulate(context.model):
             self._call_callbacks("on_batch_begin", context)
-            microbatch_prompts = (
-                context.config.async_train_microbatch_prompts
-                if context.async_rollout is not None
-                else None
-            )
-            # A batch can produce several updates (replayed rollout rounds) or
-            # none (mid-window). Steps follow every commit; the data cursor
-            # moves once per batch, because a replayed batch is one position.
-            committed = False
-            for update in context.strategy.training_updates(batch, microbatch_prompts):
+            for update in context.strategy.training_updates(
+                batch, context.config.async_train_microbatch_prompts
+            ):
                 update_loss = None
                 update_metrics = {}
                 for output in update:
@@ -175,16 +150,8 @@ class Trainer:
                 context.loss = float(update_loss.item())
                 context.metrics = update_metrics
                 if executor.sync_gradients:
-                    if (
-                        context.async_rollout is None
-                        and executor.window_steps < executor.grad_accum_steps
-                    ):
-                        executor.scale_gradients(
-                            context.model,
-                            executor.grad_accum_steps / executor.window_steps,
-                        )
-                    self._commit_update(context, batch, new_data=not committed)
-                    committed = True
+                    self._commit_online_update(context, batch, new_data=True)
+                    self._after_commit(context, agree_stop=False)
             self._call_callbacks("on_batch_end", context)
 
     def _should_stop(self, context: TrainContext) -> bool:
@@ -400,89 +367,33 @@ class Trainer:
             context.epoch = epoch + 1
 
     def _train_epoch(self, context: TrainContext, epoch: int) -> None:
-        if context.global_cursor and context.async_rollout is None:
+        if context.async_rollout is None:
             self._train_global_epoch(context, epoch)
             return
         context.epoch = epoch
+        context.dataloader.sampler.set_epoch(epoch)
+        context.dataloader.sampler.iter = context.epoch_sample_offset // context.dp_size
         self._call_callbacks("on_epoch_begin", context)
-        batches = context.dataloader
-        if context.async_rollout is not None:
-            batches = context.async_rollout.iter_rounds(
-                batches, lambda: context.stop_requested
-            )
-        # A stop waits for the next commit. The epoch tail follows the
-        # configured policy only when the epoch ends naturally.
-        if not context.stop_agreed:
-            self._agree_stop(context)
-        if context.async_rollout is None:
-            # Capture this before creating the iterator: worker prefetch can
-            # advance the sampler well beyond the batches the loop consumed.
-            remaining_samples = len(context.dataloader.sampler)
-            total_batches = len(context.dataloader)
-            if context.config.epoch_tail_policy == "drop":
-                full_batches = remaining_samples // context.config.batch_per_device
-                trainable_batches = (
-                    full_batches // context.executor.grad_accum_steps
-                ) * context.executor.grad_accum_steps
-            else:
-                trainable_batches = total_batches
+        loader_iterator = iter(context.dataloader)
+        batches = context.async_rollout.iter_rounds(
+            loader_iterator, lambda: context.stop_requested
+        )
         iterator = iter(batches)
         context.train_iterator = iterator
-        # The session runs this before any checkpoint is written: a worker
-        # killed by the stop signal would otherwise raise mid-save.
-        context.on_shutdown("train_loader", partial(stop_loader_workers, iterator))
-        batch_index = 0
-        while not self._should_stop(context) and (
-            context.async_rollout is not None or batch_index < trainable_batches
-        ):
+        context.on_shutdown(
+            "train_loader", partial(stop_loader_workers, loader_iterator)
+        )
+        exhausted = False
+        while not self._should_stop(context):
             try:
                 batch = next(iterator)
             except StopIteration:
+                exhausted = True
                 break
-            if context.async_rollout is None:
-                batch_samples = (
-                    min(
-                        context.config.batch_per_device,
-                        remaining_samples
-                        - batch_index * context.config.batch_per_device,
-                    )
-                    * context.dp_size
-                )
-                self._train_batch(
-                    context,
-                    batch,
-                    force_sync=(
-                        context.config.epoch_tail_policy == "flush"
-                        and batch_index + 1 == trainable_batches
-                    ),
-                    batch_samples=batch_samples,
-                )
-            else:
-                self._train_batch(context, batch)
-            batch_index += 1
-        dropped_samples = 0
-        if (
-            context.async_rollout is None
-            and batch_index == trainable_batches
-            and (batch_index > 0 or not context.stop_agreed)
-        ):
-            # Close prefetched workers before advancing the sampler. Under
-            # "drop", no remaining tail batch is passed through the model.
-            stop_loader_workers(iterator)
-            context.dataloader.sampler.set_epoch(epoch + 1)
-            dropped_samples = (
-                max(
-                    0,
-                    remaining_samples
-                    - trainable_batches * context.config.batch_per_device,
-                )
-                * context.dp_size
-            )
-            context.consumed_samples += dropped_samples
+            self._train_batch(context, batch)
         self._call_callbacks("on_epoch_end", context)
-        if dropped_samples:
-            # Keep the same optimizer step, but publish a distinct checkpoint
-            # for the advanced data cursor if shutdown happens at this boundary.
+        if exhausted:
+            context.epoch_sample_offset = 0
             context.epoch = epoch + 1
 
     def _trainer_loop(self, param_path: Optional[str] = None, resume: bool = False):

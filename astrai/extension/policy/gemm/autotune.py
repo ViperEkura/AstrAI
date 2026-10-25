@@ -571,6 +571,7 @@ def enable(
     tuner = GemmAutotuner(max_shapes, trigger, cache_dir)
     if not tuner.start(time_budget_s):
         return False
+    # plan re-exports this module; resolve its hook after initialization.
     from astrai.extension.policy.gemm.plan import set_autotuner
 
     set_autotuner(tuner)

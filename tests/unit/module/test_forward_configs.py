@@ -1,8 +1,11 @@
 import pytest
 import torch
+from pydantic import ValidationError
 
+from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.components.mlp import MLP, DeepSeekMoE
+from astrai.trainer.callbacks import GradientCheckpointingCallback
 from tests.support.models import TINY_CONFIG
 
 CONFIGS = [
@@ -125,8 +128,6 @@ CONFIGS = [
 
 @pytest.mark.parametrize("config_kwargs", CONFIGS)
 def test_model_forward(config_kwargs, device):
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     config = AutoRegressiveLMConfig(**config_kwargs)
     model = AutoRegressiveLM(config).to(device=device)
     model.eval()
@@ -153,8 +154,6 @@ def test_model_forward(config_kwargs, device):
 
 @pytest.mark.parametrize("config_kwargs", CONFIGS)
 def test_model_forward_with_padding(config_kwargs, device):
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     config = AutoRegressiveLMConfig(**config_kwargs)
     model = AutoRegressiveLM(config).to(device=device)
     model.eval()
@@ -174,8 +173,6 @@ def test_model_forward_with_padding(config_kwargs, device):
 
 
 def test_gated_deltanet_forward_backward_and_causal_prefix():
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     config = AutoRegressiveLMConfig(
         **TINY_CONFIG,
         attn_type="gdn",
@@ -207,8 +204,6 @@ def test_gated_deltanet_forward_backward_and_causal_prefix():
 
 
 def test_gated_deltanet_rejects_packed_document_mask():
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     config = AutoRegressiveLMConfig(**TINY_CONFIG, attn_type="gdn")
     model = AutoRegressiveLM(config)
     input_ids = torch.randint(0, config.vocab_size, (1, 4))
@@ -218,8 +213,6 @@ def test_gated_deltanet_rejects_packed_document_mask():
 
 
 def test_gated_deltanet_rejects_inference_cache():
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     config = AutoRegressiveLMConfig(**TINY_CONFIG, attn_type="gdn")
     model = AutoRegressiveLM(config)
     with pytest.raises(NotImplementedError, match="not wired into the paged cache"):
@@ -227,10 +220,6 @@ def test_gated_deltanet_rejects_inference_cache():
 
 
 def test_gated_deltanet_rejects_invalid_configuration():
-    from pydantic import ValidationError
-
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     with pytest.raises(
         ValidationError, match="gated deltanet dimensions must be positive"
     ):
@@ -248,7 +237,6 @@ def test_gated_deltanet_rejects_invalid_configuration():
 
 def test_moe_per_layer_ffn_resolution():
     """Verify that mlp_only_layers and decoder_sparse_step resolve FFN types correctly."""
-    from astrai.config.model_config import AutoRegressiveLMConfig
 
     # mlp_only_layers: first layer dense, rest MoE
     config = AutoRegressiveLMConfig(
@@ -304,7 +292,6 @@ def test_moe_per_layer_ffn_resolution():
 
 def test_moe_custom_intermediate_shape():
     """Verify MoE uses custom intermediate sizes when specified."""
-    from astrai.config.model_config import AutoRegressiveLMConfig
 
     config = AutoRegressiveLMConfig(
         **{
@@ -334,8 +321,6 @@ def test_moe_custom_intermediate_shape():
 
 
 def test_moe_defaults_preserve_normalized_routing():
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     config = AutoRegressiveLMConfig(
         **TINY_CONFIG,
         ffn_type="moe",
@@ -352,7 +337,6 @@ def test_moe_defaults_preserve_normalized_routing():
 
 def test_moe_router_stats_in_output_during_training():
     """Verify forward output carries per-layer router_stats in training mode."""
-    from astrai.config.model_config import AutoRegressiveLMConfig
 
     config = AutoRegressiveLMConfig(
         **TINY_CONFIG,
@@ -379,7 +363,6 @@ def test_moe_router_stats_in_output_during_training():
 
 def test_moe_router_stats_absent_in_eval():
     """Verify no router_stats are emitted outside training."""
-    from astrai.config.model_config import AutoRegressiveLMConfig
 
     config = AutoRegressiveLMConfig(
         **TINY_CONFIG,
@@ -399,7 +382,6 @@ def test_moe_router_stats_absent_in_eval():
 
 def test_no_router_stats_for_mlp_model():
     """Verify pure MLP models emit no router_stats and no aux_loss."""
-    from astrai.config.model_config import AutoRegressiveLMConfig
 
     config = AutoRegressiveLMConfig(**TINY_CONFIG, ffn_type="mlp")
     model = AutoRegressiveLM(config)
@@ -413,8 +395,6 @@ def test_no_router_stats_for_mlp_model():
 
 
 def test_moe_aux_loss_only_emitted_during_training():
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     config = AutoRegressiveLMConfig(
         **TINY_CONFIG,
         ffn_type="moe",
@@ -441,8 +421,6 @@ def test_moe_aux_loss_only_emitted_during_training():
 
 
 def test_moe_component_forward_returns_ffn_output():
-    from astrai.model.components.mlp import DeepSeekMoE
-
     moe = DeepSeekMoE(
         dim=8,
         dim_ffn=16,
@@ -500,7 +478,6 @@ def test_moe_router_selects_experts_from_fp32_probabilities():
 
 def test_moe_routing_replays_across_forward_recompute_and_reload(tmp_path):
     """Actual expert dispatch stays stable across online-RL replay boundaries."""
-    from astrai.trainer.callbacks import GradientCheckpointingCallback
 
     kwargs = {
         "dim": 8,
@@ -587,10 +564,6 @@ def test_moe_routing_replays_across_forward_recompute_and_reload(tmp_path):
     ],
 )
 def test_moe_rejects_inconsistent_expert_topology(overrides, message):
-    from pydantic import ValidationError
-
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     kwargs = {
         **TINY_CONFIG,
         "ffn_type": "moe",
@@ -633,10 +606,6 @@ def test_moe_component_rejects_inconsistent_expert_topology(overrides, message):
 
 @pytest.mark.parametrize("decoder_sparse_step", [0, -1])
 def test_moe_rejects_invalid_decoder_sparse_step(decoder_sparse_step):
-    from pydantic import ValidationError
-
-    from astrai.config.model_config import AutoRegressiveLMConfig
-
     with pytest.raises(ValidationError, match="decoder_sparse_step must be at least 1"):
         AutoRegressiveLMConfig(
             **TINY_CONFIG,

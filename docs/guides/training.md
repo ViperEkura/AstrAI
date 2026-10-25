@@ -51,39 +51,39 @@ to a fused CUDA kernel when available.
 
 ## Training Loop
 
-Two-level loop: **epoch** → **batch**. The outline below shows offline training:
-an optimizer step fires every `grad_accum_steps` batches, or on the last batch
-of an epoch if fewer remain. Online strategies may publish several updates per batch.
+Synchronous training groups the epoch permutation into global optimizer
+windows using `GlobalBatchSampler`. All ranks see the same window boundaries;
+each rank receives only its portion. The default `epoch_tail_policy: drop`
+discards an incomplete final window; `flush` commits its real samples with
+loss normalization across ranks. Online strategies can replay a window through
+several updates, and publish a checkpoint only after the last update.
 
 ```
 on_train_begin
   model.train()
   on_epoch_begin
-    for batch in dataloader:
-      with executor.accumulate(model, force_sync=is_epoch_tail):
-        context.pending_samples += samples_in_batch_across_dp_ranks
-        on_batch_begin
-        loss_output = strategy(batch)
-        context.loss = loss_output["loss"].item()
-        context.metrics = loss_output["metrics"]
-        stand_loss = loss_output["loss"] / executor.grad_accum_steps
-        executor.backward(stand_loss)
-        if executor.sync_gradients:
-          if executor.window_steps < executor.grad_accum_steps:
-            scale_gradients(grad_accum_steps / window_steps)
-          context.optimizer_steps_completed += 1
-          context.consumed_samples += context.pending_samples
-          before_optimizer_step
-          strategy.optimizer_step(optimizer)
-          optimizer.zero_grad()
-          if scheduler:
-            scheduler.step()
-          context.pending_samples = 0
-          after_optimizer_step
-        on_batch_end
+    for global_window in epoch:
+      checkpoint_safe = false
+      for update in global_window:
+        for microbatch in update:
+          on_batch_begin
+          backward(loss * real_target_count)
+          on_batch_end
+        reduce_target_counts_and_normalize_gradients()
+        before_optimizer_step
+        strategy.optimizer_step(optimizer)
+        optimizer.zero_grad()
+        scheduler.step()
+        if final_update:
+          commit_sample_cursor()
+          checkpoint_safe = true
+        after_optimizer_step
     on_epoch_end
 on_train_end
 ```
+
+Async rollout retains its round-based loop. It records the same explicit
+resume fields and publishes only committed learner updates.
 
 ### Callback Lifecycle
 
@@ -389,6 +389,31 @@ component flags, it loads all three components, including saved optimizer
 settings. Explicit `load_state_dict` entries override these defaults even on
 resume. To start a new stage on new data, omit `--resume`.
 
+### Resume metadata
+
+Training resumes require `resume_contract_version: 1` in `meta.json`. There is
+no fallback to the old per-rank training loop. A weight-only warm start remains
+available without `--resume`.
+
+The contract records `optimizer_step`, `dataset_len`, `epoch_sample_offset`,
+`random_seed`, the strategy, DP/CP/TP sizes, DP mode, batch and accumulation
+sizes, tail policy, rollout mode, and replay settings. Synchronous offsets count
+samples in the unpadded epoch permutation and identify a completed global
+window (or the exact epoch end). Async offsets count committed samples across
+equal padded rank shards; async resume requires the same learner layout.
+
+To migrate an older checkpoint, stop its readers and writers, back up
+`meta.json` and `manifest.json`, and supply the missing contract fields from
+the original run configuration. Derive the epoch offset from committed sample
+accounting, not a prefetched sampler position. For an unpadded first epoch,
+the offset equals `consumed_samples`; it must be divisible by the original
+global effective batch, unless it is the epoch end. Update the manifest's
+metadata size (and its checksum if present). Do not change weights, optimizer
+moments, scheduler counters, or metric history. If the committed position
+cannot be established, retain the original checkpoint rather than rounding
+its cursor. The checkpoint file format version and resume contract version
+are independent.
+
 ### A checkpoint is one coherent state
 
 Everything a checkpoint records describes the same point in training:
@@ -398,18 +423,21 @@ Everything a checkpoint records describes the same point in training:
   a window interrupted before a commit is read again;
 - `meta.json` reports the optimizer step those weights belong to; the cursor
   also accounts for any discarded epoch-tail samples;
-- the RNG states, the data order and the scheduler position are saved with them.
+- the epoch data order and scheduler position are described by the saved state.
 
 `Trainer` seeds every generator from `random_seed` before building the context, so
-a fresh run is reproducible; on `--resume` the checkpoint's RNG states replace that
-seed. The DataLoader gets its own epoch-seeded generator, because PyTorch draws the
+a fresh run starts reproducibly. The current checkpoint extras do not restore
+RNG state, so stochastic training is not guaranteed to replay bit for bit. The DataLoader gets its own epoch-seeded generator, because PyTorch draws the
 worker base seed from the global generator on every iterator creation — including
 the single-process one — and a resumed run creates one extra iterator.
 
 Signals are taken after an optimizer commit: a request that arrives inside an
 accumulation window finishes that window first (at most `grad_accum_steps - 1` more
-batches). At epoch end, a shorter window is discarded without an optimizer
-update. The checkpoint records the advanced data cursor and matching RNG state.
+batches). At epoch end, a shorter window follows `epoch_tail_policy`.
+The checkpoint records the committed or discarded data cursor. If an optimizer
+or scheduler update fails after mutating state, `checkpoint_safe` remains false:
+shutdown leaves the previous published checkpoint intact rather than labeling
+the partial update with the previous step number.
 
 Stopping is cooperative across ranks: a rank that receives a signal forwards it to
 the launcher, the launcher signals every rank, and each step ends with a one-element

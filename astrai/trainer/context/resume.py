@@ -42,7 +42,6 @@ class PreloadedState:
     epoch: int = 0
     consumed_samples: int = 0
     epoch_sample_offset: int = 0
-    global_cursor: bool = True
     optimizer_steps_completed: int = 0
     checkpoint: Optional[Checkpoint] = None
     component_states: Dict = field(default_factory=dict)
@@ -76,6 +75,7 @@ class ResumeLoader:
         state = PreloadedState(
             epoch=cfg.start_epoch,
             consumed_samples=cfg.start_samples * self.topology.dp_size,
+            epoch_sample_offset=cfg.start_samples * self.topology.dp_size,
         )
         if self.param_path:
             self._load_from_param_path(state)
@@ -153,98 +153,102 @@ class ResumeLoader:
             )
         state.epoch = checkpoint.epoch
         meta = checkpoint.meta
-        if meta.get("resume_contract_version") not in (None, 1):
+        if meta.get("resume_contract_version") != 1:
             raise ValueError(
                 f"Unsupported resume contract version "
-                f"{meta['resume_contract_version']!r}"
+                f"{meta.get('resume_contract_version')!r}; "
+                "migrate checkpoint metadata before resuming"
             )
-        if meta.get("resume_contract_version") == 1:
-            for key, current in (
-                ("random_seed", self.config.random_seed),
-                ("cp_size", self.config.cp_size),
-                ("tp_size", self.config.tp_size),
-                ("rollout_mode", self.config.rollout_mode),
-                ("strategy", self.config.strategy),
-                ("rl_update_epochs", self.config.rl_update_epochs),
-                ("rl_minibatch_prompts", self.config.rl_minibatch_prompts),
-            ):
-                if meta.get(key) != current:
-                    raise ValueError(
-                        f"Cannot resume: {key} changed from {meta.get(key)!r} "
-                        f"to {current!r}"
-                    )
-            saved_dp = meta["dp_size"]
-            if (
-                isinstance(saved_dp, bool)
-                or not isinstance(saved_dp, int)
-                or saved_dp < 1
-            ):
-                raise ValueError("Checkpoint has an invalid dp_size")
-            old_batch = saved_dp * meta["batch_per_device"] * meta["grad_accum_steps"]
-            new_batch = samples_per_step(self.config, self.topology.dp_size)
-            if old_batch != new_batch:
-                raise ValueError(
-                    f"Cannot resume: global effective batch changed from "
-                    f"{old_batch} to {new_batch}"
-                )
-            if saved_dp != self.topology.dp_size and (
-                meta.get("dp_mode") == "fsdp" or self.config.dp_mode == "fsdp"
-            ):
-                raise ValueError("FSDP optimizer state cannot resume across DP sizes")
-            if saved_dp != self.topology.dp_size and (
-                (saved_dp > 1 and meta.get("dp_mode") != "ddp")
-                or (self.topology.dp_size > 1 and self.config.dp_mode != "ddp")
-            ):
-                raise ValueError(
-                    "DP resize requires DDP or single-device optimizer state"
-                )
-            state.global_cursor = True
-            offset = meta.get("epoch_sample_offset")
-            length = meta.get("dataset_len")
-            if (
-                isinstance(offset, bool)
-                or not isinstance(offset, int)
-                or isinstance(length, bool)
-                or not isinstance(length, int)
-                or length < 1
-                or offset < 0
-                or offset > length
-                or (offset != length and offset % old_batch)
-            ):
-                raise ValueError("Checkpoint has an invalid global epoch cursor")
-            state.epoch_sample_offset = offset
-            cursor = checkpoint.consumed_samples
-            if (
-                isinstance(cursor, bool)
-                or not isinstance(cursor, int)
-                or cursor < offset
-            ):
-                raise ValueError(
-                    f"Checkpoint cursor {cursor!r} must be a non-negative sample "
-                    "count at least as large as the epoch offset"
-                )
-            state.consumed_samples = cursor
-            state.checkpoint = checkpoint
-            return
-        if meta.get("dp_size", self.topology.dp_size) != self.topology.dp_size:
-            raise ValueError("Legacy checkpoint cannot resume with a different DP size")
-        for key in ("batch_per_device", "grad_accum_steps"):
-            if key in meta and meta[key] != getattr(self.config, key):
-                raise ValueError(f"Legacy checkpoint cannot change {key}")
-        state.global_cursor = False
-        # An epoch-tail update may consume fewer samples than a nominal step.
-        # The exact committed count is the sampler cursor, independent of the
-        # optimizer step count; all data-parallel ranks share this count.
-        cursor = checkpoint.consumed_samples
-        if (
-            isinstance(cursor, bool)
-            or not isinstance(cursor, int)
-            or cursor < 0
-            or cursor % self.topology.dp_size
+        required = (
+            "optimizer_step",
+            "dataset_len",
+            "epoch_sample_offset",
+            "random_seed",
+            "strategy",
+            "dp_size",
+            "cp_size",
+            "tp_size",
+            "dp_mode",
+            "batch_per_device",
+            "grad_accum_steps",
+            "epoch_tail_policy",
+            "rollout_mode",
+            "rl_update_epochs",
+            "rl_minibatch_prompts",
+        )
+        absent = [key for key in required if key not in meta]
+        if absent:
+            raise ValueError(f"Incomplete resume contract: missing {', '.join(absent)}")
+        step = meta["optimizer_step"]
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("Checkpoint has an invalid optimizer_step")
+        for key, current in (
+            ("random_seed", self.config.random_seed),
+            ("cp_size", self.config.cp_size),
+            ("tp_size", self.config.tp_size),
+            ("rollout_mode", self.config.rollout_mode),
+            ("strategy", self.config.strategy),
+            ("rl_update_epochs", self.config.rl_update_epochs),
+            ("rl_minibatch_prompts", self.config.rl_minibatch_prompts),
         ):
+            if meta.get(key) != current:
+                raise ValueError(
+                    f"Cannot resume: {key} changed from {meta.get(key)!r} "
+                    f"to {current!r}"
+                )
+        saved_dp = meta["dp_size"]
+        if isinstance(saved_dp, bool) or not isinstance(saved_dp, int) or saved_dp < 1:
+            raise ValueError("Checkpoint has an invalid dp_size")
+        old_batch = saved_dp * meta["batch_per_device"] * meta["grad_accum_steps"]
+        new_batch = samples_per_step(self.config, self.topology.dp_size)
+        if old_batch != new_batch:
+            raise ValueError(
+                f"Cannot resume: global effective batch changed from "
+                f"{old_batch} to {new_batch}"
+            )
+        if saved_dp != self.topology.dp_size and (
+            meta.get("dp_mode") == "fsdp" or self.config.dp_mode == "fsdp"
+        ):
+            raise ValueError("FSDP optimizer state cannot resume across DP sizes")
+        if saved_dp != self.topology.dp_size and (
+            (saved_dp > 1 and meta.get("dp_mode") != "ddp")
+            or (self.topology.dp_size > 1 and self.config.dp_mode != "ddp")
+        ):
+            raise ValueError("DP resize requires DDP or single-device optimizer state")
+        asynchronous = self.config.rollout_mode == "async_round"
+        if asynchronous and any(
+            meta[key] != current
+            for key, current in (
+                ("dp_size", self.topology.dp_size),
+                ("batch_per_device", self.config.batch_per_device),
+                ("grad_accum_steps", self.config.grad_accum_steps),
+            )
+        ):
+            raise ValueError("Async rounds require the saved learner layout")
+        offset = meta.get("epoch_sample_offset")
+        length = meta.get("dataset_len")
+        # Async rollout rounds use equal padded rank shards. Their cursor is
+        # still a global committed count, with a mode-specific epoch extent.
+        extent = length
+        if asynchronous and isinstance(length, int) and not isinstance(length, bool):
+            extent = ((length + saved_dp - 1) // saved_dp) * saved_dp
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or length < 1
+            or offset < 0
+            or offset > extent
+            or (offset != extent and offset % old_batch)
+        ):
+            raise ValueError("Checkpoint has an invalid global epoch cursor")
+        state.epoch_sample_offset = offset
+        cursor = checkpoint.consumed_samples
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < offset:
             raise ValueError(
                 f"Checkpoint cursor {cursor!r} must be a non-negative sample "
-                f"count divisible by dp_size={self.topology.dp_size}"
+                "count at least as large as the epoch offset"
             )
         state.consumed_samples = cursor
         state.checkpoint = checkpoint
@@ -270,14 +274,11 @@ class ResumeLoader:
     def _step_count(self, state: PreloadedState) -> int:
         """The committed step count, which is not the cursor divided by a step.
 
-        A replayed batch yields several steps for one data position, so the
-        checkpoint's own count wins and the cursor is only a fallback for
-        checkpoints that never wrote one.
+        A replayed batch yields several steps for one data position. A resume
+        always uses its explicit count; a fresh start derives its initial count.
         """
-        if state.checkpoint is not None and state.checkpoint.meta:
-            saved = state.checkpoint.meta.get("optimizer_step")
-            if saved is not None:
-                return int(saved)
+        if state.checkpoint is not None:
+            return state.checkpoint.meta["optimizer_step"]
         return state.consumed_samples // samples_per_step(
             self.config, self.topology.dp_size
         )

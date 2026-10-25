@@ -1,7 +1,17 @@
+from datetime import timedelta
+from types import SimpleNamespace
+
 import torch
 import torch.distributed as dist
 
 from astrai.parallel import get_rank, only_on_rank, spawn_parallel_fn
+from astrai.parallel import setup as parallel_setup
+from astrai.parallel.executor import (
+    DDPExecutor,
+    ExecutorFactory,
+    FSDPExecutor,
+    NoneExecutor,
+)
 
 
 @only_on_rank(0)
@@ -33,11 +43,6 @@ def test_spawn_all_reduce():
 
 
 def test_setup_parallel_applies_process_group_timeout(monkeypatch):
-    from datetime import timedelta
-    from types import SimpleNamespace
-
-    from astrai.parallel import setup as setup_module
-
     captured = {}
 
     class FakeDist:
@@ -55,8 +60,8 @@ def test_setup_parallel_applies_process_group_timeout(monkeypatch):
         def destroy_process_group(self):
             pass
 
-    monkeypatch.setattr(setup_module, "dist", FakeDist())
-    with setup_module.setup_parallel(
+    monkeypatch.setattr(parallel_setup, "dist", FakeDist())
+    with parallel_setup.setup_parallel(
         rank=0,
         world_size=2,
         local_rank=0,
@@ -76,12 +81,6 @@ def test_every_advertised_executor_is_registered():
     moved class can silently drop it; this CPU test catches that instead of the
     GPU-only DDP/FSDP suites.
     """
-    from astrai.parallel.executor import (
-        DDPExecutor,
-        ExecutorFactory,
-        FSDPExecutor,
-        NoneExecutor,
-    )
 
     assert ExecutorFactory.get_component_class("none") is NoneExecutor
     assert ExecutorFactory.get_component_class("ddp") is DDPExecutor

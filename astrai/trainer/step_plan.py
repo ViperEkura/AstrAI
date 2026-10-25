@@ -25,15 +25,3 @@ def global_epoch_steps(
         full * ceil_div(global_batch, group_size)
         + (ceil_div(tail, group_size) if tail else 0)
     )
-
-
-def legacy_epoch_steps(
-    samples_per_replica: int,
-    batch_per_device: int,
-    grad_accum_steps: int,
-    tail_policy: str,
-) -> int:
-    """Count commits from the padded per-rank sampler used by old checkpoints."""
-    if tail_policy == "drop":
-        return (samples_per_replica // batch_per_device) // grad_accum_steps
-    return ceil_div(ceil_div(samples_per_replica, batch_per_device), grad_accum_steps)

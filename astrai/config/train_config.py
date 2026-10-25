@@ -95,7 +95,7 @@ class TrainConfig(BaseConfig):
         gradient_checkpointing_modules (List[type]): Module types to enable activation checkpointing for. Defaults to [].
         compile_mode (Optional[str]): torch.compile mode: 'default', 'reduce-overhead', 'max-autotune', or None. Defaults to None.
         start_epoch (int): Start epoch for training. Defaults to 0.
-        start_samples (int): Start samples count (per rank). Superseded by checkpoint consumed_samples. Defaults to 0.
+        start_samples (int): Committed samples within start_epoch (per rank). Must align with a global update boundary; superseded by checkpoint metadata. Defaults to 0.
         ckpt_dir (str): Checkpoint directory. Defaults to "./checkpoint".
         ckpt_interval (int): Number of optimizer steps between checkpoints. Defaults to 5000.
         lora (Optional[LoRAConfig]): LoRA config. None means full fine-tuning. Defaults to None.

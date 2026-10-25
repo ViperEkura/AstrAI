@@ -125,18 +125,17 @@ class CheckpointCallback(TrainCallback):
             "optimizer": {"type": cfg.optimizer.type},
             "scheduler": {"type": cfg.scheduler.type},
         }
-        if context.global_cursor:
-            meta.update(
-                resume_contract_version=1,
-                dataset_len=context.dataset_len,
-                epoch_sample_offset=context.epoch_sample_offset,
-                random_seed=cfg.random_seed,
-                tp_size=cfg.tp_size,
-                dp_mode=cfg.dp_mode,
-                rollout_mode=cfg.rollout_mode,
-                rl_update_epochs=cfg.rl_update_epochs,
-                rl_minibatch_prompts=cfg.rl_minibatch_prompts,
-            )
+        meta.update(
+            resume_contract_version=1,
+            dataset_len=context.dataset_len,
+            epoch_sample_offset=context.epoch_sample_offset,
+            random_seed=cfg.random_seed,
+            tp_size=cfg.tp_size,
+            dp_mode=cfg.dp_mode,
+            rollout_mode=cfg.rollout_mode,
+            rl_update_epochs=cfg.rl_update_epochs,
+            rl_minibatch_prompts=cfg.rl_minibatch_prompts,
+        )
         policy_version = context.strategy.policy_version
         if policy_version is not None:
             meta["policy_version"] = policy_version

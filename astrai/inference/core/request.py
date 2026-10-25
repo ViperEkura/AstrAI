@@ -19,6 +19,7 @@ from tokenizers.decoders import DecodeStream
 from astrai.config.inference_config import InferenceConfig
 from astrai.inference.contracts import ExecutionRequest, RequestIdentity, SamplingParams
 from astrai.inference.core.metrics import MetricsCollector
+from astrai.inference.sampling_rng import validate_seed
 from astrai.tokenize.tokenizer import AutoTokenizer
 
 _config = InferenceConfig()
@@ -91,7 +92,12 @@ class Request:
         rep_window: int = _config.default_rep_window,
         *,
         seed: Optional[int] = None,
+        sampling_seed: Optional[int] = None,
     ):
+        if sampling_seed is not None:
+            validate_seed(sampling_seed)
+            if seed is not None:
+                raise ValueError("seed and sampling_seed are mutually exclusive")
         self.request_id = request_id
         self.identity = RequestIdentity(request_id, uuid.uuid4().hex)
         self.prompt_ids = list(prompt_ids)
@@ -103,7 +109,13 @@ class Request:
         self.frequency_penalty = frequency_penalty
         self.rep_window = rep_window
         self._sampling = SamplingParams(
-            temperature, top_p, top_k, frequency_penalty, rep_window, seed
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            rep_window,
+            seed=seed,
+            sampling_seed=sampling_seed,
         )
 
         # Scoring only: how many trailing tokens of ``prompt_ids`` form the

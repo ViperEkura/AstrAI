@@ -82,7 +82,8 @@ class EngineCore:
             cache = BlockPool(
                 n_layers=config.num_hidden_layers,
                 n_kv_heads=config.num_key_value_heads,
-                head_dim=config.hidden_size // config.num_attention_heads,
+                head_dim=getattr(config, "head_dim", None)
+                or config.hidden_size // config.num_attention_heads,
                 max_batch_size=max_batch_size,
                 max_seq_len=self.max_seq_len,
                 device=self.device,
@@ -284,24 +285,35 @@ class EngineCore:
             )
         return True
 
-    def tick(self):
+    def tick(self, requests=None, *, return_logprobs=False):
+        """Advance serving admission or a fixed synchronous batch.
+
+        Both callers share submit/commit, the device token relay and
+        depth-two draining. Fixed batches do not admit unrelated requests.
+        """
         scheduler = self.scheduler
-        self._release_finished()
-        scheduler.admit_requests(safe_to_release=not self._shutdown_failed)
-        active = scheduler.active_requests()
+
+        def refresh():
+            self._release_finished()
+            if requests is None:
+                scheduler.admit_requests(safe_to_release=not self._shutdown_failed)
+                return scheduler.active_requests()
+            return [request for request in requests if not request.terminal_emitted]
+
+        active = refresh()
         overlap = self._can_overlap(active)
         if self._pending and not overlap:
             self.drain()
-            self._release_finished()
-            scheduler.admit_requests(safe_to_release=not self._shutdown_failed)
-            active = scheduler.active_requests()
+            active = refresh()
             overlap = self._can_overlap(active)
         if not active:
             self.drain()
             self._release_finished()
             return False
         old_count = len(self._pending)
-        plan = scheduler.schedule(active, self.policy_version)
+        plan = scheduler.schedule(
+            active, self.policy_version, return_logprobs=return_logprobs
+        )
         if (
             old_count
             and overlap
@@ -311,9 +323,10 @@ class EngineCore:
             # input snapshots are then stale and the D2D relay cannot match.
             scheduler.rollback_schedule(plan)
             self.drain()
-            self._release_finished()
-            active = scheduler.active_requests()
-            plan = scheduler.schedule(active, self.policy_version)
+            active = refresh()
+            plan = scheduler.schedule(
+                active, self.policy_version, return_logprobs=return_logprobs
+            )
             overlap = False
         self.submit(plan)
         if (
@@ -447,12 +460,23 @@ class EngineCore:
                 while any(not request.terminal_emitted for request in requests):
                     self.scheduler.admit_requests()
                     active = self.scheduler.active_requests()
+                    if not active and self._pending:
+                        # Terminal requests can still own a speculative step.
+                        # Retire it before deciding queued requests cannot fit.
+                        self.drain()
+                        self._release_finished()
+                        self.scheduler.admit_requests()
+                        active = self.scheduler.active_requests()
                     if not active:
                         self.scheduler.reject_waiting_for_capacity()
                         break
-                    _, aborted = self.execute_synchronously(
-                        active, return_logprobs=return_logprobs
-                    )
+                    if self.enable_overlap:
+                        self.tick(active, return_logprobs=return_logprobs)
+                        aborted = []
+                    else:
+                        _, aborted = self.execute_synchronously(
+                            active, return_logprobs=return_logprobs
+                        )
                     for request in aborted:
                         self.scheduler.finish(
                             request,
@@ -460,8 +484,13 @@ class EngineCore:
                             error_reason="kv_cache_extension_failed",
                         )
                     self._release_finished()
+        except BaseException:
+            # Fence failed overlapped work before retiring requests/KV.
+            self.fence()
+            raise
         finally:
-            self.drain()
+            if not self._shutdown_failed:
+                self.drain()
             for request in requests:
                 if not request.terminal_emitted:
                     self.scheduler.finish(

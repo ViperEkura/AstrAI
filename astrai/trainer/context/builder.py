@@ -115,6 +115,15 @@ class TrainContextBuilder:
             not self._resume and self.config.start_samples > 0
         ):
             context.global_cursor = False
+        if (
+            self.config.strategy in ("grpo", "online_grpo")
+            and not context.global_cursor
+            and self.config.grad_accum_steps != 1
+        ):
+            raise ValueError(
+                "Legacy GRPO requires grad_accum_steps=1; use "
+                "rl_microbatch_prompts within complete update windows"
+            )
         try:
             self._create_datasets(context)
             if (
@@ -310,6 +319,11 @@ class TrainContextBuilder:
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
         kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)
+        if cfg.strategy in ("grpo", "online_grpo"):
+            kwargs.setdefault("rl_microbatch_prompts", cfg.rl_microbatch_prompts)
+            kwargs["loss_process_group"] = getattr(
+                context.model, "process_group", self._topology.dp_group
+            )
         kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
         capabilities = StrategyFactory.capabilities(cfg.strategy)
         if capabilities.reference_model:

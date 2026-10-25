@@ -136,6 +136,14 @@ class Trainer:
         batch_samples: Optional[int] = None,
     ) -> None:
         executor = context.executor
+        complete_window = (
+            getattr(context.strategy, "complete_update_windows", False)
+            and context.async_rollout is None
+        )
+        if complete_window:
+            context.checkpoint_safe = False
+            context.loss = 0.0
+            context.metrics = {"loss": 0.0, "empty_update": 1.0}
         accumulation = (
             executor.accumulate(context.model, force_sync=True)
             if force_sync
@@ -167,12 +175,26 @@ class Trainer:
                         detached if update_loss is None else update_loss + detached
                     )
                     for name, value in output["metrics"].items():
-                        update_metrics[name] = update_metrics.get(name, 0.0) + float(
-                            value
-                        )
+                        if complete_window and name not in {
+                            "loss",
+                            "policy_loss",
+                            "kl_loss",
+                            "padding_microbatches",
+                        }:
+                            update_metrics[name] = float(value)
+                        else:
+                            update_metrics[name] = update_metrics.get(
+                                name, 0.0
+                            ) + float(value)
                 if update_loss is None:
+                    if complete_window:
+                        continue
                     raise RuntimeError("training update has no valid loss")
-                context.loss = float(update_loss.item())
+                context.loss = (
+                    update_metrics["loss"]
+                    if complete_window
+                    else float(update_loss.item())
+                )
                 context.metrics = update_metrics
                 if executor.sync_gradients:
                     if (
@@ -183,8 +205,14 @@ class Trainer:
                             context.model,
                             executor.grad_accum_steps / executor.window_steps,
                         )
-                    self._commit_update(context, batch, new_data=not committed)
+                    self._commit_update(
+                        context, batch, new_data=not committed and not complete_window
+                    )
                     committed = True
+            if complete_window:
+                context.consumed_samples += context.strategy.training_global_prompts
+                context.pending_samples = 0
+                context.checkpoint_safe = True
             self._call_callbacks("on_batch_end", context)
 
     def _should_stop(self, context: TrainContext) -> bool:
@@ -247,6 +275,12 @@ class Trainer:
         final_update: bool,
     ) -> None:
         """Reduce true objective numerators before committing one update."""
+        outputs = context.strategy.global_training_outputs(chunks)
+        if outputs is not None:
+            self._run_normalized_update(
+                context, outputs, window_samples, window_end, final_update
+            )
+            return
         local_count = 0.0
         local_loss = 0.0
         local_metrics: Dict[str, float] = {}
@@ -302,6 +336,46 @@ class Trainer:
             context.checkpoint_safe = True
         self._after_commit(context, agree_stop=final_update)
 
+    def _run_normalized_update(
+        self, context, outputs, window_samples, window_end, final_update
+    ):
+        """Commit losses whose strategy already owns the global denominator."""
+        metrics = {}
+        seen = False
+        with context.executor.accumulate_explicit(context.model, sync=True):
+            self._call_callbacks("on_batch_begin", context)
+            for output in outputs:
+                seen = True
+                context.executor.backward(output["loss"])
+                for name, value in output["metrics"].items():
+                    if name in {
+                        "loss",
+                        "policy_loss",
+                        "kl_loss",
+                        "padding_microbatches",
+                    }:
+                        metrics[name] = metrics.get(name, 0.0) + float(value)
+                    else:
+                        metrics[name] = float(value)
+            context.metrics = metrics if seen else {"loss": 0.0, "empty_update": 1.0}
+            context.loss = context.metrics["loss"]
+            if seen:
+                if final_update:
+                    context.pending_samples = window_samples
+                self._commit_offline_update(context, new_data=final_update)
+            elif final_update:
+                # A zero-target window consumes data, never an optimizer step.
+                context.consumed_samples += window_samples
+                context.pending_samples = 0
+            if final_update:
+                context.epoch_sample_offset = window_end
+                context.checkpoint_safe = True
+            if seen:
+                self._after_commit(context, agree_stop=final_update)
+            elif final_update:
+                self._agree_stop(context)
+            self._call_callbacks("on_batch_end", context)
+
     def _train_global_epoch(self, context: TrainContext, epoch: int) -> None:
         if context.epoch < epoch and context.epoch_sample_offset == context.dataset_len:
             context.epoch_sample_offset = 0
@@ -350,12 +424,20 @@ class Trainer:
                 groups = 1
                 total_updates = 1
 
+            grouped = online or getattr(
+                context.strategy, "complete_update_windows", False
+            )
+            if grouped and not online:
+                prepared = [batch for batch, _ in batches]
+                group_size = context.config.rl_minibatch_prompts or window_samples
+                groups = (window_samples + group_size - 1) // group_size
+                total_updates = groups
             update_index = 0
             for _pass in range(context.config.rl_update_epochs if online else 1):
                 for group in range(groups):
                     chunks = []
                     for slot, (batch, real_count) in enumerate(batches):
-                        if online:
+                        if grouped:
                             local_first = (
                                 slot * context.dp_size * context.config.batch_per_device
                                 + context.topology.dp_rank

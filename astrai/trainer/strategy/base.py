@@ -317,6 +317,13 @@ class BaseStrategy(ABC):
             for chunk in slices:
                 yield self.compute_loss_output(chunk)
 
+    # Strategies that own a complete, globally normalized update may return
+    # its loss iterator here; None keeps the trainer's local-mean reduction.
+    complete_update_windows = False
+
+    def global_training_outputs(self, chunks):
+        return None
+
     def training_updates(
         self, batch: Any, microbatch_prompts: Optional[int] = None
     ) -> Iterator[Iterator[LossOutput]]:

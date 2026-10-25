@@ -1,9 +1,9 @@
 """Group relative policy optimization objective."""
 
 import math
+from contextlib import nullcontext
 from numbers import Real
 from typing import (
-    Any,
     Dict,
     Iterator,
     Optional,
@@ -11,13 +11,13 @@ from typing import (
 )
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
 
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
-from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.strategy.base import BaseStrategy
 from astrai.trainer.strategy.factory import StrategyCapabilities, StrategyFactory
 from astrai.trainer.strategy.ops import (
@@ -70,6 +70,8 @@ class GRPOStrategy(BaseStrategy):
         overlong_max_len: Optional[int] = None,
         overlong_buffer_len: int = 0,
         overlong_penalty_scale: float = 1.0,
+        rl_microbatch_prompts: Optional[int] = None,
+        loss_process_group=None,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
@@ -100,6 +102,35 @@ class GRPOStrategy(BaseStrategy):
         )
         self.kl_coef = kl_coef
         self.group_size = group_size
+        if rl_microbatch_prompts is not None and (
+            isinstance(rl_microbatch_prompts, bool)
+            or not isinstance(rl_microbatch_prompts, int)
+            or rl_microbatch_prompts < 1
+        ):
+            raise ValueError("rl_microbatch_prompts must be a positive integer or None")
+        self.rl_microbatch_prompts = rl_microbatch_prompts
+        self.loss_process_group = loss_process_group
+        self._window_denominator = None
+        self._window_reject_aux = False
+        self.training_global_prompts = 0
+
+    complete_update_windows = True
+
+    @property
+    def loss_dp_size(self):
+        return (
+            dist.get_world_size(self.loss_process_group) if dist.is_initialized() else 1
+        )
+
+    def _sum(self, tensor):
+        if self.loss_dp_size > 1:
+            dist.all_reduce(tensor, group=self.loss_process_group)
+        return tensor
+
+    def _response_count(self, mask):
+        if self.loss_aggregation == "token":
+            return mask.sum(dtype=torch.int64)
+        return (mask.sum(dim=-1) > 0).sum().to(dtype=torch.int64)
 
     @staticmethod
     def _validate_clip_epsilon(value: float, name: str, upper: bool = False) -> float:
@@ -147,15 +178,156 @@ class GRPOStrategy(BaseStrategy):
     def _reduce_token_loss(self, loss: Tensor, mask: Tensor) -> Tensor:
         """Reduce response-token losses with GRPO or DAPO weighting."""
         mask = mask.float()
+        denominator = self._window_denominator
+        if denominator is None:
+            denominator = self._sum(self._response_count(mask))
+        denominator = denominator.clamp(min=1).to(dtype=loss.dtype)
         if self.loss_aggregation == "token":
-            return (loss * mask).sum() / mask.sum().clamp(min=1.0)
+            return self.loss_dp_size * (loss * mask).sum() / denominator
 
         lengths = mask.sum(dim=-1)
         valid_sequences = lengths > 0
         per_sequence = (loss * mask).sum(dim=-1) / lengths.clamp(min=1.0)
-        return (per_sequence * valid_sequences).sum() / valid_sequences.sum().clamp(
-            min=1
+        return self.loss_dp_size * (per_sequence * valid_sequences).sum() / denominator
+
+    @staticmethod
+    def _slice_prompt_groups(batch, begin, end):
+        total = batch["responses"].shape[0]
+        return {
+            key: value[begin:end]
+            if (isinstance(value, Tensor) and value.ndim and value.shape[0] == total)
+            or key == "finish_reasons"
+            else value
+            for key, value in batch.items()
+        }
+
+    @staticmethod
+    def _padding_group(batch):
+        # Padding only schedules the same number of DDP forwards/backwards;
+        # it contributes no responses to the frozen global denominator.
+        total = batch["responses"].shape[0]
+        padded = {
+            key: value.new_zeros((1, *value.shape[1:]))
+            if isinstance(value, Tensor) and value.ndim and value.shape[0] == total
+            else value
+            for key, value in batch.items()
+        }
+        if padded["responses"].shape[-1] == 0:
+            for key in ("responses", "masks", "logprobs_old"):
+                if key in padded:
+                    value = padded[key]
+                    padded[key] = value.new_zeros((*value.shape[:-1], 1))
+        if "prompt_mask" in padded:
+            padded["prompt_mask"].fill_(True)
+        padded["finish_reasons"] = [[]]
+        return padded
+
+    def _window_outputs(
+        self, batches, microbatch_prompts=None, *, require_targets=False
+    ):
+        # Every real input chunk belongs to one update, even when the global
+        # sampler used several dataloader batches to assemble that window.
+        count = sum(
+            (self._response_count(batch["masks"].to(self.device)) for batch in batches),
+            torch.zeros((), device=self.device, dtype=torch.int64),
         )
+        count = self._sum(count)
+        size = microbatch_prompts or self.rl_microbatch_prompts
+        chunks = []
+        for batch in batches:
+            prompts = batch["responses"].shape[0]
+            width = size or max(prompts, 1)
+            chunks.extend(
+                self._slice_prompt_groups(batch, begin, begin + width)
+                for begin in range(0, prompts, width)
+            )
+        slots = torch.tensor(max(len(chunks), 1), device=self.device, dtype=torch.int64)
+        empty_rank = torch.tensor(not chunks, device=self.device, dtype=torch.int64)
+        if self.loss_dp_size > 1:
+            dist.all_reduce(slots, op=dist.ReduceOp.MAX, group=self.loss_process_group)
+            dist.all_reduce(
+                empty_rank, op=dist.ReduceOp.MAX, group=self.loss_process_group
+            )
+        if count.item() == 0:
+            if require_targets:
+                raise RuntimeError("async GRPO round has no valid response tokens")
+            return
+        self._window_denominator = count
+        self._window_reject_aux = slots.item() > 1 or bool(empty_rank.item())
+        try:
+            for index in range(slots.item()):
+                padding = index >= len(chunks)
+                chunk = self._padding_group(batches[0]) if padding else chunks[index]
+                if chunk["responses"].shape[-1] == 0:
+                    chunk = self._padding_group(chunk)
+                    padding = True
+                sync = nullcontext()
+                if index + 1 < slots.item():
+                    if self.executor is not None and hasattr(self.executor, "_no_sync"):
+                        sync = self.executor._no_sync(self.model)
+                    elif hasattr(self.model, "no_sync"):
+                        sync = self.model.no_sync()
+                with sync:
+                    output = self.compute_loss_output(chunk)
+                    output["metrics"]["padding_microbatches"] = float(padding)
+                    # MetricCallback reduces a fixed vector across ranks. A
+                    # scheduling-only rank has no finish reasons, but must
+                    # still expose the same optional rollout metric slots.
+                    output["metrics"].setdefault("truncation_rate", 0.0)
+                    output["metrics"].setdefault("stop_rate", 0.0)
+                    yield output
+        finally:
+            self._window_denominator = None
+            self._window_reject_aux = False
+
+    def global_training_outputs(self, chunks):
+        # The sampler may supply a placeholder to ranks with no real prompts.
+        # Exclude it before freezing the denominator; matched padding is owned
+        # by _window_outputs and contributes neither targets nor cursor samples.
+        return self._window_outputs(
+            [
+                self._slice_prompt_groups(batch, 0, real_count)
+                for batch, real_count in chunks
+            ]
+        )
+
+    def training_updates(
+        self, batch, microbatch_prompts=None
+    ) -> Iterator[Iterator[LossOutput]]:
+        if isinstance(batch, RolloutResult):
+            self._on_rollout_refresh()
+            yield self._window_outputs(
+                [self.prepare_from_rollout(batch)],
+                microbatch_prompts,
+                require_targets=True,
+            )
+            return
+        if self._rollout_runner is not None:
+            result, is_fresh = self._rollout_runner(batch)
+            if is_fresh:
+                self._on_rollout_refresh()
+            prepared = self.prepare_from_rollout(result)
+            epochs = self.rl_update_epochs
+        else:
+            prepared, epochs = batch, 1
+        prompts = prepared["responses"].shape[0]
+        self.training_global_prompts = self._sum(
+            torch.tensor(prompts, device=self.device, dtype=torch.int64)
+        ).item()
+        size = self.rl_minibatch_prompts or max(prompts, 1)
+        updates = torch.tensor(
+            max(math.ceil(prompts / size), 1), device=self.device, dtype=torch.int64
+        )
+        if self.loss_dp_size > 1:
+            dist.all_reduce(
+                updates, op=dist.ReduceOp.MAX, group=self.loss_process_group
+            )
+        for _ in range(epochs):
+            for index in range(updates.item()):
+                chunk = self._slice_prompt_groups(
+                    prepared, index * size, (index + 1) * size
+                )
+                yield self._window_outputs([chunk], microbatch_prompts)
 
     def _shape_overlong_rewards(
         self, rewards: Tensor, token_masks: Tensor
@@ -223,6 +395,16 @@ class GRPOStrategy(BaseStrategy):
         )
         token_log_probs_policy = policy_output["logprobs"]
         aux_loss = policy_output["aux_loss"]
+        if (
+            self._window_reject_aux
+            and aux_loss is not None
+            and self.moe_aux_loss_coef != 0
+        ):
+            raise NotImplementedError(
+                "microbatched or empty-rank MoE auxiliary loss needs its own "
+                "global router-statistics reduction; use an unchunked update "
+                "or an explicitly zero auxiliary coefficient"
+            )
         with torch.no_grad():
             if behavior_logprobs is None:
                 token_log_probs_old = rollout_token_logprobs(
@@ -282,54 +464,29 @@ class GRPOStrategy(BaseStrategy):
             metrics["overlong_penalty_mean"] = overlong_penalty.mean()
             metrics["overlong_fraction"] = (overlong_penalty < 0).float().mean()
         metrics.update(_truncation_metric(batch.get("finish_reasons") or []))
-        return self._loss_output(
+        output = self._loss_output(
             task_loss,
             metrics,
             aux_loss,
             policy_output.get("router_stats"),
             normalizer=float(self._response_count(masks)),
         )
+        # Backward uses D * local_sum / N_global. Report the DP mean of
+        # those scaled contributions, leaving rank-local router diagnostics.
+        if self.loss_dp_size > 1:
+            names = ("loss", "policy_loss", "kl_loss")
+            reported = torch.tensor(
+                [output["metrics"][name] for name in names],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            self._sum(reported)
+            for name, value in zip(names, reported / self.loss_dp_size):
+                output["metrics"][name] = value.item()
+        return output
 
     def supports_online(self) -> bool:
         return True
-
-    def training_updates(
-        self, batch: Any, microbatch_prompts: Optional[int] = None
-    ) -> Iterator[Iterator[LossOutput]]:
-        if not isinstance(batch, RolloutResult):
-            yield from super().training_updates(batch, microbatch_prompts)
-            return
-
-        self._on_rollout_refresh()
-        prepared = self.prepare_from_rollout(batch)
-        total = prepared["prompts"].shape[0]
-        masks = prepared["masks"]
-        denominator = self._response_count(masks)
-        if denominator == 0:
-            raise RuntimeError("async GRPO round has no valid response tokens")
-
-        def microbatches() -> Iterator[LossOutput]:
-            size = microbatch_prompts or total
-            for begin in range(0, total, size):
-                indices = list(range(begin, min(begin + size, total)))
-                chunk = slice_batch(prepared, indices, total)
-                count = self._response_count(chunk["masks"])
-                if count == 0:
-                    continue
-                weight = count / denominator
-                output = self.compute_loss_output(chunk)
-                metrics = {}
-                for name, value in output["metrics"].items():
-                    metric = value.detach() if isinstance(value, Tensor) else value
-                    metrics[name] = float(metric) * weight
-                yield {"loss": output["loss"] * weight, "metrics": metrics}
-
-        yield microbatches()
-
-    def _response_count(self, masks: Tensor) -> int:
-        if self.loss_aggregation == "sequence":
-            return int(masks.any(dim=-1).sum().item())
-        return int(masks.sum().item())
 
     def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
         return {

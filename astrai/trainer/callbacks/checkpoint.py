@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from collections.abc import Callable
@@ -81,6 +82,16 @@ class CheckpointCallback(TrainCallback):
                     self.save_dir,
                     f"epoch_{context.epoch}_step_{context.optimizer_step}",
                 )
+                # An empty GRPO window can advance the cursor without a
+                # weight update. Keep the published checkpoint immutable and
+                # give the distinct resumable cursor its own atomic directory.
+                if getattr(context.strategy, "complete_update_windows", False):
+                    published_meta = Path(save_path) / "meta.json"
+                    if (Path(save_path) / "manifest.json").is_file() and (
+                        json.loads(published_meta.read_text())["consumed_samples"]
+                        != context.consumed_samples
+                    ):
+                        save_path += f"_samples_{context.consumed_samples}"
                 extra = self.save_extra_fn(context)
                 context.checkpoint = Checkpoint(
                     state_dict=state_dict,
@@ -144,6 +155,16 @@ class CheckpointCallback(TrainCallback):
 
     def after_optimizer_step(self, context: TrainContext):
         if context.optimizer_step - self.last_ckpt_step >= self.interval:
+            self._save_checkpoint(context)
+
+    def on_batch_end(self, context: TrainContext):
+        # A complete GRPO window can contain several commits. Only its final
+        # boundary is resumable; intermediate after-step hooks cannot publish.
+        if (
+            getattr(context.strategy, "complete_update_windows", False)
+            and context.checkpoint_safe
+            and context.optimizer_step - self.last_ckpt_step >= self.interval
+        ):
             self._save_checkpoint(context)
 
     def _save_pending(self, context: TrainContext):

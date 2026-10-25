@@ -141,6 +141,7 @@ class TrainConfig(BaseConfig):
         rollout_val_device (Optional[str]): Device for a dedicated validation rollout backend. None shares the training backend; setting it builds a separate replica so validation generation never touches the training scheduler's KV pool. Defaults to None.
         rl_update_epochs (int): Learner passes over one collected online rollout window. Each pass recomputes the loss against the window's fixed rewards/logprobs_old and takes its own optimizer steps. Values >1 trade on-policy freshness for sample efficiency; watch ``clip_fraction`` for stale-ratio blowup. Defaults to 1.
         rl_minibatch_prompts (Optional[int]): Global prompts per learner update within one rollout window; None updates on the whole window at once. Slicing keeps prompt groups intact, and PPO's rollout-pinned advantages are shared views. Each minibatch update is a full optimizer step and weight publication. Defaults to None.
+        rl_microbatch_prompts (Optional[int]): Complete prompt groups per GRPO forward/backward within one global optimizer update. Defaults to None.
         gradient_chunked_logprobs (bool): Compute training-path log-probs through the checkpointed chunked lm_head instead of materializing the full ``[N, S, V]`` logits (gradients identical up to GEMM tiling noise; peak memory drops by the logits tensor). Off keeps the historical full-tensor path. Defaults to False.
         save_reference_model (bool): Persist the frozen reference model as a ``reference_model`` checkpoint extra whenever the strategy has one (DPO/GRPO/PPO KL anchor). Resuming without it would silently re-anchor the KL target to the resumed actor. Adds one extra weight copy per checkpoint. Defaults to True.
         allow_reference_reanchor (bool): Escape hatch for resuming a reference-model strategy from a checkpoint saved without ``reference_model``: False (default) fails the resume explicitly, True proceeds with the reference re-anchored to the resumed actor and logs a warning. Defaults to False.
@@ -225,6 +226,7 @@ class TrainConfig(BaseConfig):
     rollout_val_device: Optional[str] = None
     rl_update_epochs: int = 1
     rl_minibatch_prompts: Optional[int] = None
+    rl_microbatch_prompts: Optional[int] = None
     gradient_chunked_logprobs: bool = False
     save_reference_model: bool = True
     allow_reference_reanchor: bool = False
@@ -406,7 +408,9 @@ class TrainConfig(BaseConfig):
             raise ValueError(f"rollout_val_group_size must be >= 1, got {v}")
         return v
 
-    @field_validator("rollout_pool_seq_len", "rl_minibatch_prompts")
+    @field_validator(
+        "rollout_pool_seq_len", "rl_minibatch_prompts", "rl_microbatch_prompts"
+    )
     def _validate_optional_positive_int(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
             raise ValueError(f"must be positive or None, got {v}")
@@ -474,6 +478,7 @@ class TrainConfig(BaseConfig):
             "moe_aux_loss_coef",
             "rl_update_epochs",
             "rl_minibatch_prompts",
+            "rl_microbatch_prompts",
             "gradient_chunked_logprobs",
         }
         duplicates = sorted(reserved.intersection(values))
@@ -493,6 +498,11 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
+        if self.rl_microbatch_prompts is not None and self.strategy not in {
+            "grpo",
+            "online_grpo",
+        }:
+            raise ValueError("rl_microbatch_prompts supports GRPO only")
         if self.model_dtype not in (None, "float32", "float16", "bfloat16"):
             raise ValueError("model_dtype must be float32, float16, or bfloat16")
 
@@ -545,7 +555,11 @@ class TrainConfig(BaseConfig):
                 raise ValueError(
                     "async_round requires rollout_interval=1 and rl_update_epochs=1"
                 )
-            if self.rl_minibatch_prompts is not None or self.grad_accum_steps != 1:
+            if (
+                self.rl_minibatch_prompts is not None
+                or self.rl_microbatch_prompts is not None
+                or self.grad_accum_steps != 1
+            ):
                 raise ValueError(
                     "async_round uses async_train_microbatch_prompts and "
                     "requires grad_accum_steps=1"

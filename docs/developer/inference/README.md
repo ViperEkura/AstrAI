@@ -60,13 +60,13 @@ classDiagram
     ModelRunnerOutput --> Scheduler
 ```
 
-`EngineCore` provides `start`/`stop`, `execute_requests`, `score_ids`,
+`EngineCore` provides `start`/`stop`, `generate`, `score_ids`,
 request submission and policy-version operations. `Scheduler` owns mutable
 request and KV state and applies results. `StepPlanner` generates execution
-entries without a back-reference to the driver. Training rollout formats
-tokenized batches in `astrai.trainer.backend.run_batch` and passes requests
-to `EngineCore.execute_requests`, using the same scheduling and result path
-as serving.
+entries without a back-reference to the driver. Training rollout backends
+pass tokenized prompts to `EngineCore.generate()`, which returns
+`List[GenerationResult]` in input order. Its private `_execute_requests()`
+drives the same `tick()` scheduling and result path as serving.
 
 ## Stages 0 and 1
 

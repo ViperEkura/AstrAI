@@ -2,7 +2,7 @@
 
 import time
 from functools import partial
-from threading import Thread
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -443,3 +443,293 @@ def test_two_learners_keep_local_order_and_distinct_response_seeds():
     finally:
         for coordinator in coordinators:
             coordinator.close()
+
+
+def test_iter_rounds_dispatches_next_generation_before_scoring(monkeypatch):
+    _, pool = _coordinator(devices=["a"])
+    events = []
+    submitted = []
+    submit = pool.submit_round
+
+    def record_submit(batch, **kwargs):
+        handle = submit(batch, **kwargs)
+        submitted.append(handle)
+        events.append(("submit", int(batch["instruction"][0])))
+        return handle
+
+    def score(prompts, responses):
+        index = int(prompts[0])
+        events.append(("score", index))
+        if index < 2:
+            assert pool._active_round is submitted[index + 1]
+            with pytest.raises(RuntimeError, match="only one rollout round"):
+                pool.submit_round({"instruction": ["99"]})
+        else:
+            assert pool._active_round is None
+        return torch.tensor([[index + 0.5]])
+
+    monkeypatch.setattr(pool, "submit_round", record_submit)
+    monkeypatch.setattr(pool.reward_model, "score", score)
+    try:
+        batches = [{"instruction": [str(index)]} for index in range(3)]
+        results = []
+        for rollout in pool.iter_rounds(batches, lambda: False):
+            index = int(rollout.prompts[0, 0])
+            events.append(("yield", index))
+            results.append(rollout)
+        assert events == [
+            ("submit", 0),
+            ("submit", 1),
+            ("score", 0),
+            ("yield", 0),
+            ("submit", 2),
+            ("score", 1),
+            ("yield", 1),
+            ("score", 2),
+            ("yield", 2),
+        ]
+        assert [result.responses.item() for result in results] == [1, 2, 3]
+        assert [result.rewards.item() for result in results] == [0.5, 1.5, 2.5]
+        assert pool._sample_cursor == 3
+        assert pool._active_round is None
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, RolloutVersionError])
+def test_iter_rounds_reward_failure_closes_prefetched_workers(monkeypatch, error_type):
+    _, pool = _coordinator(devices=["a"])
+    failure = error_type("reward failed after prefetch")
+    score_calls = []
+
+    def score(prompts, responses):
+        score_calls.append(prompts)
+        assert pool._active_round is not None
+        assert pool._active_round.round_id == 2
+        raise failure
+
+    monkeypatch.setattr(pool.reward_model, "score", score)
+    try:
+        rounds = pool.iter_rounds(
+            [{"instruction": ["0"]}, {"instruction": ["1"]}], lambda: False
+        )
+        with pytest.raises(error_type, match="reward failed after prefetch") as error:
+            next(rounds)
+        assert error.value is failure
+        assert score_calls == [["0"]]
+        assert pool._round_id == pool._sample_cursor == 2
+        assert pool._closed and pool._active_round is None
+        assert all(not process.is_alive() for process in pool._processes)
+    finally:
+        pool.close(force=True)
+
+
+def test_iter_rounds_stale_prefetch_retries_same_seeds_once(monkeypatch):
+    _, pool = _coordinator(devices=["a"])
+    submitted = []
+    scored = []
+    submit = pool.submit_round
+
+    def record_submit(batch, **kwargs):
+        handle = submit(batch, **kwargs)
+        submitted.append((batch["instruction"][0], handle, pool._sample_cursor))
+        return handle
+
+    def score(prompts, responses):
+        scored.append(prompts[0])
+        return torch.ones(len(prompts), 1)
+
+    monkeypatch.setattr(pool, "submit_round", record_submit)
+    monkeypatch.setattr(pool.reward_model, "score", score)
+    try:
+        rounds = pool.iter_rounds(
+            [{"instruction": [str(index)]} for index in range(3)], lambda: False
+        )
+        assert next(rounds).policy_version == 0
+        pool.apply_weight_update(None, lambda _version: None)
+        pool.apply_weight_update(None, lambda _version: None)
+        retried = next(rounds)
+        assert retried.prompts.item() == 1
+        assert retried.policy_version == 2
+        assert [prompt for prompt, _, _ in submitted] == ["0", "1", "1", "2"]
+        assert [handle.version for _, handle, _ in submitted] == [0, 0, 2, 2]
+        assert [cursor for _, _, cursor in submitted] == [1, 2, 2, 3]
+        assert submitted[1][1].seeds == submitted[2][1].seeds
+        assert pool._active_round is submitted[3][1]
+        assert scored == ["0", "1"]
+        assert next(rounds).prompts.item() == 2
+        with pytest.raises(StopIteration):
+            next(rounds)
+        assert scored == ["0", "1", "2"]
+        assert pool._sample_cursor == 3
+        assert pool._active_round is None
+    finally:
+        pool.close(force=True)
+
+
+def test_iter_rounds_persistently_stale_result_does_not_retry_forever(monkeypatch):
+    _, pool = _coordinator(devices=["stale"])
+    submitted = []
+    submit = pool.submit_round
+
+    def record_submit(batch, **kwargs):
+        assert len(submitted) < 2, "a rejected retry must not submit a third time"
+        handle = submit(batch, **kwargs)
+        submitted.append(handle)
+        return handle
+
+    monkeypatch.setattr(pool, "submit_round", record_submit)
+    monkeypatch.setattr(
+        pool.reward_model,
+        "score",
+        lambda *_: pytest.fail("a stale rollout must never be scored"),
+    )
+    try:
+        rounds = pool.iter_rounds([{"instruction": ["0"]}], lambda: False)
+        with pytest.raises(RolloutVersionError, match="mixed rollout versions"):
+            next(rounds)
+        assert len(submitted) == 2
+        assert submitted[0].seeds == submitted[1].seeds
+        assert pool._sample_cursor == 1
+        assert pool._closed and pool._active_round is None
+        assert all(not process.is_alive() for process in pool._processes)
+    finally:
+        pool.close(force=True)
+
+
+def test_iter_rounds_initial_stop_does_not_read_or_submit():
+    _, pool = _coordinator(devices=["a"])
+
+    def batches():
+        pytest.fail("a stopped iterator must not consume a batch")
+        yield {"instruction": ["0"]}
+
+    try:
+        assert list(pool.iter_rounds(batches(), lambda: True)) == []
+        assert pool._round_id == pool._sample_cursor == 0
+        assert pool._active_round is None
+    finally:
+        pool.close()
+
+
+def test_iter_rounds_stop_during_collect_finishes_current_without_prefetch(
+    monkeypatch,
+):
+    _, pool = _coordinator(devices=["a"])
+    stopped = Event()
+    collect_raw = pool._collect_raw
+    scored = []
+
+    def stop_after_collect(handle):
+        raw = collect_raw(handle)
+        stopped.set()
+        return raw
+
+    def batches():
+        yield {"instruction": ["0"]}
+        pytest.fail("stop during collection must not consume the next batch")
+
+    def score(prompts, responses):
+        scored.append(prompts)
+        assert pool._active_round is None
+        return torch.ones(len(prompts), 1)
+
+    monkeypatch.setattr(pool, "_collect_raw", stop_after_collect)
+    monkeypatch.setattr(pool.reward_model, "score", score)
+    try:
+        results = list(pool.iter_rounds(batches(), stopped.is_set))
+        assert len(results) == 1
+        assert results[0].prompts.item() == 0
+        assert results[0].rewards.item() == 1
+        assert scored == [["0"]]
+        assert pool._round_id == pool._sample_cursor == 1
+        assert pool._active_round is None
+    finally:
+        pool.close()
+
+
+def test_iter_rounds_stop_after_yield_leaves_prefetch_for_owner_to_close():
+    _, pool = _coordinator(devices=["a"])
+    stopped = Event()
+    try:
+        rounds = pool.iter_rounds(
+            [{"instruction": [str(index)]} for index in range(3)], stopped.is_set
+        )
+        assert next(rounds).prompts.item() == 0
+        active = pool._active_round
+        assert active is not None
+        stopped.set()
+        with pytest.raises(StopIteration):
+            next(rounds)
+        assert pool._active_round is active
+        assert not pool._closed
+        assert pool._round_id == pool._sample_cursor == 2
+    finally:
+        pool.close()
+    assert pool._active_round is None
+    assert all(not process.is_alive() for process in pool._processes)
+
+
+@pytest.mark.parametrize("pending", [False, True], ids=["idle", "pending-generation"])
+def test_default_close_orders_worker_and_weight_channel_cleanup(monkeypatch, pending):
+    _, pool = _coordinator(devices=["hang"])
+    channel_closes = []
+
+    def close_channel(force=False):
+        channel_closes.append(force)
+        if pending:
+            assert force, "busy workers cannot cooperate in weight-channel shutdown"
+            assert all(not process.is_alive() for process in pool._processes)
+
+    monkeypatch.setattr(pool.weights, "close", close_channel)
+    try:
+        if pending:
+            pool.submit_round({"instruction": ["0"]})
+        pool.close()
+        assert channel_closes == [pending]
+        assert all(not process.is_alive() for process in pool._processes)
+        pool.close()
+        assert channel_closes == [pending], "closing twice must not repeat cleanup"
+    finally:
+        pool.close(force=True)
+
+
+def test_closing_round_iterator_closes_prefetched_workers():
+    _, pool = _coordinator(devices=["a"])
+    try:
+        rounds = pool.iter_rounds(
+            [{"instruction": ["0"]}, {"instruction": ["1"]}], lambda: False
+        )
+        next(rounds)
+        assert pool._active_round is not None
+        rounds.close()
+        assert pool._closed and pool._active_round is None
+        assert all(not process.is_alive() for process in pool._processes)
+    finally:
+        pool.close(force=True)
+
+
+@pytest.mark.parametrize("missing_reply", [False, True])
+def test_expired_result_deadline_accepts_only_already_ready_replies(missing_reply):
+    devices = ["a", "hang"] if missing_reply else ["a"]
+    _, pool = _coordinator(devices=devices)
+    try:
+        handle = pool.submit_round(
+            {"instruction": [str(index) for index in range(len(devices))]}
+        )
+        assert pool._pipes[0].poll(10), "fake worker did not deliver its result"
+        # Simulate delayed collection (e.g. a slow reward call) after the
+        # result is ready, without depending on elapsed-time performance.
+        handle.started = time.monotonic() - pool.worker_timeout_s - 1
+        if missing_reply:
+            with pytest.raises(TimeoutError, match="timed out"):
+                pool.collect_round(handle)
+            assert pool._closed
+            assert all(not process.is_alive() for process in pool._processes)
+        else:
+            result = pool.collect_round(handle)
+            assert result.prompts.item() == 0
+            assert result.rewards.item() == 1
+        assert pool._active_round is None
+    finally:
+        pool.close(force=True)

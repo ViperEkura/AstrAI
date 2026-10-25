@@ -167,6 +167,7 @@ def configure_rollout(
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
                 policy_version=policy_version,
+                enable_overlap=cfg.rollout_enable_overlap,
             )
         )
 
@@ -192,6 +193,7 @@ def configure_rollout(
             max_seq_len=max_seq_len,
             policy_version=policy_version,
             enable_cuda_graph=enable_cuda_graph,
+            enable_overlap=cfg.rollout_enable_overlap,
         )
 
     if getattr(cfg, "rollout_mode", "sync") == "async_round":
@@ -234,6 +236,7 @@ def configure_rollout(
             weight_timeout_s=resolved.weight_timeout_s,
             random_seed=resolved.random_seed,
             sample_cursor=resolved.sample_cursor,
+            enable_overlap=cfg.rollout_enable_overlap,
             learner_rank=(
                 getattr(context, "rank", 0)
                 if getattr(context, "dp_size", 1) > 1

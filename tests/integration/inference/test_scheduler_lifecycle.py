@@ -11,7 +11,6 @@ from astrai.extension import op_backend, snapshot_op_selection
 from astrai.inference import EngineCore, GenerationResult
 from astrai.inference.core.scheduler import OutputEventSink
 from astrai.model.autoregressive_lm import AutoRegressiveLM
-from astrai.trainer.backend import run_batch
 from tests.support.models import make_rollout_config
 from tests.support.scheduler import (
     _make_mock_scheduler,
@@ -245,21 +244,24 @@ def test_cancel_during_kv_allocation_releases_metrics_and_kv(device):
         scheduler.stop()
 
 
-def test_run_batch_returns_token_sequences(device):
+def test_generate_returns_structured_token_sequences(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30], [5, 6, 7, 8]]
-        results = run_batch(scheduler, prompts, max_tokens=4, temperature=1.0)
+        results = scheduler.generate(prompts, max_tokens=4, temperature=1.0)
         assert len(results) == 2
-        for ids in results:
-            assert isinstance(ids, list)
-            assert len(ids) <= 4
-            assert all(0 <= i < 200 for i in ids)
+        for result in results:
+            assert isinstance(result, GenerationResult)
+            assert isinstance(result.token_ids, list)
+            assert len(result.token_ids) <= 4
+            assert all(0 <= i < 200 for i in result.token_ids)
+            assert result.logprobs == []
+            assert result.error_reason is None
     finally:
         scheduler.stop()
 
 
-def test_run_batch_queues_beyond_active_capacity(device):
+def test_generate_queues_beyond_active_capacity(device):
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     scheduler = EngineCore(
@@ -272,8 +274,7 @@ def test_run_batch_queues_beyond_active_capacity(device):
     prompts = [[10, 20 + index] for index in range(5)]
     seeds = [100 + index for index in range(5)]
     try:
-        batch = run_batch(
-            scheduler,
+        batch = scheduler.generate(
             prompts,
             max_tokens=3,
             top_k=0,
@@ -281,8 +282,7 @@ def test_run_batch_queues_beyond_active_capacity(device):
             return_logprobs=True,
         )
         single = [
-            run_batch(
-                scheduler,
+            scheduler.generate(
                 [prompt],
                 max_tokens=3,
                 top_k=0,
@@ -291,16 +291,18 @@ def test_run_batch_queues_beyond_active_capacity(device):
             )[0]
             for prompt, seed in zip(prompts, seeds)
         ]
-        assert [tokens for tokens, _ in batch] == [tokens for tokens, _ in single]
-        for (_, actual), (_, expected) in zip(batch, single):
-            assert actual == pytest.approx(expected)
+        assert [result.token_ids for result in batch] == [
+            result.token_ids for result in single
+        ]
+        for actual, expected in zip(batch, single):
+            assert actual.logprobs == pytest.approx(expected.logprobs)
         assert scheduler.get_stats()["kv_cache_tasks"] == 0
         assert scheduler.get_stats()["waiting"] == 0
     finally:
         scheduler.stop()
 
 
-def test_run_batch_execution_failure_releases_queued_kv(device):
+def test_generate_execution_failure_releases_queued_kv(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     scheduler.scheduler._requests.max_batch_size = 2
     try:
@@ -310,8 +312,7 @@ def test_run_batch_execution_failure_releases_queued_kv(device):
             side_effect=RuntimeError("injected execution failure"),
         ):
             with pytest.raises(RuntimeError, match="injected execution failure"):
-                run_batch(
-                    scheduler,
+                scheduler.generate(
                     [[10, 20], [11, 21], [12, 22]],
                     max_tokens=2,
                 )
@@ -322,7 +323,7 @@ def test_run_batch_execution_failure_releases_queued_kv(device):
         scheduler.stop()
 
 
-def test_run_batch_tokens_match_full_sequence_forward(device):
+def test_generate_tokens_match_full_sequence_forward(device):
     scheduler, _tok, model = _make_real_scheduler(device)
     prompt = [10, 20, 30, 40]
     try:
@@ -344,24 +345,24 @@ def test_run_batch_tokens_match_full_sequence_forward(device):
             expected.append(token)
             sequence.append(token)
 
-        result = run_batch(
-            scheduler, prompt_ids_list=[prompt], max_tokens=2, temperature=0
+        result = scheduler.generate(
+            prompt_ids_list=[prompt], max_tokens=2, temperature=0
         )
-        assert result == [expected]
+        assert [item.token_ids for item in result] == [expected]
     finally:
         scheduler.stop()
 
 
-def test_run_batch_return_logprobs_aligned(device):
-    """return_logprobs=True gives (token_ids, logprobs) tuples with equal len."""
+def test_generate_return_logprobs_aligned(device):
+    """Requested logprobs align with each structured result's token IDs."""
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30, 40]]
-        results = run_batch(
-            scheduler, prompts, max_tokens=5, temperature=1.0, return_logprobs=True
+        results = scheduler.generate(
+            prompts, max_tokens=5, temperature=1.0, return_logprobs=True
         )
         assert len(results) == 1
-        token_ids, logprobs = results[0]
+        token_ids, logprobs = results[0].token_ids, results[0].logprobs
         assert len(token_ids) == len(logprobs)
         assert all(lp <= 1e-5 for lp in logprobs)  # logprobs ≤ 0
     finally:
@@ -376,32 +377,38 @@ def test_ragged_prefill_matches_sequential_greedy_tokens_and_logprobs(device):
         [40, 41, 42, 43, 44],
     ]
     try:
-        ragged = run_batch(
-            scheduler, prompts, max_tokens=1, temperature=0, return_logprobs=True
+        ragged = scheduler.generate(
+            prompts, max_tokens=1, temperature=0, return_logprobs=True
         )
         sequential = [
-            run_batch(
-                scheduler, [prompt], max_tokens=1, temperature=0, return_logprobs=True
+            scheduler.generate(
+                [prompt], max_tokens=1, temperature=0, return_logprobs=True
             )[0]
             for prompt in prompts
         ]
 
-        assert [result[0] for result in ragged] == [result[0] for result in sequential]
+        assert [result.token_ids for result in ragged] == [
+            result.token_ids for result in sequential
+        ]
         for ragged_result, sequential_result in zip(ragged, sequential):
-            assert ragged_result[1] == pytest.approx(sequential_result[1], abs=1e-6)
+            assert ragged_result.logprobs == pytest.approx(
+                sequential_result.logprobs, abs=1e-6
+            )
     finally:
         scheduler.stop()
 
 
-def test_run_batch_zero_max_tokens_returns_empty(device):
+def test_generate_zero_max_tokens_returns_empty(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
-        assert run_batch(scheduler, [[10, 20, 30]], max_tokens=0) == [[]]
+        assert scheduler.generate([[10, 20, 30]], max_tokens=0) == [
+            GenerationResult([], [], "rejected", "max_tokens_non_positive")
+        ]
     finally:
         scheduler.stop()
 
 
-def test_run_batch_stop_id_terminates(device):
+def test_generate_stop_id_terminates(device):
     """A token matching stop_ids terminates generation for that prompt."""
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
@@ -409,44 +416,44 @@ def test_run_batch_stop_id_terminates(device):
         # one token (the stop token itself) instead of running to max_tokens.
         scheduler.scheduler._requests.tokenizer.stop_ids = list(range(200))
         prompts = [[10, 20, 30]]
-        results = run_batch(scheduler, prompts, max_tokens=32, temperature=1.0)
-        assert len(results[0]) == 1
+        results = scheduler.generate(prompts, max_tokens=32, temperature=1.0)
+        assert len(results[0].token_ids) == 1
+        assert results[0].finish_reason == "stop"
     finally:
         scheduler.stop()
 
 
-def test_run_batch_empty_prompts(device):
+def test_generate_empty_prompts(device):
     """Empty prompt list yields empty result list."""
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
-        assert run_batch(scheduler, [], max_tokens=4) == []
+        assert scheduler.generate([], max_tokens=4) == []
     finally:
         scheduler.stop()
 
 
-def test_run_batch_too_long_prompt_skipped(device):
-    """A prompt longer than max_seq_len yields an empty result slot."""
+def test_generate_too_long_prompt_skipped(device):
+    """An oversized prompt yields a rejection without dropping its result slot."""
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         long = list(range(100))  # > max_seq_len=64
-        results = run_batch(scheduler, [long, [10, 20]], max_tokens=2)
-        assert results[0] == []
-        assert len(results[1]) <= 2
+        results = scheduler.generate([long, [10, 20]], max_tokens=2)
+        assert results[0] == GenerationResult([], [], "rejected", "prompt_too_long")
+        assert len(results[1].token_ids) <= 2
+        assert results[1].error_reason is None
     finally:
         scheduler.stop()
 
 
-def test_run_batch_details_distinguish_rejection_from_success(device):
+def test_generate_details_distinguish_rejection_from_success(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         long_prompt = list(range(100))
-        results = run_batch(
-            scheduler,
+        results = scheduler.generate(
             [long_prompt, [10, 20]],
             max_tokens=2,
             temperature=0,
             return_logprobs=True,
-            return_details=True,
         )
 
         assert results[0] == GenerationResult(
@@ -462,42 +469,39 @@ def test_run_batch_details_distinguish_rejection_from_success(device):
         scheduler.stop()
 
 
-def test_run_batch_details_report_non_positive_max_tokens(device):
+def test_generate_details_report_non_positive_max_tokens(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
-        result = run_batch(scheduler, [[10, 20]], max_tokens=0, return_details=True)[0]
+        result = scheduler.generate([[10, 20]], max_tokens=0)[0]
         assert result.finish_reason == "rejected"
         assert result.error_reason == "max_tokens_non_positive"
     finally:
         scheduler.stop()
 
 
-def test_run_batch_details_report_allocation_failure(device):
+def test_generate_details_report_allocation_failure(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         with patch.object(
             scheduler.scheduler.kv_manager, "alloc_slots", return_value=False
         ):
-            result = run_batch(
-                scheduler, [[10, 20]], max_tokens=2, return_details=True
-            )[0]
+            result = scheduler.generate([[10, 20]], max_tokens=2)[0]
         assert result.finish_reason == "rejected"
         assert result.error_reason == "kv_cache_allocation_failed"
     finally:
         scheduler.stop()
 
 
-def test_run_batch_details_report_extension_failure_and_cleanup(device):
+def test_generate_details_report_extension_failure_and_cleanup(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
+    _tok.stop_ids = []
     try:
         with patch.object(
-            scheduler,
-            "execute_synchronously",
-            side_effect=lambda requests, **_kwargs: ([], list(requests)),
+            scheduler.scheduler.kv_manager,
+            "extend_slots_batch",
+            side_effect=lambda ids, _positions: [False] * len(ids),
         ):
-            result = run_batch(
-                scheduler, [[10, 20]], max_tokens=2, return_details=True
-            )[0]
+            result = scheduler.generate([[10, 20]], max_tokens=2)[0]
 
         assert result.finish_reason == "rejected"
         assert result.error_reason == "kv_cache_extension_failed"

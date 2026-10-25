@@ -16,7 +16,6 @@ from astrai.inference.contracts import (
 from astrai.inference.core.events import RequestError, RequestFinished, TokenDelta
 from astrai.inference.core.request import Request
 from astrai.inference.worker.pending import PendingExecution, ResultRing
-from astrai.trainer.backend import run_batch
 from tests.support.core_contracts import admit, output, pending
 from tests.support.core_contracts import scheduler as scheduler
 from tests.support.inference import make_cpu_model, make_cpu_scheduler
@@ -282,7 +281,7 @@ def test_sync_execution_refuses_live_online_requests(scheduler):
     with pytest.raises(RuntimeError, match="queued requests"):
         sched.score_ids([[10]], [[11]])
     with pytest.raises(RuntimeError, match="queued requests"):
-        run_batch(sched, [[10]], max_tokens=1)
+        sched.generate([[10]], max_tokens=1)
 
 
 def test_overlap_rebuilds_shrunken_plan_after_committing_old_history():

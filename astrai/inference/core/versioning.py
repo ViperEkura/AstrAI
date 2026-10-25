@@ -1,7 +1,7 @@
 """Policy version protocol for weights shared between trainer and server.
 
 The guard owns the monotonic version counter, the RLock that serializes
-weight publication against generation (``execute_requests`` acquires the same
+weight publication against generation (``EngineCore.generate`` acquires the same
 lock), and the validation/commit rules around both.  Scheduler-specific
 preconditions (no in-flight generation, no queued requests) and side effects
 (dropping stale KV entries) are injected as callables so the guard stays

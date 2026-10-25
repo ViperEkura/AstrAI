@@ -18,7 +18,6 @@ from astrai.inference.worker.pending import (
     PendingExecution,
 )
 from astrai.model.autoregressive_lm import AutoRegressiveLM
-from astrai.trainer.backend import run_batch
 from tests.support.models import make_rollout_config
 from tests.support.scheduler import (
     _make_contract_scheduler,
@@ -57,7 +56,7 @@ def test_submit_decode_returns_pending_without_touching_tasks(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30, 40]]
-        run_batch(scheduler, prompts, max_tokens=2, temperature=0.7)
+        scheduler.generate(prompts, max_tokens=2, temperature=0.7)
         requests = [
             Request(
                 request_id=f"probe_{uuid.uuid4().hex[:8]}",
@@ -172,7 +171,7 @@ def test_overlap_loop_matches_synchronous_tokens(device):
     the KV cap with half their tokens and interleaved-token detext.
     Token-count gates cannot see this on small configs (the requests still
     finish); only the full sequence comparison against the synchronous
-    run_batch reference catches it.
+    generate reference catches it.
     """
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
@@ -194,14 +193,17 @@ def test_overlap_loop_matches_synchronous_tokens(device):
         # random model may sample a stop id (FakeTokenizer: eos=2) mid-stream,
         # so accept an early stop-token termination on either side of the
         # comparison; what must match is the committed token stream itself.
-        reference = run_batch(
-            scheduler,
+        reference = scheduler.generate(
             [[ord(c) for c in p] for p in prompts],
             max_tokens=12,
             temperature=0,
         )
         stop_ids = set(scheduler.scheduler.stop_ids)
-        assert all(len(ids) == 12 or (ids and ids[-1] in stop_ids) for ids in reference)
+        assert all(
+            len(result.token_ids) == 12
+            or (result.token_ids and result.token_ids[-1] in stop_ids)
+            for result in reference
+        )
 
         # Collect the committed token stream through the event sink before
         # release_finished discards the finished requests.
@@ -242,13 +244,126 @@ def test_overlap_loop_matches_synchronous_tokens(device):
 
         by_task = {tid: stream.get(tid, []) for tid in request_ids}
         for i, tid in enumerate(request_ids):
-            assert by_task[tid] == list(reference[i]), (
+            assert by_task[tid] == reference[i].token_ids, (
                 f"request {i} overlap stream {by_task[tid]} != reference "
-                f"{list(reference[i])}"
+                f"{reference[i].token_ids}"
             )
         assert scheduler.model_runner.peek_pending() is None
     finally:
         scheduler.stop()
+
+
+@pytest.mark.parametrize(
+    "temperature,frequency_penalty",
+    [(0.0, 0.0), (0.7, 0.0), (0.7, 0.5)],
+    ids=["greedy", "seeded", "frequency-penalty"],
+)
+def test_rollout_overlap_matches_sync_with_queued_prefill_and_shrinking_batch(
+    temperature, frequency_penalty, monkeypatch
+):
+    """Rollouts use overlap without changing samples or raw policy logprobs."""
+    torch.manual_seed(3407)
+    config = make_rollout_config(
+        vocab_size=32, max_position_embeddings=14, num_hidden_layers=1
+    )
+    model = AutoRegressiveLM(config).to(device="cpu", dtype=torch.float32).eval()
+    tokenizer = FakeTokenizer()
+    tokenizer.stop_ids = []
+    core = EngineCore(
+        model=model,
+        tokenizer=tokenizer,
+        device="cpu",
+        max_batch_size=2,
+        max_seq_len=14,
+        enable_cuda_graph=False,
+        enable_overlap=False,
+    )
+    prompts = [[3, 4, 5], [6, 7, 6, 8, 6, 9, 6, 7, 6], [10, 11, 12, 13]]
+    kwargs = dict(
+        max_tokens=7,
+        temperature=temperature,
+        top_k=5,
+        top_p=0.9,
+        frequency_penalty=frequency_penalty,
+        rep_window=3,
+        seeds=[11, 22, 33],
+        return_logprobs=True,
+    )
+    submissions = []
+    submit = core.submit
+
+    def record_submit(plan):
+        submissions.append(
+            (tuple(request.phase for request in plan.requests), len(core._pending))
+        )
+        return submit(plan)
+
+    try:
+        reference = core.generate(prompts, **kwargs)
+        core.enable_overlap = True
+        monkeypatch.setattr(core, "submit", record_submit)
+        actual = core.generate(prompts, **kwargs)
+
+        assert [len(result.token_ids) for result in actual] == [7, 5, 7]
+        for prompt, expected, result in zip(prompts, reference, actual):
+            assert result.token_ids == expected.token_ids
+            assert result.finish_reason == expected.finish_reason == "length"
+            assert result.error_reason is None
+            torch.testing.assert_close(
+                torch.tensor(result.logprobs),
+                torch.tensor(expected.logprobs),
+                rtol=1e-5,
+                atol=1e-6,
+            )
+            # Temperature, top-k/p and penalties must not transform the
+            # logprobs consumed by PPO/GRPO's policy-ratio calculation.
+            with torch.no_grad(), use_op_selection(core.op_selection):
+                inputs = torch.tensor([prompt + result.token_ids[:-1]])
+                logits = model(inputs)["logits"][0, len(prompt) - 1 :]
+                raw = (
+                    logits.float()
+                    .log_softmax(-1)
+                    .gather(-1, torch.tensor(result.token_ids).unsqueeze(-1))
+                )
+            torch.testing.assert_close(
+                torch.tensor(result.logprobs),
+                raw.squeeze(-1),
+                rtol=1e-5,
+                atol=1e-6,
+            )
+
+        # The third prompt must enter after decoding has started, and the
+        # final request must continue after the batch shrinks to one row.
+        first_decode = next(
+            index for index, (phases, _) in enumerate(submissions) if "decode" in phases
+        )
+        assert any("prefill" in phases for phases, _ in submissions[first_decode + 1 :])
+        assert any(phases == ("decode",) for phases, _ in submissions)
+        if frequency_penalty:
+            assert all(pending == 0 for _, pending in submissions)
+        else:
+            assert any(pending == 1 for _, pending in submissions)
+
+        assert not core._pending
+        assert core.model_runner.peek_pending() is None
+        assert not core.scheduler.has_outstanding()
+        assert not core.scheduler.has_requests()
+        assert core.get_stats()["kv_cache_tasks"] == 0
+
+        def update(_version):
+            with torch.no_grad():
+                model.lm_head.weight.mul_(0.9)
+
+        core.apply_weight_update(1, update)
+        assert core.policy_version == 1
+        assert (
+            len(core.generate([prompts[0]], max_tokens=2, temperature=0)[0].token_ids)
+            == 2
+        )
+        assert not core._pending
+        assert core.get_stats()["kv_cache_tasks"] == 0
+    finally:
+        core.stop()
 
 
 def test_stop_leaves_state_intact_when_loop_does_not_drain():

@@ -120,6 +120,7 @@ class TrainConfig(BaseConfig):
         neftune_alpha (float): NEFTune noise alpha, 0=disabled, typical: 5.0. Defaults to 0.0.
         moe_aux_loss_coef (float): Weight applied to the MoE load-balancing loss. Defaults to 0.01.
         rollout_interval (int): Number of optimizer steps between online rollouts. Defaults to 512.
+        rollout_enable_overlap (bool): Pipeline CPU result handling with the next GPU decode step within each rollout backend, including validation and async_round workers. Generation finishes before weights can change. Defaults to True.
         rollout_max_policy_lag (Optional[int]): Maximum accepted gap between rollout and live policy versions. None derives ``rollout_interval - 1`` for sync and normalizes to 1 for async_round. Defaults to None.
         rollout_temperature (float): Sampling temperature for online rollout. Defaults to 0.7.
         rollout_top_k (int): Top-k filtering for online rollout, 0=disable. Defaults to 0.
@@ -130,7 +131,7 @@ class TrainConfig(BaseConfig):
         rollout_val_top_k (Optional[int]): Validation top-k override. None inherits ``rollout_top_k``. Defaults to None.
         rollout_val_max_tokens (Optional[int]): Validation max generated tokens override. None inherits ``rollout_max_tokens``. Defaults to None.
         rollout_val_group_size (Optional[int]): Validation responses per prompt override. None inherits the strategy's ``group_size``. Defaults to None.
-        rollout_pool_seq_len (Optional[int]): Sequence budget per rollout request when sizing the rollout scheduler's KV pool. None uses the model's ``max_position_embeddings``. Must cover the longest prompt plus ``rollout_max_tokens`` or ``run_batch`` rejects the request. Right-sizing pays off: the pool holds ``2 × layers × (batch_capacity × seq) × kv_heads × head_dim`` bytes — for the 1B policy (24 layers, 4 KV heads, head_dim 64, bf16) the default 32768 context allocates ~3.2 GB against ~400 MB at 4096. Defaults to None.
+        rollout_pool_seq_len (Optional[int]): Sequence budget per rollout request when sizing the rollout scheduler's KV pool. None uses the model's ``max_position_embeddings``. ``EngineCore.generate`` rejects prompts at least this long and caps generated tokens by the remaining sequence budget. Right-sizing pays off: the pool holds ``2 × layers × (batch_capacity × seq) × kv_heads × head_dim`` bytes — for the 1B policy (24 layers, 4 KV heads, head_dim 64, bf16) the default 32768 context allocates ~3.2 GB against ~400 MB at 4096. Defaults to None.
         rollout_device (Optional[str]): Device for the training rollout backend, e.g. ``"cuda:1"``. None keeps the in-process colocated backend (generation shares the training model object; weight updates are free). Setting it builds a frozen replica whose weights are copied to inside the policy-version lock every optimizer step — the copy is a full state transfer (e.g. ~2GB/step for 1B bf16), so pay it only when backend isolation is worth it. Defaults to None.
         rollout_mode (str): "sync" retains the existing backend; "async_round" overlaps each learner with its assigned isolated rollout processes. Scripts using async_round must guard Trainer.train() with ``if __name__ == "__main__":``. Defaults to "sync".
         rollout_devices (List[str]): One or more distinct CUDA devices for async_round, separate from all learner devices. Defaults to [].
@@ -204,6 +205,7 @@ class TrainConfig(BaseConfig):
     moe_aux_loss_coef: float = 0.01
 
     rollout_interval: int = 512
+    rollout_enable_overlap: bool = True
     rollout_max_policy_lag: Optional[int] = None
     rollout_temperature: float = 0.7
     rollout_top_k: int = 0

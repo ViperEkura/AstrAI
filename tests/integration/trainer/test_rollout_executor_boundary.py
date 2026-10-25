@@ -15,7 +15,6 @@ from astrai.config import ComponentSpec, TrainConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.parallel import get_rank
 from astrai.parallel.executor import DDPExecutor, FSDPExecutor, NoneExecutor
-from astrai.trainer.backend import run_batch
 from astrai.trainer.context import TrainContextBuilder
 from astrai.trainer.context import builder as train_context_builder
 from astrai.trainer.rollout.setup import configure_rollout, resolve_async_rollout
@@ -99,6 +98,7 @@ def _rollout_config(*, compile_mode=None):
     return SimpleNamespace(
         strategy="online_grpo",
         rollout_mode="sync",
+        rollout_enable_overlap=True,
         compile_mode=compile_mode,
         batch_per_device=1,
         rollout_max_tokens=4,
@@ -262,8 +262,7 @@ def _multi_rank_rollout_then_train_worker():
     scheduler = make_cpu_scheduler(
         inference_model, FakeTokenizer(), max_batch_size=1, max_seq_len=64
     )
-    result = run_batch(
-        scheduler,
+    result = scheduler.generate(
         [[5 + rank, 6 + rank, 7 + rank]],
         max_tokens=2 + rank,
         temperature=0,
@@ -295,7 +294,7 @@ def _multi_rank_rollout_then_train_worker():
     # generation agrees across replicas after invalidating stale KV state.
     scheduler.update_weights(1)
     inference_model.eval()
-    post_update = run_batch(scheduler, [[11, 12, 13]], max_tokens=3, temperature=0)
+    post_update = scheduler.generate([[11, 12, 13]], max_tokens=3, temperature=0)
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, post_update)
     assert all(tokens == gathered[0] for tokens in gathered)

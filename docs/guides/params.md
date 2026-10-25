@@ -171,6 +171,7 @@ provide a command-line option for configuring one.
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--rollout_interval` | Optimizer steps between rollout refreshes | 512 |
+| `--rollout_enable_overlap` / `--no-rollout_enable_overlap` | Pipeline CPU result handling with GPU decode inside training and validation rollout backends, including async workers | True |
 | `--rollout_max_policy_lag` | Maximum accepted rollout/live policy-version gap (`None` derives `rollout_interval - 1`) | None |
 | `--rollout_temperature` | Rollout sampling temperature | 0.7 |
 | `--rollout_top_k` | Rollout top-k filtering (`0` disables) | 0 |

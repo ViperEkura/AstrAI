@@ -129,7 +129,6 @@ class RolloutGenerator:
             frequency_penalty=params.frequency_penalty,
             rep_window=params.rep_window,
             return_logprobs=True,
-            return_details=True,
             **({"seeds": seeds} if seeds is not None else {}),
         )
         if len(results) != B * G:

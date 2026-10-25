@@ -262,7 +262,12 @@ class Scheduler:
         self.release_finished(safe_to_release)
 
     def schedule(
-        self, requests=None, policy_version=None, *, return_logprobs=False
+        self,
+        requests=None,
+        policy_version=None,
+        *,
+        return_logprobs=False,
+        defer_kv_failures=False,
     ) -> SchedulerOutput:
         if policy_version is None:
             policy_version = self._policy_version
@@ -280,12 +285,13 @@ class Scheduler:
             else:
                 eligible.append(request)
         entries, failed = self._planner.plan(eligible)
-        for request in failed:
-            self.finish(
-                request,
-                FINISH_ABORTED,
-                error_reason="kv_cache_extension_failed",
-            )
+        if not defer_kv_failures:
+            for request in failed:
+                self.finish(
+                    request,
+                    FINISH_ABORTED,
+                    error_reason="kv_cache_extension_failed",
+                )
         self._step_id += 1
         plan = SchedulerOutput(
             self._step_id, policy_version, tuple(entries), return_logprobs

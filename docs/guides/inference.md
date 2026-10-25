@@ -112,24 +112,33 @@ a `[batch, seq_len, dim/2, 2]` slice indexed by `position_ids`. Rotary dispatch 
 
 ## Continuous Batching
 
-`Scheduler` runs a daemon thread (`run_busy_loop`) with a 4-phase loop:
+`EngineCore` runs a daemon thread (`run_busy_loop`) that repeatedly calls
+`tick()`:
 
 ```
 1. Cleanup → Record complete materialized pages, then release request-owned KV resources
 2. Refill  → Pop from waiting, alloc_slots resources, activate
-3. Prefill → Group by (prompt_len, start_pos), run full forward
-4. Decode  → Run single-token forward for each same-position group
+3. Plan    → Group prefill windows and reserve decode KV slots
+4. Execute → Submit groups, then apply completed results; eligible decode steps overlap
 ```
 
 Each step's results leave the loop as output events (`TokenDelta` /
 `RequestFinished`); text rendering happens in the frontend's
 `OutputProcessor`, never on the loop thread.
 
-For in-process training rollout, `Scheduler.update_weights(version)`
+For in-process training rollout, `EngineCore.update_weights(version)`
 acknowledges that the shared model was updated in place. Versions are monotonic;
-the scheduler rejects updates while requests are queued and invalidates reusable
-prefix KV pages before exposing the new version. Synchronous `run_batch()` and
-weight updates are serialized so a generation cannot straddle two versions.
+the core rejects updates while requests are queued and invalidates reusable
+prefix KV pages before exposing the new version. Synchronous
+`EngineCore.generate()` and weight updates are serialized so a generation
+cannot straddle two versions.
+
+`EngineCore.generate(prompt_ids_list, ...)` accepts tokenized prompts and always
+returns `List[GenerationResult]` in input order. Read each result's `token_ids`,
+`logprobs`, `finish_reason`, and `error_reason`. Set `return_logprobs=True` when
+per-token logprobs are needed; otherwise `logprobs` is empty. Rejected requests
+remain in their original result positions with an error reason. The call
+finishes all submitted GPU work before returning.
 
 ## Sampling (Strategy Pattern)
 

@@ -295,6 +295,14 @@ training weights into the replica inside the policy-version lock on every
 optimizer step, so the replica's generations stay version-attributable. The
 copy transfers the full model state at every optimizer step.
 
+`rollout_enable_overlap` defaults to `true` for colocated generation, training
+and validation replicas, and `async_round` workers. It pipelines CPU result
+handling with the next GPU decode step inside each backend. The generation
+call still waits for all submitted work before returning or updating weights.
+Use `--no-rollout_enable_overlap` or set `rollout_enable_overlap: false` in
+the training YAML to disable this pipeline. Learner/rollout concurrency is
+configured separately with `rollout_mode`.
+
 The scheduler's KV pool is sized from the model's full
 `max_position_embeddings` by default; `--rollout_pool_seq_len` right-sizes it
 to the true rollout horizon (it must cover the longest prompt plus

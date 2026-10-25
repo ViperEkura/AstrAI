@@ -37,19 +37,39 @@ flowchart LR
   logits stay on each worker. NCCL carries model state through a standalone
   process group; workers are not training or checkpoint ranks.
 
-Round zero uses the initial actor. Before training a collected round, the
-coordinator submits the following round under the current actor version.
-Generation therefore overlaps the learner update with a maximum lag of one
-optimizer version. After collection, the next submission synchronizes the
-latest weights. Every worker joins each broadcast, including workers with no
-prompts in a short final round; an ACK is sent only after CUDA completion.
+Round zero uses the initial actor. The training iterator performs these steps:
+
+1. Collect the current raw round and validate its request, round and policy
+   identities and allowed policy lag.
+2. If another batch exists and stopping has not been requested, synchronize
+   the latest weights and submit that batch as the single prefetched round.
+3. Score rewards for the current raw round and yield its complete
+   `RolloutResult`.
+4. Let the learner commit the current update, then collect the prefetched round.
+
+This ordering allows generation to overlap both reward scoring and the learner
+update, with a maximum lag of one optimizer version. It does not make reward
+scoring asynchronous. The public `collect_round()` method still blocks until
+its requested round is collected and scored, and does not submit another round.
+Every worker joins each weight broadcast, including workers with no prompts in
+a short final round; an ACK is sent only after CUDA completion.
 
 A failed or stale collection performs no learner update. An optimizer update
 that advanced the policy version remains a committed step even if later
 publication fails. Resume restores the completed sample cursor and version,
-rebuilds worker replicas, and discards pending prefetched results. Normal
-shutdown sends STOP and enters NCCL shutdown on the learner before joining
-workers; failure cleanup aborts the channel and terminates remaining workers.
+rebuilds worker replicas, and discards pending prefetched results. Submitting a
+prefetch advances only the coordinator's request-seed cursor; the checkpoint's
+sample cursor advances when the learner commits an update.
+
+The iterator checks for a stop before starting and before fetching a following
+batch. A current round already being collected can finish scoring and training;
+an already submitted prefetch is discarded during shutdown. Within the training
+iterator, reward failure, iteration failure or explicitly closing it aborts the
+channel and terminates remaining workers, including an active prefetch. Session
+shutdown also terminates workers and aborts the channel if a prefetched round
+has not been collected: a worker sending a large result may be unable to read
+STOP until the learner drains that result. When no round is pending, shutdown
+sends STOP and enters NCCL shutdown on the learner before joining workers.
 
 ### Capacity and extension boundary
 
@@ -87,6 +107,13 @@ seed/cursor and the three independent deadlines:
 - `rollout_startup_timeout_s`: startup, default 300 seconds.
 - `rollout_worker_timeout_s`: generation, default 600 seconds.
 - `rollout_weight_timeout_s`: NCCL broadcast and ACK, default 600 seconds.
+
+The generation deadline starts when the round is submitted. Reward scoring and
+learner computation can delay collection of a prefetched result beyond that
+deadline. In that case, collection first checks for ready worker replies
+without waiting: ready results are still accepted and validated, while a worker
+with no ready reply times out. Startup and weight ACK collection retain their
+own deadlines and do not accept replies after those deadlines.
 
 Each generated response receives a seed derived from `random_seed`, its global
 prompt cursor and its response index. Request execution derives a stateless

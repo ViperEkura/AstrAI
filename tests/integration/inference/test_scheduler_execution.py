@@ -19,7 +19,6 @@ from astrai.inference.worker.pending import (
     ResultRing,
 )
 from astrai.model.autoregressive_lm import AutoRegressiveLM
-from astrai.trainer.backend import run_batch
 from tests.support.models import make_rollout_config
 from tests.support.scheduler import (
     _make_contract_scheduler,
@@ -248,10 +247,10 @@ def test_steady_decode_submit_path_is_sync_free(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30, 40], [5, 6, 7, 8]]
-        # First run_batch call warms everything the steady state touches
+        # First generate call warms everything the steady state touches
         # (prefill, first decode, sampling-info build) so the instrumented
         # second batch enters steady state from its first step.
-        run_batch(scheduler, prompts, max_tokens=2, temperature=0.7, top_k=10)
+        scheduler.generate(prompts, max_tokens=2, temperature=0.7, top_k=10)
         torch.manual_seed(1234)
 
         banned = (
@@ -273,19 +272,19 @@ def test_steady_decode_submit_path_is_sync_free(device):
             for name, orig in zip(("item", "any", "all"), banned)
         )
         with _MultiPatch(patched):
-            run_batch(scheduler, prompts, max_tokens=2, temperature=0.7, top_k=10)
+            scheduler.generate(prompts, max_tokens=2, temperature=0.7, top_k=10)
         assert not calls, f"steady decode resolved device predicates on host: {calls}"
     finally:
         scheduler.stop()
 
 
-def test_run_batch_greedy_reproducible_across_calls(device):
+def test_generate_greedy_reproducible_across_calls(device):
     """Greedy decode is bit-identical across invocations of one scheduler.
 
     Guards the submit/commit split without RNG in play: argmax tokens must
     be stable when the same batch runs twice through the same engine.
 
-    Stochastic reproducibility across run_batch calls is deliberately NOT
+    Stochastic reproducibility across generate calls is deliberately NOT
     asserted: bf16 GEMM reductions are not bit-deterministic under
     different kernel interleavings, and the async result relay changes the
     host/GPU overlap between calls. Same-seed replay is only guaranteed
@@ -294,10 +293,10 @@ def test_run_batch_greedy_reproducible_across_calls(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         prompts = [[10, 20, 30, 40], [7, 8, 9]]
-        first = run_batch(scheduler, prompts, max_tokens=6, temperature=0)
-        second = run_batch(scheduler, prompts, max_tokens=6, temperature=0)
+        first = scheduler.generate(prompts, max_tokens=6, temperature=0)
+        second = scheduler.generate(prompts, max_tokens=6, temperature=0)
         assert first == second
-        assert all(len(ids) == 6 for ids in first)
+        assert all(len(result.token_ids) == 6 for result in first)
     finally:
         scheduler.stop()
 
@@ -320,10 +319,8 @@ def test_paged_pool_selected_via_scheduler_kwargs(device):
         assert scheduler.scheduler.cache.page_size == 4
         assert scheduler.scheduler.cache.n_tokens == 128
         # End-to-end: generation works on the paged path.
-        out = run_batch(
-            scheduler, [[10, 11, 12, 13, 14]], max_tokens=3, temperature=0.0
-        )
-        assert len(out[0]) == 3
+        out = scheduler.generate([[10, 11, 12, 13, 14]], max_tokens=3, temperature=0.0)
+        assert len(out[0].token_ids) == 3
     finally:
         scheduler.stop()
 
@@ -370,8 +367,8 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
 
     ref_sched.model_runner.execute_prefill = counting_prefill
     try:
-        reference = run_batch(
-            ref_sched, [list(p) for p in prompts], max_tokens=5, temperature=0.0
+        reference = ref_sched.generate(
+            [list(p) for p in prompts], max_tokens=5, temperature=0.0
         )
     finally:
         ref_sched.stop()
@@ -387,14 +384,14 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
     try:
         # Sanity: budget must actually be in force.
         assert chunked.scheduler._planner._token_budget == 3
-        chunked_result = run_batch(
-            chunked, [list(p) for p in prompts], max_tokens=5, temperature=0.0
+        chunked_result = chunked.generate(
+            [list(p) for p in prompts], max_tokens=5, temperature=0.0
         )
     finally:
         chunked.stop()
 
     assert chunked_result == reference, (chunked_result, reference)
-    assert all(len(ids) == 5 for ids in chunked_result)
+    assert all(len(result.token_ids) == 5 for result in chunked_result)
 
 
 def test_chunked_prefill_budget_caps_forward_tokens(device):
@@ -425,13 +422,12 @@ def test_chunked_prefill_budget_caps_forward_tokens(device):
 
     scheduler.model_runner.execute_prefill = spy
     try:
-        out = run_batch(
-            scheduler,
+        out = scheduler.generate(
             [[10, 11, 12, 13, 14, 15, 16, 17, 18, 19]],
             max_tokens=2,
             temperature=0.0,
         )
-        assert len(out[0]) == 2
+        assert len(out[0].token_ids) == 2
     finally:
         scheduler.stop()
     assert seen, "no prefill forwards observed"
@@ -442,21 +438,15 @@ def test_chunked_prefill_budget_caps_forward_tokens(device):
 def test_scheduler_seeds_survive_batching_and_request_completion():
     scheduler, _, _ = _make_real_scheduler("cpu")
     prompts = [[1, 2], [3, 4, 5]]
-    first = run_batch(
-        scheduler, prompts, seeds=[11, 22], max_tokens=6, top_k=0, return_details=True
-    )
+    first = scheduler.generate(prompts, seeds=[11, 22], max_tokens=6, top_k=0)
     torch.manual_seed(999)
-    reordered = run_batch(
-        scheduler,
+    reordered = scheduler.generate(
         list(reversed(prompts)),
         seeds=[22, 11],
         max_tokens=6,
         top_k=0,
-        return_details=True,
     )
-    individual = run_batch(
-        scheduler, [prompts[1]], seeds=[22], max_tokens=6, top_k=0, return_details=True
-    )
+    individual = scheduler.generate([prompts[1]], seeds=[22], max_tokens=6, top_k=0)
     assert [r.token_ids for r in first] == [r.token_ids for r in reversed(reordered)]
     assert individual[0].token_ids == first[1].token_ids
     assert all(r.error_reason is None for r in first + reordered + individual)
@@ -466,5 +456,5 @@ def test_scheduler_seeds_survive_batching_and_request_completion():
 def test_bad_request_seeds_fail_before_allocating_cache(seeds):
     scheduler, _, _ = _make_real_scheduler("cpu")
     with pytest.raises(ValueError, match="seeds"):
-        run_batch(scheduler, [[1, 2]], seeds=seeds)
+        scheduler.generate([[1, 2]], seeds=seeds)
     assert not scheduler.scheduler._planned

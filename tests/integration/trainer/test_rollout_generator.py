@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from astrai.inference.core.request import GenerationResult
-from astrai.trainer.backend import run_batch
 from astrai.trainer.rollout import (
     RolloutEvaluator,
     SamplingParams,
@@ -39,13 +38,14 @@ def test_rollout_generator_uses_eval_and_restores_mode(device, monkeypatch):
     gen, model = _make_generator(device, group_size=1, max_tokens=2)
     model.train()
     seen_training = []
-    original = run_batch
+    core = gen.backend.engine_core
+    original = core.generate
 
-    def recording_run_batch(*args, **kwargs):
+    def recording_generate(*args, **kwargs):
         seen_training.append(model.training)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr("astrai.trainer.backend.run_batch", recording_run_batch)
+    monkeypatch.setattr(core, "generate", recording_generate)
     gen.generate(_make_instruction_batch(n=1))
     assert seen_training == [False]
     assert model.training is True
@@ -162,14 +162,15 @@ def test_rollout_generator_serializes_direct_scheduler_update(device):
 
 def test_rollout_generator_keeps_generation_start_version(device, monkeypatch):
     gen, _ = _make_generator(device, group_size=1, max_tokens=2)
-    original_run_batch = run_batch
+    core = gen.backend.engine_core
+    original_generate = core.generate
 
     def update_after_generation(*args, **kwargs):
-        result = original_run_batch(*args, **kwargs)
-        gen.backend.engine_core.update_weights(1)
+        result = original_generate(*args, **kwargs)
+        core.update_weights(1)
         return result
 
-    monkeypatch.setattr("astrai.trainer.backend.run_batch", update_after_generation)
+    monkeypatch.setattr(core, "generate", update_after_generation)
 
     rollout = gen.generate(_make_instruction_batch(n=1))
 
@@ -205,14 +206,14 @@ def test_rollout_generator_logprobs_are_nonpositive(device):
 def test_rollout_generator_rejects_failed_requests(device, monkeypatch):
     gen, _ = _make_generator(device, group_size=2, max_tokens=4)
 
-    def failed_run_batch(*_args, **kwargs):
-        assert kwargs["return_details"] is True
+    def failed_generate(*_args, **kwargs):
+        assert kwargs["return_logprobs"] is True
         return [
             GenerationResult([1], [-0.1], "length"),
             GenerationResult([], [], "rejected", "kv_cache_allocation_failed"),
         ]
 
-    monkeypatch.setattr("astrai.trainer.backend.run_batch", failed_run_batch)
+    monkeypatch.setattr(gen.backend.engine_core, "generate", failed_generate)
 
     with pytest.raises(
         RuntimeError,

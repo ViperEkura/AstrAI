@@ -18,7 +18,8 @@ classDiagram
     direction TB
     class EngineCore {
         start() / stop()
-        execute_requests() / score_ids()
+        generate() / score_ids()
+        _execute_requests(requests)
         tick() / drain()
         policy operation lock
     }
@@ -63,10 +64,17 @@ output. Result application validates execution/request identity and policy
 version, then advances the corresponding live request. Reapplying a result
 must not append the same token twice.
 
-`astrai.trainer.backend.run_batch` is the synchronous token-ID API used by
-training rollout. It validates and formats the batch, then calls
-`EngineCore.execute_requests` to use the same `Scheduler.schedule()` and
-submit/drain path as serving.
+`EngineCore.generate()` is the synchronous token-ID API used by training
+rollout. It validates prompts and seeds, constructs requests, and returns
+`List[GenerationResult]` in input order. Each result contains `token_ids`,
+`logprobs`, `finish_reason`, and `error_reason`; rejected prompts retain their
+position in the result list. `return_logprobs=True` enables per-token logprob
+calculation. With `False`, the result type stays the same and `logprobs` is an
+empty list.
+
+The private `_execute_requests()` drives these requests through `tick()`,
+sharing the same planning, overlap, and submit/drain path as serving.
+The public call returns after all submitted execution has retired.
 
 ## Execution and event ordering
 

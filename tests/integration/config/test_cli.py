@@ -276,6 +276,7 @@ def test_async_cli_yaml_and_explicit_flags_reach_training_config(tmp_path, monke
             "cuda:3",
             "--rollout_temperature",
             "0.8",
+            "--no-rollout_enable_overlap",
         ],
     )
     assert result.exit_code == 0, (result.output, result.exception)
@@ -283,6 +284,7 @@ def test_async_cli_yaml_and_explicit_flags_reach_training_config(tmp_path, monke
     assert config.rollout_mode == "async_round"
     assert config.rollout_devices == ["cuda:3"]
     assert config.rollout_temperature == 0.8
+    assert config.rollout_enable_overlap is False
     assert (
         config.rollout_startup_timeout_s,
         config.rollout_worker_timeout_s,

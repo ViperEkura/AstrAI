@@ -25,6 +25,7 @@ from astrai.trainer.rollout.protocol import (
 )
 from astrai.trainer.rollout.runner import _score_rewards
 from astrai.trainer.rollout.types import (
+    RawRollout,
     RolloutResult,
     RolloutVersionError,
     SamplingParams,
@@ -95,6 +96,7 @@ class AsyncRoundCoordinator:
         random_seed: int = 3407,
         sample_cursor: int = 0,
         learner_rank: Optional[int] = None,
+        enable_overlap: bool = True,
     ):
         try:
             pickle.dumps(model_fn)
@@ -178,6 +180,7 @@ class AsyncRoundCoordinator:
                     nccl_timeout_s=self._nccl_timeout_s,
                     layout=self.weights.layout,
                     max_prompts_per_worker=max_prompts_per_worker,
+                    enable_overlap=enable_overlap,
                 )
                 process = self._ctx.Process(
                     target=self._worker_target,
@@ -224,20 +227,34 @@ class AsyncRoundCoordinator:
         return self._policy_version
 
     def _collect_replies(
-        self, indices, kind, deadline, request_ids, round_id=None, version=None
+        self,
+        indices,
+        kind,
+        deadline,
+        request_ids,
+        round_id=None,
+        version=None,
+        *,
+        accept_ready_on_expiry=False,
     ):
         pending = set(indices)
         messages = {}
         while pending:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"async rollout {kind} timed out on workers {sorted(pending)}"
-                )
             handles = [self._pipes[index] for index in pending]
             handles.extend(self._processes[index].sentinel for index in pending)
-            ready = wait(handles, timeout=remaining)
+            # Lookahead results can be ready while reward or learning runs.
+            # Expiry permits collecting buffered replies, never another wait.
+            ready = (
+                wait(handles, timeout=max(0.0, remaining))
+                if remaining > 0 or accept_ready_on_expiry
+                else []
+            )
             if not ready:
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"async rollout {kind} timed out on workers {sorted(pending)}"
+                    )
                 continue
             for index in list(pending):
                 conn = self._pipes[index]
@@ -333,26 +350,37 @@ class AsyncRoundCoordinator:
     def iter_rounds(
         self, batches, stop_requested: Callable[[], bool]
     ) -> Iterator[RolloutResult]:
-        """Generate one round ahead while the learner consumes the current one."""
-        batches = iter(batches)
-        batch = next(batches, None)
-        if batch is None:
-            return
-        handle = self.submit_round(batch)
-        while batch is not None and not stop_requested():
-            try:
-                rollout = self.collect_round(handle)
-            except RolloutVersionError:
-                # A stale round contributes no gradient or sample accounting.
-                handle = self.submit_round(batch, seeds=handle.seeds)
-                rollout = self.collect_round(handle)
+        """Prefetch one round while the current round is scored and learned."""
+        try:
+            if stop_requested():
+                return
+            batches = iter(batches)
+            batch = next(batches, None)
+            if batch is None:
+                return
+            handle = self.submit_round(batch)
+            while batch is not None and not stop_requested():
+                try:
+                    raw = self._collect_raw(handle)
+                except RolloutVersionError:
+                    # A stale round contributes no gradient or sample accounting.
+                    handle = self.submit_round(batch, seeds=handle.seeds)
+                    raw = self._collect_raw(handle)
 
-            next_batch = next(batches, None)
-            next_handle = (
-                self.submit_round(next_batch) if next_batch is not None else None
-            )
-            yield rollout
-            batch, handle = next_batch, next_handle
+                next_batch = None if stop_requested() else next(batches, None)
+                next_handle = (
+                    self.submit_round(next_batch) if next_batch is not None else None
+                )
+                rewards = _score_rewards(self.reward_model, raw).to(device="cpu")
+                yield RolloutResult.from_raw(raw, rewards)
+                batch, handle = next_batch, next_handle
+        except BaseException:
+            # A failed reward or abandoned iterator must retire its lookahead.
+            try:
+                self.close(force=True)
+            except Exception:
+                logger.exception("Failed to close rollout workers after round failure")
+            raise
 
     def submit_round(
         self, batch: Dict, seeds: Optional[List[int]] = None
@@ -417,6 +445,12 @@ class AsyncRoundCoordinator:
             raise
 
     def collect_round(self, handle: PendingRound) -> RolloutResult:
+        """Collect and score one round without starting another generation."""
+        raw = self._collect_raw(handle)
+        rewards = _score_rewards(self.reward_model, raw).to(device="cpu")
+        return RolloutResult.from_raw(raw, rewards)
+
+    def _collect_raw(self, handle: PendingRound) -> RawRollout:
         if handle is not self._active_round:
             raise RuntimeError("round handle is not active")
         wait_started = time.perf_counter()
@@ -428,6 +462,7 @@ class AsyncRoundCoordinator:
                 handle.request_ids,
                 round_id=handle.round_id,
                 version=handle.version,
+                accept_ready_on_expiry=True,
             )
         except BaseException:
             self.close(force=True)
@@ -454,15 +489,18 @@ class AsyncRoundCoordinator:
                 f"rollout policy lag {lag} exceeds {self.max_policy_lag}"
             )
         raw = merge_rollouts(parts, handle.total)
-        rewards = _score_rewards(self.reward_model, raw).to(device="cpu")
         self.generated_tokens += int(raw.response_mask.sum().item())
         self.generation_seconds += max(durations)
-        return RolloutResult.from_raw(raw, rewards)
+        return raw
 
     def close(self, force: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
+        # A worker sending an uncollected result may never read STOP or
+        # join NCCL shutdown. Abandon lookahead without waiting for peers.
+        force = force or self._active_round is not None
+        self._active_round = None
         weights_closed = False
         try:
             if not force:

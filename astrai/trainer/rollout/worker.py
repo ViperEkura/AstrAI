@@ -42,6 +42,7 @@ class RolloutWorkerSpec:
     nccl_timeout_s: float
     layout: List[Tuple[str, Tuple[int, ...], str]]
     max_prompts_per_worker: int
+    enable_overlap: bool = True
 
 
 def run_rollout_worker(conn, spec: RolloutWorkerSpec):
@@ -100,6 +101,7 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
             max_seq_len=spec.max_seq_len,
             policy_version=spec.policy_version,
             enable_cuda_graph=True,
+            enable_overlap=spec.enable_overlap,
         )
         generator = RolloutGenerator(
             backend=backend,

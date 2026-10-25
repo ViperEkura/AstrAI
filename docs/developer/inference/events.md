@@ -97,11 +97,12 @@ the loop. If joining times out, the live thread and its state remain owned;
 restarting over that thread is forbidden. Successful shutdown retires all
 pending executions before freeing KV and terminating the remaining requests.
 
-Rollout `run_batch` uses the same plan/result state-application rules but returns
-structured token/logprob results directly; it does not detokenize through the
-frontend. `score_ids` runs under the same operation boundary. Active online
-requests are not interleaved with an independent synchronous run on shared
-workspace/KV state.
+Rollout calls `EngineCore.generate()` with tokenized prompts. It uses the same
+plan/result state-application rules and returns `List[GenerationResult]` in
+input order, with tokens, optional logprobs, finish reasons and request errors.
+It does not detokenize through the frontend. `score_ids` runs under the same
+operation boundary. Active online requests are not interleaved with an
+independent synchronous run on shared workspace/KV state.
 
 Consumers receive core events only through the sink installed via
 ``set_event_sink``: the HTTP frontend and streaming generation use the

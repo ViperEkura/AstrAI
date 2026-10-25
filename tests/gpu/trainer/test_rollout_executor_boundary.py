@@ -13,7 +13,6 @@ from astrai.config import ComponentSpec, TrainConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.parallel import get_rank, spawn_parallel_fn
 from astrai.parallel.executor import DDPExecutor
-from astrai.trainer.backend import run_batch
 from tests.support.inference import make_cpu_scheduler
 from tests.support.models import make_rollout_config
 from tests.support.tokenizers import FakeTokenizer
@@ -143,8 +142,8 @@ def test_l20_ddp_inference_view_matches_greedy_generation(tmp_path):
         )
         prompts = [[5, 6, 7], [8, 9, 10, 11]]
 
-        expected = run_batch(baseline, prompts, max_tokens=4, temperature=0)
-        actual = run_batch(ddp_view, prompts, max_tokens=4, temperature=0)
+        expected = baseline.generate(prompts, max_tokens=4, temperature=0)
+        actual = ddp_view.generate(prompts, max_tokens=4, temperature=0)
 
         assert actual == expected
     finally:
@@ -178,8 +177,7 @@ def _multi_rank_rollout_then_train_worker():
     scheduler = make_cpu_scheduler(
         inference_model, FakeTokenizer(), max_batch_size=1, max_seq_len=64
     )
-    result = run_batch(
-        scheduler,
+    result = scheduler.generate(
         [[5 + rank, 6 + rank, 7 + rank]],
         max_tokens=2 + rank,
         temperature=0,
@@ -211,7 +209,7 @@ def _multi_rank_rollout_then_train_worker():
     # generation agrees across replicas after invalidating stale KV state.
     scheduler.update_weights(1)
     inference_model.eval()
-    post_update = run_batch(scheduler, [[11, 12, 13]], max_tokens=3, temperature=0)
+    post_update = scheduler.generate([[11, 12, 13]], max_tokens=3, temperature=0)
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, post_update)
     assert all(tokens == gathered[0] for tokens in gathered)

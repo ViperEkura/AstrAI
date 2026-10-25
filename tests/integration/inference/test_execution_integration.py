@@ -10,7 +10,6 @@ from astrai.inference.core.events import (
     RequestFinished,
     TokenDelta,
 )
-from astrai.trainer.backend import run_batch
 from tests.support.inference import make_cpu_scheduler
 
 
@@ -89,13 +88,12 @@ def test_online_batch_changes_preserve_events_and_greedy_tokens(
             assert len(deltas) <= limits[request_id]
             assert deltas[-1].token_id in test_tokenizer.stop_ids
         assert terminal.prompt_tokens == len(prompt)
-        expected = run_batch(
-            scheduler,
+        expected = scheduler.generate(
             [prompt],
             max_tokens=limits[request_id],
             temperature=0,
-            return_details=True,
         )[0]
-        # The online run stops at the first sampled stop token; run_batch
-        # keeps decoding to max_tokens, so compare only the emitted prefix.
-        assert [event.token_id for event in deltas] == expected.token_ids[: len(deltas)]
+        # Both entry points must commit the same complete token sequence,
+        # including a sampled stop token.
+        assert expected.error_reason is None
+        assert [event.token_id for event in deltas] == expected.token_ids

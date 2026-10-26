@@ -47,13 +47,15 @@ class Trainer:
             "metric",
             metrics=cfg.metrics,
             val_step=cfg.val_step,
-            grad_snr_interval=cfg.grad_snr_interval,
+            grad_noise_interval=cfg.grad_noise_interval,
+            grad_noise_beta=cfg.grad_noise_beta,
         )
         callbacks = [
             CallbackFactory.create_checked(
                 "gradient_checkpointing",
                 modules=cfg.gradient_checkpointing_modules,
             ),
+            CallbackFactory.create_checked("gradient_clipping", cfg.max_grad_norm),
             metric_callback,
             CallbackFactory.create_checked(
                 "checkpoint",
@@ -62,15 +64,14 @@ class Trainer:
                 metric_callback=metric_callback,
             ),
             CallbackFactory.create_checked("progress_bar", cfg.n_epoch),
-            CallbackFactory.create_checked("gradient_clipping", cfg.max_grad_norm),
         ]
         return callbacks
 
-    def _call_callbacks(self, method_name: str, context: TrainContext):
+    def _call_callbacks(self, method_name: str, context: TrainContext, **kwargs):
         for callback in self.callbacks:
             method = getattr(callback, method_name, None)
             if method:
-                method(context)
+                method(context, **kwargs)
 
     def _after_commit(self, context: TrainContext, *, agree_stop: bool) -> None:
         self._call_callbacks("after_optimizer_step", context)
@@ -123,6 +124,7 @@ class Trainer:
                     context.consumed_samples += count
                     context.epoch_sample_offset += count
                 context.checkpoint_safe = True
+                self._after_commit(context, agree_stop=False)
 
     def _train_batch(self, context: TrainContext, batch) -> None:
         context.checkpoint_safe = False
@@ -151,7 +153,6 @@ class Trainer:
                 context.metrics = update_metrics
                 if executor.sync_gradients:
                     self._commit_online_update(context, batch, new_data=True)
-                    self._after_commit(context, agree_stop=False)
             self._call_callbacks("on_batch_end", context)
 
     def _should_stop(self, context: TrainContext) -> bool:
@@ -261,6 +262,9 @@ class Trainer:
             for index, name in enumerate(local_metrics)
         }
         context.metrics["loss"] = context.loss
+        self._call_callbacks(
+            "after_backward", context, local_count=local_count, global_count=denominator
+        )
         if final_update:
             context.pending_samples = window_samples
         self._commit_offline_update(context, new_data=final_update)

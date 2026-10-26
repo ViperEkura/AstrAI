@@ -54,7 +54,6 @@ def test_metric_callback_includes_dynamic_strategy_metrics(tmp_path):
         optimizer=SimpleNamespace(param_groups=[{"lr": 1e-3}]),
         val_loss=None,
         grad_norm=None,
-        grad_snr_tracker=None,
         world_size=1,
         dp_size=1,
     )
@@ -77,7 +76,7 @@ def test_metric_callback_only_computes_requested_metrics(tmp_path):
     callback = MetricCallback(
         metrics=["loss"],
     )
-    callback._metric_funcs["grad_snr"] = fail_metric
+    callback._metric_funcs["grad_noise_scale"] = fail_metric
     context = SimpleNamespace(
         metrics={},
         loss=2.0,

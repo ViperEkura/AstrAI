@@ -108,7 +108,9 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--metrics` | Repeatable metric option (for example, `--metrics loss --metrics lr --metrics val_loss`) | `loss`, `lr`, `grad_norm`, `grad_snr` |
+| `--metrics` | Repeatable metric option (for example, `--metrics loss --metrics lr --metrics val_loss`) | `loss`, `lr`, `grad_norm` |
+| `--grad_noise_interval` | Updates between optional `grad_noise_scale` probes | 100 |
+| `--grad_noise_beta` | EMA decay per gradient-noise observation | 0.95 |
 
 ### Gradient Checkpointing
 

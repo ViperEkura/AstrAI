@@ -428,8 +428,18 @@ _SPECS = [
     OptSpec(
         "metrics",
         "Validation",
-        default=("loss", "lr", "grad_norm", "grad_snr"),
+        default=("loss", "lr", "grad_norm"),
         help="Metrics to log (repeatable).",
+    ),
+    OptSpec(
+        "grad_noise_interval",
+        "Validation",
+        help="Updates between optional gradient-noise samples.",
+    ),
+    OptSpec(
+        "grad_noise_beta",
+        "Validation",
+        help="EMA decay per gradient-noise observation.",
     ),
     OptSpec("ckpt_interval", "Checkpoint", help="Steps between checkpoints."),
     OptSpec(

@@ -99,6 +99,9 @@ class CheckpointCallback(TrainCallback):
                         self.metric_callback.write_snapshot(
                             staging_path / "metric.jsonl"
                         )
+                        self.metric_callback.write_state(
+                            staging_path / "metric_state.json", context.optimizer_step
+                        )
 
                 published = context.checkpoint.save(
                     save_path, prepare_staging=prepare_staging

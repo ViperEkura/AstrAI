@@ -34,6 +34,11 @@ class TrainCallback(Protocol):
     def on_batch_end(self, context: TrainContext):
         """Called at the end of each batch."""
 
+    def after_backward(
+        self, context: TrainContext, local_count: float, global_count: float
+    ):
+        """Completed global update gradients, normalized and not yet clipped."""
+
     def before_optimizer_step(self, context: TrainContext):
         """Called immediately before every optimizer step (sync step only)."""
 

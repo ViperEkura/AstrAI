@@ -100,7 +100,8 @@ class TrainConfig(BaseConfig):
         ckpt_interval (int): Number of optimizer steps between checkpoints. Defaults to 5000.
         lora (Optional[LoRAConfig]): LoRA config. None means full fine-tuning. Defaults to None.
         metrics (List[str]): Metrics to record during training. Defaults to ["loss", "lr", "grad_norm"].
-        grad_snr_interval (int): Update GradSNR every N optimizer steps when the metric is requested. Defaults to 1.
+        grad_noise_interval (int): Sample gradient noise every N committed updates when requested. Defaults to 100.
+        grad_noise_beta (float): EMA decay per noise observation. Defaults to 0.95.
         random_seed (int): Random seed. Defaults to 3407.
         num_workers (int): Number of workers for dataloader. Defaults to 0.
         prefetch_factor (Optional[int]): Prefetch factor for dataloader. Defaults to None.
@@ -180,7 +181,8 @@ class TrainConfig(BaseConfig):
     lora: Optional[LoRAConfig] = None
 
     metrics: List[str] = field(default_factory=lambda: ["loss", "lr", "grad_norm"])
-    grad_snr_interval: int = 1
+    grad_noise_interval: int = 100
+    grad_noise_beta: float = 0.95
 
     random_seed: int = 3407
     num_workers: int = 0
@@ -335,7 +337,7 @@ class TrainConfig(BaseConfig):
         "n_epoch",
         "batch_per_device",
         "grad_accum_steps",
-        "grad_snr_interval",
+        "grad_noise_interval",
         "ckpt_interval",
         "val_step",
         "rollout_interval",
@@ -490,6 +492,32 @@ class TrainConfig(BaseConfig):
             ):
                 raise ValueError("group_size must be a positive integer")
         return values
+
+    @field_validator("grad_noise_beta")
+    def _validate_grad_noise_beta(cls, value: float) -> float:
+        if not isfinite(value) or not 0 <= value < 1:
+            raise ValueError("grad_noise_beta must be finite and in [0, 1)")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_gradient_noise(self) -> "TrainConfig":
+        if "grad_snr" in self.metrics:
+            raise ValueError(
+                "grad_snr was retired; use explicit grad_noise_scale sampling"
+            )
+        if "grad_noise_scale" in self.metrics and (
+            self.dp_size < 2
+            or self.dp_mode != "ddp"
+            or self.cp_size != 1
+            or self.tp_size != 1
+            or self.rollout_mode != "sync"
+            or self.compile_mode is not None
+            or _STRATEGY_CAPABILITIES[self.strategy].online
+        ):
+            raise ValueError(
+                "grad_noise_scale requires synchronous offline DDP with dp_size >= 2, cp_size=tp_size=1 and compile_mode=None"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":

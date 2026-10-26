@@ -31,7 +31,6 @@ from astrai.extension.kernel.cross_entropy import linear_cross_entropy
 from astrai.model import AutoRegressiveLM
 from astrai.optimization.optimizer.muon import MuonAdamW
 from astrai.parallel.executor import FSDPExecutor
-from astrai.trainer.callbacks.metric_util import GradSNRTracker
 from astrai.trainer.callbacks.metrics import MetricCallback
 from astrai.trainer.strategy.ops import _collect_moe_diagnostics
 
@@ -61,7 +60,6 @@ SMOKE_CASES = [
         "seq_len": 64,
         "grad_accum_steps": 2,
         "moe_diagnostics": True,
-        "grad_snr_interval": 10,
         "measured_steps": 12,
         "phase_steps": 10,
     },
@@ -147,7 +145,6 @@ def _case_config(case):
         "dtype": "float32",
         "ffn_type": "mlp",
         "moe_diagnostics": False,
-        "grad_snr_interval": 0,
         "warmup_steps": 3,
         "measured_steps": 12,
         "phase_steps": 4,
@@ -178,11 +175,6 @@ def _case_config(case):
     ):
         if not isinstance(config[key], int) or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
-    if (
-        not isinstance(config["grad_snr_interval"], int)
-        or config["grad_snr_interval"] < 0
-    ):
-        raise ValueError("grad_snr_interval must be nonnegative")
     if config["hidden_size"] % config["num_attention_heads"]:
         raise ValueError("hidden_size must be divisible by num_attention_heads")
     if config["num_attention_heads"] % config["num_key_value_heads"]:
@@ -226,12 +218,8 @@ def _run_case(case, torch):
     targets = torch.randint(
         case["vocab_size"], (case["batch_size"], case["seq_len"]), device="cuda"
     )
-    tracker = GradSNRTracker() if case["grad_snr_interval"] else None
-    step_index = 0
-    last_snr = None
 
     def step(phase_times=None):
-        nonlocal step_index, last_snr
         optimizer.zero_grad(set_to_none=True)
         for _ in range(case["grad_accum_steps"]):
             start = time.perf_counter()
@@ -256,18 +244,10 @@ def _run_case(case, torch):
                 torch.cuda.synchronize()
                 phase_times["backward"].append((time.perf_counter() - start) * 1000)
         start = time.perf_counter()
-        if tracker is not None and step_index % case["grad_snr_interval"] == 0:
-            tracker.update(model, step_span=case["grad_snr_interval"])
-            last_snr = tracker.snr
-        if phase_times is not None:
-            torch.cuda.synchronize()
-            phase_times["snr"].append((time.perf_counter() - start) * 1000)
-        start = time.perf_counter()
         optimizer.step()
         if phase_times is not None:
             torch.cuda.synchronize()
             phase_times["optimizer"].append((time.perf_counter() - start) * 1000)
-        step_index += 1
 
     for _ in range(case["warmup_steps"]):
         step()
@@ -293,25 +273,23 @@ def _run_case(case, torch):
         ),
         "peak_allocated_mib": round(torch.cuda.max_memory_allocated() / 2**20, 2),
         "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20, 2),
-        "last_grad_snr_db": last_snr,
     }
     phases = {
-        name: []
-        for name in ("forward_loss", "diagnostics", "backward", "snr", "optimizer")
+        name: [] for name in ("forward_loss", "diagnostics", "backward", "optimizer")
     }
     for _ in range(case["phase_steps"]):
         step(phases)
     result["sync_phase_ms"] = {
         name: _summary(values) for name, values in phases.items()
     }
-    del step, model, optimizer, inputs, targets, tracker
+    del step, model, optimizer, inputs, targets
     gc.collect()
     torch.cuda.empty_cache()
     return result
 
 
 def _run_stats(args, torch):
-    """Measure SNR and MoE diagnostic costs on the selected idle GPU."""
+    """Measure metric and MoE diagnostic costs on the selected idle GPU."""
 
     device = "cuda"
     result = {}
@@ -336,15 +314,6 @@ def _run_stats(args, torch):
             "p90_ms": round(ordered[int(0.9 * len(samples))], 4),
             "p95_ms": round(ordered[int(0.95 * len(samples))], 4),
         }
-
-    def timed_wall(fn, repeats=20):
-        samples = []
-        for _ in range(repeats):
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            fn()
-            samples.append((time.perf_counter() - start) * 1000)
-        return round(statistics.median(samples), 4)
 
     def timed_abba(first, second, cycles=25):
         """Interleave alternatives to reduce clock-drift bias."""
@@ -375,7 +344,7 @@ def _run_stats(args, torch):
             for key, values in samples.items()
         }
 
-    # 8.4 million trainable weights, ~32 MiB per full-size FP32 moment.
+    # Single-device metric overhead; distributed noise probes require DDP.
     layers = []
     for _ in range(8):
         layers.extend((nn.Linear(1024, 1024), nn.GELU()))
@@ -383,10 +352,8 @@ def _run_stats(args, torch):
     params = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     x = torch.randn(16, 1024, device=device)
-    tracker = GradSNRTracker()
     ctx = SimpleNamespace(
         model=model,
-        grad_snr_tracker=tracker,
         val_dataloader=None,
         optimizer_step=0,
         epoch=0,
@@ -402,50 +369,16 @@ def _run_stats(args, torch):
         opt.zero_grad(set_to_none=True)
         loss = model(x).square().mean()
         loss.backward()
-        if track == "direct_snr":
-            tracker.update(model)
-        elif track == "default_metric":
+        if track == "default_metric":
             default_metric.before_optimizer_step(ctx)
         opt.step()
 
     result["train_params"] = params
-    result["train_without_snr"] = timed(lambda: train_step(None), repeats=20)
+    result["train_baseline"] = timed(lambda: train_step(None), repeats=20)
     result["train_default_metric"] = timed(
         lambda: train_step("default_metric"), repeats=20
     )
-    assert not tracker._first, "default metric unexpectedly allocated SNR state"
-    torch.cuda.synchronize()
-    allocated_before = torch.cuda.memory_allocated()
-    result["train_with_snr"] = timed(lambda: train_step("direct_snr"), repeats=20)
-    torch.cuda.synchronize()
-    result["snr_extra_allocated_mib"] = round(
-        (torch.cuda.memory_allocated() - allocated_before) / 2**20, 2
-    )
-    result["snr_db"] = round(tracker.snr, 4)
-    result["snr_read_wall_ms"] = timed_wall(lambda: tracker.snr)
-
-    def sampled_metric_step(callback, sampled_ctx):
-        opt.zero_grad(set_to_none=True)
-        loss = model(x).square().mean()
-        loss.backward()
-        sampled_ctx.optimizer_step += 1
-        callback.before_optimizer_step(sampled_ctx)
-        opt.step()
-
-    for interval in (1, 10):
-        sample_ctx = SimpleNamespace(**vars(ctx))
-        sample_ctx.grad_snr_tracker = GradSNRTracker()
-        sample_ctx.grad_snr_value = None
-        callback = MetricCallback(
-            metrics=["grad_snr"],
-            grad_snr_interval=interval,
-        )
-        result[f"train_snr_interval_{interval}"] = timed(
-            lambda: sampled_metric_step(callback, sample_ctx), repeats=20
-        )
-        assert sample_ctx.grad_snr_value is not None
-    del model, opt, x, tracker, ctx, sample_ctx, callback, default_metric
-    del train_step, sampled_metric_step
+    del model, opt, x, ctx, default_metric, train_step
     gc.collect()
     torch.cuda.empty_cache()
 

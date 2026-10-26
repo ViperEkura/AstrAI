@@ -13,7 +13,6 @@ from astrai.optimization.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.parallel.executor import BaseExecutor
 from astrai.parallel.topology import ParallelTopology
 from astrai.serialization import Checkpoint
-from astrai.trainer.callbacks.metric_util import GradSNRTracker
 from astrai.trainer.rollout import RolloutEvaluator, RolloutRunner
 from astrai.trainer.strategy import BaseStrategy
 
@@ -56,8 +55,6 @@ class TrainContext:
     loss: float = field(default=0.0)
     metrics: Dict[str, float] = field(default_factory=dict)
     grad_norm: Optional[float] = field(default=None)
-    grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
-    grad_snr_value: Optional[float] = field(default=None)
     val_dataloader: Optional[DataLoader] = field(default=None)
     val_loss: Optional[float] = field(default=None)
     #: Online-strategy validation: reward-statistics evaluator under its

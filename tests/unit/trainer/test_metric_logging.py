@@ -20,7 +20,6 @@ def _context(step=0, samples=0, checkpoint=None, param_path=None, async_rollout=
         metrics={},
         loss=1.0,
         val_dataloader=None,
-        grad_snr_tracker=None,
         dp_size=1,
         async_rollout=async_rollout,
     )

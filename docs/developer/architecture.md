@@ -592,7 +592,6 @@ classDiagram
             +float loss
             +Dict[str, float] metrics
             +Optional[float] grad_norm
-            +GradSNRTracker grad_snr_tracker
             +DataLoader val_dataloader
             +Optional[float] val_loss
             +Optional[RolloutEvaluator] val_evaluator

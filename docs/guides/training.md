@@ -414,6 +414,49 @@ cannot be established, retain the original checkpoint rather than rounding
 its cursor. The checkpoint file format version and resume contract version
 are independent.
 
+### Gradient diagnostics
+
+`grad_norm` records the current update's pre-clipping total gradient norm.
+The retired `grad_snr` metric used an across-step parameter-sized EMA; it
+is not interchangeable with `grad_noise_scale`. Remove `grad_snr` and
+`grad_snr_interval` from older configurations. Existing JSONL history keeps
+its original metric names.
+
+Noise measurement is opt-in for synchronous offline DDP with at least two
+replicas, CP/TP sizes of one, and no compiled model. The configuration rejects
+unsupported layouts instead of reporting post-reduction gradients as noise.
+
+```yaml
+training:
+  metrics: [loss, lr, grad_norm, grad_noise_scale]
+  grad_noise_interval: 100
+  grad_noise_beta: 0.95
+```
+
+The estimator follows [McCandlish et al., Appendix A.1](https://arxiv.org/html/1812.06162v1#A1).
+For local mean gradients `g_i` and positive loss normalizers `b_i`, let
+`B = sum(b_i)`, `T = sum(b_i * ||g_i||^2)`, `C = ||sum(b_i*g_i)/B||^2`,
+and `R` be the number of nonempty rank batches. The per-target covariance
+estimate is `(T - B*C)/(R-1)`; signal power is `C - covariance/B`.
+Gradients are converted to FP32 before squaring, with FP64 norm reductions.
+The weighted formula assumes variance scales inversely with the normalizer;
+token correlations make this a diagnostic rather than a guaranteed optimal
+batch size, and it measures raw gradients before optimizer preconditioning.
+
+Separate scalar EMAs are averaged before taking their ratio. `grad_noise_scale`
+is emitted only on sampled, successfully committed updates, after at least two
+valid observations and a positive smoothed signal. Diagnostics also report
+the sample step, effective batch normalizer, signal and covariance. Unsampled
+steps never repeat a cached value. A tail with fewer than two active ranks or
+a nonfinite observation leaves the estimator unchanged. Small negative
+covariance caused by floating-point cancellation is clamped to zero.
+
+For SEQ/SFT, the batch-size unit is valid targets; other offline strategies
+use their loss normalizer. The value is not the former decibel SNR.
+`metric_state.json` stores the committed scalar estimator alongside the
+cumulative `metric.jsonl` in each checkpoint. Missing old state starts
+warmup; valid state resumes the observation cadence and EMA.
+
 ### A checkpoint is one coherent state
 
 Everything a checkpoint records describes the same point in training:

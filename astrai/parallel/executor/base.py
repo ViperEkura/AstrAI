@@ -13,11 +13,6 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from astrai.factory import BaseFactory
-from astrai.parallel.executor.accumulate import (
-    AccumOptimizer,
-    AccumScheduler,
-    GradientState,
-)
 from astrai.parallel.setup import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
@@ -124,7 +119,8 @@ def broadcast_state_dict(
 
 class BaseExecutor:
     def __init__(self, grad_accum_steps: int = 1):
-        self.gradient_state = GradientState(grad_accum_steps)
+        self.grad_accum_steps = max(grad_accum_steps, 1)
+        self._sync_gradients = True
 
     def prepare(
         self,
@@ -146,9 +142,6 @@ class BaseExecutor:
             optimizer = optimizer_fn(model)
             if scheduler_fn is not None:
                 scheduler = scheduler_fn(optimizer)
-            optimizer = AccumOptimizer(optimizer, self.gradient_state)
-            if scheduler is not None:
-                scheduler = AccumScheduler(scheduler, self.gradient_state)
         return model, optimizer, scheduler
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
@@ -171,19 +164,9 @@ class BaseExecutor:
         return contextlib.nullcontext()
 
     @contextmanager
-    def accumulate(self, model: nn.Module, force_sync: bool = False):
-        self.gradient_state._do_sync(force_sync=force_sync)
-        if not self.gradient_state.sync_gradients:
-            with self._no_sync(model):
-                yield
-        else:
-            yield
-
-    @contextmanager
     def accumulate_explicit(self, model: nn.Module, sync: bool):
         """Use an explicit collective boundary for a global data window."""
-        self.gradient_state._sync_gradients = sync
-        self.gradient_state._window_steps = 0 if sync else 1
+        self._sync_gradients = sync
         if sync:
             yield
         else:
@@ -223,15 +206,8 @@ class BaseExecutor:
 
     @property
     def sync_gradients(self) -> bool:
-        return self.gradient_state.sync_gradients
-
-    @property
-    def grad_accum_steps(self) -> int:
-        return self.gradient_state.num_steps
-
-    @property
-    def window_steps(self) -> int:
-        return self.gradient_state.window_steps
+        """Observe the current explicit boundary; optimizer calls are ungated."""
+        return self._sync_gradients
 
     def scale_gradients(self, model: nn.Module, factor: float) -> None:
         for parameter in model.parameters():

@@ -143,8 +143,8 @@ classDiagram
             +ComponentSpec dataset
             +ComponentSpec optimizer
             +ComponentSpec scheduler
-            +Optional[str] optimizer_name
-            +Dict[str, Any] optimizer_hyperparameters
+            +str optimizer_name «derived property»
+            +Dict[str, Any] optimizer_hyperparameters «derived property»
             +int n_epoch
             +int batch_per_device
             +int grad_accum_steps
@@ -624,6 +624,9 @@ classDiagram
                 +set_rollout_runner(runner)
                 +set_weight_publishers(publishers)
                 +prepare_from_rollout(result) Dict
+                +prepare_rollout_batch(batch) Dict
+                +training_steps(batch) Iterator
+                +training_updates(batch, microbatch_prompts) Iterator
                 +validate_online(batch) Optional[LossOutput]
                 +optimizer_step(optimizer)
             }
@@ -1128,41 +1131,16 @@ classDiagram
             +launch(func, **kwargs)
         }
 
-        class GradientState {
-            +int num_steps
-            +sync_gradients (property) bool
-        }
-
-        class AccumOptimizer {
-            +Optimizer optimizer
-            +GradientState gradient_state
-            +param_groups (property)
-            +step(closure)
-            +zero_grad()
-            +state_dict() dict
-            +load_state_dict(d)
-        }
-
-        class AccumScheduler {
-            +LRScheduler scheduler
-            +GradientState gradient_state
-            +step()
-            +state_dict() dict
-            +load_state_dict(d)
-            +get_last_lr()
-        }
-
         class BaseExecutor {
-            +GradientState gradient_state
+            +int grad_accum_steps
             +prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap, after_wrap) tuple
-            +accumulate(model) context manager
+            +accumulate_explicit(model, sync) context manager
             +backward(loss)
             +unwrap_model(model) dict
             +checkpoint_context(model) context manager
             +clip_grad_norm(model, max_norm) float
             +use_distributed (property) bool
             +sync_gradients (property) bool
-            +grad_accum_steps (property) int
         }
 
         class NoneExecutor {
@@ -1284,9 +1262,6 @@ classDiagram
     ChatCompletionRequest *-- ToolDef
     ToolDef *-- FunctionDef
     MessagesRequest *-- AnthropicMessage
-    BaseExecutor *-- GradientState
-    AccumOptimizer o-- GradientState
-    AccumScheduler o-- GradientState
 
     %% --- Aggregation (weak ownership) ---
     AutoModel o-- BaseModelConfig
@@ -1404,7 +1379,7 @@ classDiagram
 | **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, EngineCoreClient/InprocClient, events (TokenDelta/RequestFinished/RequestError) · core: Scheduler, SchedulerStep, RequestManager, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
 | **astrai.extension** | `runtime` context/spec/dispatcher, `backend` per-operator policy, `kernel` exact wrappers, attention, op_backend, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler · `protocols.py`: OptimizerProtocol, SchedulerProtocol | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
-| **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch, executors & gradient accumulation |
+| **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch and explicit gradient synchronization |
 | **astrai.factory** | BaseFactory | Component registration |
 
 ## Design Patterns

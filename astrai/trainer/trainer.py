@@ -17,6 +17,7 @@ from astrai.trainer.components import stop_loader_workers
 from astrai.trainer.context import TrainContext, TrainContextBuilder
 from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.session import TrainSession
+from astrai.trainer.step_plan import learner_update_slices
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ class Trainer:
     def _train_batch(self, context: TrainContext, batch) -> None:
         context.checkpoint_safe = False
         executor = context.executor
-        with executor.accumulate(context.model):
+        with executor.accumulate_explicit(context.model, sync=True):
             self._call_callbacks("on_batch_begin", context)
             for update in context.strategy.training_updates(
                 batch, context.config.async_train_microbatch_prompts
@@ -136,7 +137,7 @@ class Trainer:
                 update_metrics = {}
                 for output in update:
                     loss = output["loss"]
-                    executor.backward(loss / executor.grad_accum_steps)
+                    executor.backward(loss)
                     detached = loss.detach()
                     update_loss = (
                         detached if update_loss is None else update_loss + detached
@@ -149,9 +150,8 @@ class Trainer:
                     raise RuntimeError("training update has no valid loss")
                 context.loss = float(update_loss.item())
                 context.metrics = update_metrics
-                if executor.sync_gradients:
-                    self._commit_online_update(context, batch, new_data=True)
-                    self._after_commit(context, agree_stop=False)
+                self._commit_online_update(context, batch, new_data=True)
+                self._after_commit(context, agree_stop=False)
             self._call_callbacks("on_batch_end", context)
 
     def _should_stop(self, context: TrainContext) -> bool:
@@ -295,64 +295,53 @@ class Trainer:
             if online:
                 prepared = []
                 for batch, _real_count in batches:
-                    result, is_fresh = context.strategy._rollout_runner(batch)
-                    if is_fresh:
-                        context.strategy._on_rollout_refresh()
                     prepared.append(
                         {
                             key: value.detach().cpu()
                             if isinstance(value, torch.Tensor)
                             else value
-                            for key, value in context.strategy.prepare_from_rollout(
-                                result
+                            for key, value in context.strategy.prepare_rollout_batch(
+                                batch
                             ).items()
                         }
                     )
-                group_size = context.config.rl_minibatch_prompts or window_samples
-                groups = (window_samples + group_size - 1) // group_size
-                total_updates = context.config.rl_update_epochs * groups
             else:
                 prepared = []
-                group_size = window_samples
-                groups = 1
-                total_updates = 1
 
-            update_index = 0
-            for _pass in range(context.config.rl_update_epochs if online else 1):
-                for group in range(groups):
-                    chunks = []
-                    for slot, (batch, real_count) in enumerate(batches):
-                        if online:
-                            local_first = (
-                                slot * context.dp_size * context.config.batch_per_device
-                                + context.topology.dp_rank
-                                * context.config.batch_per_device
-                            )
-                            indices = [
-                                index
-                                for index in range(real_count)
-                                if group * group_size
-                                <= local_first + index
-                                < min((group + 1) * group_size, window_samples)
-                            ]
-                            source = prepared[slot]
-                            total = next(
-                                value.shape[0]
-                                for value in source.values()
-                                if isinstance(value, torch.Tensor)
-                            )
-                            chunk = slice_batch(source, indices or [0], total)
-                            chunks.append((chunk, len(indices)))
-                        else:
-                            chunks.append((batch, real_count))
-                    update_index += 1
-                    self._run_global_update(
-                        context,
-                        chunks,
-                        window_samples,
-                        window_start + window_samples,
-                        final_update=update_index == total_updates,
-                    )
+            for selection, final_update in learner_update_slices(
+                window_samples,
+                context.config.rl_update_epochs if online else 1,
+                context.config.rl_minibatch_prompts if online else None,
+            ):
+                chunks = []
+                for slot, (batch, real_count) in enumerate(batches):
+                    if online:
+                        local_first = (
+                            slot * context.dp_size * context.config.batch_per_device
+                            + context.topology.dp_rank * context.config.batch_per_device
+                        )
+                        indices = [
+                            index
+                            for index in range(real_count)
+                            if selection.start <= local_first + index < selection.stop
+                        ]
+                        source = prepared[slot]
+                        total = next(
+                            value.shape[0]
+                            for value in source.values()
+                            if isinstance(value, torch.Tensor)
+                        )
+                        chunk = slice_batch(source, indices or [0], total)
+                        chunks.append((chunk, len(indices)))
+                    else:
+                        chunks.append((batch, real_count))
+                self._run_global_update(
+                    context,
+                    chunks,
+                    window_samples,
+                    window_start + window_samples,
+                    final_update=final_update,
+                )
 
         if not context.stop_agreed:
             stop_loader_workers(iterator)

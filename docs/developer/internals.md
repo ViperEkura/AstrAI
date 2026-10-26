@@ -105,42 +105,50 @@ $$ L = L_{\text{task}} + \lambda_{\text{MoE}} L_{\text{aux}} $$
 
 ## Training Loop Internals
 
-Two-level loop: **epoch** → **batch**. Optimizer step fires every `grad_accum_steps` batches.
+Synchronous training uses **epoch → global data window → learner update →
+microbatch**. Trainer chooses the update boundary; executors perform the
+requested synchronization and return ordinary optimizers and schedulers.
 
 ```
 on_train_begin
-  model.train()
+for epoch:
   on_epoch_begin
-    for batch in dataloader:
-      with executor.accumulate(model):
-        on_batch_begin
-        loss_output = strategy(batch)
-        context.loss = loss_output["loss"].item()
-        context.metrics = loss_output["metrics"]
-        stand_loss = loss_output["loss"] / executor.grad_accum_steps
-        executor.backward(stand_loss)
-        context.consumed_samples += (
-            context.config.batch_per_device * context.dp_size
-        )
-        on_batch_end
-
-        if executor.sync_gradients:
-          before_optimizer_step
-          strategy.optimizer_step(optimizer)
-          optimizer.zero_grad()
-          if scheduler:
-            scheduler.step()
-          after_optimizer_step
-    on_epoch_end
+  for global window:
+    prepare a rollout once when using an online strategy
+    for learner update in learner_update_slices(...):
+      for microbatch in this update:
+        with executor.accumulate_explicit(model, sync=is_last_microbatch):
+          on_batch_begin
+          backward(loss * actual_target_count)
+          on_batch_end
+      reduce objective counts and normalize accumulated gradients
+      before_optimizer_step
+      strategy.optimizer_step(optimizer)
+      optimizer.zero_grad()
+      scheduler.step() if configured
+      commit the window cursor only after its final learner update
+      after_optimizer_step
+  on_epoch_end
+on_shutdown
 on_train_end
 ```
 
-The loss is divided by `grad_accum_steps` before `backward()`, so accumulated gradients sum to the correct mean.
+The global-window objective uses actual valid token/sample counts, including
+uneven `flush` tails and empty ranks. It does not divide every microbatch by a
+fixed accumulation factor. Empty ranks participate in synchronization with
+zero objective weight. Data progress advances at complete window boundaries;
+each learner update has its own optimizer step.
+
+Async rounds require `grad_accum_steps=1`. A strategy emits one update containing
+its already-weighted microbatch losses; Trainer backpropagates them, then commits
+once and publishes one policy version. It does not add another accumulation
+counter or loss scaling factor.
+
 Strategy metrics are detached and converted to Python `float` values before the
 `LossOutput` is returned; only `LossOutput.loss` remains a differentiable tensor.
 
 With `cp_size > 1`, `TrainContextBuilder` wraps the strategy in `CPStrategy`
-(`astrai/parallel/cp.py`): the same `strategy(batch)` call shards the batch
+(`astrai/parallel/cp.py`): the loss path shards the batch
 across the cp group, runs the strategy's forward/reduction on the local slice,
 and rescales the local token loss to the global mean. Metric and validation
 reductions go through `ParallelTopology.reduce_mean`/`reduce_sum` over the dp
@@ -154,14 +162,14 @@ would double-count.
 | `on_train_begin` | Before training starts | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 | `on_epoch_begin` | Start of each epoch | `ProgressBarCallback` |
 | `on_batch_begin` | Every batch | — |
-| `before_optimizer_step` | Every accumulation window, before `optimizer.step()` | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
+| `before_optimizer_step` | Every learner update, before `optimizer.step()` | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
 | `on_batch_end` | Every batch | — |
-| `after_optimizer_step` | Every accumulation window, after `optimizer.step()` and `scheduler.step()` | `CheckpointCallback` |
-| `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
-| `on_error` | On exception after context construction, or requested stop | `CheckpointCallback`, `MetricCallback` |
+| `after_optimizer_step` | Every learner update, after `optimizer.step()` and `scheduler.step()` | `MetricCallback`, `CheckpointCallback` |
+| `on_epoch_end` | End of each epoch | `ProgressBarCallback` |
+| `on_shutdown` | Session completion, requested stop or failure after context construction | `MetricCallback`, `CheckpointCallback` |
 | `on_train_end` | Session teardown after context construction, including a failed start callback | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
 
-Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm, rank-0), `gradient_clipping`. The gradient-clipping callback is always registered and always calls `executor.clip_grad_norm()` with the numeric `max_grad_norm` value.
+Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `metric` (JSONL + validation), `checkpoint` (safetensors, rank-0 writer), `progress_bar` (tqdm, rank-0), `gradient_clipping`. The gradient-clipping callback is always registered and always calls `executor.clip_grad_norm()` with the numeric `max_grad_norm` value.
 
 ## KV Cache Mathematics
 
@@ -248,18 +256,27 @@ Default is `doc_reset`, which ensures each document in a packed bin starts from 
 
 ## Gradient Accumulation Mechanics
 
-Three cooperating layers enable gradient accumulation:
+Trainer plans global windows and explicitly selects the final synchronized
+microbatch of each learner update with `accumulate_explicit(model, sync=...)`.
+The executor's read-only `sync_gradients` property reports that selection;
+`grad_accum_steps` is configuration, not a hidden microstep counter.
 
-1. **`GradientState`** — tracks the micro-step counter. Fires `sync_gradients=True` every `grad_accum_steps` micro-batches. The counter is incremented at the **start** of `accumulate()`, before the forward pass.
+Non-final microbatches use the executor's `_no_sync` implementation:
 
-2. **`executor._no_sync(model)`** — suppresses gradient synchronization on non-sync micro-steps:
-   - `NoneExecutor`: `nullcontext` (nothing to skip)
-   - `DDPExecutor`: `model.no_sync()` (PyTorch's built-in — skips all-reduce of gradient buckets)
-   - `FSDPExecutor`: `set_requires_gradient_sync(False, recurse=True)` on each `FSDPModule` (FSDP2's native mechanism)
+- `NoneExecutor`: a no-op context.
+- `DDPExecutor`: `model.no_sync()` suppresses gradient all-reduce.
+- `FSDPExecutor`: disables gradient synchronization on each `FSDPModule` and
+  optionally retains unsharded parameters until the synchronized backward.
 
-3. **`AccumOptimizer` / `AccumScheduler`** — wrap the real optimizer/scheduler. `step()` and `zero_grad()` are gated on `sync_gradients` — they only forward to the inner optimizer when the sync flag is True.
+The optimizer and scheduler returned by `prepare()` are real objects. Trainer
+calls their update/clear operations only at the chosen boundary; direct callers
+must do the same. `GradientState`, `AccumOptimizer`, `AccumScheduler`,
+`executor.accumulate()` and `window_steps` are removed. Calling `optimizer.step()`
+outside a commit boundary is no longer silently suppressed.
 
-The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum to the correct mean across micro-steps. `consumed_samples` increments by `batch_per_device * dp_size` every micro-batch (cp ranks share a batch, so they do not scale it).
+After summing target-weighted losses, Trainer reduces the actual target counts
+and rescales gradients to the global mean. `consumed_samples` advances only when
+the full window is committed. CP and TP ranks do not multiply the sample count.
 
 ### Effective batch size
 
@@ -270,11 +287,16 @@ effective_batch = dp_size × batch_per_device × grad_accum_steps
 ### Total optimizer steps
 
 ```
-samples_per_replica = ceil(dataset_len / dp_size)
-batches_per_replica  = ceil(samples_per_replica / batch_per_device)
-total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
+global_batch = dp_size * batch_per_device * grad_accum_steps
+full_windows, tail = divmod(remaining_samples_in_epoch, global_batch)
+epoch_steps = full_windows + int(epoch_tail_policy == "flush" and tail > 0)
 ```
 
-This accounts for data-parallel sharding — each dp replica processes `1/dp_size` of the dataset.
+This is the offline count. Synchronous online windows contribute
+`rl_update_epochs * ceil(window_samples / rl_minibatch_prompts)` updates when
+minibatching is configured, or `rl_update_epochs` otherwise. `step_plan.py`
+supplies the shared counts and update ranges; a resumed epoch counts only its
+remaining samples. `drop` records and skips the incomplete window without an
+optimizer update.
 
 > Document Update Time: 2026-09-05

@@ -1,6 +1,6 @@
 """CPU batch slicing and rollout assembly shared by trainer and workers."""
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -8,13 +8,30 @@ from torch import Tensor
 from astrai.trainer.rollout.types import RawRollout, RolloutVersionError
 
 
-def slice_batch(batch: Dict, indices: List[int], total: int) -> Dict:
+def slice_batch(
+    batch: Dict,
+    indices: Union[List[int], slice],
+    total: int,
+    *,
+    slice_sequences: bool = True,
+) -> Dict:
+    """Select prompt rows; continuous slices retain tensor views.
+
+    Legacy strategy replay shares non-tensor metadata across updates, while
+    worker/global-window batches also select aligned Python sequences.
+    """
     result = {}
     for key, value in batch.items():
-        if isinstance(value, Tensor) and value.shape[0] == total:
+        if isinstance(value, Tensor) and value.ndim and value.shape[0] == total:
             result[key] = value[indices]
-        elif isinstance(value, (list, tuple)) and len(value) == total:
-            result[key] = [value[index] for index in indices]
+        elif (
+            slice_sequences and isinstance(value, (list, tuple)) and len(value) == total
+        ):
+            result[key] = (
+                value[indices]
+                if isinstance(indices, slice)
+                else [value[index] for index in indices]
+            )
         else:
             result[key] = value
     return result

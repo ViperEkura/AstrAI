@@ -199,7 +199,8 @@ def test_shared_train_batch_commits_async_round_once():
         grad_accum_steps = 1
         sync_gradients = True
 
-        def accumulate(self, _model):
+        def accumulate_explicit(self, _model, sync):
+            assert sync
             return nullcontext()
 
         def backward(self, loss):
@@ -281,6 +282,19 @@ def test_rollout_truncation_metric_reaches_grpo_metrics():
     (output,) = list(strategy.training_steps({"instruction": ["x"] * 4}))
     assert output["metrics"]["truncation_rate"] == pytest.approx(0.5)
     assert output["metrics"]["stop_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("minibatch", [None, 2])
+def test_replay_accepts_scalar_metadata_before_prompt_tensors(minibatch):
+    strategy = _grpo_strategy(_rollout_result(), rl_minibatch_prompts=minibatch)
+    prepare = strategy.prepare_from_rollout
+    strategy.prepare_from_rollout = lambda result: {
+        "temperature": torch.tensor(1.0),
+        **prepare(result),
+    }
+    outputs = list(strategy.training_steps({"instruction": ["x"] * 4}))
+    assert len(outputs) == (1 if minibatch is None else 2)
+    assert all(torch.isfinite(output["loss"]) for output in outputs)
 
 
 def test_ppo_advantages_pinned_once_across_minibatches_and_epochs():

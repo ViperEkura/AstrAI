@@ -166,7 +166,7 @@ def test_changing_optimizer_requires_explicit_reset(tmp_path, monkeypatch):
         .with_param_path(str(tmp_path))
         .build()
     )
-    assert isinstance(context.optimizer.optimizer, torch.optim.SGD)
+    assert isinstance(context.optimizer, torch.optim.SGD)
     assert not context.optimizer.state_dict()["state"]
 
 

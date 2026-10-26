@@ -4,12 +4,13 @@ The builder supplies the reference-model factory and capability validator so
 this module owns rollout wiring without owning model restoration or topology.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Type
 
 import torch
 
+from astrai.config.rollout import resolve_rollout_devices
 from astrai.config.train_config import TrainConfig
 from astrai.parallel.executor import BaseExecutor
 from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
@@ -21,29 +22,11 @@ from astrai.trainer.rollout import (
     SamplingParams,
 )
 from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
+from astrai.trainer.rollout.types import ResolvedAsyncRolloutConfig
 from astrai.trainer.strategy import StrategyFactory
 
 if TYPE_CHECKING:
     from astrai.trainer.context import TrainContext
-
-
-@dataclass(frozen=True)
-class ResolvedAsyncRolloutConfig:
-    learner_device: str
-    devices: Tuple[str, ...]
-    params: SamplingParams
-    max_seq_len: Optional[int]
-    max_prompts_per_worker: int
-    startup_timeout_s: float
-    generation_timeout_s: float
-    weight_timeout_s: float
-    max_policy_lag: int
-    random_seed: int
-    sample_cursor: int
-
-    @property
-    def max_batch_size(self) -> int:
-        return self.params.group_size * self.max_prompts_per_worker
 
 
 def resolve_async_rollout(
@@ -55,33 +38,24 @@ def resolve_async_rollout(
     rank: int = 0,
     world_size: int = 1,
 ) -> ResolvedAsyncRolloutConfig:
-    devices = tuple(torch.device(name) for name in config.rollout_devices)
-    if not devices or any(d.type != "cuda" or d.index is None for d in devices):
-        raise ValueError("async_round requires indexed CUDA rollout devices")
-    if len(set(devices)) != len(devices):
-        raise ValueError("async_round requires distinct rollout_devices")
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError("invalid async_round learner rank or world_size")
+    devices = resolve_rollout_devices(config.rollout_devices, world_size)
     available = torch.cuda.device_count()
-    if any(d.index >= available for d in devices):
+    if any(torch.device(name).index >= available for name in devices):
         raise ValueError(f"rollout_devices exceed available CUDA devices ({available})")
     if learner_device.type != "cuda" or learner_device.index is None:
         raise ValueError("async_round learner must use an indexed CUDA device")
-    if world_size < 1 or not 0 <= rank < world_size:
-        raise ValueError("invalid async_round learner rank or world_size")
     if sample_cursor < 0 or sample_cursor % world_size:
         raise ValueError("async_round global sample cursor must divide by world_size")
-    learner_devices = {torch.device(f"cuda:{index}") for index in range(world_size)}
     if learner_device != torch.device(f"cuda:{rank}"):
         raise ValueError("async_round learner device must match its training rank")
-    if learner_devices.intersection(devices):
-        raise ValueError("rollout_devices must exclude all learner devices")
-    if len(devices) < world_size:
-        raise ValueError("each learner rank requires at least one rollout device")
     assigned = devices[rank::world_size]
     if params.group_size < 2:
         raise ValueError("online_grpo group_size must be >= 2")
     return ResolvedAsyncRolloutConfig(
         learner_device=str(learner_device),
-        devices=tuple(str(d) for d in assigned),
+        devices=assigned,
         params=params,
         max_seq_len=max_seq_len,
         max_prompts_per_worker=max(
@@ -93,6 +67,7 @@ def resolve_async_rollout(
         max_policy_lag=config.rollout_max_policy_lag,
         random_seed=config.random_seed,
         sample_cursor=sample_cursor // world_size,
+        learner_rank=rank if world_size > 1 else None,
     )
 
 
@@ -217,28 +192,13 @@ def configure_rollout(
             world_size=getattr(context, "dp_size", 1),
         )
         coordinator = AsyncRoundCoordinator(
+            config=resolved,
             source=inference_model,
             model_fn=model_factory,
             param_path=param_path,
-            devices=list(resolved.devices),
-            params=resolved.params,
             reward_model=cfg.reward_model_fn(),
             policy_version=policy_version,
-            max_batch_size=resolved.max_batch_size,
-            max_seq_len=resolved.max_seq_len,
             model_dtype=next(context.model.parameters()).dtype,
-            max_policy_lag=resolved.max_policy_lag,
-            max_prompts_per_worker=resolved.max_prompts_per_worker,
-            worker_timeout_s=resolved.generation_timeout_s,
-            startup_timeout_s=resolved.startup_timeout_s,
-            weight_timeout_s=resolved.weight_timeout_s,
-            random_seed=resolved.random_seed,
-            sample_cursor=resolved.sample_cursor,
-            learner_rank=(
-                getattr(context, "rank", 0)
-                if getattr(context, "dp_size", 1) > 1
-                else None
-            ),
         )
         context.async_rollout = RolloutRunner(coordinator=coordinator)
         context.strategy.set_rollout_runner(context.async_rollout)

@@ -412,19 +412,21 @@ def test_effective_grpo_defaults_and_all_worker_parameters(monkeypatch):
         context, cfg, "tokenizer", {}, Mock(), lambda _: None, Mock(), Mock()
     )
     values = coordinator.call_args.kwargs
-    assert values["params"] == SamplingParams(
+    resolved = values["config"]
+    assert resolved.params == SamplingParams(
         group_size=4, max_tokens=16, temperature=0.8, top_k=7, top_p=0.75
     )
-    assert values["max_batch_size"] == 12
-    assert values["max_prompts_per_worker"] == 3
-    assert values["startup_timeout_s"] == 73
-    assert values["worker_timeout_s"] == 91
-    assert values["weight_timeout_s"] == 123
-    assert values["random_seed"] == 42
-    assert values["sample_cursor"] == 10
-    assert cfg.rollout_max_policy_lag == values["max_policy_lag"] == 1
+    assert resolved.max_batch_size == 12
+    assert resolved.max_prompts_per_worker == 3
+    assert resolved.startup_timeout_s == 73
+    assert resolved.generation_timeout_s == 91
+    assert resolved.weight_timeout_s == 123
+    assert resolved.random_seed == 42
+    assert resolved.sample_cursor == 10
+    assert cfg.rollout_max_policy_lag == resolved.max_policy_lag == 1
     assert values["model_dtype"] == torch.bfloat16
-    assert values["devices"] == ["cuda:1", "cuda:2"]
+    assert resolved.devices == ("cuda:1", "cuda:2")
+    assert resolved.learner_rank is None
     assert (
         context.async_rollout is context.strategy.set_rollout_runner.call_args.args[0]
     )
@@ -468,6 +470,7 @@ def test_ddp_rollout_devices_are_partitioned_by_learner_rank(monkeypatch):
     assert resolved[1].devices == ("cuda:3", "cuda:5")
     assert all(item.sample_cursor == 6 for item in resolved)
     assert all(item.max_prompts_per_worker == 3 for item in resolved)
+    assert [item.learner_rank for item in resolved] == [0, 1]
 
 
 def test_ddp_rollout_rejects_shared_or_missing_worker_devices():
@@ -475,3 +478,37 @@ def test_ddp_rollout_rejects_shared_or_missing_worker_devices():
         _config(dp_size=2, dp_mode="ddp", rollout_devices=["cuda:1", "cuda:2"])
     with pytest.raises(ValueError, match="at least one rollout device per learner"):
         _config(dp_size=2, dp_mode="ddp", rollout_devices=["cuda:2"])
+
+
+@pytest.mark.parametrize(
+    "devices, message",
+    [
+        ([], "at least one rollout device"),
+        (["cpu"], "indexed CUDA"),
+        (["cuda"], "indexed CUDA"),
+        (["cuda:-1"], "indexed CUDA"),
+        (["cuda:1", "cuda:01"], "distinct"),
+        (["cuda:0"], "exclude all learner"),
+    ],
+)
+def test_async_layout_rules_match_at_config_and_runtime(devices, message):
+    with pytest.raises(ValueError, match=message):
+        _config(rollout_devices=devices)
+    # Setup may be invoked directly, so it enforces the same pure rules.
+    with pytest.raises(ValueError, match=message):
+        resolve_async_rollout(
+            SimpleNamespace(rollout_devices=devices),
+            torch.device("cuda:0"),
+            SamplingParams(group_size=4),
+            256,
+            0,
+        )
+
+
+def test_async_runtime_rechecks_available_devices(monkeypatch):
+    config = _config(rollout_devices=["cuda:1", "cuda:2"])
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 2)
+    with pytest.raises(ValueError, match="exceed available CUDA devices"):
+        resolve_async_rollout(
+            config, torch.device("cuda:0"), SamplingParams(group_size=4), 256, 0
+        )

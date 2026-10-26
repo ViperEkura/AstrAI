@@ -14,7 +14,7 @@ from astrai.serialization import Checkpoint
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
-from astrai.trainer.rollout.types import SamplingParams
+from astrai.trainer.rollout.types import ResolvedAsyncRolloutConfig, SamplingParams
 from astrai.trainer.trainer import Trainer
 from tests.support.tokenizers import CHAT_TEMPLATE
 from tests.support.trainer import (
@@ -405,21 +405,27 @@ def test_async_seeds_match_after_worker_repartition_and_resume(base_test_env):
     ):
         per_worker = 8 // len(devices)
         pool = AsyncRoundCoordinator(
+            config=ResolvedAsyncRolloutConfig(
+                learner_device="cuda:0",
+                devices=tuple(devices),
+                params=SamplingParams(
+                    group_size=2, max_tokens=6, temperature=0.7, top_k=0, top_p=1.0
+                ),
+                max_seq_len=64,
+                max_prompts_per_worker=per_worker,
+                startup_timeout_s=300.0,
+                generation_timeout_s=600.0,
+                weight_timeout_s=600.0,
+                max_policy_lag=1,
+                random_seed=42,
+                sample_cursor=10,
+            ),
             source=source,
             model_fn=model_fn,
             param_path=base_test_env["test_dir"],
-            devices=devices,
-            params=SamplingParams(
-                group_size=2, max_tokens=6, temperature=0.7, top_k=0, top_p=1.0
-            ),
             reward_model=LengthRewardModel(),
             policy_version=0,
-            max_batch_size=per_worker * 2,
-            max_seq_len=64,
             model_dtype=torch.bfloat16,
-            max_prompts_per_worker=per_worker,
-            random_seed=42,
-            sample_cursor=10,
         )
         try:
             results.append(pool.collect_round(pool.submit_round(batch)))

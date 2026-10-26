@@ -78,7 +78,11 @@ requires at least 2 online), and rollout uses that same value.
 Before loading models, the builder checks the actual distributed world size:
 `async_round` requires one learner even under torchrun. Rollout setup resolves
 devices, sampling, capacities, timeouts and the committed sample cursor into
-an immutable `ResolvedAsyncRolloutConfig` in `rollout/setup.py`. All CUDA indexes
+an immutable `ResolvedAsyncRolloutConfig` from `rollout/types.py`. The coordinator
+receives this object directly; worker settings, deadlines, sampling and seed
+settings have one resolved source. Its mutable sample cursor remains local to
+the coordinator. `config/rollout.py` supplies the pure device-layout rules used
+by both TrainConfig validation and runtime resolution. All CUDA indexes
 are logical indexes
 after `CUDA_VISIBLE_DEVICES`; worker devices must be distinct and exclude the
 learner. Startup logs include device assignments, GPU UUIDs, effective sampling,

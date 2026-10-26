@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import List, Optional, TypeVar
+from typing import List, Optional, Tuple, TypeVar
 
 from torch import Tensor
 
@@ -127,3 +127,25 @@ class SamplingParams:
     group_size: int = 8
     frequency_penalty: float = 0.0
     rep_window: int = 64
+
+
+@dataclass(frozen=True)
+class ResolvedAsyncRolloutConfig:
+    """Resolved settings for one learner's assigned rollout workers."""
+
+    learner_device: str
+    devices: Tuple[str, ...]
+    params: SamplingParams
+    max_seq_len: Optional[int]
+    max_prompts_per_worker: int
+    startup_timeout_s: float
+    generation_timeout_s: float
+    weight_timeout_s: float
+    max_policy_lag: int
+    random_seed: int
+    sample_cursor: int
+    learner_rank: Optional[int] = None
+
+    @property
+    def max_batch_size(self) -> int:
+        return self.params.group_size * self.max_prompts_per_worker

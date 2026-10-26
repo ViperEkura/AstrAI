@@ -43,7 +43,7 @@ A single config file captures the entire pipeline, reusable and version-controll
 | `field` | str | -- | JSONL key to read |
 | `action` | str | -- | `"train"` / `"mask"` / `"$role"` / `"value"`; `"value"` copies raw values without tokenization |
 | `template` | bool | `false` | Apply `chat_template` per message |
-| `add_special_tokens` | bool | `true` for first non-template section | Add special tokens during encode |
+| `add_special_tokens` | bool | `true` when the first retained section is non-template; `false` for list elements | Add special tokens during encode; template sections always encode without additional special tokens |
 
 ### Source Fields (multi-output mode)
 
@@ -52,6 +52,25 @@ A single config file captures the entire pipeline, reusable and version-controll
 | `sections` | list[dict] | -- | Same as single-output section list |
 | `list_field` | bool | `false` | JSONL field holds a list; tokenise each element |
 | `mask_key` | str | `"{key}_mask"` | Explicit output key for loss mask |
+
+Scalar and batch rendering use the same filtering, masking and truncation rules.
+An empty or filtered section does not consume the first-section special-token
+default. Top-level template sequences retain the existing masked BOS prefix;
+individual template messages and list elements do not add another prefix.
+
+For `list_field`, every element defaults to `add_special_tokens: false`; an
+explicit `true` or `false` is honored for non-template elements. This fixes an
+earlier scalar/batch discrepancy: batch encoding used to add special tokens by
+default, while scalar encoding ignored an explicit `true`. Template elements
+continue to use the tokens supplied by `chat_template`, without extra encoder
+special tokens.
+
+Custom `SectionRenderer` implementations can override `process_sections` and
+`process_sections_batch`, or the corresponding `process_list_field` methods.
+Builders keep these scalar and batch entry points separate: scalar rendering
+uses `encode(str)` and supports scalar-only tokenizers; batch rendering uses
+`encode(list)` grouped by special-token policy. A batch renderer/tokenizer must
+return one result per input record/text in the same order.
 
 ---
 
@@ -238,7 +257,7 @@ Config:
 Output keys: `prompts`, `prompts_mask`, `responses`, `masks`, `rewards` (float32)
 
 - `action: "value"` — extract raw values from JSONL without tokenisation
-- `list_field: true` — tokenise each list element independently, then concatenate
+- `list_field: true` — tokenise each list element independently; builders retain one token and mask list per element
 - `mask_key: "masks"` — rename the auto-generated mask key (default: `responses_mask`)
 - `prompts_mask` is auto-generated (all masked) and unused by GRPOStrategy
 

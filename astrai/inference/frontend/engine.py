@@ -12,6 +12,7 @@ import gc
 import logging
 import time
 import warnings
+from functools import partial
 from pathlib import Path
 from typing import (
     Any,
@@ -108,9 +109,9 @@ class InferenceEngine:
 
     # ---- frontend internals ----
 
-    def _submit_prompt(
+    def _submit_processed(
         self,
-        prompt: str,
+        processed: List[ProcessedInput],
         *,
         max_tokens: Optional[int],
         temperature: float,
@@ -118,26 +119,26 @@ class InferenceEngine:
         top_k: int,
         frequency_penalty: float,
         rep_window: int,
-    ) -> ProcessedInput:
-        """Tokenize + submit one prompt; the id exists before the core does."""
-        processed = self._input_processor.process(prompt)
-        self._tracker.register(processed.request_id, maxlen=self._max_seq_len + 1)
+    ) -> None:
+        """Register every consumer before admitting the prepared requests."""
+        request_ids = [item.request_id for item in processed]
+        for request_id in request_ids:
+            self._tracker.register(request_id, maxlen=self._max_seq_len + 1)
         try:
-            self._core.send_request(
-                prompt=prompt,
+            self._core.send_requests(
+                prompts=[item.prompt_text or "" for item in processed],
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
-                request_id=processed.request_id,
-                prompt_ids=processed.prompt_ids,
+                request_ids=request_ids,
+                prompts_ids=[item.prompt_ids for item in processed],
             )
         except BaseException:
-            self._release_requests([processed.request_id])
+            self._release_requests(request_ids)
             raise
-        return processed
 
     def _release_requests(self, request_ids: List[str]) -> None:
         """Cancel unfinished core work and always discard frontend bookkeeping."""
@@ -332,8 +333,9 @@ class InferenceEngine:
         """
 
         async def _agen():
-            processed = self._submit_prompt(
-                prompt,
+            processed = self._input_processor.process(prompt)
+            self._submit_processed(
+                [processed],
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -470,24 +472,16 @@ class InferenceEngine:
         processed = self._input_processor.process_batch(prompts)
         request_ids = [item.request_id for item in processed]
 
-        def submit():
-            for rid in request_ids:
-                self._tracker.register(rid, maxlen=self._max_seq_len + 1)
-            try:
-                self._core.send_requests(
-                    prompts=prompts,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    frequency_penalty=frequency_penalty,
-                    rep_window=rep_window,
-                    request_ids=request_ids,
-                    prompts_ids=[item.prompt_ids for item in processed],
-                )
-            except BaseException:
-                self._release_requests(request_ids)
-                raise
+        submit = partial(
+            self._submit_processed,
+            processed,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            rep_window=rep_window,
+        )
 
         if not stream:
             submit()

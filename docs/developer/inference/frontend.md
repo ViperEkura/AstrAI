@@ -105,6 +105,11 @@ classDiagram
   Because the id exists before the scheduler knows about the request, an
   event can never precede its consumer — this is what allowed the old
   `_ResultSink` replay buffer to be deleted.
+  Single and batch inputs then share one prepared-request submission path:
+  register every consumer, submit the IDs and tokens through the core client,
+  and release the registered requests if submission fails. Scalar tokenization
+  remains available for tokenizers without a batch API; stream submission
+  stays deferred until iteration starts.
 - **`OutputProcessor`** folds events for one request: incremental
   detokenization (via `StreamDecoder`), stop-sequence matching with a
   sliding window over the ambiguous tail (never a full-body substring

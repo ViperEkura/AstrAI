@@ -54,6 +54,52 @@ def test_task_manager_add_task():
     assert len(tm.waiting) == 1
 
 
+@pytest.mark.parametrize("encoded", [[1, 2, 3], [[1, 2, 3]]])
+@pytest.mark.parametrize("request_id", [None, "", "supplied-id"])
+def test_single_request_preserves_scalar_encoding_and_request_id(encoded, request_id):
+    tokenizer = _make_mock_tokenizer()
+
+    def encode(prompt):
+        assert isinstance(prompt, str)
+        return encoded
+
+    tokenizer.encode.side_effect = encode
+    manager = RequestManager(tokenizer, max_seq_len=5)
+    actual_id = manager.add_request("hello", request_id=request_id)
+
+    tokenizer.encode.assert_called_once_with("hello")
+    if request_id:
+        assert actual_id == request_id
+    else:
+        assert actual_id.startswith("req_")
+    request = manager.get_request(actual_id)
+    assert request.prompt_ids == [1, 2, 3]
+    assert request.max_tokens == 2
+    assert manager.get_stats()["total_tasks"] == 1
+
+
+@pytest.mark.parametrize(("max_tokens", "expected"), [(None, 2), (1, 1), (10, 2)])
+def test_single_tokenized_request_keeps_budget_and_sampling(max_tokens, expected):
+    tokenizer = _make_mock_tokenizer()
+    manager = RequestManager(tokenizer, max_seq_len=5)
+    request_id = manager.add_request(
+        "unused text",
+        prompt_ids=[1, 2, 3],
+        max_tokens=max_tokens,
+        temperature=0.7,
+        top_p=0.8,
+        top_k=4,
+        frequency_penalty=0.2,
+        rep_window=7,
+    )
+
+    tokenizer.encode.assert_not_called()
+    request = manager.get_request(request_id)
+    assert request.max_tokens == expected
+    assert (request.temperature, request.top_p, request.top_k) == (0.7, 0.8, 4)
+    assert (request.frequency_penalty, request.rep_window) == (0.2, 7)
+
+
 @pytest.mark.parametrize(
     ("method", "request_ids"),
     [
@@ -108,6 +154,24 @@ def test_task_manager_batch_encodes_once_and_registers_each_request_once():
     assert metrics.register.call_args_list == [call("a"), call("b")]
     assert tm.get_stats()["total_tasks"] == 2
     assert tm._request_event.is_set()
+
+
+def test_empty_prompt_later_in_batch_does_not_register_valid_prefix():
+    tokenizer = _make_mock_tokenizer()
+    metrics = Mock()
+    manager = RequestManager(tokenizer, metrics=metrics)
+    with pytest.raises(ValueError, match="zero tokens"):
+        manager.add_requests(
+            ["valid", "empty"],
+            request_ids=["first", "second"],
+            prompts_ids=[[1], []],
+        )
+
+    tokenizer.encode.assert_not_called()
+    metrics.register.assert_not_called()
+    assert not manager.waiting and not manager._requests
+    assert manager._total_requests == 0
+    assert not manager._request_event.is_set()
 
 
 def test_task_manager_long_prompt_truncated_not_stopped():

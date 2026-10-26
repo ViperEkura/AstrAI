@@ -130,6 +130,7 @@ def test_unstarted_async_stream_does_not_submit_or_leak(event_engine, method):
     stream = getattr(event_engine, method)("hi")
     asyncio.run(stream.aclose())
     event_engine._core.send_request.assert_not_called()
+    event_engine._core.send_requests.assert_not_called()
     event_engine._core.abort_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
@@ -140,7 +141,32 @@ def test_async_stream_does_not_send_per_request_attention_choice(event_engine, m
     with op_backend(attention="torch"):
         stream = getattr(event_engine, method)("hi")
     _collect_async(stream)
-    assert "backend" not in event_engine._core.send_request.call_args.kwargs
+    assert "backend" not in event_engine._core.send_requests.call_args.kwargs
+
+
+@pytest.mark.parametrize("method", ["generate_events", "generate_async"])
+def test_async_submission_preserves_scalar_only_tokenizer(
+    event_engine, monkeypatch, method
+):
+    def encode(prompt, *, add_special_tokens):
+        assert prompt == "hi" and add_special_tokens is True
+        return [[10, 11]]
+
+    encode = MagicMock(side_effect=encode)
+    monkeypatch.setattr(event_engine.tokenizer, "encode", encode)
+    _emit_on_submission(event_engine, reason=FINISH_LENGTH)
+
+    _collect_async(getattr(event_engine, method)("hi", temperature=0.7, top_k=3))
+
+    encode.assert_called_once_with("hi", add_special_tokens=True)
+    event_engine._core.send_request.assert_not_called()
+    event_engine._core.send_requests.assert_called_once()
+    submitted = event_engine._core.send_requests.call_args.kwargs
+    assert submitted["prompts"] == ["hi"]
+    assert submitted["prompts_ids"] == [[10, 11]]
+    assert len(submitted["request_ids"]) == 1
+    assert submitted["temperature"] == 0.7 and submitted["top_k"] == 3
+    _assert_frontend_released(event_engine)
 
 
 def test_unstarted_sync_stream_does_not_submit_or_leak(event_engine):
@@ -302,6 +328,22 @@ def test_submission_failure_releases_frontend_state(event_engine, method):
     _assert_frontend_released(event_engine)
 
 
+def test_batch_submission_failure_releases_all_registered_consumers(event_engine):
+    def submit(**kwargs):
+        request_ids = kwargs["request_ids"]
+        assert set(request_ids) == set(event_engine._tracker._finished)
+        event_engine._tracker.sink([RequestFinished(request_ids[0], FINISH_LENGTH)])
+        raise RuntimeError("submit failed after first completion")
+
+    event_engine._core.send_requests.side_effect = submit
+    with pytest.raises(RuntimeError, match="submit failed"):
+        event_engine.generate(["first", "second"])
+
+    request_ids = event_engine._core.send_requests.call_args.kwargs["request_ids"]
+    event_engine._core.abort_request.assert_called_once_with(request_ids[1])
+    _assert_frontend_released(event_engine)
+
+
 def test_output_fold_exception_cancels_and_releases_stream(event_engine, monkeypatch):
     _emit_on_submission(event_engine, "a")
     monkeypatch.setattr(
@@ -330,7 +372,7 @@ def test_cancellation_before_first_token_releases_request(event_engine, method):
         stream = getattr(event_engine, method)("hi")
         pending = asyncio.create_task(anext(stream))
         await asyncio.sleep(0)
-        event_engine._core.send_request.assert_called_once()
+        event_engine._core.send_requests.assert_called_once()
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending

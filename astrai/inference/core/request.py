@@ -209,27 +209,17 @@ class RequestManager:
             # False) and would crash the decode path on ``prompt_ids[-1]``;
             # rejecting it here keeps the scheduling loop alive.
             raise ValueError("prompt encoded to zero tokens; refusing to schedule")
-        if len(prompt_ids) > self.max_seq_len:
-            prompt_ids = prompt_ids[-self.max_seq_len :]
-
-        if max_tokens is None:
-            max_tokens = self.max_seq_len - len(prompt_ids)
-        else:
-            max_tokens = min(max_tokens, self.max_seq_len - len(prompt_ids))
-
-        request = Request(
-            request_id=request_id,
-            prompt_ids=prompt_ids,
+        return self.add_requests(
+            [prompt],
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             rep_window=rep_window,
-        )
-
-        self.enqueue_tokenized_requests([request])
-        return request_id
+            request_ids=[request_id],
+            prompts_ids=[prompt_ids],
+        )[0]
 
     def add_requests(
         self,

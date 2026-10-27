@@ -46,14 +46,6 @@ def test_task_is_finished_not_yet():
     assert not request.is_finished([0])
 
 
-def test_task_manager_add_task():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    tid = tm.add_request("hello")
-    assert tid.startswith("req_")
-    assert tm._total_requests == 1
-    assert len(tm.waiting) == 1
-
-
 @pytest.mark.parametrize("encoded", [[1, 2, 3], [[1, 2, 3]]])
 @pytest.mark.parametrize("request_id", [None, "", "supplied-id"])
 def test_single_request_preserves_scalar_encoding_and_request_id(encoded, request_id):
@@ -75,7 +67,11 @@ def test_single_request_preserves_scalar_encoding_and_request_id(encoded, reques
     request = manager.get_request(actual_id)
     assert request.prompt_ids == [1, 2, 3]
     assert request.max_tokens == 2
-    assert manager.get_stats()["total_tasks"] == 1
+    assert list(manager.waiting) == [request]
+    stats = manager.get_stats()
+    assert stats["total_tasks"] == 1
+    assert stats["waiting"] == 1
+    assert stats["running"] == 0
 
 
 @pytest.mark.parametrize(("max_tokens", "expected"), [(None, 2), (1, 1), (10, 2)])
@@ -196,7 +192,8 @@ def test_task_manager_cancel_active_task_defers_removal():
     tid = tm.add_request("test")
     requests = tm.pull_waiting(1)
     tm.activate(requests[0])
-    assert len(tm.running) == 1
+    assert list(tm.running) == [requests[0]]
+    assert requests[0].status == RequestStatus.RUNNING
     immediate, cancelled = tm.cancel_request(tid)
     assert cancelled is True
     assert immediate == []
@@ -218,15 +215,6 @@ def test_task_manager_pull_candidates_fifo():
     assert len(tm.waiting) == 1
 
 
-def test_task_manager_activate():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    tm.add_request("test")
-    request = tm.pull_waiting(1)[0]
-    tm.activate(request)
-    assert request.status == RequestStatus.RUNNING
-    assert request in tm.running
-
-
 def test_task_manager_return_to_waiting():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     tm.add_request("a")
@@ -244,15 +232,6 @@ def test_task_manager_has_work():
     assert tm.has_requests()
 
 
-def test_task_manager_get_stats():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    tm.add_request("test")
-    stats = tm.get_stats()
-    assert stats["total_tasks"] == 1
-    assert stats["waiting"] == 1
-    assert stats["running"] == 0
-
-
 def test_task_manager_add_task_rejects_empty_prompt():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     tm.tokenizer.encode.return_value = []
@@ -265,16 +244,3 @@ def test_task_manager_cancel_unknown_request_is_noop():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     immediate, cancelled = tm.cancel_request("does-not-exist")
     assert not cancelled and immediate == []
-
-
-def test_task_manager_cancel_running_request_defers_removal():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    request_id = tm.add_request("test")
-    request = tm._requests[request_id]
-    tm.waiting.clear()
-    tm.running.append(request)
-    request.status = RequestStatus.RUNNING
-
-    immediate, cancelled = tm.cancel_request(request_id)
-    assert cancelled and immediate == []
-    assert request.status == RequestStatus.ABORTED

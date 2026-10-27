@@ -43,15 +43,27 @@ def config_for(*, sections=None, sources=None, **processing):
     )
 
 
+def response_source(**section):
+    return {
+        "list_field": True,
+        "sections": [{"field": "responses", "action": "train", **section}],
+    }
+
+
+def assert_scalar_and_batch(builder, items, config, expected):
+    scalar, batch = RecordingTokenizer(), RecordingTokenizer()
+    assert [builder.build(item, config, scalar) for item in items] == expected
+    assert builder.build_batch(items, config, batch) == expected
+    return scalar, batch
+
+
 @pytest.mark.parametrize("special", [None, False, True])
 def test_list_special_tokens_match_for_scalar_and_batch(special):
     """Regression: batch used to add BOS by default; scalar ignored explicit True."""
     section = {"field": "responses", "action": "train"}
     if special is not None:
         section["add_special_tokens"] = special
-    config = config_for(
-        sources={"responses": {"list_field": True, "sections": [section]}}
-    )
+    config = config_for(sources={"responses": response_source(**section)})
     builder = MultiOutputMaskBuilder()
     items = [{"responses": ["a", "bc"], "source": "test"}, {"responses": ["d"]}]
     prefix = [1000] if special else []
@@ -67,9 +79,9 @@ def test_list_special_tokens_match_for_scalar_and_batch(special):
             "domain": "__default__",
         },
     ]
-    scalar_tokenizer, batch_tokenizer = RecordingTokenizer(), RecordingTokenizer()
-    assert [builder.build(item, config, scalar_tokenizer) for item in items] == expected
-    assert builder.build_batch(items, config, batch_tokenizer) == expected
+    scalar_tokenizer, batch_tokenizer = assert_scalar_and_batch(
+        builder, items, config, expected
+    )
     assert all(isinstance(text, str) for text, _ in scalar_tokenizer.calls)
     assert batch_tokenizer.calls == [(["a", "bc", "d"], bool(special))]
 
@@ -78,17 +90,9 @@ def test_list_special_tokens_match_for_scalar_and_batch(special):
 def test_list_templates_do_not_add_encoder_special_tokens(special):
     config = config_for(
         sources={
-            "responses": {
-                "list_field": True,
-                "sections": [
-                    {
-                        "field": "responses",
-                        "action": "$role",
-                        "template": True,
-                        "add_special_tokens": special,
-                    }
-                ],
-            }
+            "responses": response_source(
+                action="$role", template=True, add_special_tokens=special
+            )
         },
         min_chars=100,
     )
@@ -103,25 +107,15 @@ def test_list_templates_do_not_add_encoder_special_tokens(special):
         }
     ]
     builder = MultiOutputMaskBuilder()
-    for batched in [False, True]:
-        tokenizer = RecordingTokenizer()
-        actual = (
-            builder.build_batch(items, config, tokenizer)
-            if batched
-            else [builder.build(items[0], config, tokenizer)]
-        )
-        assert actual == expected
-        assert all(add is False for _, add in tokenizer.calls)
+    tokenizers = assert_scalar_and_batch(builder, items, config, expected)
+    assert all(
+        not special for tokenizer in tokenizers for _, special in tokenizer.calls
+    )
 
 
 def test_list_elements_skip_empty_values_and_truncate_without_text_filtering():
     config = config_for(
-        sources={
-            "responses": {
-                "list_field": True,
-                "sections": [{"field": "responses", "action": "train"}],
-            }
-        },
+        sources={"responses": response_source()},
         min_chars=10,
         max_chars=2,
         max_seq_len=2,
@@ -136,10 +130,7 @@ def test_list_elements_skip_empty_values_and_truncate_without_text_filtering():
         None,
     ]
     builder = MultiOutputMaskBuilder()
-    assert builder.build_batch(items, config, RecordingTokenizer()) == expected
-    assert [
-        builder.build(item, config, RecordingTokenizer()) for item in items
-    ] == expected
+    assert_scalar_and_batch(builder, items, config, expected)
 
 
 @pytest.mark.parametrize("first", ["", " ", "a", "too-long-text"])
@@ -156,8 +147,7 @@ def test_first_retained_section_gets_special_tokens_after_filtering(first):
     item = {"first": first, "second": "abcd", "source": 123}
     expected = {"sequence": [1000, 97, 98], "domain": "__default__"}
     builder = SingleOutputMaskBuilder()
-    assert builder.build(item, config, RecordingTokenizer()) == expected
-    assert builder.build_batch([item], config, RecordingTokenizer()) == [expected]
+    assert_scalar_and_batch(builder, [item], config, [expected])
 
 
 def test_batch_groups_special_policy_and_preserves_mask_truncation():
@@ -177,13 +167,15 @@ def test_batch_groups_special_policy_and_preserves_mask_truncation():
         },
         {"sequence": [1000, 101, 102], "domain": "__default__"},
     ]
-    tokenizer = RecordingTokenizer()
-    builder = SingleOutputMaskBuilder()
-    assert builder.build_batch(items, config, tokenizer) == expected
-    assert tokenizer.calls == [(["cd"], False), (["ab", "ef"], True)]
-    assert [
-        builder.build(item, config, RecordingTokenizer()) for item in items
-    ] == expected
+    _, tokenizer = assert_scalar_and_batch(
+        SingleOutputMaskBuilder(), items, config, expected
+    )
+    # Group policies must stay distinct, but group execution order is immaterial.
+    assert len(tokenizer.calls) == 2
+    assert {special: texts for texts, special in tokenizer.calls} == {
+        False: ["cd"],
+        True: ["ab", "ef"],
+    }
 
 
 def test_top_level_template_bos_and_empty_or_truncated_records():
@@ -203,10 +195,7 @@ def test_top_level_template_bos_and_empty_or_truncated_records():
         None,
     ]
     builder = SingleOutputMaskBuilder()
-    assert builder.build_batch(items, config, RecordingTokenizer()) == expected
-    assert [
-        builder.build(item, config, RecordingTokenizer()) for item in items
-    ] == expected
+    assert_scalar_and_batch(builder, items, config, expected)
     config.preprocessing.max_seq_len = 1
     assert builder.build_batch(items, config, RecordingTokenizer()) == [None] * 3
 
@@ -238,10 +227,7 @@ def test_multi_requires_all_outputs_and_preserves_explicit_masks_and_values():
         None,
     ]
     builder = MultiOutputMaskBuilder()
-    assert builder.build_batch(items, config, RecordingTokenizer()) == expected
-    assert [
-        builder.build(row, config, RecordingTokenizer()) for row in items
-    ] == expected
+    assert_scalar_and_batch(builder, items, config, expected)
 
 
 @pytest.mark.parametrize(
@@ -266,14 +252,7 @@ def test_scalar_build_supports_scalar_only_tokenizers():
             return super().encode(text, add_special_tokens=add_special_tokens)
 
     tokenizer = ScalarOnlyTokenizer()
-    config = config_for(
-        sources={
-            "responses": {
-                "list_field": True,
-                "sections": [{"field": "responses", "action": "train"}],
-            }
-        }
-    )
+    config = config_for(sources={"responses": response_source()})
     result = MultiOutputMaskBuilder().build(
         {"responses": ["a", "b"]}, config, tokenizer
     )

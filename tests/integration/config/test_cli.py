@@ -303,7 +303,21 @@ def test_cli_rejects_unknown_yaml_parameters(tmp_path):
     assert "Unknown config keys: learner_device" in result.output
 
 
-def test_seq_cli_defers_dataset_construction(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "optimizer, flags, expected",
+    [
+        ("muon_adamw", ["--muon_ns_steps", "7"], {"ns_steps": 7}),
+        ("nora_nadamw", ["--nora_lr", "0.02"], {"nora_lr": 0.02}),
+        (
+            "mano_adamw",
+            ["--mano_momentum", "0.8", "--no-mano_nesterov"],
+            {"momentum": 0.8, "nesterov": False},
+        ),
+    ],
+)
+def test_seq_cli_defers_dataset_construction(
+    tmp_path, monkeypatch, optimizer, flags, expected
+):
     make_rollout_config(max_position_embeddings=8).to_file(tmp_path / "config.json")
     data_dir = tmp_path / "packed"
     save_bin(str(data_dir), {"sequence": [torch.arange(33)]})
@@ -327,13 +341,22 @@ def test_seq_cli_defers_dataset_construction(tmp_path, monkeypatch):
 
     monkeypatch.setattr(train_module, "Trainer", Trainer)
     monkeypatch.setattr(DatasetFactory, "load", reject_parent_load)
-    result = CliRunner().invoke(train_module.train_command, ["--config", str(yaml)])
+    result = CliRunner().invoke(
+        train_module.train_command,
+        ["--config", str(yaml), "--optimizer", optimizer, "--max_lr", "0.003", *flags],
+    )
     assert result.exit_code == 0, (result.output, result.exception)
     assert len(captured) == 1
     assert captured[0].dataset.type == "packed"
     assert captured[0].dataset.params["path"] == str(data_dir)
     assert isinstance(captured[0].dataset, ComponentSpec)
     assert captured[0].scheduler.type == "cosine"
+    config = captured[0]
+    assert config.optimizer.type == optimizer
+    assert config.optimizer.params["lr"] == 0.003
+    for key, value in expected.items():
+        assert config.optimizer.params[key] == value
+    assert config.to_dict()["optimizer_hyperparameters"] == config.optimizer.params
 
 
 def test_cli_accepts_declarative_components(tmp_path, monkeypatch):

@@ -2,7 +2,7 @@
 
 Bridges the Reader layer (``JsonlStore`` reads raw JSON records) and the
 Dataset layer (expects per-record tensors).  Holds the tokenizer,
-mask-builder and position-id strategy together so that I/O code stays
+mask-builder and position-id configuration together so that I/O code stays
 free of model dependencies.
 
 The record-processing core (mask building, primary-id extraction,
@@ -19,11 +19,11 @@ import torch
 
 from astrai.config.preprocess_config import PipelineConfig
 from astrai.preprocessing.core import (
-    build_position_ids,
     build_preprocessing_components,
     iter_raw_records,
     to_per_record_tensors,
 )
+from astrai.preprocessing.position_id import generate_position_ids
 
 
 class TokenizeTransform:
@@ -41,8 +41,8 @@ class TokenizeTransform:
 
     def __init__(self, config: PipelineConfig, tokenizer_path: str):
         self.config = config
-        self.tokenizer, self.mask_builder, self.position_strategy = (
-            build_preprocessing_components(config, tokenizer_path)
+        self.tokenizer, self.mask_builder = build_preprocessing_components(
+            tokenizer_path
         )
 
     @classmethod
@@ -85,8 +85,10 @@ class TokenizeTransform:
 
         tensors = to_per_record_tensors(raw)
 
-        pos_ids = build_position_ids(doc_sequences, self.position_strategy)
-        if pos_ids is not None:
+        pos_ids = generate_position_ids(
+            doc_sequences, self.config.output.position_ids_mode
+        )
+        if pos_ids:
             tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
 
         return tensors

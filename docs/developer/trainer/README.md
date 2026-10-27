@@ -24,6 +24,7 @@ rather than owning the optimizer loop.
 
 | Document | Scope |
 | --- | --- |
+| [configuration.md](configuration.md) | Canonical optimizer settings and resolved rollout configuration |
 | [lifecycle.md](lifecycle.md) | Trainer, session, context, configuration and scheduler |
 | [strategy.md](strategy.md) | Strategy protocol, registration, capabilities and objectives |
 | [rollout.md](rollout.md) | Backend, generation, scoring, worker protocol and weight transport |

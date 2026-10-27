@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 from torch import nn
+from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from astrai.config.model_config import ConfigFactory
@@ -21,7 +22,6 @@ from astrai.dataset import (
 )
 from astrai.model.automodel import ModelFactory
 from astrai.optimization.optimizer import OptimizerFactory
-from astrai.optimization.protocols import OptimizerProtocol
 from astrai.optimization.scheduler import SchedulerFactory
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -87,7 +87,7 @@ def build_optimizer_component(spec: ComponentSpec, model: nn.Module):
     return target(first_arg, **spec.params)
 
 
-def load_optimizer_state_dict(optimizer: OptimizerProtocol, state_dict: Dict) -> None:
+def load_optimizer_state_dict(optimizer: Optimizer, state_dict: Dict) -> None:
     """Load optimizer state_dict while retaining configured parameter-group options."""
     options = [
         deepcopy({key: value for key, value in group.items() if key != "params"})

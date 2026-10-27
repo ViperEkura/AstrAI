@@ -18,8 +18,11 @@ optimizer loop. Shared tensor operations live in ops.py.
 
 ## Loss boundary
 
-BaseStrategy.prepare_batch() receives an offline batch or converts a
-RolloutResult in online mode. compute_loss_output() returns loss and metrics.
+BaseStrategy.prepare_batch() places objective inputs on the target device;
+strategy overrides may synthesize missing inputs.
+prepare_rollout_batch() collects or reuses a rollout, refreshes objective state
+only when the rollout is fresh, and calls prepare_from_rollout() once before
+learner replay. compute_loss_output() returns loss and metrics.
 The token-mean forward/reduce path supports context parallelism; each
 algorithm retains its own reduction semantics. training_steps() and
 training_updates() express microbatch or update shape while Trainer retains
@@ -33,6 +36,18 @@ count is applied. The trainer rejects additional groups because it owns the
 optimizer-window boundary. Synchronous online training collects the rollout
 window first and schedules learner updates in the trainer, then calls
 `compute_loss_output()` on each prepared chunk.
+
+`step_plan.learner_update_slices()` supplies the common replay-epoch and prompt
+minibatch order for synchronous Trainer windows and direct strategy iteration.
+Its final-update marker controls when a complete global window can commit its
+data cursor. Slicing never divides a prompt's response group or recomputes PPO's
+rollout-pinned advantages and returns.
+
+`rollout.batching.slice_batch()` accepts index lists or continuous slices; the
+latter retain tensor views. Direct strategy replay uses
+`slice_sequences=False` to keep its existing shared non-tensor metadata behavior.
+Worker and global-window batches also select aligned Python sequences. Async
+GRPO retains its weighted microbatch iterator and one update per round.
 
 ## Registry and capabilities
 

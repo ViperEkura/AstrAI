@@ -21,6 +21,8 @@ from astrai.model.components.mlp import RouterStats
 from astrai.parallel.cp import LossReduction, TokenLoss
 from astrai.trainer.backend import WeightPublisher
 from astrai.trainer.rollout import RolloutResult
+from astrai.trainer.rollout.batching import slice_batch
+from astrai.trainer.step_plan import learner_update_slices
 from astrai.trainer.strategy.ops import (
     ForwardResult,
     LossOutput,
@@ -273,17 +275,18 @@ class BaseStrategy(ABC):
         """
         self._weight_publishers = tuple(publishers)
 
-    def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:
-        """Run offline or online forward depending on runner injection."""
-        if self._rollout_runner is None:
-            return self.compute_loss_output(batch)
-
+    def prepare_rollout_batch(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Collect, refresh and prepare one rollout for all of its updates."""
         result, is_fresh = self._rollout_runner(batch)
         if is_fresh:
             self._on_rollout_refresh()
+        return self.prepare_from_rollout(result)
 
-        train_batch = self.prepare_from_rollout(result)
-        return self.compute_loss_output(train_batch)
+    def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:
+        """Run offline or online forward depending on runner injection."""
+        if self._rollout_runner is not None:
+            batch = self.prepare_rollout_batch(batch)
+        return self.compute_loss_output(batch)
 
     def training_steps(self, batch: Dict[str, Tensor]) -> Iterator[LossOutput]:
         """Yield one :class:`LossOutput` per learner update for this batch.
@@ -308,14 +311,25 @@ class BaseStrategy(ABC):
             yield self.compute_loss_output(batch)
             return
 
-        result, is_fresh = self._rollout_runner(batch)
-        if is_fresh:
-            self._on_rollout_refresh()
-        prepared = self.prepare_from_rollout(result)
-        slices = self._split_rollout_batch(prepared)
-        for _ in range(self.rl_update_epochs):
-            for chunk in slices:
-                yield self.compute_loss_output(chunk)
+        prepared = self.prepare_rollout_batch(batch)
+        total = next(
+            (
+                value.shape[0]
+                for value in prepared.values()
+                if isinstance(value, Tensor) and value.ndim
+            ),
+            1,
+        )
+        for selection, _ in learner_update_slices(
+            total, self.rl_update_epochs, self.rl_minibatch_prompts
+        ):
+            chunk = (
+                prepared
+                if self.rl_minibatch_prompts is None
+                or self.rl_minibatch_prompts >= total
+                else slice_batch(prepared, selection, total, slice_sequences=False)
+            )
+            yield self.compute_loss_output(chunk)
 
     def training_updates(
         self, batch: Any, microbatch_prompts: Optional[int] = None
@@ -328,31 +342,3 @@ class BaseStrategy(ABC):
         """
         for output in self.training_steps(batch):
             yield iter((output,))
-
-    def _split_rollout_batch(self, prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Slice one prepared rollout batch along the prompt dimension.
-
-        Every prepared tensor's leading dim is the prompt count B, and the
-        group dimension rides along inside each slice — GRPO advantages are
-        group-normalized from per-group rewards, so slicing along B never
-        re-mixes groups, and PPO's rollout-pinned advantages/returns are
-        shared views rather than recomputed targets.
-        """
-        size = self.rl_minibatch_prompts
-        if size is None:
-            return [prepared]
-        first = prepared[next(iter(prepared))]
-        total = first.shape[0]
-        if size >= total:
-            return [prepared]
-        return [
-            {
-                key: (
-                    value[begin : begin + size]
-                    if isinstance(value, Tensor) and value.shape[0] == total
-                    else value
-                )
-                for key, value in prepared.items()
-            }
-            for begin in range(0, total, size)
-        ]

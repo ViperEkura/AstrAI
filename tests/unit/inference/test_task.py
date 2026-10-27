@@ -46,12 +46,54 @@ def test_task_is_finished_not_yet():
     assert not request.is_finished([0])
 
 
-def test_task_manager_add_task():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    tid = tm.add_request("hello")
-    assert tid.startswith("req_")
-    assert tm._total_requests == 1
-    assert len(tm.waiting) == 1
+@pytest.mark.parametrize("encoded", [[1, 2, 3], [[1, 2, 3]]])
+@pytest.mark.parametrize("request_id", [None, "", "supplied-id"])
+def test_single_request_preserves_scalar_encoding_and_request_id(encoded, request_id):
+    tokenizer = _make_mock_tokenizer()
+
+    def encode(prompt):
+        assert isinstance(prompt, str)
+        return encoded
+
+    tokenizer.encode.side_effect = encode
+    manager = RequestManager(tokenizer, max_seq_len=5)
+    actual_id = manager.add_request("hello", request_id=request_id)
+
+    tokenizer.encode.assert_called_once_with("hello")
+    if request_id:
+        assert actual_id == request_id
+    else:
+        assert actual_id.startswith("req_")
+    request = manager.get_request(actual_id)
+    assert request.prompt_ids == [1, 2, 3]
+    assert request.max_tokens == 2
+    assert list(manager.waiting) == [request]
+    stats = manager.get_stats()
+    assert stats["total_tasks"] == 1
+    assert stats["waiting"] == 1
+    assert stats["running"] == 0
+
+
+@pytest.mark.parametrize(("max_tokens", "expected"), [(None, 2), (1, 1), (10, 2)])
+def test_single_tokenized_request_keeps_budget_and_sampling(max_tokens, expected):
+    tokenizer = _make_mock_tokenizer()
+    manager = RequestManager(tokenizer, max_seq_len=5)
+    request_id = manager.add_request(
+        "unused text",
+        prompt_ids=[1, 2, 3],
+        max_tokens=max_tokens,
+        temperature=0.7,
+        top_p=0.8,
+        top_k=4,
+        frequency_penalty=0.2,
+        rep_window=7,
+    )
+
+    tokenizer.encode.assert_not_called()
+    request = manager.get_request(request_id)
+    assert request.max_tokens == expected
+    assert (request.temperature, request.top_p, request.top_k) == (0.7, 0.8, 4)
+    assert (request.frequency_penalty, request.rep_window) == (0.2, 7)
 
 
 @pytest.mark.parametrize(
@@ -110,6 +152,24 @@ def test_task_manager_batch_encodes_once_and_registers_each_request_once():
     assert tm._request_event.is_set()
 
 
+def test_empty_prompt_later_in_batch_does_not_register_valid_prefix():
+    tokenizer = _make_mock_tokenizer()
+    metrics = Mock()
+    manager = RequestManager(tokenizer, metrics=metrics)
+    with pytest.raises(ValueError, match="zero tokens"):
+        manager.add_requests(
+            ["valid", "empty"],
+            request_ids=["first", "second"],
+            prompts_ids=[[1], []],
+        )
+
+    tokenizer.encode.assert_not_called()
+    metrics.register.assert_not_called()
+    assert not manager.waiting and not manager._requests
+    assert manager._total_requests == 0
+    assert not manager._request_event.is_set()
+
+
 def test_task_manager_long_prompt_truncated_not_stopped():
     t = _make_mock_tokenizer()
     t.encode.return_value = list(range(9000))
@@ -132,7 +192,8 @@ def test_task_manager_cancel_active_task_defers_removal():
     tid = tm.add_request("test")
     requests = tm.pull_waiting(1)
     tm.activate(requests[0])
-    assert len(tm.running) == 1
+    assert list(tm.running) == [requests[0]]
+    assert requests[0].status == RequestStatus.RUNNING
     immediate, cancelled = tm.cancel_request(tid)
     assert cancelled is True
     assert immediate == []
@@ -154,15 +215,6 @@ def test_task_manager_pull_candidates_fifo():
     assert len(tm.waiting) == 1
 
 
-def test_task_manager_activate():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    tm.add_request("test")
-    request = tm.pull_waiting(1)[0]
-    tm.activate(request)
-    assert request.status == RequestStatus.RUNNING
-    assert request in tm.running
-
-
 def test_task_manager_return_to_waiting():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     tm.add_request("a")
@@ -180,15 +232,6 @@ def test_task_manager_has_work():
     assert tm.has_requests()
 
 
-def test_task_manager_get_stats():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    tm.add_request("test")
-    stats = tm.get_stats()
-    assert stats["total_tasks"] == 1
-    assert stats["waiting"] == 1
-    assert stats["running"] == 0
-
-
 def test_task_manager_add_task_rejects_empty_prompt():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     tm.tokenizer.encode.return_value = []
@@ -201,16 +244,3 @@ def test_task_manager_cancel_unknown_request_is_noop():
     tm = RequestManager(tokenizer=_make_mock_tokenizer())
     immediate, cancelled = tm.cancel_request("does-not-exist")
     assert not cancelled and immediate == []
-
-
-def test_task_manager_cancel_running_request_defers_removal():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
-    request_id = tm.add_request("test")
-    request = tm._requests[request_id]
-    tm.waiting.clear()
-    tm.running.append(request)
-    request.status = RequestStatus.RUNNING
-
-    immediate, cancelled = tm.cancel_request(request_id)
-    assert cancelled and immediate == []
-    assert request.status == RequestStatus.ABORTED

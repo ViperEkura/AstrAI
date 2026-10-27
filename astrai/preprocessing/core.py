@@ -10,29 +10,18 @@ stay in lockstep.
 """
 
 from itertools import chain
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List
 
 import torch
 
 from astrai.config.preprocess_config import PipelineConfig
-from astrai.preprocessing.builder import MaskBuilderFactory
-from astrai.preprocessing.position_id import PositionIdStrategyFactory
+from astrai.preprocessing.builder import SectionedMaskBuilder
 from astrai.tokenize import AutoTokenizer
 
 
-def build_preprocessing_components(config: PipelineConfig, tokenizer_path: str):
-    """Load tokenizer, mask builder and position-id strategy together.
-
-    Both ``Pipeline`` and ``TokenizeTransform`` need the same triple;
-    centralising the construction avoids drift (e.g. one path forgetting
-    to create the position-id strategy).
-    """
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    mask_builder = MaskBuilderFactory.create_checked("sectioned")
-    position_strategy = PositionIdStrategyFactory.create_checked(
-        config.output.position_ids_mode
-    )
-    return tokenizer, mask_builder, position_strategy
+def build_preprocessing_components(tokenizer_path: str):
+    """Load the tokenizer and built-in section builder for both input paths."""
+    return AutoTokenizer.from_pretrained(tokenizer_path), SectionedMaskBuilder()
 
 
 def primary_ids(result: Dict) -> List[int]:
@@ -108,17 +97,3 @@ def to_per_record_tensors(
                 torch.tensor(list(chain.from_iterable(ids_list)), dtype=torch.int32)
             ]
     return tensors
-
-
-def build_position_ids(
-    sequences: List[List[int]],
-    strategy,
-) -> Optional[List[int]]:
-    """Generate position ids for *sequences* using *strategy*.
-
-    Returns ``None`` when the strategy produces no ids (e.g. ``none``
-    mode), so callers can skip attaching the key instead of storing
-    an empty list.
-    """
-    pos_ids = strategy.generate(sequences)
-    return pos_ids or None

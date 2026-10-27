@@ -1,8 +1,23 @@
 """Optimizer-step counts shared by scheduling and progress reporting."""
 
+from typing import Iterator, Optional, Tuple
+
 
 def ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def learner_update_slices(
+    total: int, update_epochs: int = 1, minibatch_prompts: Optional[int] = None
+) -> Iterator[Tuple[slice, bool]]:
+    """Yield prompt ranges in replay order, marking the final window update."""
+    size = minibatch_prompts or total
+    if total <= 0 or update_epochs <= 0 or size <= 0:
+        raise ValueError("learner updates require positive sizes and replay epochs")
+    for epoch in range(update_epochs):
+        for begin in range(0, total, size):
+            end = min(begin + size, total)
+            yield slice(begin, end), epoch + 1 == update_epochs and end == total
 
 
 def global_epoch_steps(
@@ -13,7 +28,7 @@ def global_epoch_steps(
     *,
     online: bool = False,
     rl_update_epochs: int = 1,
-    rl_minibatch_prompts: int | None = None,
+    rl_minibatch_prompts: Optional[int] = None,
 ) -> int:
     """Count commits from unpadded global windows, including a flush tail."""
     full, tail = divmod(dataset_len - start_offset, global_batch)

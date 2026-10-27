@@ -6,12 +6,6 @@ from astrai.config.preprocess_config import (
     PipelineConfig,
     ProcessingConfig,
 )
-from astrai.preprocessing.builder import (
-    MaskBuilderFactory,
-    MultiOutputMaskBuilder,
-    SectionedMaskBuilder,
-    SingleOutputMaskBuilder,
-)
 from tests.support.data import (
     CHAT_SECTIONS,
     TEXT_SECTIONS,
@@ -243,19 +237,6 @@ def test_text_truncation(test_tokenizer, builder):
     item = {"text": "This is a very long text that should be truncated"}
     result = builder.build(item, config, test_tokenizer)
     assert len(result["sequence"]) <= 3
-
-
-@pytest.mark.parametrize(
-    ("name", "builder_cls"),
-    [
-        ("single", SingleOutputMaskBuilder),
-        ("multi", MultiOutputMaskBuilder),
-        ("sectioned", SectionedMaskBuilder),
-    ],
-)
-def test_factory_create(name, builder_cls):
-    assert name in MaskBuilderFactory.list_registered()
-    assert isinstance(MaskBuilderFactory.create(name), builder_cls)
 
 
 def test_dpo_chat_basic(chat_tokenizer, builder):

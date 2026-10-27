@@ -7,7 +7,7 @@ not a process or an RPC server.
 ```text
 astrai/inference/
   contracts.py  immutable scheduling and execution data
-  frontend/     engine facade, input/output processing, tracking, core client
+  frontend/     engine facade, input/output processing, tracking, direct core calls
   core/         EngineCore driver, Scheduler, request lifecycle, KV accounting
   worker/       model runner, pending execution, CUDA graphs, sampling, workspace
   network/      OpenAI/Anthropic protocol adapters
@@ -33,7 +33,6 @@ core request-lifecycle types at runtime or retain mutable `Request` objects.
 classDiagram
     direction LR
     class InferenceEngine
-    class InprocClient
     class EngineCore {
         driver and operation lock
         in-flight execution and draining
@@ -50,8 +49,7 @@ classDiagram
     class ModelRunnerOutput
     class PendingExecution
 
-    InferenceEngine --> InprocClient
-    InprocClient --> EngineCore : public facade
+    InferenceEngine --> EngineCore : public operations
     EngineCore *-- Scheduler : plan and apply results
     EngineCore --> GPUModelRunner : execute
     Scheduler --> SchedulerOutput

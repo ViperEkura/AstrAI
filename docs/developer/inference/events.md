@@ -20,7 +20,7 @@ sequenceDiagram
     C->>E: generate_events(prompt, stop_sequences)
     E->>E: tokenize and mint request_id
     E->>T: register before submission
-    E->>S: send_request via InprocClient
+    E->>S: add_requests via EngineCore
     loop execution steps
         D->>S: schedule
         S-->>D: SchedulerOutput

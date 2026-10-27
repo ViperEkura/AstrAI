@@ -243,7 +243,7 @@ def test_build_engine_from_live_objects_starts_scheduler():
     try:
         assert isinstance(engine, InferenceEngine)
         assert engine.tokenizer is tokenizer
-        assert engine._core._core.stop_event.is_set() is False
+        assert engine._core.stop_event.is_set() is False
     finally:
         engine.shutdown()
 

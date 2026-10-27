@@ -25,9 +25,9 @@ from astrai.trainer.rollout.protocol import (
 )
 from astrai.trainer.rollout.runner import _score_rewards
 from astrai.trainer.rollout.types import (
+    ResolvedAsyncRolloutConfig,
     RolloutResult,
     RolloutVersionError,
-    SamplingParams,
 )
 from astrai.trainer.rollout.worker import RolloutWorkerSpec, run_rollout_worker
 
@@ -75,26 +75,15 @@ class AsyncRoundCoordinator:
 
     def __init__(
         self,
+        config: ResolvedAsyncRolloutConfig,
         source: nn.Module,
         model_fn,
         param_path: str,
-        devices: List[str],
-        params: SamplingParams,
         reward_model,
         policy_version: int,
-        max_batch_size: int,
-        max_seq_len: Optional[int],
         model_dtype: torch.dtype,
-        max_policy_lag: int = 1,
-        max_prompts_per_worker: int = 1,
-        worker_timeout_s: float = 600.0,
         worker_target=None,
         weight_channel=None,
-        startup_timeout_s: float = 300.0,
-        weight_timeout_s: Optional[float] = None,
-        random_seed: int = 3407,
-        sample_cursor: int = 0,
-        learner_rank: Optional[int] = None,
     ):
         try:
             pickle.dumps(model_fn)
@@ -102,17 +91,8 @@ class AsyncRoundCoordinator:
             raise ValueError("async_round model_fn must be pickleable") from exc
         self.reward_model = reward_model
         self._policy_version = policy_version
-        self.max_policy_lag = max_policy_lag
-        self.max_prompts_per_worker = max_prompts_per_worker
-        self.worker_timeout_s = worker_timeout_s
-        self.weight_timeout_s = (
-            worker_timeout_s if weight_timeout_s is None else weight_timeout_s
-        )
-        self.random_seed = random_seed
-        self._sample_cursor = sample_cursor
-        self.learner_rank = learner_rank
-        self._group_size = params.group_size
-        self._devices = list(devices)
+        self.config = config
+        self._sample_cursor = config.sample_cursor
         self._round_id = 0
         self._request_id = 0
         self._closed = False
@@ -122,7 +102,6 @@ class AsyncRoundCoordinator:
         self.peak_gpu_memory = {}
         self.worker_cuda_graph_enabled = {}
         self.weights = weight_channel or NCCLWeightChannel(source, policy_version)
-        self._nccl_timeout_s = self.weight_timeout_s
         self._ctx = mp.get_context("spawn")
         self._processes = []
         self._pipes = []
@@ -132,14 +111,14 @@ class AsyncRoundCoordinator:
         logger.info(
             "async rollout: learner=%s workers=%s CUDA_VISIBLE_DEVICES=%s sampling=%s startup_timeout=%s generation_timeout=%s weight_timeout=%s seed=%s cursor=%s",
             next(source.parameters()).device,
-            devices,
+            config.devices,
             os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
-            params,
-            startup_timeout_s,
-            worker_timeout_s,
-            self.weight_timeout_s,
-            random_seed,
-            sample_cursor,
+            config.params,
+            config.startup_timeout_s,
+            config.generation_timeout_s,
+            config.weight_timeout_s,
+            config.random_seed,
+            config.sample_cursor,
         )
         if next(source.parameters()).device.type == "cuda":
             logger.info(
@@ -153,31 +132,31 @@ class AsyncRoundCoordinator:
                         )
                     )
                     for device in [next(source.parameters()).device]
-                    + [torch.device(name) for name in devices]
+                    + [torch.device(name) for name in config.devices]
                 },
             )
         try:
-            startup_deadline = time.monotonic() + startup_timeout_s
+            startup_deadline = time.monotonic() + config.startup_timeout_s
             self._rendezvous_port = self.weights.prepare_rendezvous(
-                len(devices) + 1, startup_timeout_s
+                len(config.devices) + 1, config.startup_timeout_s
             )
-            for index, device in enumerate(devices):
+            for index, device in enumerate(config.devices):
                 parent, child = self._ctx.Pipe(duplex=True)
                 spec = RolloutWorkerSpec(
                     device=device,
                     model_fn=model_fn,
                     param_path=param_path,
-                    params=params,
-                    max_batch_size=max_batch_size,
-                    max_seq_len=max_seq_len,
+                    params=config.params,
+                    max_batch_size=config.max_batch_size,
+                    max_seq_len=config.max_seq_len,
                     policy_version=policy_version,
                     model_dtype=str(model_dtype).split(".")[-1],
                     rank=index + 1,
-                    world_size=len(devices) + 1,
+                    world_size=len(config.devices) + 1,
                     rendezvous_port=self._rendezvous_port,
-                    nccl_timeout_s=self._nccl_timeout_s,
+                    nccl_timeout_s=config.weight_timeout_s,
                     layout=self.weights.layout,
-                    max_prompts_per_worker=max_prompts_per_worker,
+                    max_prompts_per_worker=config.max_prompts_per_worker,
                 )
                 process = self._ctx.Process(
                     target=self._worker_target,
@@ -194,27 +173,27 @@ class AsyncRoundCoordinator:
                 self._processes.append(process)
                 self._worker_versions.append(None)
             self._collect_replies(
-                list(range(len(devices))),
+                list(range(len(config.devices))),
                 MessageKind.MODEL_READY,
                 startup_deadline,
-                request_ids={index: 0 for index in range(len(devices))},
+                request_ids={index: 0 for index in range(len(config.devices))},
                 version=policy_version,
             )
             self._sync_weights(policy_version)
             ready = self._collect_replies(
-                list(range(len(devices))),
+                list(range(len(config.devices))),
                 MessageKind.READY,
                 startup_deadline,
-                request_ids={index: 0 for index in range(len(devices))},
+                request_ids={index: 0 for index in range(len(config.devices))},
                 version=policy_version,
             )
             for index, message in ready.items():
                 payload = message.payload
                 self._worker_versions[index] = message.policy_version
-                self.worker_cuda_graph_enabled[devices[index]] = (
+                self.worker_cuda_graph_enabled[config.devices[index]] = (
                     payload.cuda_graph_enabled
                 )
-                self.peak_gpu_memory[devices[index]] = payload.peak_gpu_memory
+                self.peak_gpu_memory[config.devices[index]] = payload.peak_gpu_memory
         except BaseException:
             self.close(force=True)
             raise
@@ -303,13 +282,13 @@ class AsyncRoundCoordinator:
             rank=0,
             world_size=len(self._processes) + 1,
             port=self._rendezvous_port,
-            timeout_s=self._nccl_timeout_s,
+            timeout_s=self.config.weight_timeout_s,
         )
         self.weights.broadcast()
         acks = self._collect_replies(
             missing,
             MessageKind.WEIGHT_SYNC_ACK,
-            time.monotonic() + self.weight_timeout_s,
+            time.monotonic() + self.config.weight_timeout_s,
             request_ids,
             version=version,
         )
@@ -367,13 +346,13 @@ class AsyncRoundCoordinator:
         fresh = seeds is None
         if fresh:
             seeds = _response_seeds(
-                self.random_seed,
+                self.config.random_seed,
                 self._sample_cursor,
                 total,
-                self._group_size,
-                self.learner_rank,
+                self.config.params.group_size,
+                self.config.learner_rank,
             )
-        if len(seeds) != total * self._group_size:
+        if len(seeds) != total * self.config.params.group_size:
             raise ValueError("rollout seeds must match the prompt/response count")
         version = self._policy_version
         jobs = {
@@ -393,9 +372,9 @@ class AsyncRoundCoordinator:
                     payload=GenerationRequest(
                         slice_batch(batch, indices, total),
                         [
-                            seeds[i * self._group_size + g]
+                            seeds[i * self.config.params.group_size + g]
                             for i in indices
-                            for g in range(self._group_size)
+                            for g in range(self.config.params.group_size)
                         ],
                     ),
                 )
@@ -424,7 +403,7 @@ class AsyncRoundCoordinator:
             messages = self._collect_replies(
                 list(handle.jobs),
                 MessageKind.RESULT,
-                handle.started + self.worker_timeout_s,
+                handle.started + self.config.generation_timeout_s,
                 handle.request_ids,
                 round_id=handle.round_id,
                 version=handle.version,
@@ -444,14 +423,14 @@ class AsyncRoundCoordinator:
                 raise RolloutVersionError("mixed rollout versions")
             parts.append((indices, payload.rollout))
             durations.append(payload.generation_seconds)
-            device = str(self._devices[index])
+            device = self.config.devices[index]
             self.peak_gpu_memory[device] = max(
                 self.peak_gpu_memory.get(device, 0), payload.peak_gpu_memory
             )
         lag = self._policy_version - handle.version
-        if lag < 0 or lag > self.max_policy_lag:
+        if lag < 0 or lag > self.config.max_policy_lag:
             raise RolloutVersionError(
-                f"rollout policy lag {lag} exceeds {self.max_policy_lag}"
+                f"rollout policy lag {lag} exceeds {self.config.max_policy_lag}"
             )
         raw = merge_rollouts(parts, handle.total)
         rewards = _score_rewards(self.reward_model, raw).to(device="cpu")

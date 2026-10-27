@@ -899,7 +899,7 @@ def train(
         "mano_nesterov": kwargs.pop("mano_nesterov", True),
     }
     if optimizer_name == "nora_nadamw":
-        optimizer_hyperparameters = {
+        optimizer_params = {
             key: optimizer_kwargs[key]
             for key in (
                 "lr",
@@ -910,19 +910,15 @@ def train(
                 "nora_weight_decay",
             )
         }
-        optimizer_hyperparameters.update(
-            {"nadamw_betas": [0.9, 0.999], "nadamw_eps": 1e-8, "nora_eps": 1e-10}
-        )
     elif optimizer_name == "mano_adamw":
-        optimizer_hyperparameters = {
-            key: optimizer_kwargs[key]
-            for key in ("lr", "weight_decay", "mano_momentum", "mano_nesterov")
+        optimizer_params = {
+            "lr": optimizer_kwargs["lr"],
+            "weight_decay": optimizer_kwargs["weight_decay"],
+            "momentum": optimizer_kwargs["mano_momentum"],
+            "nesterov": optimizer_kwargs["mano_nesterov"],
         }
-        optimizer_hyperparameters.update(
-            {"adamw_betas": [0.9, 0.95], "adamw_eps": 1e-8}
-        )
     else:
-        optimizer_hyperparameters = {
+        optimizer_params = {
             key: optimizer_kwargs[key]
             for key in (
                 "lr",
@@ -939,21 +935,7 @@ def train(
 
     if optimizer_raw is not None:
         optimizer_spec = ComponentSpec(**optimizer_raw)
-        optimizer_name = optimizer_spec.type
-        optimizer_hyperparameters = dict(optimizer_spec.params)
     else:
-        optimizer_params = dict(optimizer_hyperparameters)
-        for key in (
-            "nadamw_betas",
-            "nadamw_eps",
-            "nora_eps",
-            "adamw_betas",
-            "adamw_eps",
-        ):
-            optimizer_params.pop(key, None)
-        if optimizer_name == "mano_adamw":
-            optimizer_params["momentum"] = optimizer_params.pop("mano_momentum")
-            optimizer_params["nesterov"] = optimizer_params.pop("mano_nesterov")
         optimizer_spec = ComponentSpec(type=optimizer_name, params=optimizer_params)
 
     if scheduler_raw is not None:
@@ -993,8 +975,6 @@ def train(
         model_dtype=model_dtype,
         optimizer=optimizer_spec,
         scheduler=scheduler_spec,
-        optimizer_name=optimizer_name,
-        optimizer_hyperparameters=optimizer_hyperparameters,
         load_state_dict=load_state_dict,
         ckpt_dir=ckpt_dir,
         n_epoch=n_epoch,

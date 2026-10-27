@@ -40,7 +40,7 @@ def test_generate_events_text_stop_aborts_before_yielding_final(
         async for chunk in stream:
             chunks.append(chunk)
             if chunk.is_final:
-                engine._core.abort_request.assert_called_once()
+                engine._core.cancel_request.assert_called_once()
                 _assert_frontend_released(engine)
                 break
         await stream.aclose()
@@ -56,7 +56,7 @@ def test_generate_events_text_stop_aborts_before_yielding_final(
     assert final.completion_tokens == len("ab" + stop)
     assert len(final.current_token_ids) == final.completion_tokens
     assert sum(chunk.is_final for chunk in chunks) == 1
-    engine._core.abort_request.assert_called_once()
+    engine._core.cancel_request.assert_called_once()
 
 
 @pytest.mark.parametrize("reason", [FINISH_STOP_TOKEN, FINISH_LENGTH, FINISH_CANCELLED])
@@ -71,7 +71,7 @@ def test_generate_events_core_terminal_flushes_tail_without_abort(event_engine, 
     assert final.completion_tokens == len("hello EN")
     assert not final.stopped
     assert sum(chunk.is_final for chunk in chunks) == 1
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -81,7 +81,7 @@ def test_generate_events_stop_after_core_terminal_needs_no_abort(event_engine):
     assert chunks[-1].stopped
     assert "".join(chunk.text for chunk in chunks) == "ab"
     assert chunks[-1].prompt_tokens == 2
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -107,7 +107,7 @@ def test_async_consumer_exit_cancels_and_releases(event_engine, method, exit_kin
         await stream.aclose()
 
     asyncio.run(asyncio.wait_for(consume(), timeout=2))
-    event_engine._core.abort_request.assert_called_once()
+    event_engine._core.cancel_request.assert_called_once()
     _assert_frontend_released(event_engine)
 
 
@@ -121,7 +121,7 @@ def test_async_close_after_core_terminal_is_not_cancelled(event_engine, method):
         await stream.aclose()
 
     asyncio.run(asyncio.wait_for(consume(), timeout=2))
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -129,8 +129,9 @@ def test_async_close_after_core_terminal_is_not_cancelled(event_engine, method):
 def test_unstarted_async_stream_does_not_submit_or_leak(event_engine, method):
     stream = getattr(event_engine, method)("hi")
     asyncio.run(stream.aclose())
-    event_engine._core.send_request.assert_not_called()
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.add_request.assert_not_called()
+    event_engine._core.add_requests.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -140,14 +141,39 @@ def test_async_stream_does_not_send_per_request_attention_choice(event_engine, m
     with op_backend(attention="torch"):
         stream = getattr(event_engine, method)("hi")
     _collect_async(stream)
-    assert "backend" not in event_engine._core.send_request.call_args.kwargs
+    assert "backend" not in event_engine._core.add_requests.call_args.kwargs
+
+
+@pytest.mark.parametrize("method", ["generate_events", "generate_async"])
+def test_async_submission_preserves_scalar_only_tokenizer(
+    event_engine, monkeypatch, method
+):
+    def encode(prompt, *, add_special_tokens):
+        assert prompt == "hi" and add_special_tokens is True
+        return [[10, 11]]
+
+    encode = MagicMock(side_effect=encode)
+    monkeypatch.setattr(event_engine.tokenizer, "encode", encode)
+    _emit_on_submission(event_engine, reason=FINISH_LENGTH)
+
+    _collect_async(getattr(event_engine, method)("hi", temperature=0.7, top_k=3))
+
+    encode.assert_called_once_with("hi", add_special_tokens=True)
+    event_engine._core.add_request.assert_not_called()
+    event_engine._core.add_requests.assert_called_once()
+    submitted = event_engine._core.add_requests.call_args.kwargs
+    assert submitted["prompts"] == ["hi"]
+    assert submitted["prompts_ids"] == [[10, 11]]
+    assert len(submitted["request_ids"]) == 1
+    assert submitted["temperature"] == 0.7 and submitted["top_k"] == 3
+    _assert_frontend_released(event_engine)
 
 
 def test_unstarted_sync_stream_does_not_submit_or_leak(event_engine):
     stream = event_engine.generate("hi", stream=True)
     stream.close()
-    event_engine._core.send_requests.assert_not_called()
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.add_requests.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -157,7 +183,7 @@ def test_sync_stream_close_cancels_only_unfinished_core(event_engine, core_finis
     stream = event_engine.generate("hi", stream=True)
     assert next(stream) == "a"
     stream.close()
-    assert event_engine._core.abort_request.call_count == int(not core_finished)
+    assert event_engine._core.cancel_request.call_count == int(not core_finished)
     _assert_frontend_released(event_engine)
 
 
@@ -194,7 +220,7 @@ def test_request_error_terminates_every_frontend_path(
             assert chunks[-1].completion_tokens == 2
         else:
             assert "".join(chunks) == "ab"
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -221,7 +247,7 @@ def test_zero_token_terminal_does_not_wait_for_token_delta(
             [] if method == "stream" else ""
         )
         if max_tokens is not None:
-            event_engine._core.send_requests.assert_not_called()
+            event_engine._core.add_requests.assert_not_called()
     else:
         chunks = _collect_async(
             getattr(event_engine, method)(prompt, max_tokens=max_tokens)
@@ -234,7 +260,7 @@ def test_zero_token_terminal_does_not_wait_for_token_delta(
             assert chunks[0].completion_tokens == 0
         else:
             assert chunks == []
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -255,7 +281,7 @@ def test_non_streaming_still_bulk_decodes_once_without_helper_threads(
     )
     assert event_engine.generate(["hi", "there"]) == ["abc", "abc"]
     assert event_engine.tokenizer.decode.call_count == 2
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -266,12 +292,12 @@ def test_blocking_timeout_cancels_only_unfinished_requests(event_engine, monkeyp
         )
         return kwargs["request_ids"]
 
-    event_engine._core.send_requests.side_effect = submit
+    event_engine._core.add_requests.side_effect = submit
     monkeypatch.setattr("astrai.inference.frontend.engine._GENERATE_TIMEOUT_S", 0.01)
     with pytest.raises(TimeoutError, match="1/2 completed"):
         event_engine.generate(["hi", "there"])
-    request_ids = event_engine._core.send_requests.call_args.kwargs["request_ids"]
-    event_engine._core.abort_request.assert_called_once_with(request_ids[1])
+    request_ids = event_engine._core.add_requests.call_args.kwargs["request_ids"]
+    event_engine._core.cancel_request.assert_called_once_with(request_ids[1])
     _assert_frontend_released(event_engine)
 
 
@@ -281,7 +307,7 @@ def test_blocking_wait_exception_cancels_and_releases_batch(event_engine, monkey
     )
     with pytest.raises(KeyboardInterrupt):
         event_engine.generate(["hi", "there"])
-    assert event_engine._core.abort_request.call_count == 2
+    assert event_engine._core.cancel_request.call_count == 2
     _assert_frontend_released(event_engine)
 
 
@@ -289,8 +315,8 @@ def test_blocking_wait_exception_cancels_and_releases_batch(event_engine, monkey
     "method", ["generate", "stream", "generate_events", "generate_async"]
 )
 def test_submission_failure_releases_frontend_state(event_engine, method):
-    event_engine._core.send_request.side_effect = RuntimeError("submit failed")
-    event_engine._core.send_requests.side_effect = RuntimeError("submit failed")
+    event_engine._core.add_request.side_effect = RuntimeError("submit failed")
+    event_engine._core.add_requests.side_effect = RuntimeError("submit failed")
     with pytest.raises(RuntimeError, match="submit failed"):
         if method == "generate":
             event_engine.generate("hi")
@@ -298,7 +324,23 @@ def test_submission_failure_releases_frontend_state(event_engine, method):
             list(event_engine.generate("hi", stream=True))
         else:
             _collect_async(getattr(event_engine, method)("hi"))
-    event_engine._core.abort_request.assert_called_once()
+    event_engine._core.cancel_request.assert_called_once()
+    _assert_frontend_released(event_engine)
+
+
+def test_batch_submission_failure_releases_all_registered_consumers(event_engine):
+    def submit(**kwargs):
+        request_ids = kwargs["request_ids"]
+        assert set(request_ids) == set(event_engine._tracker._finished)
+        event_engine._tracker.sink([RequestFinished(request_ids[0], FINISH_LENGTH)])
+        raise RuntimeError("submit failed after first completion")
+
+    event_engine._core.add_requests.side_effect = submit
+    with pytest.raises(RuntimeError, match="submit failed"):
+        event_engine.generate(["first", "second"])
+
+    request_ids = event_engine._core.add_requests.call_args.kwargs["request_ids"]
+    event_engine._core.cancel_request.assert_called_once_with(request_ids[1])
     _assert_frontend_released(event_engine)
 
 
@@ -310,7 +352,7 @@ def test_output_fold_exception_cancels_and_releases_stream(event_engine, monkeyp
     )
     with pytest.raises(RuntimeError, match="fold failed"):
         _collect_async(event_engine.generate_events("hi"))
-    event_engine._core.abort_request.assert_called_once()
+    event_engine._core.cancel_request.assert_called_once()
     _assert_frontend_released(event_engine)
 
 
@@ -320,7 +362,7 @@ def test_async_backlog_is_bounded_for_full_context_without_token_loss(event_engi
     chunks = _collect_async(event_engine.generate_events("hi"))
     assert "".join(chunk.text for chunk in chunks) == "a" * 4500
     assert chunks[-1].completion_tokens == 4500
-    event_engine._core.abort_request.assert_not_called()
+    event_engine._core.cancel_request.assert_not_called()
     _assert_frontend_released(event_engine)
 
 
@@ -330,14 +372,14 @@ def test_cancellation_before_first_token_releases_request(event_engine, method):
         stream = getattr(event_engine, method)("hi")
         pending = asyncio.create_task(anext(stream))
         await asyncio.sleep(0)
-        event_engine._core.send_request.assert_called_once()
+        event_engine._core.add_requests.assert_called_once()
         pending.cancel()
         with pytest.raises(asyncio.CancelledError):
             await pending
         await stream.aclose()
 
     asyncio.run(asyncio.wait_for(consume(), timeout=2))
-    event_engine._core.abort_request.assert_called_once()
+    event_engine._core.cancel_request.assert_called_once()
     _assert_frontend_released(event_engine)
 
 
@@ -367,7 +409,7 @@ def test_real_cpu_engine_zero_output_boundaries(monkeypatch, method, full_prompt
             return original_wait(rid, timeout=timeout)
 
         monkeypatch.setattr(engine._tracker, "wait", bounded_wait)
-        engine._core.abort_request = MagicMock(wraps=engine._core.abort_request)
+        engine._core.cancel_request = MagicMock(wraps=engine._core.cancel_request)
         prompt, max_tokens = ("p" * 32, None) if full_prompt else ("hi", 0)
         if method == "generate":
             assert engine.generate(prompt, max_tokens=max_tokens) == ""
@@ -387,5 +429,5 @@ def test_real_cpu_engine_zero_output_boundaries(monkeypatch, method, full_prompt
                 assert chunks[0].completion_tokens == 0
             else:
                 assert chunks == []
-        engine._core.abort_request.assert_not_called()
+        engine._core.cancel_request.assert_not_called()
         _assert_frontend_released(engine)

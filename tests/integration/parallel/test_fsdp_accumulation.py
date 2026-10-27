@@ -56,8 +56,8 @@ def _compare_accumulation(rank, port):
         for step in range(2):
             for model, executor, optimizer in zip(models, executors, optimizers):
                 optimizer.zero_grad(set_to_none=True)
-                for x, target in batches[step * 3 : (step + 1) * 3]:
-                    with executor.accumulate(model):
+                for index, (x, target) in enumerate(batches[step * 3 : (step + 1) * 3]):
+                    with executor.accumulate_explicit(model, sync=index == 2):
                         ((model(x) - target).square().mean() / 3).backward()
             for expected, actual in zip(models[0].parameters(), models[1].parameters()):
                 assert isinstance(expected.grad, DTensor)

@@ -179,7 +179,7 @@ carries the incremental `text`, `delta_token_ids`, and â€” on the final chunk â€
 exact `usage` and a mapped `finish_reason` (no re-tokenizing text to count
 tokens). Internally the engine mints request ids up front (`InputProcessor`),
 folds scheduler events through `OutputProcessor` (detokenize, stop matching,
-usage), and reaches the core only via `EngineCoreClient`. Blocking `generate` folds
+usage), and calls the public operations of `EngineCore` directly. Blocking `generate` folds
 the request's events on the caller's thread once the terminal event lands;
 there is no intermediate accumulator object.
 
@@ -391,3 +391,16 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
 ```
 
 > Document Update Time: 2026-08-22
+
+## Core injection API migration
+
+Pass an `EngineCore` (or a test double implementing the same operations) as
+`InferenceEngine(model, tokenizer, core=core)`. The frontend installs its event
+sink, starts the supplied core and stops it on shutdown, as it does for a core
+it constructs itself. A supplied core should belong to this frontend lifecycle.
+
+`core_client=`, `EngineCoreClient`, `InprocClient` and the deprecated
+`InferenceEngine.scheduler` property have been removed. Migrate custom clients
+to the core methods: `add_requests`, `cancel_request`, `get_stats`, `stop`,
+`set_event_sink`, `start`, and `score_ids`; retain `max_batch_size`,
+`op_selection`, and `cuda_graph_enabled`. Generation and HTTP APIs are unchanged.

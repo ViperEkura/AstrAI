@@ -70,7 +70,9 @@ python scripts/tools/train.py \
 
 ### NoneExecutor
 
-No wrapping. The model runs as-is on a single device. Gradient accumulation still works via `AccumOptimizer`/`AccumScheduler` (they gate `step()` on the sync counter). Checkpoint saving is a plain `state_dict()` call.
+No wrapping. The model runs as-is on a single device. Trainer accumulates
+microbatch gradients and calls the real optimizer and scheduler at each planned
+update boundary. Checkpoint saving is a plain `state_dict()` call.
 
 ### DDPExecutor
 
@@ -160,23 +162,36 @@ Gradient accumulation lets you simulate a larger effective batch size by accumul
 Effective batch = dp_size × batch_per_device × grad_accum_steps
 ```
 
-cp ranks share each batch (they shard the sequence), so `--cp_size` does not
-scale the effective batch. The launcher starts `dp_size × cp_size` processes.
+CP and TP ranks share each batch, so neither degree scales the effective batch.
+The launcher starts `dp_size × cp_size × tp_size` processes.
 
 Example: dp_size 4 × batch 4 × accum 8 = effective batch 256.
 
 ### How it works
 
-Three cooperating layers:
+Trainer divides the epoch into global data windows and chooses each learner
+update's final microbatch. It calls `executor.accumulate_explicit(model, sync=...)`
+with that choice; there is no executor-owned microstep counter.
 
-1. **`GradientState`** — tracks the micro-step counter. Fires `sync_gradients=True` every `grad_accum_steps` micro-batches.
-2. **`executor._no_sync(model)`** — suppresses gradient synchronization on non-sync micro-steps:
-   - `none`: `nullcontext` (nothing to skip)
-   - `ddp`: `model.no_sync()` (skips all-reduce)
-   - `fsdp`: `set_requires_gradient_sync(False)` on each `FSDPModule`
-3. **`AccumOptimizer` / `AccumScheduler`** — gate `step()` and `zero_grad()` on `sync_gradients`, so the optimizer only fires on the last micro-step.
+Non-final microbatches suppress synchronization through `nullcontext` (`none`),
+`model.no_sync()` (`ddp`), or FSDP's gradient-sync controls. The final backward
+synchronizes the accumulated gradients. Trainer then clips, updates and clears
+the real optimizer, and advances the scheduler once per learner update.
 
-The loss is divided by `grad_accum_steps` before `backward()`, so gradients sum to the correct mean.
+The objective is weighted by actual valid sample/token counts. This preserves the
+global mean for uneven `flush` windows and ranks with no real samples; it is not
+a fixed division by `grad_accum_steps`. `drop` skips an incomplete epoch window;
+`flush` commits its remaining samples. Saved progress advances only at a complete
+window boundary.
+
+Async rollout uses `grad_accum_steps=1`: its strategy supplies weighted
+microbatch losses for one complete learner update per round.
+
+For custom executor loops, migrate `accumulate()` to
+`accumulate_explicit(model, sync=...)` and call optimizer/scheduler operations
+only at your chosen update boundary. `sync_gradients` remains a read-only
+observation of the explicit selection. The removed accumulation wrappers no
+longer suppress incorrectly placed `step()` or `zero_grad()` calls.
 
 ## Process Launching
 
@@ -241,15 +256,18 @@ Checkpoints are saved by **rank-0 only**. The flow:
 
 ## Total Steps Calculation
 
-The scheduler's total step count accounts for data-parallel sharding:
+The scheduler counts unpadded global windows. For an offline epoch:
 
 ```
-samples_per_replica = ceil(dataset_len / dp_size)
-batches_per_replica  = ceil(samples_per_replica / batch_per_device)
-total_steps          = (batches_per_replica // grad_accum_steps) * n_epoch
+global_batch = dp_size * batch_per_device * grad_accum_steps
+full_windows, tail = divmod(remaining_samples_in_epoch, global_batch)
+epoch_steps = full_windows + int(epoch_tail_policy == "flush" and tail > 0)
 ```
 
-This ensures the LR schedule is correctly scaled regardless of the number of GPUs.
+Synchronous online RL counts each window's replay passes and prompt minibatches
+as separate learner updates. The shared `step_plan.py` calculations use the
+resumed epoch offset and configured tail policy, keeping scheduler and progress
+counts aligned with the actual update plan.
 
 ## Real Examples
 

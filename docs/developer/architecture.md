@@ -143,8 +143,8 @@ classDiagram
             +ComponentSpec dataset
             +ComponentSpec optimizer
             +ComponentSpec scheduler
-            +Optional[str] optimizer_name
-            +Dict[str, Any] optimizer_hyperparameters
+            +str optimizer_name «derived property»
+            +Dict[str, Any] optimizer_hyperparameters «derived property»
             +int n_epoch
             +int batch_per_device
             +int grad_accum_steps
@@ -464,11 +464,6 @@ classDiagram
             <<abstract>>
             +build(item, config, tokenizer) Optional[dict]
         }
-        class MaskBuilderFactory {
-            +Dict _entries
-            +register(name) decorator
-            +create(name, *args, **kwargs) BaseMaskBuilder
-        }
         class SingleOutputMaskBuilder {
             +SectionRenderer renderer
             +build(item, config, tokenizer) Optional[dict]
@@ -496,22 +491,6 @@ classDiagram
         class BFDSplitPacking {
             +apply(keys, max_packed_len, truncation_mode) Dict
         }
-        class PositionIdStrategy {
-            <<abstract>>
-            +generate(sequences) List[int]
-        }
-        class PositionIdStrategyFactory {
-            +create(name, *args, **kwargs) PositionIdStrategy
-        }
-        class NoPositionId {
-            +generate(sequences) List[int]
-        }
-        class DocResetPositionId {
-            +generate(sequences) List[int]
-        }
-        class ContinuousPositionId {
-            +generate(sequences) List[int]
-        }
         class StoreWriter {
             <<abstract>>
             +save(output_dir, domain, shard_idx, tensors)
@@ -530,7 +509,6 @@ classDiagram
             +AutoTokenizer tokenizer
             +BaseMaskBuilder mask_builder
             +PackingStrategy _packer
-            +PositionIdStrategy _position_id
             +StoreWriter _writer
             +transform(item) Optional[dict]
             +run()
@@ -543,7 +521,6 @@ classDiagram
             +PipelineConfig config
             +AutoTokenizer tokenizer
             +BaseMaskBuilder mask_builder
-            +PositionIdStrategy position_strategy
             +from_config_file(path) TokenizeTransform
             +apply(records) Dict[str, list]
         }
@@ -581,8 +558,8 @@ classDiagram
             +nn.Module model
             +BaseStrategy strategy
             +DataLoader dataloader
-            +OptimizerProtocol optimizer
-            +SchedulerProtocol scheduler
+            +Optimizer optimizer
+            +LRScheduler scheduler
             +Checkpoint checkpoint
             +TrainConfig config
             +dict model_config
@@ -624,6 +601,9 @@ classDiagram
                 +set_rollout_runner(runner)
                 +set_weight_publishers(publishers)
                 +prepare_from_rollout(result) Dict
+                +prepare_rollout_batch(batch) Dict
+                +training_steps(batch) Iterator
+                +training_updates(batch, microbatch_prompts) Iterator
                 +validate_online(batch) Optional[LossOutput]
                 +optimizer_step(optimizer)
             }
@@ -864,22 +844,6 @@ classDiagram
                 +float min_rate
             }
         }
-        namespace protocols {
-            class OptimizerProtocol {
-                <<protocol>>
-                +step(closure)
-                +zero_grad()
-                +state_dict() dict
-                +load_state_dict(d)
-            }
-            class SchedulerProtocol {
-                <<protocol>>
-                +step()
-                +state_dict() dict
-                +load_state_dict(d)
-                +get_last_lr()
-            }
-        }
     }
 
     namespace inference {
@@ -887,14 +851,14 @@ classDiagram
             class InferenceEngine {
                 +generate() / generate_async() / generate_events() / score()
             }
-            class EngineCoreClient {
-                <<abstract>>
-            }
-            class InprocClient
             class InputProcessor
             class OutputProcessor
         }
         namespace core {
+            class EngineCore {
+                +start() / stop()
+                +add_requests() / cancel_request() / get_stats()
+            }
             class Scheduler {
                 +run_busy_loop()
                 +run_batch() / score_ids()
@@ -1128,41 +1092,16 @@ classDiagram
             +launch(func, **kwargs)
         }
 
-        class GradientState {
-            +int num_steps
-            +sync_gradients (property) bool
-        }
-
-        class AccumOptimizer {
-            +Optimizer optimizer
-            +GradientState gradient_state
-            +param_groups (property)
-            +step(closure)
-            +zero_grad()
-            +state_dict() dict
-            +load_state_dict(d)
-        }
-
-        class AccumScheduler {
-            +LRScheduler scheduler
-            +GradientState gradient_state
-            +step()
-            +state_dict() dict
-            +load_state_dict(d)
-            +get_last_lr()
-        }
-
         class BaseExecutor {
-            +GradientState gradient_state
+            +int grad_accum_steps
             +prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap, after_wrap) tuple
-            +accumulate(model) context manager
+            +accumulate_explicit(model, sync) context manager
             +backward(loss)
             +unwrap_model(model) dict
             +checkpoint_context(model) context manager
             +clip_grad_norm(model, max_norm) float
             +use_distributed (property) bool
             +sync_gradients (property) bool
-            +grad_accum_steps (property) int
         }
 
         class NoneExecutor {
@@ -1246,9 +1185,6 @@ classDiagram
     PackingStrategy <|-- SimplePacking
     PackingStrategy <|-- BFDPacking
     BFDPacking <|-- BFDSplitPacking
-    PositionIdStrategy <|-- NoPositionId
-    PositionIdStrategy <|-- DocResetPositionId
-    PositionIdStrategy <|-- ContinuousPositionId
     StoreWriter <|-- BinWriter
     AllocationStrategy <|-- ContiguousStrategy
     BaseKVCache <|-- PrefillKVCache
@@ -1284,17 +1220,14 @@ classDiagram
     ChatCompletionRequest *-- ToolDef
     ToolDef *-- FunctionDef
     MessagesRequest *-- AnthropicMessage
-    BaseExecutor *-- GradientState
-    AccumOptimizer o-- GradientState
-    AccumScheduler o-- GradientState
 
     %% --- Aggregation (weak ownership) ---
     AutoModel o-- BaseModelConfig
     AutoTokenizer o-- ChatTemplate
     Trainer o-- TrainCallback
     TrainContext o-- BaseStrategy
-    TrainContext o-- OptimizerProtocol
-    TrainContext o-- SchedulerProtocol
+    TrainContext o-- Optimizer : torch.optim
+    TrainContext o-- LRScheduler : torch.optim.lr_scheduler
     TrainContext o-- Checkpoint
     TrainContext o-- BaseExecutor
     SamplingPipeline o-- BaseSamplingStrategy
@@ -1303,17 +1236,13 @@ classDiagram
     Pipeline o-- BaseMaskBuilder
     Pipeline o-- AutoTokenizer
     Pipeline o-- PackingStrategy
-    Pipeline o-- PositionIdStrategy
     Pipeline o-- StoreWriter
     TokenizeTransform o-- AutoTokenizer
     TokenizeTransform o-- BaseMaskBuilder
 
     %% --- Dependency (uses temporarily) ---
     TrainConfig ..> BaseStrategy : selects
-    PipelineConfig ..> MaskBuilderFactory : selects
-    MaskBuilderFactory ..> BaseMaskBuilder : creates
     PackingStrategyFactory ..> PackingStrategy : creates
-    PositionIdStrategyFactory ..> PositionIdStrategy : creates
     StoreWriterFactory ..> StoreWriter : creates
     StrategyFactory ..> BaseStrategy : creates
     SchedulerFactory ..> BaseScheduler : creates
@@ -1371,11 +1300,10 @@ classDiagram
     GPUModelRunner ..> KVCacheManager : TYPE_CHECKING only
     RequestManager --> AutoTokenizer
 
-    InferenceEngine *-- EngineCoreClient
-    EngineCoreClient <|.. InprocClient
+    InferenceEngine --> EngineCore
+    EngineCore *-- Scheduler
     InferenceEngine --> InputProcessor
     InferenceEngine --> OutputProcessor
-    InprocClient ..> Scheduler : direct call
     Scheduler *-- RequestManager
     Scheduler *-- SchedulerStep
     Scheduler *-- KVCacheManager
@@ -1395,23 +1323,23 @@ classDiagram
 | Module | Components | Description |
 |--------|------------|-------------|
 | **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, AttentionConfig, GQAConfig, GDNConfig, MLAConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
-| **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, MaskBuilderFactory, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, PackingStrategy, PackingStrategyFactory, SimplePacking, BFDPacking, BFDSplitPacking, PositionIdStrategy, PositionIdStrategyFactory, NoPositionId, DocResetPositionId, ContinuousPositionId, StoreWriter, StoreWriterFactory, BinWriter | Declarative JSON-driven data preprocessing |
+| **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, PackingStrategy, PackingStrategyFactory, generate_position_ids, SimplePacking, BFDPacking, BFDSplitPacking, StoreWriter, StoreWriterFactory, BinWriter | Declarative JSON-driven data preprocessing |
 | **astrai.dataset** | BaseDataset, SEQDataset, SFTDataset, DPODataset, GRPODataset, Store, Streamable, Recordable, MmapStore, JsonlStore, StoreFactory, RDSampler, DatasetFactory | Dataset loading and management |
 | **astrai.serialization** | Checkpoint | Model serialization |
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, TransformerModel · `components/`: DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding · `kv_cache.py`: KVStorage, ReqToTokenPool, BaseKVCache, PrefillKVCache, DecodeKVCache, KVCache alias | Neural network model and KV layout contract |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model · `strategy/`: BaseStrategy–GRPOStrategy, StrategyFactory · `callbacks/`: TrainCallback, GradientClippingCallback, GradientCheckpointingCallback, CheckpointCallback, ProgressBarCallback, MetricCallback, CallbackFactory · `backend.py`: RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher · `rollout/`: RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator | Training workflow (online RL rollout via injectable backends) |
-| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, EngineCoreClient/InprocClient, events (TokenDelta/RequestFinished/RequestError) · core: Scheduler, SchedulerStep, RequestManager, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
+| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, events (TokenDelta/RequestFinished/RequestError) · core: EngineCore, Scheduler, SchedulerStep, RequestManager, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
 | **astrai.extension** | `runtime` context/spec/dispatcher, `backend` per-operator policy, `kernel` exact wrappers, attention, op_backend, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
-| **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler · `protocols.py`: OptimizerProtocol, SchedulerProtocol | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
-| **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch, executors & gradient accumulation |
+| **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
+| **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch and explicit gradient synchronization |
 | **astrai.factory** | BaseFactory | Component registration |
 
 ## Design Patterns
 
 | Pattern | Classes | Purpose |
 |---------|---------|---------|
-| **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `CallbackFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory`, `MaskBuilderFactory`, `StoreWriterFactory`, `PackingStrategyFactory`, `PositionIdStrategyFactory`, `ToolParserFactory` | Decorator-based component creation |
+| **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `CallbackFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory`, `StoreWriterFactory`, `PackingStrategyFactory`, `ToolParserFactory` | Decorator-based component creation |
 | **Registry** | `BaseFactory` | Component registration |
 | **Strategy** | `SEQStrategy`, `SFTStrategy`, `DPOStrategy`, `GRPOStrategy` | Training strategy switching |
 | **Strategy (Sampling)** | `TemperatureStrategy`, `TopKStrategy`, `TopPStrategy`, `FrequencyPenaltyStrategy`, `SamplingPipeline` | Composable logit transformations |
@@ -1443,6 +1371,6 @@ classDiagram
 8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata; `CheckpointCallback` performs rank-0 training saves, with extra state saved as `{key}.pt`
 9. **Scheduler**: `SchedulerFactory` creates `CosineScheduler`/`SGDRScheduler`/`WSDScheduler`
 10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
-11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` define the structural contracts used by `TrainContext`
+11. **Optimizer and scheduler types**: `TrainContext` uses PyTorch `torch.optim.Optimizer` and `torch.optim.lr_scheduler.LRScheduler` directly. Custom components should follow these base-class contracts; this annotation change adds no runtime type checks.
 
 > Document Update Time: 2026-10-12

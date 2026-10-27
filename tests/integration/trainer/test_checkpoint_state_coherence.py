@@ -15,25 +15,8 @@ from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks import TrainCallback
 from astrai.trainer.components import build_dataloader, build_scheduler_component
 from astrai.trainer.trainer import Trainer
+from tests.support.checkpoint import assert_state_dicts_equal
 from tests.support.rollout import RandomTokenDataset
-
-
-class _DeterministicTokenDataset(torch.utils.data.Dataset):
-    """Fixed tokens make checkpoint replay independent of global RNG state."""
-
-    def __init__(self, length, max_length=8, vocab_size=100):
-        self.length = length
-        self.max_length = max_length
-        self.vocab_size = vocab_size
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, index):
-        inputs = (
-            torch.arange(self.max_length) + index * self.max_length
-        ) % self.vocab_size
-        return {"input_ids": inputs, "target_ids": (inputs + 1) % self.vocab_size}
 
 
 class _StopAfterSteps(TrainCallback):
@@ -92,10 +75,29 @@ def _checkpoints(directory):
     )
 
 
-def _final_state(directory):
+def _last_checkpoint(directory):
     paths = _checkpoints(directory)
     assert paths, f"no checkpoint written under {directory}"
-    return Checkpoint.load(str(paths[-1])).state_dict
+    return Checkpoint.load(str(paths[-1]))
+
+
+@pytest.fixture
+def resume_config(train_config_factory):
+    def make(directory, *, length=64, **overrides):
+        settings = dict(
+            device="cpu",
+            n_epoch=2,
+            batch_per_device=2,
+            grad_accum_steps=2,
+            ckpt_interval=1000,
+            random_seed=1234,
+        )
+        settings.update(overrides)
+        return train_config_factory(
+            _DeterministicTokenDataset(length=length), str(directory), **settings
+        )
+
+    return make
 
 
 def _train(config, callbacks=None, param_path=None, resume=False):
@@ -141,29 +143,16 @@ def test_saved_cursor_matches_committed_steps(
     ],
 )
 def test_resume_reproduces_the_uninterrupted_run(
-    train_config_factory, tmp_path, stop_callback, expected_step
+    resume_config, tmp_path, stop_callback, expected_step
 ):
     """Committed state and fixed data replay exactly after a restart."""
     baseline_dir = tmp_path / "baseline"
     split_dir = tmp_path / "split"
     per_step_total = 2 * 2  # batch_per_device * grad_accum_steps, dp_size == 1
 
-    def config_for(directory):
-        return train_config_factory(
-            _DeterministicTokenDataset(length=64),
-            str(directory),
-            device="cpu",
-            n_epoch=2,
-            batch_per_device=2,
-            grad_accum_steps=2,
-            # Only stop/end checkpoints, so the split leg resumes from a known one.
-            ckpt_interval=1000,
-            random_seed=1234,
-        )
+    _train(resume_config(baseline_dir))
 
-    _train(config_for(baseline_dir))
-
-    _train(config_for(split_dir), callbacks=[stop_callback])
+    _train(resume_config(split_dir), callbacks=[stop_callback])
     first_leg = _checkpoints(split_dir)
     assert len(first_leg) == 1, (
         f"expected a single emergency checkpoint, got {first_leg}"
@@ -179,15 +168,11 @@ def test_resume_reproduces_the_uninterrupted_run(
     if mid_window is not None:
         assert mid_window is False, "the stop must land mid-window"
 
-    _train(config_for(split_dir), param_path=str(checkpoint), resume=True)
+    _train(resume_config(split_dir), param_path=str(checkpoint), resume=True)
 
-    baseline = _final_state(baseline_dir)
-    resumed = _final_state(split_dir)
-    assert set(baseline) == set(resumed)
-    differing = [
-        key for key in baseline if not torch.equal(baseline[key], resumed[key])
-    ]
-    assert not differing, f"resume diverged from the uninterrupted run: {differing[:5]}"
+    baseline = _last_checkpoint(baseline_dir).state_dict
+    resumed = _last_checkpoint(split_dir).state_dict
+    assert_state_dicts_equal(baseline, resumed)
 
     def metric_coordinates(directory):
         path = _checkpoints(directory)[-1] / "metric.jsonl"
@@ -223,43 +208,36 @@ def test_loader_iterator_leaves_global_rng_untouched(train_config_factory, tmp_p
     )
 
 
-@pytest.mark.parametrize("length", [9, 10])
-def test_short_epoch_tail_is_discarded_and_resumes_at_next_epoch(
-    train_config_factory, tmp_path, length
+@pytest.mark.parametrize("policy, length", [("drop", 9), ("drop", 10), ("flush", 7)])
+def test_epoch_tail_resume_matches_uninterrupted_run(
+    resume_config, tmp_path, policy, length
 ):
-    """An incomplete accumulation window is skipped at the epoch boundary."""
+    """Both tail policies preserve committed weights and the next-epoch cursor."""
     baseline_dir = tmp_path / "baseline_tail"
     split_dir = tmp_path / "split_tail"
 
-    def config_for(directory):
-        return train_config_factory(
-            _DeterministicTokenDataset(length=length),
-            str(directory),
-            device="cpu",
-            n_epoch=2,
-            batch_per_device=2,
-            grad_accum_steps=2,
-            ckpt_interval=1000,
-            random_seed=1234,
-        )
-
-    _train(config_for(baseline_dir))
-    _train(config_for(split_dir), callbacks=[_StopAfterFirstEpoch()])
+    _train(resume_config(baseline_dir, length=length, epoch_tail_policy=policy))
+    _train(
+        resume_config(split_dir, length=length, epoch_tail_policy=policy),
+        callbacks=[_StopAfterFirstEpoch()],
+    )
     first = _checkpoints(split_dir)[-1]
     checkpoint = Checkpoint.load(str(first))
     assert checkpoint.meta["optimizer_step"] == 2
     assert checkpoint.consumed_samples == length
-    assert first.name == "epoch_1_step_2"
+    if policy == "drop":
+        assert first.name == "epoch_1_step_2"
 
-    _train(config_for(split_dir), param_path=str(first), resume=True)
-    baseline = Checkpoint.load(str(_checkpoints(baseline_dir)[-1]))
-    resumed = Checkpoint.load(str(_checkpoints(split_dir)[-1]))
+    _train(
+        resume_config(split_dir, length=length, epoch_tail_policy=policy),
+        param_path=str(first),
+        resume=True,
+    )
+    baseline = _last_checkpoint(baseline_dir)
+    resumed = _last_checkpoint(split_dir)
     assert baseline.meta["optimizer_step"] == resumed.meta["optimizer_step"] == 4
     assert baseline.consumed_samples == resumed.consumed_samples == 2 * length
-    for key in baseline.state_dict:
-        torch.testing.assert_close(
-            baseline.state_dict[key], resumed.state_dict[key], rtol=0, atol=0
-        )
+    assert_state_dicts_equal(baseline.state_dict, resumed.state_dict)
     assert "rng_state" not in resumed.extra
 
 
@@ -275,7 +253,7 @@ def test_discarded_tail_is_not_loaded(train_config_factory, tmp_path):
         ckpt_interval=1000,
     )
     _train(config)
-    checkpoint = Checkpoint.load(str(_checkpoints(tmp_path)[-1]))
+    checkpoint = _last_checkpoint(tmp_path)
     assert checkpoint.meta["optimizer_step"] == 2
     assert checkpoint.consumed_samples == 9
 
@@ -333,40 +311,6 @@ def test_epoch_tail_policy_counts_full_and_short_batches(
     assert checkpoint.consumed_samples == length
 
 
-def test_flushed_tail_resume_matches_uninterrupted_run(train_config_factory, tmp_path):
-    def config_for(directory):
-        return train_config_factory(
-            _DeterministicTokenDataset(length=7, max_length=8, vocab_size=100),
-            str(directory),
-            device="cpu",
-            n_epoch=2,
-            batch_per_device=2,
-            grad_accum_steps=2,
-            ckpt_interval=1000,
-            random_seed=1234,
-            epoch_tail_policy="flush",
-        )
-
-    baseline_dir = tmp_path / "baseline_flush"
-    split_dir = tmp_path / "split_flush"
-    _train(config_for(baseline_dir))
-    _train(config_for(split_dir), callbacks=[_StopAfterFirstEpoch()])
-    first = _checkpoints(split_dir)[-1]
-    first_checkpoint = Checkpoint.load(str(first))
-    assert first_checkpoint.meta["optimizer_step"] == 2
-    assert first_checkpoint.consumed_samples == 7
-
-    _train(config_for(split_dir), param_path=str(first), resume=True)
-    baseline = Checkpoint.load(str(_checkpoints(baseline_dir)[-1]))
-    resumed = Checkpoint.load(str(_checkpoints(split_dir)[-1]))
-    assert baseline.meta["optimizer_step"] == resumed.meta["optimizer_step"] == 4
-    assert baseline.consumed_samples == resumed.consumed_samples == 14
-    for key in baseline.state_dict:
-        torch.testing.assert_close(
-            baseline.state_dict[key], resumed.state_dict[key], rtol=0, atol=0
-        )
-
-
 def test_resume_refuses_epoch_tail_policy_change(train_config_factory, tmp_path):
     dataset = RandomTokenDataset(length=7, max_length=8, vocab_size=100)
     config = train_config_factory(
@@ -391,38 +335,30 @@ def test_resume_refuses_epoch_tail_policy_change(train_config_factory, tmp_path)
         _train(changed, param_path=str(checkpoint), resume=True)
 
 
-def test_resume_from_checkpoint_before_discarded_tail(train_config_factory, tmp_path):
+def test_resume_from_checkpoint_before_discarded_tail(resume_config, tmp_path):
     baseline_dir = tmp_path / "baseline"
     stopped_dir = tmp_path / "stopped"
     resumed_dir = tmp_path / "resumed"
 
-    def config_for(directory):
-        return train_config_factory(
-            _DeterministicTokenDataset(length=9),
-            str(directory),
-            device="cpu",
-            n_epoch=2,
-            batch_per_device=2,
-            grad_accum_steps=2,
-            ckpt_interval=1,
-            random_seed=1234,
-        )
-
-    _train(config_for(baseline_dir))
-    _train(config_for(stopped_dir), callbacks=[_StopAfterFirstEpoch()])
+    _train(resume_config(baseline_dir, length=9, ckpt_interval=1))
+    _train(
+        resume_config(stopped_dir, length=9, ckpt_interval=1),
+        callbacks=[_StopAfterFirstEpoch()],
+    )
     before_tail = stopped_dir / "epoch_0_step_2"
     assert before_tail.is_dir()
     assert Checkpoint.load(str(before_tail)).consumed_samples == 8
 
-    _train(config_for(resumed_dir), param_path=str(before_tail), resume=True)
-    baseline = Checkpoint.load(str(_checkpoints(baseline_dir)[-1]))
-    resumed = Checkpoint.load(str(_checkpoints(resumed_dir)[-1]))
+    _train(
+        resume_config(resumed_dir, length=9, ckpt_interval=1),
+        param_path=str(before_tail),
+        resume=True,
+    )
+    baseline = _last_checkpoint(baseline_dir)
+    resumed = _last_checkpoint(resumed_dir)
     assert baseline.meta["optimizer_step"] == resumed.meta["optimizer_step"] == 4
     assert baseline.consumed_samples == resumed.consumed_samples == 18
-    for key in baseline.state_dict:
-        torch.testing.assert_close(
-            baseline.state_dict[key], resumed.state_dict[key], rtol=0, atol=0
-        )
+    assert_state_dicts_equal(baseline.state_dict, resumed.state_dict)
 
 
 def test_negative_cursor_is_refused(train_config_factory, tmp_path):

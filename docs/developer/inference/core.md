@@ -63,6 +63,12 @@ output. Result application validates execution/request identity and policy
 version, then advances the corresponding live request. Reapplying a result
 must not append the same token twice.
 
+`RequestManager.add_request` preserves scalar tokenization and delegates its
+prepared tokens to the batch construction path. Token budgets and request
+construction have one implementation. Batch tokenization still runs once,
+and all requests are validated before a single atomic enqueue, so a bad
+request cannot leave a valid prefix registered.
+
 `astrai.trainer.backend.run_batch` is the synchronous token-ID API used by
 training rollout. It validates and formats the batch, then calls
 `EngineCore.execute_requests` to use the same `Scheduler.schedule()` and

@@ -65,7 +65,7 @@ def event_engine(monkeypatch):
     with patch("astrai.inference.frontend.engine.EngineCore"):
         engine = InferenceEngine(MagicMock(), FakeTokenizer(), max_seq_len=32)
     engine._core = MagicMock()
-    engine._core.abort_request.side_effect = lambda rid: (
+    engine._core.cancel_request.side_effect = lambda rid: (
         engine._tracker.sink([RequestFinished(rid, FINISH_CANCELLED)]) or True
     )
     _emit_on_submission(engine)
@@ -81,18 +81,18 @@ def _emit_on_submission(engine, text="", reason=None, error=False):
             events.append(RequestFinished(rid, reason, len(prompt_ids), len(text)))
         engine._tracker.sink(events)
 
-    def send_request(**kwargs):
+    def add_request(**kwargs):
         rid = kwargs["request_id"]
         emit(rid, kwargs["prompt_ids"])
         return rid
 
-    def send_requests(**kwargs):
+    def add_requests(**kwargs):
         for rid, ids in zip(kwargs["request_ids"], kwargs["prompts_ids"]):
             emit(rid, ids)
         return kwargs["request_ids"]
 
-    engine._core.send_request.side_effect = send_request
-    engine._core.send_requests.side_effect = send_requests
+    engine._core.add_request.side_effect = add_request
+    engine._core.add_requests.side_effect = add_requests
 
 
 def _assert_frontend_released(engine):

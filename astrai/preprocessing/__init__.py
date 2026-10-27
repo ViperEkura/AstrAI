@@ -1,6 +1,5 @@
 from astrai.preprocessing.builder import (
     BaseMaskBuilder,
-    MaskBuilderFactory,
     MultiOutputMaskBuilder,
     SectionedMaskBuilder,
     SingleOutputMaskBuilder,
@@ -11,10 +10,7 @@ from astrai.preprocessing.packing import (
     plan_bfd,
 )
 from astrai.preprocessing.pipeline import Pipeline, filter_by_length
-from astrai.preprocessing.position_id import (
-    PositionIdStrategy,
-    PositionIdStrategyFactory,
-)
+from astrai.preprocessing.position_id import generate_position_ids
 from astrai.preprocessing.transform import TokenizeTransform
 from astrai.preprocessing.writer import (
     StoreWriter,
@@ -23,18 +19,16 @@ from astrai.preprocessing.writer import (
 
 __all__ = [
     "BaseMaskBuilder",
-    "MaskBuilderFactory",
     "MultiOutputMaskBuilder",
     "PackingStrategy",
     "PackingStrategyFactory",
     "Pipeline",
-    "PositionIdStrategy",
-    "PositionIdStrategyFactory",
     "SectionedMaskBuilder",
     "SingleOutputMaskBuilder",
     "StoreWriter",
     "StoreWriterFactory",
     "TokenizeTransform",
     "filter_by_length",
+    "generate_position_ids",
     "plan_bfd",
 ]

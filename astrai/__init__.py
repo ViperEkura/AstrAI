@@ -18,9 +18,7 @@ from astrai.dataset import (
 )
 from astrai.factory import BaseFactory
 from astrai.inference import (
-    EngineCoreClient,
     InferenceEngine,
-    InprocClient,
     build_engine,
     get_app,
     run_server,

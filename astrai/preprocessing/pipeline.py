@@ -26,6 +26,7 @@ from astrai.preprocessing.core import (
     primary_ids,
 )
 from astrai.preprocessing.packing import PackingStrategyFactory
+from astrai.preprocessing.position_id import generate_position_ids
 from astrai.preprocessing.writer import StoreWriterFactory
 
 logger = logging.getLogger(__name__)
@@ -69,8 +70,8 @@ class Pipeline:
         self.output_dir = output_dir
         self.tokenizer_path = tokenizer_path
 
-        self.tokenizer, self.mask_builder, self._position_id = (
-            build_preprocessing_components(config, tokenizer_path)
+        self.tokenizer, self.mask_builder = build_preprocessing_components(
+            tokenizer_path
         )
         self._packer = PackingStrategyFactory.create_checked(
             config.preprocessing.packing_strategy
@@ -262,7 +263,7 @@ class Pipeline:
         packed bin concatenates the per-doc ranges in bin order.  The
         per-record structure ``[range(len(s)) for s in seqs]`` is required
         by the packer (it concatenates per-record lists per bin); the
-        ``PositionIdStrategy.generate`` flattens, so it cannot be used
+        ``generate_position_ids`` flattens, so it cannot be used
         directly here — it is only consulted for the ``continuous``
         post-packing path.
         """
@@ -285,7 +286,7 @@ class Pipeline:
         """
         if mode != "continuous" or not packed_sequences:
             return tensors
-        pos_ids = self._position_id.generate(packed_sequences)
+        pos_ids = generate_position_ids(packed_sequences, mode)
         if pos_ids:
             tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
         return tensors

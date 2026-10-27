@@ -10,8 +10,6 @@ orchestrates both modes as a façade.
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
-from astrai.factory import BaseFactory
-
 
 def _extract_domain(item: Dict, domain_key: Optional[str]) -> str:
     if not domain_key:
@@ -286,11 +284,6 @@ class BaseMaskBuilder(ABC):
         return [self.build(item, config, tokenizer) for item in items]
 
 
-class MaskBuilderFactory(BaseFactory["BaseMaskBuilder"]):
-    pass
-
-
-@MaskBuilderFactory.register("single")
 class SingleOutputMaskBuilder(BaseMaskBuilder):
     """Build a single output sequence with optional loss mask.
 
@@ -335,7 +328,6 @@ class SingleOutputMaskBuilder(BaseMaskBuilder):
         return results
 
 
-@MaskBuilderFactory.register("multi")
 class MultiOutputMaskBuilder(BaseMaskBuilder):
     """Build multiple output sequences (DPO / GRPO).
 
@@ -407,7 +399,6 @@ class MultiOutputMaskBuilder(BaseMaskBuilder):
         ]
 
 
-@MaskBuilderFactory.register("sectioned")
 class SectionedMaskBuilder(BaseMaskBuilder):
     """Façade that dispatches to SingleOutputMaskBuilder or MultiOutputMaskBuilder.
 

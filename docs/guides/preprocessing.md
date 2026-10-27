@@ -1,6 +1,6 @@
 # Preprocessing Pipeline
 
-Declarative JSON-driven data preprocessing. `MaskBuilderFactory` supports three registered builders: `"single"` (single-output via `input.sections`), `"multi"` (multi-output via `input.sources`), and `"sectioned"` (façade dispatching to `single` or `multi` based on config).
+Declarative JSON-driven data preprocessing. The built-in pipeline directly constructs `SectionedMaskBuilder`, which selects `SingleOutputMaskBuilder` for `input.sections` or `MultiOutputMaskBuilder` for `input.sources`. All three builders remain available for direct construction and custom renderer injection.
 
 ## Contents
 
@@ -465,3 +465,19 @@ Pipeline(
 ```
 
 > Document Update Time: 2026-07-09
+
+## Python API migration
+
+Construct `SectionedMaskBuilder()`, `SingleOutputMaskBuilder()` or
+`MultiOutputMaskBuilder()` directly instead of using `MaskBuilderFactory`.
+Their `build` / `build_batch` methods and renderer injection remain available.
+
+Position generation is now the pure function
+`generate_position_ids(sequences, mode)` from `astrai.preprocessing`.
+It returns `[]` for `none`, resets numbering for each document in `doc_reset`,
+and returns one continuous range for `continuous`. Empty sequences produce no
+positions; an unsupported mode raises `ValueError`. The position strategy
+classes and their factory have been removed. Online transforms omit the
+`position_ids` key when there are no positions. Offline packing still attaches
+per-document resets before packing and continuous positions after packing.
+Configuration names and stored data formats are unchanged.

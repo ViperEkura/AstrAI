@@ -17,7 +17,7 @@ classDiagram
         <<FACADE>>
         +nn.Module model
         +AutoTokenizer tokenizer
-        -EngineCoreClient _core
+        -EngineCore _core
         -RequestTracker _tracker
         -InputProcessor _input_processor
         +generate(prompt, stream, max_tokens, ...) Union~Generator, str, List~str~~
@@ -27,23 +27,13 @@ classDiagram
         +get_stats() Dict
         +shutdown()
     }
-    class EngineCoreClient {
-        <<abstract · STRATEGY>>
+    class EngineCore {
         +set_event_sink(sink)
-        +start()
-        +send_request(**kwargs) str
-        +send_requests(prompts, **kwargs) List~str~
-        +abort_request(request_id) bool
+        +start() / stop()
+        +add_requests(prompts, **kwargs) List~str~
+        +cancel_request(request_id) bool
         +score_ids(prompts, continuations, per_token)
-        +stats() Dict
-        +max_batch_size int
-        +op_selection OpSelection
-        +cuda_graph_enabled bool
-        +shutdown()
-    }
-    class InprocClient {
-        direct calls to Scheduler facade
-        shared in-process EngineCore
+        +get_stats() Dict
     }
     class InputProcessor {
         +AutoTokenizer _tokenizer
@@ -87,8 +77,7 @@ classDiagram
         +finish_reason / prompt_tokens / completion_tokens
     }
 
-    InferenceEngine *-- EngineCoreClient
-    EngineCoreClient <|.. InprocClient
+    InferenceEngine --> EngineCore
     InferenceEngine --> InputProcessor : uses
     InferenceEngine --> OutputProcessor : folds events
     InferenceEngine *-- RequestTracker
@@ -106,7 +95,7 @@ classDiagram
   event can never precede its consumer — this is what allowed the old
   `_ResultSink` replay buffer to be deleted.
   Single and batch inputs then share one prepared-request submission path:
-  register every consumer, submit the IDs and tokens through the core client,
+  register every consumer, submit the IDs and tokens through EngineCore,
   and release the registered requests if submission fails. Scalar tokenization
   remains available for tokenizers without a batch API; stream submission
   stays deferred until iteration starts.
@@ -117,12 +106,12 @@ classDiagram
   text to count tokens). Degrades to token-id-as-string when the
   tokenizer lacks the Rust streaming handle, so a stream always
   terminates.
-- **EngineCoreClient** owns the frontend-to-core boundary for requests,
-  scoring, status, event delivery and lifecycle. The engine accepts an
-  injected client through the core_client constructor argument. The default
-  InprocClient still calls the live Scheduler facade in the same process.
-  Direct InferenceEngine.scheduler access warns in the first refactor release
-  and remains available for one minor version.
+- **`EngineCore`** owns the request, scoring, status, event-sink and
+  lifecycle operations used directly by the frontend. The engine accepts an
+  existing core through `core=`; otherwise it constructs one in-process.
+  The frontend attaches its event sink, starts the core and stops it on
+  shutdown in either case. Locking and scheduler/KV ownership remain in the
+  core. The deprecated frontend `scheduler` property has been removed.
 - **`RequestTracker`** holds bounded per-request event queues for blocking
   consumers and supports async subscriptions for streaming consumers. A
   subscriber atomically takes the queued backlog and becomes the live route;

@@ -177,11 +177,11 @@ def test_unknown_state_dict_component_is_rejected():
 
 def test_muon_adamw_reuses_both_histories_with_new_stage_lr():
     model = torch.nn.Linear(4, 4)
-    old = OptimizerFactory.create_checked("muon_adamw", model, lr=0.1, ns_steps=1)
+    old = OptimizerFactory.create("muon_adamw", model, lr=0.1, ns_steps=1)
     for param in model.parameters():
         param.grad = torch.ones_like(param)
     old.step()
-    new = OptimizerFactory.create_checked("muon_adamw", model, lr=0.02, ns_steps=1)
+    new = OptimizerFactory.create("muon_adamw", model, lr=0.02, ns_steps=1)
     scheduler = torch.optim.lr_scheduler.StepLR(new, step_size=1, gamma=0.8)
     saved = old.state_dict()
 

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import json
-import shutil
 import time
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
@@ -14,7 +11,7 @@ import torch.distributed as dist
 
 from astrai.parallel import only_on_rank
 from astrai.parallel.setup import get_current_device
-from astrai.trainer.callbacks.base import CallbackFactory, TrainCallback
+from astrai.trainer.callbacks.base import TrainCallback
 from astrai.trainer.callbacks.metric_util import (
     ctx_get_grad_norm,
     ctx_get_grad_snr,
@@ -28,7 +25,6 @@ if TYPE_CHECKING:
     from astrai.trainer.context import TrainContext
 
 
-@CallbackFactory.register("metric")
 class MetricCallback(TrainCallback):
     def __init__(
         self,
@@ -42,9 +38,6 @@ class MetricCallback(TrainCallback):
         self.val_step = val_step
         self.grad_snr_interval = grad_snr_interval
         self._next_val_step = 0
-        self.log_cache = []
-        self.pending_records = []
-        self.source_log_path = None
 
         self._metric_funcs = {
             "loss": ctx_get_loss,
@@ -89,7 +82,7 @@ class MetricCallback(TrainCallback):
         return result
 
     @only_on_rank(0)
-    def _append(self, event_type: str, context: TrainContext, pending=False, **extra):
+    def _append(self, event_type: str, context: TrainContext, **extra):
         entry = {
             "type": event_type,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -98,7 +91,7 @@ class MetricCallback(TrainCallback):
             "consumed_samples": context.consumed_samples,
             **extra,
         }
-        (self.pending_records if pending else self.log_cache).append(entry)
+        context.metric_history.stage(entry)
 
     def _run_validation(self, context: TrainContext) -> float:
         context.model.eval()
@@ -159,33 +152,8 @@ class MetricCallback(TrainCallback):
             self._next_val_step = next_slot + (
                 0 if context.async_rollout is not None else 1
             )
-        if context.checkpoint is not None and context.param_path is not None:
-            source = Path(context.param_path) / "metric.jsonl"
-            if source.is_file():
-                self.source_log_path = source
-
-    @only_on_rank(0)
-    def write_snapshot(self, destination: Path) -> None:
-        """Add the committed metric history to a checkpoint's staging directory."""
-        with destination.open("wb") as output:
-            if self.source_log_path is not None:
-                with self.source_log_path.open("rb") as source:
-                    shutil.copyfileobj(source, output)
-            for record in self.log_cache:
-                output.write((json.dumps(record) + "\n").encode("utf-8"))
-
-    def checkpoint_saved(self, path: Path, published: bool) -> None:
-        if not published:
-            if self.log_cache:
-                raise RuntimeError(
-                    f"Checkpoint {path} already exists but has unsaved metrics"
-                )
-            return
-        self.source_log_path = path / "metric.jsonl"
-        self.log_cache.clear()
 
     def before_optimizer_step(self, context):
-        self.pending_records.clear()
         # GradSNR keeps model-sized first-moment state. Only update it when
         # requested and at the configured sampling interval.
         if (
@@ -207,28 +175,11 @@ class MetricCallback(TrainCallback):
                 context.val_loss = None
                 val_metrics = self._run_rollout_validation(context)
                 self._next_val_step = context.optimizer_step + self.val_step
-                self._append("validation", context, pending=True, **val_metrics)
+                self._append("validation", context, **val_metrics)
             else:
                 context.val_loss = self._run_validation(context)
                 self._next_val_step = context.optimizer_step + self.val_step
-                self._append(
-                    "validation", context, pending=True, val_loss=context.val_loss
-                )
+                self._append("validation", context, val_loss=context.val_loss)
 
         step_metrics = [m for m in self.metrics if m != "val_loss"]
-        self._append(
-            "step", context, pending=True, **self._metrics(context, step_metrics)
-        )
-
-    def after_optimizer_step(self, context):
-        for record in self.pending_records:
-            record["step"] = context.optimizer_step
-            record["consumed_samples"] = context.consumed_samples
-        self.log_cache.extend(self.pending_records)
-        self.pending_records.clear()
-
-    def on_train_end(self, context):
-        self.pending_records.clear()
-
-    def on_shutdown(self, context):
-        self.pending_records.clear()
+        self._append("step", context, **self._metrics(context, step_metrics))

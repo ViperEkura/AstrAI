@@ -2,6 +2,7 @@
 
 import logging
 from functools import partial
+from pathlib import Path
 from typing import Dict, Optional, Self, Tuple
 
 import torch
@@ -32,6 +33,7 @@ from astrai.trainer.components import (
     create_ref_model,
     stop_loader_workers,
 )
+from astrai.trainer.context.metric import MetricHistory
 from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.context.state import TrainContext
 from astrai.trainer.optional_extras import (
@@ -146,7 +148,7 @@ class TrainContextBuilder:
                 kwargs.setdefault("process_group", self._topology.dp_group)
             elif cfg.dp_mode == "fsdp":
                 kwargs.setdefault("mesh", self._topology.mesh["dp"])
-        return ExecutorFactory.create_checked(
+        return ExecutorFactory.create(
             cfg.dp_mode,
             grad_accum_steps=cfg.grad_accum_steps,
             **kwargs,
@@ -165,6 +167,9 @@ class TrainContextBuilder:
     def _create_context(
         self, state: PreloadedState, executor: BaseExecutor
     ) -> TrainContext:
+        resume_path = None
+        if state.checkpoint is not None and self._param_path is not None:
+            resume_path = Path(self._param_path)
         return TrainContext(
             world_size=get_world_size(),
             rank=get_rank(),
@@ -177,6 +182,7 @@ class TrainContextBuilder:
             epoch_sample_offset=state.epoch_sample_offset,
             optimizer_steps_completed=state.optimizer_steps_completed,
             checkpoint=state.checkpoint,
+            metric_history=MetricHistory(resume_path),
             param_path=self._param_path,
         )
 
@@ -320,7 +326,7 @@ class TrainContextBuilder:
             kwargs["critic"] = critic
             kwargs["critic_optimizer"] = critic_optimizer
             kwargs.setdefault("max_grad_norm", cfg.max_grad_norm)
-        context.strategy = StrategyFactory.create_checked(
+        context.strategy = StrategyFactory.create(
             cfg.strategy,
             model=context.model,
             device=get_current_device(),

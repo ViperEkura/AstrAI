@@ -58,6 +58,7 @@ class TrainSession:
         """
         steps: list[tuple[str, Callable[[], None]]] = [
             ("shutdown_hooks", context.run_shutdown),
+            ("discard_pending_metrics", context.metric_history.discard_pending),
             (
                 "on_shutdown",
                 lambda: self._call_callbacks("on_shutdown", context),

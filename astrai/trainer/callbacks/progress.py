@@ -8,14 +8,13 @@ from typing import IO, TYPE_CHECKING, Optional
 from tqdm import tqdm
 
 from astrai.parallel import only_on_rank
-from astrai.trainer.callbacks.base import CallbackFactory, TrainCallback
+from astrai.trainer.callbacks.base import TrainCallback
 from astrai.trainer.step_plan import global_epoch_steps
 
 if TYPE_CHECKING:
     from astrai.trainer.context import TrainContext
 
 
-@CallbackFactory.register("progress_bar")
 class ProgressBarCallback(TrainCallback):
     """
     Progress bar callback for trainer.

@@ -27,7 +27,7 @@ from astrai.preprocessing.core import (
 )
 from astrai.preprocessing.packing import PackingStrategyFactory
 from astrai.preprocessing.position_id import generate_position_ids
-from astrai.preprocessing.writer import StoreWriterFactory
+from astrai.preprocessing.writer import BinWriter
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,8 @@ class Pipeline:
         output_dir: str,
         tokenizer_path: str,
     ):
+        if config.output.storage_format != "bin":
+            raise ValueError("Pipeline output storage_format only supports 'bin'")
         os.makedirs(output_dir, exist_ok=True)
         self.config = config
         self.paths = input_paths
@@ -73,10 +75,10 @@ class Pipeline:
         self.tokenizer, self.mask_builder = build_preprocessing_components(
             tokenizer_path
         )
-        self._packer = PackingStrategyFactory.create_checked(
+        self._packer = PackingStrategyFactory.create(
             config.preprocessing.packing_strategy
         )
-        self._writer = StoreWriterFactory.create_checked(config.output.storage_format)
+        self._writer = BinWriter()
 
     def transform(self, item: Dict) -> Optional[Dict]:
         return self.mask_builder.build(item, self.config, self.tokenizer)

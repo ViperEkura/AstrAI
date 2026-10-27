@@ -268,7 +268,7 @@ classDiagram
         class DatasetFactory {
             +Dict _entries
             +register(name) decorator
-            +create(train_type, window_size, stride) BaseDataset
+            +create(train_type, store) BaseDataset
             +load(train_type, load_path, window_size, stride, storage_type, tokenizer_path, max_len, store) BaseDataset
         }
     }
@@ -491,13 +491,6 @@ classDiagram
         class BFDSplitPacking {
             +apply(keys, max_packed_len, truncation_mode) Dict
         }
-        class StoreWriter {
-            <<abstract>>
-            +save(output_dir, domain, shard_idx, tensors)
-        }
-        class StoreWriterFactory {
-            +create(name, *args, **kwargs) StoreWriter
-        }
         class BinWriter {
             +save(output_dir, domain, shard_idx, tensors)
         }
@@ -509,7 +502,7 @@ classDiagram
             +AutoTokenizer tokenizer
             +BaseMaskBuilder mask_builder
             +PackingStrategy _packer
-            +StoreWriter _writer
+            +BinWriter _writer
             +transform(item) Optional[dict]
             +run()
             +_flush(domains, shard_idx)
@@ -775,11 +768,6 @@ classDiagram
                 +on_error(context)
                 -_run_validation(context)
                 -_run_rollout_validation(context) Dict[str, float]
-            }
-            class CallbackFactory {
-                +Dict _entries
-                +register(name) decorator
-                +create(name, **kwargs) TrainCallback
             }
         }
     }
@@ -1185,7 +1173,6 @@ classDiagram
     PackingStrategy <|-- SimplePacking
     PackingStrategy <|-- BFDPacking
     BFDPacking <|-- BFDSplitPacking
-    StoreWriter <|-- BinWriter
     AllocationStrategy <|-- ContiguousStrategy
     BaseKVCache <|-- PrefillKVCache
     BaseKVCache <|-- DecodeKVCache
@@ -1236,18 +1223,16 @@ classDiagram
     Pipeline o-- BaseMaskBuilder
     Pipeline o-- AutoTokenizer
     Pipeline o-- PackingStrategy
-    Pipeline o-- StoreWriter
+    Pipeline o-- BinWriter
     TokenizeTransform o-- AutoTokenizer
     TokenizeTransform o-- BaseMaskBuilder
 
     %% --- Dependency (uses temporarily) ---
     TrainConfig ..> BaseStrategy : selects
     PackingStrategyFactory ..> PackingStrategy : creates
-    StoreWriterFactory ..> StoreWriter : creates
     StrategyFactory ..> BaseStrategy : creates
     SchedulerFactory ..> BaseScheduler : creates
     DatasetFactory ..> BaseDataset : creates
-    CallbackFactory ..> TrainCallback : creates
     AttnFactory ..> GQA : creates
     AttnFactory ..> MLA : creates
     FFNFactory ..> MLP : creates
@@ -1323,12 +1308,12 @@ classDiagram
 | Module | Components | Description |
 |--------|------------|-------------|
 | **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, AttentionConfig, GQAConfig, GDNConfig, MLAConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
-| **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, PackingStrategy, PackingStrategyFactory, generate_position_ids, SimplePacking, BFDPacking, BFDSplitPacking, StoreWriter, StoreWriterFactory, BinWriter | Declarative JSON-driven data preprocessing |
+| **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, PackingStrategy, PackingStrategyFactory, generate_position_ids, SimplePacking, BFDPacking, BFDSplitPacking, BinWriter | Declarative JSON-driven data preprocessing |
 | **astrai.dataset** | BaseDataset, SEQDataset, SFTDataset, DPODataset, GRPODataset, Store, Streamable, Recordable, MmapStore, JsonlStore, StoreFactory, RDSampler, DatasetFactory | Dataset loading and management |
 | **astrai.serialization** | Checkpoint | Model serialization |
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, TransformerModel · `components/`: DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding · `kv_cache.py`: KVStorage, ReqToTokenPool, BaseKVCache, PrefillKVCache, DecodeKVCache, KVCache alias | Neural network model and KV layout contract |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
-| **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model · `strategy/`: BaseStrategy–GRPOStrategy, StrategyFactory · `callbacks/`: TrainCallback, GradientClippingCallback, GradientCheckpointingCallback, CheckpointCallback, ProgressBarCallback, MetricCallback, CallbackFactory · `backend.py`: RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher · `rollout/`: RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator | Training workflow (online RL rollout via injectable backends) |
+| **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model · `strategy/`: BaseStrategy–GRPOStrategy, StrategyFactory · `callbacks/`: TrainCallback, GradientClippingCallback, GradientCheckpointingCallback, CheckpointCallback, ProgressBarCallback, MetricCallback · `backend.py`: RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher · `rollout/`: RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator | Training workflow (online RL rollout via injectable backends) |
 | **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, events (TokenDelta/RequestFinished/RequestError) · core: EngineCore, Scheduler, SchedulerStep, RequestManager, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
 | **astrai.extension** | `runtime` context/spec/dispatcher, `backend` per-operator policy, `kernel` exact wrappers, attention, op_backend, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
@@ -1339,7 +1324,7 @@ classDiagram
 
 | Pattern | Classes | Purpose |
 |---------|---------|---------|
-| **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `CallbackFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory`, `StoreWriterFactory`, `PackingStrategyFactory`, `ToolParserFactory` | Decorator-based component creation |
+| **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory`, `PackingStrategyFactory`, `ToolParserFactory` | Decorator-based component creation |
 | **Registry** | `BaseFactory` | Component registration |
 | **Strategy** | `SEQStrategy`, `SFTStrategy`, `DPOStrategy`, `GRPOStrategy` | Training strategy switching |
 | **Strategy (Sampling)** | `TemperatureStrategy`, `TopKStrategy`, `TopPStrategy`, `FrequencyPenaltyStrategy`, `SamplingPipeline` | Composable logit transformations |

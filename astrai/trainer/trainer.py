@@ -10,7 +10,11 @@ from astrai.config import TrainConfig
 from astrai.dataset import GlobalBatchSampler
 from astrai.parallel.setup import agree_stop, get_rank, spawn_parallel_fn
 from astrai.trainer.callbacks import (
-    CallbackFactory,
+    CheckpointCallback,
+    GradientCheckpointingCallback,
+    GradientClippingCallback,
+    MetricCallback,
+    ProgressBarCallback,
     TrainCallback,
 )
 from astrai.trainer.components import stop_loader_workers
@@ -44,28 +48,17 @@ class Trainer:
 
     def _get_default_callbacks(self) -> List[TrainCallback]:
         cfg = self.train_config
-        metric_callback = CallbackFactory.create_checked(
-            "metric",
-            metrics=cfg.metrics,
-            val_step=cfg.val_step,
-            grad_snr_interval=cfg.grad_snr_interval,
-        )
-        callbacks = [
-            CallbackFactory.create_checked(
-                "gradient_checkpointing",
-                modules=cfg.gradient_checkpointing_modules,
+        return [
+            GradientCheckpointingCallback(modules=cfg.gradient_checkpointing_modules),
+            MetricCallback(
+                metrics=cfg.metrics,
+                val_step=cfg.val_step,
+                grad_snr_interval=cfg.grad_snr_interval,
             ),
-            metric_callback,
-            CallbackFactory.create_checked(
-                "checkpoint",
-                cfg.ckpt_dir,
-                cfg.ckpt_interval,
-                metric_callback=metric_callback,
-            ),
-            CallbackFactory.create_checked("progress_bar", cfg.n_epoch),
-            CallbackFactory.create_checked("gradient_clipping", cfg.max_grad_norm),
+            CheckpointCallback(cfg.ckpt_dir, cfg.ckpt_interval),
+            ProgressBarCallback(cfg.n_epoch),
+            GradientClippingCallback(cfg.max_grad_norm),
         ]
-        return callbacks
 
     def _call_callbacks(self, method_name: str, context: TrainContext):
         for callback in self.callbacks:
@@ -85,6 +78,7 @@ class Trainer:
         validate record the step they belong to; advancing it after would
         label every logged step with the previous one.
         """
+        context.metric_history.discard_pending()
         committed_samples = context.pending_samples if new_data else 0
         context.optimizer_steps_completed += 1
         if new_data:
@@ -97,19 +91,22 @@ class Trainer:
                 context.scheduler.step()
             context.pending_samples = 0
         except BaseException:
+            context.metric_history.discard_pending()
             context.optimizer_steps_completed -= 1
             if new_data:
                 context.consumed_samples -= committed_samples
             raise
+        context.metric_history.commit(context.optimizer_step, context.consumed_samples)
 
     def _commit_online_update(
         self, context: TrainContext, batch, new_data: bool
     ) -> None:
         """Publish one policy version; the cursor follows the version, not the call."""
-        self._call_callbacks("before_optimizer_step", context)
+        context.metric_history.discard_pending()
         coordinator = context.async_rollout
         version_before = coordinator.policy_version
         try:
+            self._call_callbacks("before_optimizer_step", context)
             context.strategy.optimizer_step(context.optimizer)
         finally:
             # A version advance marks a committed step, even if later
@@ -123,7 +120,12 @@ class Trainer:
                     count = batch.prompts.shape[0] * context.dp_size
                     context.consumed_samples += count
                     context.epoch_sample_offset += count
+                context.metric_history.commit(
+                    context.optimizer_step, context.consumed_samples
+                )
                 context.checkpoint_safe = True
+            else:
+                context.metric_history.discard_pending()
 
     def _train_batch(self, context: TrainContext, batch) -> None:
         context.checkpoint_safe = False

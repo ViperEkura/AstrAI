@@ -4,8 +4,10 @@ import pytest
 
 from astrai.config.preprocess_config import (
     InputConfig,
+    OutputConfig,
     PipelineConfig,
 )
+from astrai.preprocessing import Pipeline
 from tests.support.data import INSTRUCTION_SECTIONS, TEXT_SECTIONS, make_dpo_chat_config
 
 
@@ -82,3 +84,15 @@ def test_dpo_config_roundtrip(temp_dir):
 def test_invalid_record_keys(keys):
     with pytest.raises(ValueError):
         PipelineConfig.from_dict({"output": {"record_keys": keys}})
+
+
+@pytest.mark.parametrize("storage_format", ["jsonl", "parquet"])
+def test_pipeline_rejects_unsupported_output_before_loading(storage_format, tmp_path):
+    with pytest.raises(ValueError, match="storage_format"):
+        OutputConfig(storage_format=storage_format)
+    config = PipelineConfig()
+    config.output.storage_format = storage_format
+    output = tmp_path / "out"
+    with pytest.raises(ValueError, match="storage_format"):
+        Pipeline(config, [], str(output), tokenizer_path="unused")
+    assert not output.exists()

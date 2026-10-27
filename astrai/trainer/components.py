@@ -55,7 +55,7 @@ def build_model_component(
     if ModelFactory.is_registered(spec.type):
         if not model_config:
             raise ValueError("Registered model requires model config")
-        model = ModelFactory.create_checked(
+        model = ModelFactory.create(
             spec.type, ConfigFactory.load(model_config), **params
         )
     else:
@@ -76,7 +76,7 @@ def build_model_component(
 
 def build_optimizer_component(spec: ComponentSpec, model: nn.Module):
     if OptimizerFactory.is_registered(spec.type):
-        return OptimizerFactory.create_checked(spec.type, model, **spec.params)
+        return OptimizerFactory.create(spec.type, model, **spec.params)
     target = resolve_component(spec.type)
     parameters = list(inspect.signature(target).parameters.values())
     first_arg = (
@@ -161,7 +161,7 @@ def build_scheduler_component(
             stable_steps = max(1, int(remaining * 0.8))
             params.setdefault("stable_steps", stable_steps)
             params.setdefault("decay_steps", max(1, remaining - stable_steps))
-        return SchedulerFactory.create_checked(spec.type, optimizer, **params)
+        return SchedulerFactory.create(spec.type, optimizer, **params)
     return resolve_component(spec.type)(optimizer, **params)
 
 

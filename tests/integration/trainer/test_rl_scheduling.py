@@ -212,13 +212,12 @@ def test_shared_train_batch_commits_async_round_once():
     strategy._rollout_runner = coordinator
     optimizer = torch.optim.SGD(strategy.model.parameters(), lr=0.01)
     before = strategy.model.embed.weight.detach().clone()
-    context = SimpleNamespace(
+    context = TrainContext(
         model=strategy.model,
         strategy=strategy,
         executor=Executor(),
         config=SimpleNamespace(async_train_microbatch_prompts=1),
         async_rollout=coordinator,
-        dp_size=1,
         optimizer=optimizer,
         scheduler=None,
         consumed_samples=0,

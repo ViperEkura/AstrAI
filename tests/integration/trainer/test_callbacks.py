@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
+import astrai.trainer.callbacks.checkpoint as checkpoint_module
 from astrai.model.components.decoder_block import DecoderBlock
 from astrai.model.components.mlp import MLP
 from astrai.serialization import Checkpoint
@@ -13,6 +15,7 @@ from astrai.trainer.callbacks import (
 from astrai.trainer.callbacks.checkpoint import (
     CheckpointCallback,
     _copy_tokenizer_files,
+    _write_metric_snapshot,
 )
 from astrai.trainer.trainer import Trainer
 from tests.support.checkpoint import load_checkpoint_meta
@@ -215,8 +218,9 @@ def test_checkpoint_captures_completed_optimizer_step(
     assert not (Path(base_test_env["test_dir"]) / "metric.jsonl").exists()
 
 
+@pytest.mark.parametrize("reverse_callbacks", [False, True])
 def test_metrics_are_published_with_each_checkpoint(
-    base_test_env, train_config_factory, device
+    base_test_env, train_config_factory, device, reverse_callbacks
 ):
     config = train_config_factory(
         dataset=RandomTokenDataset(length=4),
@@ -226,7 +230,10 @@ def test_metrics_are_published_with_each_checkpoint(
         ckpt_interval=1,
     )
 
-    Trainer(config).train()
+    trainer = Trainer(config)
+    if reverse_callbacks:
+        trainer.callbacks.reverse()
+    trainer.train()
 
     directory = Path(base_test_env["test_dir"])
     for step in (1, 2):
@@ -305,3 +312,47 @@ def test_interrupt_before_first_step_still_checkpoints(
 
     meta = load_checkpoint_meta(base_test_env["test_dir"])
     assert meta["optimizer_step"] == 0
+
+
+def test_failed_metric_write_retries_without_losing_committed_history(
+    train_config_factory, tmp_path, monkeypatch
+):
+    config = train_config_factory(
+        RandomTokenDataset(length=4), str(tmp_path), device="cpu", ckpt_interval=1
+    )
+    attempts = []
+
+    def fail_first_write(snapshot, destination):
+        attempts.append(destination)
+        _write_metric_snapshot(snapshot, destination)
+        if len(attempts) == 1:
+            raise OSError("metric write interrupted")
+
+    monkeypatch.setattr(checkpoint_module, "_write_metric_snapshot", fail_first_write)
+    with pytest.raises(OSError, match="metric write interrupted"):
+        Trainer(config).train()
+
+    # Shutdown retries the committed step after the failed staging directory
+    # was removed. The failed write must neither acknowledge nor duplicate it.
+    checkpoint = tmp_path / "epoch_0_step_1"
+    records = list(
+        map(json.loads, (checkpoint / "metric.jsonl").read_text().splitlines())
+    )
+    assert [(r["step"], r["consumed_samples"]) for r in records] == [(1, 2)]
+    assert len(attempts) == 2
+    assert not list(tmp_path.glob(".epoch_*.tmp-*"))
+    Checkpoint.verify(str(checkpoint))
+
+
+def test_existing_checkpoint_cannot_discard_new_metric_records(
+    train_config_factory, tmp_path
+):
+    config = train_config_factory(
+        RandomTokenDataset(length=4), str(tmp_path), device="cpu", ckpt_interval=1
+    )
+    Trainer(config).train()
+    checkpoint = tmp_path / "epoch_0_step_1" / "metric.jsonl"
+    original = checkpoint.read_bytes()
+    with pytest.raises(RuntimeError, match="unsaved metrics"):
+        Trainer(config).train()
+    assert checkpoint.read_bytes() == original

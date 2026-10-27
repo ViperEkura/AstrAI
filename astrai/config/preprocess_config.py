@@ -15,7 +15,6 @@ from astrai.config.base import BaseConfig
 
 _PACKING_STRATEGIES = frozenset({"simple", "bfd", "bfd_split"})
 _TRUNCATION_MODES = frozenset({"keep_start", "keep_end"})
-_STORAGE_FORMATS = frozenset({"bin", "jsonl"})
 _POSITION_IDS_MODES = frozenset({"none", "doc_reset", "continuous"})
 
 
@@ -102,7 +101,7 @@ class OutputConfig(BaseConfig):
 
     Args:
         domain_key (Optional[str]): Domain key for the output store. Defaults to None.
-        storage_format (str): Storage format: 'bin' or 'jsonl'. Defaults to "bin".
+        storage_format (str): Pipeline output format: 'bin'. Defaults to "bin".
         max_tokens_per_shard (int): Maximum tokens per shard before splitting. Defaults to 100_000_000.
         dtype (Dict[str, str]): Per-key dtype overrides, e.g. {"input_ids": "int32"}. Defaults to {}.
         position_ids_mode (str): Position ids mode: 'none', 'doc_reset', or 'continuous'. Defaults to "doc_reset".
@@ -124,10 +123,8 @@ class OutputConfig(BaseConfig):
 
     @field_validator("storage_format")
     def _validate_storage_format(cls, v: str) -> str:
-        if v not in _STORAGE_FORMATS:
-            raise ValueError(
-                f"storage_format must be one of {sorted(_STORAGE_FORMATS)}, got {v!r}"
-            )
+        if v != "bin":
+            raise ValueError("Pipeline output storage_format only supports 'bin'")
         return v
 
     @field_validator("position_ids_mode")

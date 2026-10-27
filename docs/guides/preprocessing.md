@@ -320,7 +320,7 @@ launching the job; they do not reconfigure already-running workers.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `domain_key` | str or null | `null` | JSONL key for domain grouping |
-| `storage_format` | str | `"bin"` | Pipeline output format. Only `"bin"` has a registered writer; `"jsonl"` is accepted by config validation but cannot be emitted by `Pipeline`. |
+| `storage_format` | str | `"bin"` | Pipeline output format. Only `"bin"` is supported; other formats are rejected before preprocessing starts. JSONL input is still supported. |
 | `max_tokens_per_shard` | int | `100000000` | Flush threshold counted from each record's primary flat sequence: `sequence` for single-output data, otherwise the first flat source output |
 | `dtype` | dict[str, str] | `{}` | Per-key tensor dtype override (e.g. `{"loss_mask": "bool"}`) |
 | `position_ids_mode` | str | `"doc_reset"` | How to compute position_ids: `"none"`, `"doc_reset"`, `"continuous"` |
@@ -481,3 +481,13 @@ classes and their factory have been removed. Online transforms omit the
 `position_ids` key when there are no positions. Offline packing still attaches
 per-document resets before packing and continuous positions after packing.
 Configuration names and stored data formats are unchanged.
+
+
+### Writer construction
+
+The pipeline constructs `BinWriter()` directly. `StoreWriter` and
+`StoreWriterFactory` have been removed; direct callers can import `BinWriter`
+from `astrai.preprocessing`. Record validation and partial-shard cleanup remain
+part of the writer. `output.storage_format` accepts only `"bin"`, including
+when loading a configuration file. This restriction concerns output;
+`JsonlStore` and JSONL input tokenization remain available.

@@ -15,6 +15,7 @@ from astrai.parallel.executor import BaseExecutor
 from astrai.parallel.topology import ParallelTopology
 from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks.metric_util import GradSNRTracker
+from astrai.trainer.context.metric import MetricHistory
 from astrai.trainer.rollout import RolloutEvaluator, RolloutRunner
 from astrai.trainer.strategy import BaseStrategy
 
@@ -56,6 +57,7 @@ class TrainContext:
     checkpoint_safe: bool = field(default=True)
     loss: float = field(default=0.0)
     metrics: Dict[str, float] = field(default_factory=dict)
+    metric_history: MetricHistory = field(default_factory=MetricHistory)
     grad_norm: Optional[float] = field(default=None)
     grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
     grad_snr_value: Optional[float] = field(default=None)

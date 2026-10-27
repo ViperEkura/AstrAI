@@ -557,7 +557,7 @@ def test_cli_options_instantiate_selected_strategy(tmp_path, monkeypatch, strate
     if capabilities.critic:
         options["critic"] = model
         options["critic_optimizer"] = torch.optim.SGD(model.parameters(), lr=0.1)
-    instance = train_module.StrategyFactory.create_checked(
+    instance = train_module.StrategyFactory.create(
         strategy, model=model, device="cpu", **options
     )
     assert instance.model is model

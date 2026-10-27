@@ -596,3 +596,22 @@ to the algorithm's `strategy_kwargs`; Python callers use
 `strategy_kwargs={"group_size": 4}`. Python model factories must be pickleable and
 should construct models on CPU; worker placement is resolved afterward. Guard
 `Trainer.train()` with `if __name__ == "__main__":` when using a custom script.
+
+
+## Component construction API migration
+
+Use `Factory.create(name, ...)` for registered components. It now validates
+constructor arguments strictly instead of discarding unknown arguments.
+`create_from_config()` remains the explicit adapter for selecting constructor
+parameters from a broad model configuration; explicit overrides are validated.
+
+Built-in top-level models accept a validated `config` object. Extra
+`ComponentSpec.params` must match the chosen constructor. Decoder blocks use
+`create_from_config()` to select the attention and feed-forward parameters
+from the full model configuration. Custom constructors declaring `**kwargs`
+remain responsible for validating those extra options.
+
+Built-in callbacks are constructed directly; `CallbackFactory` is removed.
+Pass custom instances with `Trainer(config, callbacks=[MyCallback()])`.
+The `TrainCallback` protocol, its default empty hooks, callback order and
+lifecycle dispatch are unchanged.

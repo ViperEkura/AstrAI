@@ -11,6 +11,7 @@ from astrai.factory import BaseFactory
 from astrai.trainer import components as dataset_component
 from astrai.trainer.components import build_scheduler_component
 from astrai.trainer.context import TrainContext, TrainContextBuilder
+from astrai.trainer.context.metric import MetricHistory
 from astrai.trainer.rollout import worker as worker_module
 from astrai.trainer.session import TrainSession
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
@@ -234,17 +235,17 @@ def test_registered_custom_strategy_and_unknown_options():
     config = _config(strategy="custom_refactor_test")
     assert config.strategy == "custom_refactor_test"
     model = torch.nn.Linear(1, 1)
-    strategy = StrategyFactory.create_checked(
+    strategy = StrategyFactory.create(
         "custom_refactor_test", model=model, device="cpu", custom_scale=2.0
     )
     assert strategy.custom_scale == 2.0
     with pytest.raises(TypeError, match="unknown arguments"):
-        StrategyFactory.create_checked(
+        StrategyFactory.create(
             "custom_refactor_test", model=model, device="cpu", custm_scale=2.0
         )
 
 
-def test_legacy_factory_warns_for_dropped_kwargs_and_checked_path_raises():
+def test_factory_preserves_arguments_and_rejects_unknown_options():
     class Component:
         def __init__(self, value):
             self.value = value
@@ -253,10 +254,15 @@ def test_legacy_factory_warns_for_dropped_kwargs_and_checked_path_raises():
         pass
 
     Factory.register("component")(Component)
-    with pytest.warns(DeprecationWarning, match="ignored arguments"):
-        assert Factory.create("component", value=1, typo=2).value == 1
+    assert Factory.create("component", value=1).value == 1
     with pytest.raises(TypeError):
-        Factory.create_checked("component", value=1, typo=2)
+        Factory.create("component", value=1, typo=2)
+    config = {"value": 1, "other_component_option": 2}
+    assert Factory.create_from_config("component", config).value == 1
+    assert Factory.create_from_config("component", config, value=3).value == 3
+    with pytest.raises(TypeError):
+        Factory.create_from_config("component", config, typo=2)
+    assert config == {"value": 1, "other_component_option": 2}
 
 
 def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):
@@ -275,12 +281,17 @@ def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):
         executor=SimpleNamespace(use_distributed=False),
         stop_requested=False,
         run_shutdown=lambda: events.append("shutdown_hooks"),
+        metric_history=MetricHistory(),
     )
 
     def callback(name, _):
         events.append(name)
         if name == "on_train_begin":
+            context.metric_history.stage({"type": "step"})
             raise RuntimeError("startup failed")
+        if name == "on_shutdown":
+            context.metric_history.commit(1, 2)
+            assert not context.metric_history.snapshot().records
 
     with pytest.raises(RuntimeError, match="startup failed"):
         with TrainSession(lambda: context, callback):

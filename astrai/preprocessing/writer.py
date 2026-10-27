@@ -1,41 +1,15 @@
-"""Storage writer strategies for pipeline output.
-
-The :class:`StoreWriter` abstraction decouples the pipeline from the
-concrete storage format (bin).  The pipeline builds a ``{key:
-List[Tensor]}`` dict and delegates the write to the writer selected
-by ``output.storage_format``.
-"""
+"""Binary shard output with record validation and partial-write cleanup."""
 
 import logging
 import os
 import shutil
-from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
 import torch
 
-from astrai.factory import BaseFactory
 from astrai.serialization import save_bin
 
 logger = logging.getLogger(__name__)
-
-
-class StoreWriter(ABC):
-    """Write pre-tokenized tensors to disk in a format-specific way."""
-
-    @abstractmethod
-    def save(
-        self,
-        output_dir: str,
-        domain: str,
-        shard_idx: int,
-        tensors: Dict[str, List[torch.Tensor]],
-        record_keys: Optional[List[str]] = None,
-    ) -> None: ...
-
-
-class StoreWriterFactory(BaseFactory["StoreWriter"]):
-    pass
 
 
 def _resolve_record_keys(
@@ -61,8 +35,7 @@ def _resolve_record_keys(
     return keys
 
 
-@StoreWriterFactory.register("bin")
-class BinWriter(StoreWriter):
+class BinWriter:
     def save(self, output_dir, domain, shard_idx, tensors, record_keys=None):
         shard_path = os.path.join(output_dir, domain, f"shard_{shard_idx:04d}")
         try:

@@ -12,10 +12,7 @@ from astrai.preprocessing.packing import (
 from astrai.preprocessing.pipeline import Pipeline, filter_by_length
 from astrai.preprocessing.position_id import generate_position_ids
 from astrai.preprocessing.transform import TokenizeTransform
-from astrai.preprocessing.writer import (
-    StoreWriter,
-    StoreWriterFactory,
-)
+from astrai.preprocessing.writer import BinWriter
 
 __all__ = [
     "BaseMaskBuilder",
@@ -25,8 +22,7 @@ __all__ = [
     "Pipeline",
     "SectionedMaskBuilder",
     "SingleOutputMaskBuilder",
-    "StoreWriter",
-    "StoreWriterFactory",
+    "BinWriter",
     "TokenizeTransform",
     "filter_by_length",
     "generate_position_ids",

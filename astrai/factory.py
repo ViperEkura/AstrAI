@@ -1,8 +1,7 @@
-"""Base factory with decorator-based registration and kwarg-filtered instantiation."""
+"""Base factory with decorator-based registration and strict instantiation."""
 
 import inspect
 import sys
-import warnings
 from abc import ABC
 from typing import (
     Callable,
@@ -77,9 +76,9 @@ class BaseFactory(ABC, Generic[T]):
 
         obj = MyFactory.create("custom", *args, **kwargs)
 
-    ``create()`` filters kwargs to match the component's ``__init__``
-    signature so components don't need ``**kwargs`` just to absorb
-    unrelated parameters.
+    ``create()`` validates the constructor signature without dropping
+    arguments. ``create_from_config()`` explicitly selects parameters from a
+    broad model configuration.
     """
 
     _entries: Dict[str, Type[T]]
@@ -112,37 +111,6 @@ class BaseFactory(ABC, Generic[T]):
 
     @classmethod
     def create(cls, name: str, *args, **kwargs) -> T:
-        """Create a component instance by name, filtering kwargs to match
-        the component's ``__init__`` signature.
-        """
-        component_cls = cls._entries.get(name)
-        if component_cls is None:
-            raise ValueError(
-                f"Unknown component: '{name}'. Supported types: {sorted(cls._entries)}"
-            )
-        sig = inspect.signature(component_cls.__init__)
-        has_var_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-        if not has_var_kwargs:
-            valid = {
-                p.name
-                for p in sig.parameters.values()
-                if p.name != "self" and p.kind != inspect.Parameter.VAR_KEYWORD
-            }
-            discarded = sorted(set(kwargs) - valid)
-            if discarded:
-                warnings.warn(
-                    f"{cls.__name__}.create({name!r}) ignored arguments {discarded}; "
-                    "this will raise TypeError in the next minor release",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            kwargs = {k: v for k, v in kwargs.items() if k in valid}
-        return component_cls(*args, **kwargs)
-
-    @classmethod
-    def create_checked(cls, name: str, *args, **kwargs) -> T:
         """Instantiate with Python's normal signature validation."""
         component_cls = cls.get_component_class(name)
         inspect.signature(component_cls).bind(*args, **kwargs)
@@ -156,7 +124,7 @@ class BaseFactory(ABC, Generic[T]):
         valid = set(sig.parameters)
         kwargs = {key: value for key, value in config.items() if key in valid}
         kwargs.update(explicit)
-        return cls.create_checked(name, **kwargs)
+        return cls.create(name, **kwargs)
 
     @classmethod
     def get_component_class(cls, name: str) -> Type[T]:

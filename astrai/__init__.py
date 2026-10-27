@@ -46,7 +46,6 @@ from astrai.serialization import Checkpoint
 from astrai.tokenize import AutoTokenizer, ChatTemplate
 from astrai.trainer import (
     BaseStrategy,
-    CallbackFactory,
     StrategyFactory,
     TrainCallback,
     Trainer,
@@ -61,7 +60,6 @@ __all__ = [
     "BaseFactory",
     "BaseModelConfig",
     "BaseStrategy",
-    "CallbackFactory",
     "ChatTemplate",
     "Checkpoint",
     "ConfigFactory",

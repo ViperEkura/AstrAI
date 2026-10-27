@@ -72,9 +72,8 @@ Register custom strategies before constructing TrainConfig. Offline
 strategies can use the default capability declaration. An online strategy
 must declare the capabilities it needs and implement the online strategy
 contract. Constructor options should appear in its signature or in
-accepted_options; internal StrategyFactory.create_checked rejects unknown
-options. The legacy BaseFactory.create path warns when it discards an
-argument for one minor version before becoming strict.
+accepted_options; internal StrategyFactory.create rejects unknown
+options. The legacy filtering construction API has been removed.
 
 ```python
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
@@ -91,5 +90,5 @@ class CustomStrategy(BaseStrategy):
 Register a custom strategy before constructing TrainConfig, since its
 validator checks the registry. Declare online, reference, old-policy, critic
 and async-round requirements in StrategyCapabilities. Internal creation uses
-create_checked() to reject unknown options; the legacy BaseFactory.create()
-warns for one minor version when it filters an option.
+`create()` to reject unknown options. Unknown arguments are no longer
+filtered; pass only supported options.

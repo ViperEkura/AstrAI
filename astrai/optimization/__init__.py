@@ -1,4 +1,4 @@
-"""Training optimizers, learning-rate schedulers and their protocols."""
+"""Training optimizers and learning-rate schedulers."""
 
 from astrai.optimization.optimizer import (
     Mano,
@@ -17,7 +17,6 @@ from astrai.optimization.optimizer import (
     partition_optimizer_parameters,
     refresh_param_groups,
 )
-from astrai.optimization.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.optimization.scheduler import (
     BaseScheduler,
     CosineScheduler,
@@ -37,10 +36,8 @@ __all__ = [
     "NoraNAdamW",
     "OptimizerFactory",
     "OptimizerParameterGroups",
-    "OptimizerProtocol",
     "SGDRScheduler",
     "SchedulerFactory",
-    "SchedulerProtocol",
     "WSDScheduler",
     "composite_state_dict",
     "composite_step",

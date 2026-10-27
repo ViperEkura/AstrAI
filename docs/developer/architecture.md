@@ -581,8 +581,8 @@ classDiagram
             +nn.Module model
             +BaseStrategy strategy
             +DataLoader dataloader
-            +OptimizerProtocol optimizer
-            +SchedulerProtocol scheduler
+            +Optimizer optimizer
+            +LRScheduler scheduler
             +Checkpoint checkpoint
             +TrainConfig config
             +dict model_config
@@ -865,22 +865,6 @@ classDiagram
                 +int stable_steps
                 +int decay_steps
                 +float min_rate
-            }
-        }
-        namespace protocols {
-            class OptimizerProtocol {
-                <<protocol>>
-                +step(closure)
-                +zero_grad()
-                +state_dict() dict
-                +load_state_dict(d)
-            }
-            class SchedulerProtocol {
-                <<protocol>>
-                +step()
-                +state_dict() dict
-                +load_state_dict(d)
-                +get_last_lr()
             }
         }
     }
@@ -1268,8 +1252,8 @@ classDiagram
     AutoTokenizer o-- ChatTemplate
     Trainer o-- TrainCallback
     TrainContext o-- BaseStrategy
-    TrainContext o-- OptimizerProtocol
-    TrainContext o-- SchedulerProtocol
+    TrainContext o-- Optimizer : torch.optim
+    TrainContext o-- LRScheduler : torch.optim.lr_scheduler
     TrainContext o-- Checkpoint
     TrainContext o-- BaseExecutor
     SamplingPipeline o-- BaseSamplingStrategy
@@ -1378,7 +1362,7 @@ classDiagram
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model · `strategy/`: BaseStrategy–GRPOStrategy, StrategyFactory · `callbacks/`: TrainCallback, GradientClippingCallback, GradientCheckpointingCallback, CheckpointCallback, ProgressBarCallback, MetricCallback, CallbackFactory · `backend.py`: RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher · `rollout/`: RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator | Training workflow (online RL rollout via injectable backends) |
 | **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, EngineCoreClient/InprocClient, events (TokenDelta/RequestFinished/RequestError) · core: Scheduler, SchedulerStep, RequestManager, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
 | **astrai.extension** | `runtime` context/spec/dispatcher, `backend` per-operator policy, `kernel` exact wrappers, attention, op_backend, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
-| **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler · `protocols.py`: OptimizerProtocol, SchedulerProtocol | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
+| **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch and explicit gradient synchronization |
 | **astrai.factory** | BaseFactory | Component registration |
 
@@ -1418,6 +1402,6 @@ classDiagram
 8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata; `CheckpointCallback` performs rank-0 training saves, with extra state saved as `{key}.pt`
 9. **Scheduler**: `SchedulerFactory` creates `CosineScheduler`/`SGDRScheduler`/`WSDScheduler`
 10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
-11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` define the structural contracts used by `TrainContext`
+11. **Optimizer and scheduler types**: `TrainContext` uses PyTorch `torch.optim.Optimizer` and `torch.optim.lr_scheduler.LRScheduler` directly. Custom components should follow these base-class contracts; this annotation change adds no runtime type checks.
 
 > Document Update Time: 2026-10-12

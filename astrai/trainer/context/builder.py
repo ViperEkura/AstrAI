@@ -7,11 +7,11 @@ from typing import Dict, Optional, Self, Tuple
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.optim import Optimizer
 
 from astrai.config.train_config import TrainConfig, _TrainRuntimeDependencies
 from astrai.inference.core.engine_core import EngineCore
 from astrai.model.components.lora import inject_lora
-from astrai.optimization.protocols import OptimizerProtocol
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -401,7 +401,7 @@ class TrainContextBuilder:
 
     def _create_critic(
         self, context: TrainContext, executor: BaseExecutor
-    ) -> Tuple[nn.Module, OptimizerProtocol]:
+    ) -> Tuple[nn.Module, Optimizer]:
         """Build the PPO critic and its optimizer, restoring persisted state.
 
         The critic backbone warm-starts from the policy weights (standard

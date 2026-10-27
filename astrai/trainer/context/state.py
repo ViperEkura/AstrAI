@@ -6,10 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 from torch import nn
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, Dataset
 
 from astrai.config.train_config import TrainConfig
-from astrai.optimization.protocols import OptimizerProtocol, SchedulerProtocol
 from astrai.parallel.executor import BaseExecutor
 from astrai.parallel.topology import ParallelTopology
 from astrai.serialization import Checkpoint
@@ -41,8 +42,8 @@ class TrainContext:
     #: cleanup detail): the shutdown hook closes it so a worker death cannot
     #: abort the save, and a reader can see what the run is consuming.
     train_iterator: Any = field(default=None)
-    optimizer: OptimizerProtocol = field(default=None)
-    scheduler: SchedulerProtocol = field(default=None)
+    optimizer: Optimizer = field(default=None)
+    scheduler: LRScheduler = field(default=None)
     checkpoint: Checkpoint = field(default=None)
     config: TrainConfig = field(default=None)
     model_config: Dict = field(default_factory=dict)

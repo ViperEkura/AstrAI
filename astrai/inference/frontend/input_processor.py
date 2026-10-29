@@ -43,7 +43,7 @@ class InputProcessor:
     ) -> ProcessedInput:
         """Tokenize one prompt into a :class:`ProcessedInput`.
 
-        Follows the previous ``RequestManager`` semantics: empty encodes
+        Empty encodes
         are refused (a zero-token prompt never completes prefill), and
         over-length prompts are truncated to the model window from the
         left (keep the tail).

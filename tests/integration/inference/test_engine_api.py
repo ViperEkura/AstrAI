@@ -48,9 +48,9 @@ def test_engine_generate_non_streaming_single():
         def inject():
             deadline = time.time() + 5
             while time.time() < deadline:
-                if eng._tracker._sink._queues:
-                    rid = next(iter(eng._tracker._sink._queues))
-                    eng._tracker.sink(
+                if eng._tracker._queues:
+                    rid = next(iter(eng._tracker._queues))
+                    eng._tracker(
                         [
                             TokenDelta(rid, 11, 1),
                             TokenDelta(rid, 12, 2),
@@ -87,9 +87,9 @@ def test_engine_generate_streaming_yields_token_ids():
         def inject():
             deadline = time.time() + 5
             while time.time() < deadline:
-                if eng._tracker._sink._queues:
-                    rid = next(iter(eng._tracker._sink._queues))
-                    eng._tracker.sink(
+                if eng._tracker._queues:
+                    rid = next(iter(eng._tracker._queues))
+                    eng._tracker(
                         [
                             TokenDelta(rid, 11, 1),
                             TokenDelta(rid, 12, 2),
@@ -123,7 +123,7 @@ def test_engine_generate_non_streaming_batch():
         def inject():
             deadline = time.time() + 5
             while time.time() < deadline:
-                queues = eng._tracker._sink._queues
+                queues = eng._tracker._queues
                 if len(queues) >= 2:
                     ids = list(queues)
                     events = []
@@ -134,7 +134,7 @@ def test_engine_generate_non_streaming_batch():
                                 RequestFinished(rid, FINISH_LENGTH, 3, 1),
                             ]
                         )
-                    eng._tracker.sink(events)
+                    eng._tracker(events)
                     return
                 time.sleep(0.01)
 
@@ -215,12 +215,10 @@ def test_generate_does_not_send_per_request_attention_choice():
             # Terminate via the event protocol (the mock core has no loop).
             def inject():
                 for _ in range(500):
-                    qs = engine._tracker._sink._queues
+                    qs = engine._tracker._queues
                     if qs:
                         rid = next(iter(qs))
-                        engine._tracker.sink(
-                            [RequestFinished(rid, FINISH_LENGTH, 1, 0)]
-                        )
+                        engine._tracker([RequestFinished(rid, FINISH_LENGTH, 1, 0)])
                         return
                     time.sleep(0.01)
 
@@ -278,10 +276,10 @@ def test_build_engine_passes_engine_kwargs_through():
 
         def inject():
             for _ in range(500):
-                qs = engine._tracker._sink._queues
+                qs = engine._tracker._queues
                 if qs:
                     rid = next(iter(qs))
-                    engine._tracker.sink([RequestFinished(rid, FINISH_LENGTH, 1, 0)])
+                    engine._tracker([RequestFinished(rid, FINISH_LENGTH, 1, 0)])
                     return
                 time.sleep(0.01)
 

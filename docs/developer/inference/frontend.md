@@ -59,7 +59,7 @@ classDiagram
         incremental windowed matching
     }
     class RequestTracker {
-        +EventQueueSink sink
+        +__call__(events)
         +register(request_id, maxlen) Event
         +drain(request_id) List
         +wait(request_id, timeout) bool
@@ -114,14 +114,19 @@ classDiagram
   The frontend attaches its event sink, starts the core and stops it on
   shutdown in either case. Locking and scheduler/KV ownership remain in the
   core. The deprecated frontend `scheduler` property has been removed.
-- **`RequestTracker`** holds bounded per-request event queues for blocking
-  consumers and supports async subscriptions for streaming consumers. A
-  subscriber atomically takes the queued backlog and becomes the live route;
-  the scheduler thread batches notifications per event loop and hands events
-  to each stream's ``asyncio.Queue``. Detokenization and protocol formatting
-  stay on the consumer loop, outside the sink lock. The sink flags the
-  request's finished ``Event`` when it receives the terminal event, so
-  completion is observable without a consumer folding the stream.
+- **`RequestTracker`** is also the core's event sink. One lock protects its
+  event queues, completion events and async subscriptions. Terminal delivery
+  sets the same completion event used to suppress duplicate/late output;
+  there is no second sink object or terminal callback. Async notifications
+  are posted after releasing the lock, and a closed consumer loop restores
+  undelivered events to the pending queue.
+
+`OutputProcessor` emits text deltas and retains token IDs for usage and delta
+boundaries, but does not accumulate another full-text copy. Ordinary streaming
+protocol responses forward the deltas directly. Only tool parsing retains a
+streaming text body; non-streaming responses collect fragments and join once.
+Terminal protocol events carry finish metadata without replaying output text.
+
 
 
 ## Blocking generate is completion-driven

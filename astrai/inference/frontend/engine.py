@@ -74,7 +74,7 @@ class InferenceEngine:
             )
         self._core = core
         self._tracker = RequestTracker()
-        self._core.set_event_sink(self._tracker.sink)
+        self._core.set_event_sink(self._tracker)
         self._max_seq_len = int(core.max_seq_len)
         self._input_processor = InputProcessor(tokenizer, self._max_seq_len)
 
@@ -419,6 +419,7 @@ class InferenceEngine:
 
     def _fold_events_incrementally(self, request_id: str, events: List[Any]) -> str:
         proc = OutputProcessor(request_id, self.tokenizer)
+        parts = []
         for event in events:
             if isinstance(event, RequestError):
                 logger.error(
@@ -428,8 +429,9 @@ class InferenceEngine:
                     event.message,
                 )
                 break
-            proc.push(event)
-        return proc.state.text
+            text, _ = proc.push(event)
+            parts.append(text)
+        return "".join(parts)
 
     def _generate(
         self,

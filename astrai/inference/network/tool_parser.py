@@ -13,8 +13,6 @@ import uuid
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
-from astrai.factory import BaseFactory
-
 
 class BaseToolParser(ABC):
     """Abstract tool call parser — one instance per request.
@@ -69,10 +67,6 @@ class BaseToolParser(ABC):
     def finalize(self, body: str) -> List[Dict]:
         """Flush parser state once generation ended. Default: nothing."""
         return []
-
-
-class ToolParserFactory(BaseFactory["BaseToolParser"]):
-    pass
 
 
 _TOOL_CALL_HEAD_RE = re.compile(r'\{\s*"name"\s*:')
@@ -249,7 +243,6 @@ def _find_partial_tool_call(text: str, start_pos: int = 0):
     }
 
 
-@ToolParserFactory.register("simple_json")
 class SimpleJsonToolParser(BaseToolParser):
     """Parser for models that output tool calls as plain JSON objects.
 

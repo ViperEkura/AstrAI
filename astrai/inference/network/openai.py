@@ -14,7 +14,7 @@ from astrai.inference.network.protocol import (
     StopInfo,
     sse_event,
 )
-from astrai.inference.network.tool_parser import BaseToolParser, ToolParserFactory
+from astrai.inference.network.tool_parser import BaseToolParser, SimpleJsonToolParser
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +76,9 @@ class OpenAIResponseBuilder(ResponseBuilder):
         self._parser: Optional[BaseToolParser] = None
         if tools:
             tool_choice = _resolve_tool_choice(request)
-            self._parser = ToolParserFactory.create(
-                "simple_json", tools=tools, tool_choice=tool_choice
-            )
+            self._parser = SimpleJsonToolParser(tools=tools, tool_choice=tool_choice)
         self._content_started = False
+        self._body = ""
 
         ctx = GenContext(
             resp_id=self._resp_id,
@@ -112,9 +111,9 @@ class OpenAIResponseBuilder(ResponseBuilder):
         ]
 
     def format_chunk(self, token: str, **kwargs) -> List[str]:
-        body = kwargs.pop("body", "")
         if self._parser is not None:
-            return self._format_tool_chunk(body, **kwargs)
+            self._body += token
+            return self._format_tool_chunk(**kwargs)
 
         return [
             sse_event(
@@ -134,9 +133,9 @@ class OpenAIResponseBuilder(ResponseBuilder):
             )
         ]
 
-    def _format_tool_chunk(self, body: str, **kwargs) -> List[str]:
+    def _format_tool_chunk(self, **kwargs) -> List[str]:
         deltas = self._parser.feed(
-            body,
+            self._body,
             delta_token_ids=kwargs.get("delta_token_ids"),
         )
         events: List[str] = []
@@ -205,7 +204,7 @@ class OpenAIResponseBuilder(ResponseBuilder):
     def format_stream_end(self, ctx: GenContext, stop: StopInfo) -> List[str]:
         events: List[str] = []
         if self._parser is not None:
-            for d in self._parser.finalize(stop.body):
+            for d in self._parser.finalize(self._body):
                 if "content" in d:
                     events.append(
                         sse_event(

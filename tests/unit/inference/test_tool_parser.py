@@ -5,7 +5,6 @@ import pytest
 from astrai.inference.network.tool_parser import (
     _TOOL_CALL_HEAD_RE,
     SimpleJsonToolParser,
-    ToolParserFactory,
     _find_partial_tool_call,
     _find_tool_calls,
     _scan_json,
@@ -504,7 +503,7 @@ def test_pattern_regex(text, matches):
 )
 def test_factory_parser_preserves_options_and_parses_calls(options, expected_choice):
     tools = [{"type": "function", "function": {"name": "get_weather"}}]
-    parser = ToolParserFactory.create("simple_json", tools=tools, **options)
+    parser = SimpleJsonToolParser(tools=tools, **options)
     assert parser.tools == tools
     assert parser.tool_choice == expected_choice
     result = parser.parse_complete(

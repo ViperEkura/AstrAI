@@ -29,7 +29,7 @@ def _make_engine_mocks(decode=None):
 def _drive_events(engine, events_by_id):
     """Push output events through the engine's installed sink (mock schedulers
     emit nothing on their own; tests drive the event protocol directly)."""
-    sink = engine._tracker.sink
+    sink = engine._tracker
     flat = []
     for rid, events in events_by_id.items():
         flat.extend(events)
@@ -67,7 +67,7 @@ def event_engine(monkeypatch):
         engine = InferenceEngine(MagicMock(), FakeTokenizer(), max_seq_len=32)
     engine._core = MagicMock()
     engine._core.cancel_request.side_effect = lambda rid: (
-        engine._tracker.sink([RequestFinished(rid, FINISH_CANCELLED)]) or True
+        engine._tracker([RequestFinished(rid, FINISH_CANCELLED)]) or True
     )
     _emit_on_submission(engine)
     return engine
@@ -80,7 +80,7 @@ def _emit_on_submission(engine, text="", reason=None, error=False):
             events.append(RequestError(rid, "test", "failed"))
         elif reason is not None:
             events.append(RequestFinished(rid, reason, len(prompt_ids), len(text)))
-        engine._tracker.sink(events)
+        engine._tracker(events)
 
     def add_request(**kwargs):
         rid = kwargs["request_id"]
@@ -99,9 +99,8 @@ def _emit_on_submission(engine, text="", reason=None, error=False):
 def _assert_frontend_released(engine):
     tracker = engine._tracker
     assert not tracker._finished
-    assert not tracker.sink._queues
-    assert not tracker.sink._async_subscribers
-    assert not tracker.sink._terminal
+    assert not tracker._queues
+    assert not tracker._async_subscribers
 
 
 def _collect_async(stream):

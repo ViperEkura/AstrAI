@@ -92,9 +92,6 @@ class AnthropicResponseBuilder(ResponseBuilder):
 
     def format_stream_end(self, ctx: GenContext, stop: StopInfo) -> List[str]:
         events: List[str] = []
-        unyielded = stop.body[len(stop.yielded) :]
-        if unyielded:
-            events.extend(self.format_chunk(unyielded))
         events.append(
             sse_event(
                 {"type": "content_block_stop", "index": 0},

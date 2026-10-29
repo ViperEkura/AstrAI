@@ -1,16 +1,13 @@
-"""Unit tests for Request and RequestManager."""
+"""Unit tests for Request and Scheduler."""
 
 import threading
 import time
 
-from astrai.inference import (
-    RequestManager,
-)
-from tests.support.task import _make_mock_tokenizer
+from tests.support.task import _make_mock_tokenizer, _make_scheduler
 
 
-def test_task_manager_wake():
-    tm = RequestManager(tokenizer=_make_mock_tokenizer())
+def test_scheduler_wake():
+    tm = _make_scheduler(tokenizer=_make_mock_tokenizer())
     called = threading.Event()
 
     def waiter():

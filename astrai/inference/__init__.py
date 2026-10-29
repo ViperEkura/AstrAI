@@ -24,7 +24,6 @@ from astrai.inference.core.events import (
 from astrai.inference.core.request import (
     GenerationResult,
     Request,
-    RequestManager,
     RequestStatus,
 )
 from astrai.inference.core.scheduler import Scheduler
@@ -46,7 +45,6 @@ __all__ = [
     "Request",
     "RequestError",
     "RequestFinished",
-    "RequestManager",
     "RequestStatus",
     "Scheduler",
     "SchedulerOutput",

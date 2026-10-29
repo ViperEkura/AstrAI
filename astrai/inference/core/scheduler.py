@@ -1,6 +1,9 @@
 """Request state, KV accounting, scheduling, and result application."""
 
 import logging
+import threading
+import time
+import uuid
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -19,7 +22,7 @@ from astrai.inference.core.events import (
 )
 from astrai.inference.core.metrics import MetricsCollector
 from astrai.inference.core.planner import StepPlanner
-from astrai.inference.core.request import Request, RequestManager, RequestStatus
+from astrai.inference.core.request import Request, RequestStatus
 
 logger = logging.getLogger(__name__)
 _config = InferenceConfig()
@@ -33,7 +36,7 @@ class OutputEventSink:
 
 
 class Scheduler:
-    """Own request and logical KV state; never launch model execution."""
+    """Own request lifecycle and KV state; mutations run under EngineCore's lock."""
 
     def __init__(
         self,
@@ -48,9 +51,14 @@ class Scheduler:
         self._cache = cache
         self._metrics = MetricsCollector()
         self._kv_manager = KVCacheManager(cache)
-        self._requests = RequestManager(
-            tokenizer, max_batch_size, max_seq_len, self._metrics
-        )
+        self.tokenizer = tokenizer
+        self.max_batch_size = max_batch_size
+        self.waiting = deque()
+        self.running: List[Request] = []
+        self._request_event = threading.Event()
+        self._total_requests = 0
+        self._total_tokens = 0
+        self._cancelled_total = 0
         self._stop_ids = frozenset(tokenizer.stop_ids)
         effective_budget = token_budget or _config.max_num_batched_tokens or None
         self._planner = StepPlanner(self._kv_manager, effective_budget)
@@ -67,10 +75,6 @@ class Scheduler:
         return self._stop_ids
 
     @property
-    def max_batch_size(self):
-        return self._requests.max_batch_size
-
-    @property
     def kv_manager(self):
         return self._kv_manager
 
@@ -83,13 +87,15 @@ class Scheduler:
         return self._metrics
 
     def has_requests(self):
-        return self._requests.has_requests()
+        return bool(self.running or self.waiting)
 
     def wait_for_requests(self, timeout):
-        return self._requests.wait_for_requests(timeout=timeout)
+        self._request_event.clear()
+        if not self.has_requests():
+            self._request_event.wait(timeout)
 
     def wake(self):
-        self._requests.wake()
+        self._request_event.set()
 
     def has_outstanding(self):
         return bool(self._planned)
@@ -98,7 +104,7 @@ class Scheduler:
         self._policy_version = policy_version
 
     def refresh_stop_ids(self):
-        self._stop_ids = frozenset(self._requests.tokenizer.stop_ids)
+        self._stop_ids = frozenset(self.tokenizer.stop_ids)
 
     def set_event_sink(self, sink):
         self._event_sink = sink
@@ -118,58 +124,150 @@ class Scheduler:
         self._states[request.request_id] = request
         request.input_tokens = len(request.prompt_ids)
 
-    def add_request(self, prompt: str, **kwargs) -> str:
-        rid = self._requests.add_request(prompt, **kwargs)
-        request = self._requests.get_request(rid)
-        self.remember(request)
-        if request.max_tokens is not None and request.max_tokens <= 0:
-            self.finish(request, FINISH_LENGTH)
-            self.release_finished()
-        return rid
+    def add_request(
+        self,
+        prompt: str,
+        max_tokens: Optional[int] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
+        request_id: Optional[str] = None,
+        prompt_ids: Optional[List[int]] = None,
+    ) -> str:
+        request_id = request_id or f"req_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        if prompt_ids is None:
+            prompt_ids = self.tokenizer.encode(prompt)
+            # Some tokenizers answer a bare string with the batched shape
+            # ([[ids]]); unwrap so one prompt is always a flat id list.
+            if prompt_ids and isinstance(prompt_ids[0], list):
+                prompt_ids = prompt_ids[0]
+        if not prompt_ids:
+            # An empty prompt never completes prefill (``prefill_complete`` stays
+            # False) and would crash the decode path on ``prompt_ids[-1]``;
+            # rejecting it here keeps the scheduling loop alive.
+            raise ValueError("prompt encoded to zero tokens; refusing to schedule")
+        return self.add_requests(
+            [prompt],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            rep_window=rep_window,
+            request_ids=[request_id],
+            prompts_ids=[prompt_ids],
+        )[0]
 
-    def add_requests(self, prompts: List[str], **kwargs) -> List[str]:
-        ids = self._requests.add_requests(prompts, **kwargs)
-        for rid in ids:
-            request = self._requests.get_request(rid)
+    def add_requests(
+        self,
+        prompts: List[str],
+        max_tokens: Optional[int] = None,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        frequency_penalty: float = 0.0,
+        rep_window: int = 64,
+        request_ids: Optional[List[str]] = None,
+        prompts_ids: Optional[List[List[int]]] = None,
+    ) -> List[str]:
+        """Encode a batch once and validate it before registering any request."""
+        if not prompts:
+            return []
+        if prompts_ids is not None:
+            if len(prompts_ids) != len(prompts):
+                raise ValueError("prompts_ids must match prompts in length")
+            encoded = prompts_ids
+        else:
+            encoded = self.tokenizer.encode(list(prompts))
+            if not isinstance(encoded, list) or len(encoded) != len(prompts):
+                raise ValueError("batch tokenizer returned unexpected shape")
+        if request_ids is not None and len(request_ids) != len(prompts):
+            raise ValueError("request_ids must match prompts in length")
+
+        request_ids_out: List[str] = []
+        requests: List[Request] = []
+        stamp = time.time()
+        for i, prompt_ids in enumerate(encoded):
+            if not prompt_ids:
+                raise ValueError(
+                    f"prompt {i} encoded to zero tokens; refusing to schedule"
+                )
+            request_id = (
+                request_ids[i]
+                if request_ids is not None
+                else f"req_{int(stamp)}_{uuid.uuid4().hex[:8]}"
+            )
+            if len(prompt_ids) > self.max_seq_len:
+                prompt_ids = prompt_ids[-self.max_seq_len :]
+            task_max = (
+                self.max_seq_len - len(prompt_ids)
+                if max_tokens is None
+                else min(max_tokens, self.max_seq_len - len(prompt_ids))
+            )
+            request = Request(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                max_tokens=task_max,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                frequency_penalty=frequency_penalty,
+                rep_window=rep_window,
+            )
+            requests.append(request)
+            request_ids_out.append(request_id)
+
+        self.enqueue_tokenized_requests(requests, emit_events=True)
+        return request_ids_out
+
+    def enqueue_tokenized_requests(self, requests: List[Request], *, emit_events=False):
+        """Register a whole batch atomically, including synchronous rollout work."""
+        ids = [request.request_id for request in requests]
+        if len(set(ids)) != len(ids) or any(rid in self._states for rid in ids):
+            raise ValueError("duplicate live request id in batch")
+        for request in requests:
+            request.emit_events = emit_events
             self.remember(request)
+            self.waiting.append(request)
+            self._total_requests += 1
+            self._metrics.register(request.request_id)
             if request.max_tokens is not None and request.max_tokens <= 0:
                 self.finish(request, FINISH_LENGTH)
         self.release_finished()
-        return ids
-
-    def enqueue_tokenized_requests(self, requests: List[Request]) -> None:
-        self._requests.enqueue_tokenized_requests(requests)
-        for request in requests:
-            request.emit_events = False
-            self.remember(request)
+        if requests:
+            self.wake()
 
     def reject_waiting_for_capacity(self) -> None:
         """End a synchronous batch when no active request can free capacity."""
-        waiting = self._requests.pull_waiting(self._requests.get_stats()["waiting"])
-        for request in waiting:
+        for request in list(self.waiting):
             self.finish(
-                request,
-                FINISH_REJECTED,
-                error_reason="kv_cache_allocation_failed",
+                request, FINISH_REJECTED, error_reason="kv_cache_allocation_failed"
             )
-        self._requests.discard_waiting(waiting)
         self.release_finished()
 
     def cancel_request(self, request_id: str) -> bool:
         request = self._states.get(request_id)
         if request is None or request.terminal_emitted:
             return False
-        _, cancelled = self._requests.cancel_request(request_id)
-        if cancelled:
-            self.finish(request, FINISH_CANCELLED)
-            self.release_finished()
-            self._requests.wake()
-        return cancelled
+        self._cancelled_total += 1
+        self.finish(request, FINISH_CANCELLED)
+        self.release_finished()
+        self.wake()
+        return True
 
     def get_stats(self):
-        stats = self._requests.get_stats()
-        stats["kv_cache_tasks"] = self._kv_manager.request_count
-        return stats
+        return {
+            "total_tasks": self._total_requests,
+            "total_tokens": self._total_tokens,
+            "running": len(self.running),
+            "waiting_tasks": len(self.waiting),
+            "waiting": len(self.waiting),
+            "cancelled_total": self._cancelled_total,
+            "kv_cache_tasks": self._kv_manager.request_count,
+            **self._metrics.get_stats(),
+        }
 
     def finish_reason(self, request):
         return (
@@ -230,20 +328,21 @@ class Scheduler:
             self._metrics.mark_finished(
                 rid, request.input_tokens, request.output_tokens
             )
-            self._requests.discard(request)
-            self._states.pop(rid, None)
+            self.waiting = deque(r for r in self.waiting if r is not request)
+            self.running = [r for r in self.running if r is not request]
+            self._states.pop(rid)
+            self._total_tokens += request.output_tokens
 
     def active_requests(self):
-        return [
-            r for r in self._requests.get_running_requests() if not r.terminal_emitted
-        ]
+        return [r for r in self.running if not r.terminal_emitted]
 
     def admit_requests(self, safe_to_release=True):
-        available = self.max_batch_size - len(self._requests.get_running_requests())
+        available = self.max_batch_size - len(self.running)
         if available <= 0:
             return
         failed = []
-        for request in self._requests.pull_waiting(available):
+        for _ in range(min(available, len(self.waiting))):
+            request = self.waiting.popleft()
             if request.terminal_emitted:
                 continue
             if not self._kv_manager.can_ever_fit(len(request.prompt_ids)):
@@ -253,12 +352,12 @@ class Scheduler:
                     error_reason="kv_cache_allocation_failed",
                 )
             elif self._kv_manager.alloc_slots(request.request_id, request.prompt_ids):
-                if not self._requests.activate(request):
-                    self.finish(request, FINISH_CANCELLED)
+                if not request.terminal_emitted:
+                    request.status = RequestStatus.RUNNING
+                    self.running.append(request)
             else:
                 failed.append(request)
-        if failed:
-            self._requests.return_to_waiting(failed)
+        self.waiting.extendleft(reversed(failed))
         self.release_finished(safe_to_release)
 
     def schedule(
@@ -410,6 +509,8 @@ class Scheduler:
             request.num_computed_tokens = request.num_materialized_tokens
 
     def reserve_tokenized_request(self, request, register_metrics=False):
+        if request.request_id in self._states:
+            raise ValueError(f"duplicate live request id: {request.request_id}")
         if not self._kv_manager.alloc_slots(request.request_id, request.prompt_ids):
             return False
         request.emit_events = False

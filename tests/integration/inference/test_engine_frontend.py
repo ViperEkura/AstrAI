@@ -292,7 +292,7 @@ def test_non_streaming_still_bulk_decodes_once_without_helper_threads(
 
 def test_blocking_timeout_cancels_only_unfinished_requests(event_engine, monkeypatch):
     def submit(**kwargs):
-        event_engine._tracker.sink(
+        event_engine._tracker(
             [RequestFinished(kwargs["request_ids"][0], FINISH_LENGTH, 2, 0)]
         )
         return kwargs["request_ids"]
@@ -337,7 +337,7 @@ def test_batch_submission_failure_releases_all_registered_consumers(event_engine
     def submit(**kwargs):
         request_ids = kwargs["request_ids"]
         assert set(request_ids) == set(event_engine._tracker._finished)
-        event_engine._tracker.sink([RequestFinished(request_ids[0], FINISH_LENGTH)])
+        event_engine._tracker([RequestFinished(request_ids[0], FINISH_LENGTH)])
         raise RuntimeError("submit failed after first completion")
 
     event_engine._core.add_requests.side_effect = submit

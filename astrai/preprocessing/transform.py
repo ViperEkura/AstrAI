@@ -15,15 +15,15 @@ import json
 from pathlib import Path
 from typing import Dict, List
 
-import torch
-
 from astrai.config.preprocess_config import PipelineConfig
 from astrai.preprocessing.core import (
+    accumulate_record,
     build_preprocessing_components,
     iter_raw_records,
+    prepare_sequences,
+    primary_ids,
     to_per_record_tensors,
 )
-from astrai.preprocessing.position_id import generate_position_ids
 
 
 class TokenizeTransform:
@@ -68,27 +68,13 @@ class TokenizeTransform:
         multi-response keys such as GRPO ``responses``).
         """
         raw: Dict[str, List] = {}
-        doc_sequences: List[List[int]] = []
 
         for result in iter_raw_records(
             records, self.mask_builder, self.config, self.tokenizer
         ):
-            primary = None
-            for val in result.values():
-                if isinstance(val, list) and val and isinstance(val[0], int):
-                    primary = val
-                    break
-            if primary is not None:
-                doc_sequences.append(primary)
-            for key, ids in result.items():
-                raw.setdefault(key, []).append(ids)
-
-        tensors = to_per_record_tensors(raw)
-
-        pos_ids = generate_position_ids(
-            doc_sequences, self.config.output.position_ids_mode
-        )
-        if pos_ids:
-            tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
-
-        return tensors
+            if "sequence" in result:
+                accumulate_record(raw, result, primary_ids(result))
+            else:
+                for key, ids in result.items():
+                    raw.setdefault(key, []).append(ids)
+        return to_per_record_tensors(prepare_sequences(raw, self.config))

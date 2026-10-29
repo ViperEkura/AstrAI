@@ -114,7 +114,8 @@ classDiagram
             +int min_chars
             +int max_chars
             +Optional[int] max_items
-            +str packing_strategy
+            +str overflow
+            +str packing
             +int max_packed_len
             +str truncation_mode
         }
@@ -475,21 +476,10 @@ classDiagram
         class SectionedMaskBuilder {
             +build(item, config, tokenizer) Optional[dict]
         }
-        class PackingStrategy {
-            <<abstract>>
-            +apply(keys, max_packed_len, truncation_mode) Dict
-        }
-        class PackingStrategyFactory {
-            +create(name, *args, **kwargs) PackingStrategy
-        }
-        class SimplePacking {
-            +apply(keys, max_packed_len, truncation_mode) Dict
-        }
-        class BFDPacking {
-            +apply(keys, max_packed_len, truncation_mode) Dict
-        }
-        class BFDSplitPacking {
-            +apply(keys, max_packed_len, truncation_mode) Dict
+        class SequencePacking {
+            <<module>>
+            +plan_bfd(lengths, capacity) List
+            +pack_sequences(keys, max_seq_len, max_packed_len, overflow, packing) Dict
         }
         class BinWriter {
             +save(output_dir, domain, shard_idx, tensors)
@@ -501,13 +491,10 @@ classDiagram
             +str tokenizer_path
             +AutoTokenizer tokenizer
             +BaseMaskBuilder mask_builder
-            +PackingStrategy _packer
             +BinWriter _writer
             +transform(item) Optional[dict]
             +run()
             +_flush(domains, shard_idx)
-            +_inject_doc_reset_position_ids(keys, mode, seqs) Dict
-            +_inject_continuous_position_ids(tensors, mode, seqs) Dict
             +_to_tensors(keys) Dict
         }
         class TokenizeTransform {
@@ -1163,9 +1150,6 @@ classDiagram
     BaseMaskBuilder <|-- SectionedMaskBuilder
     BaseMaskBuilder <|-- SingleOutputMaskBuilder
     BaseMaskBuilder <|-- MultiOutputMaskBuilder
-    PackingStrategy <|-- SimplePacking
-    PackingStrategy <|-- BFDPacking
-    BFDPacking <|-- BFDSplitPacking
     AllocationStrategy <|-- ContiguousStrategy
     BaseKVCache <|-- PrefillKVCache
     BaseKVCache <|-- DecodeKVCache
@@ -1214,14 +1198,13 @@ classDiagram
     Pipeline o-- PipelineConfig
     Pipeline o-- BaseMaskBuilder
     Pipeline o-- AutoTokenizer
-    Pipeline o-- PackingStrategy
+    Pipeline ..> SequencePacking
     Pipeline o-- BinWriter
     TokenizeTransform o-- AutoTokenizer
     TokenizeTransform o-- BaseMaskBuilder
 
     %% --- Dependency (uses temporarily) ---
     TrainConfig ..> BaseStrategy : selects
-    PackingStrategyFactory ..> PackingStrategy : creates
     StrategyFactory ..> BaseStrategy : creates
     SchedulerFactory ..> BaseScheduler : creates
     DatasetFactory ..> BaseDataset : creates
@@ -1299,7 +1282,7 @@ classDiagram
 | Module | Components | Description |
 |--------|------------|-------------|
 | **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, AttentionConfig, GQAConfig, GDNConfig, MLAConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
-| **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, PackingStrategy, PackingStrategyFactory, generate_position_ids, SimplePacking, BFDPacking, BFDSplitPacking, BinWriter | Declarative JSON-driven data preprocessing |
+| **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, plan_bfd, pack_sequences, prepare_sequences, generate_position_ids, BinWriter | Declarative JSON-driven data preprocessing |
 | **astrai.dataset** | BaseDataset, SEQDataset, SFTDataset, DPODataset, GRPODataset, Store, Streamable, Recordable, MmapStore, JsonlStore, StoreFactory, RDSampler, DatasetFactory | Dataset loading and management |
 | **astrai.serialization** | Checkpoint | Model serialization |
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, TransformerModel · `components/`: DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding · `kv_cache.py`: KVStorage, ReqToTokenPool, BaseKVCache, PrefillKVCache, DecodeKVCache, KVCache alias | Neural network model and KV layout contract |
@@ -1315,7 +1298,7 @@ classDiagram
 
 | Pattern | Classes | Purpose |
 |---------|---------|---------|
-| **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory`, `PackingStrategyFactory` | Decorator-based component creation |
+| **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory` | Decorator-based component creation |
 | **Registry** | `BaseFactory` | Component registration |
 | **Strategy** | `SEQStrategy`, `SFTStrategy`, `DPOStrategy`, `GRPOStrategy` | Training strategy switching |
 | **Strategy (Sampling)** | `TemperatureStrategy`, `TopKStrategy`, `TopPStrategy`, `FrequencyPenaltyStrategy`, `SamplingPipeline` | Composable logit transformations |

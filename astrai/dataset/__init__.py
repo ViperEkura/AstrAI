@@ -3,6 +3,7 @@ from astrai.dataset.dataset import (
     DatasetFactory,
     dpo_collate_fn,
     grpo_collate_fn,
+    sft_collate_fn,
 )
 from astrai.dataset.sampler import GlobalBatchSampler, RDSampler
 from astrai.dataset.storage import (
@@ -24,6 +25,7 @@ __all__ = [
     "DatasetFactory",
     "dpo_collate_fn",
     "grpo_collate_fn",
+    "sft_collate_fn",
     "Store",
     "Streamable",
     "Recordable",

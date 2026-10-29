@@ -19,7 +19,7 @@ from tests.support.data import make_dpo_chat_config
 from tests.support.models import make_tiny_config
 
 
-@pytest.mark.parametrize("packing", ["simple", "bfd", "bfd_split"])
+@pytest.mark.parametrize("packing", ["none", "bfd"])
 @pytest.mark.parametrize(
     "shard_limit", [1, 100_000], ids=["multi-shard", "single-shard"]
 )
@@ -46,7 +46,7 @@ def test_dpo_pipeline_binary_roundtrip(
     source.write_text("".join(json.dumps(record) + "\n" for record in records))
     config = make_dpo_chat_config()
     config.output.record_keys = ["chosen", "rejected", "chosen_mask", "rejected_mask"]
-    config.preprocessing.packing_strategy = packing
+    config.preprocessing.packing = packing
     config.output.max_tokens_per_shard = shard_limit
     pipeline = Pipeline(
         config, [str(source)], str(tmp_path / "out"), chat_tokenizer_dir

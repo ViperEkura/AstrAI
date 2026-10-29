@@ -22,11 +22,11 @@ import tqdm
 
 from astrai.config.preprocess_config import PipelineConfig
 from astrai.preprocessing.core import (
+    accumulate_record,
     build_preprocessing_components,
+    prepare_sequences,
     primary_ids,
 )
-from astrai.preprocessing.packing import PackingStrategyFactory
-from astrai.preprocessing.position_id import generate_position_ids
 from astrai.preprocessing.writer import BinWriter
 
 logger = logging.getLogger(__name__)
@@ -74,9 +74,6 @@ class Pipeline:
 
         self.tokenizer, self.mask_builder = build_preprocessing_components(
             tokenizer_path
-        )
-        self._packer = PackingStrategyFactory.create(
-            config.preprocessing.packing_strategy
         )
         self._writer = BinWriter()
 
@@ -129,9 +126,7 @@ class Pipeline:
                     continue
 
                 bucket = domains[domain]
-                self._align_bucket(bucket, result, ids)
-                for key, val in result.items():
-                    bucket[key].append(val)
+                accumulate_record(bucket, result, ids)
 
                 count += 1
                 total_tokens += len(ids)
@@ -163,7 +158,9 @@ class Pipeline:
                 raise ValueError(
                     f"Record mask '{mask_key}' must match '{name}' lengths"
                 )
-        missing = record_keys.difference(result)
+        if "sequence" in result and "loss_mask" in record_keys:
+            result.setdefault("loss_mask", [1] * len(result["sequence"]))
+        missing = record_keys.difference(result).difference({"seq_lengths"})
         if missing:
             raise ValueError(f"Record output is missing fields: {sorted(missing)}")
 
@@ -181,20 +178,6 @@ class Pipeline:
                 raise ValueError(
                     f"Record mask '{mask_key}' must match '{name}' lengths"
                 )
-
-    @staticmethod
-    def _align_bucket(bucket: Dict, result: Dict, ids: List):
-        """Pad previously-accumulated keys that are missing from *result*.
-
-        Builders omit all-ones masks (``loss_mask`` / ``*_mask``) to save
-        space, so an omitted mask means "train on every token" and is
-        back-filled with ones; every other missing key pads with zeros.
-        """
-        for key in list(bucket.keys()):
-            if key in result:
-                continue
-            fill = 1 if key == "loss_mask" or key.endswith("_mask") else 0
-            bucket[key].append([fill] * len(ids))
 
     def _iter_items(self):
         for path in self.paths:
@@ -227,16 +210,8 @@ class Pipeline:
         for domain, keys in domains.items():
             idx = shard_idx[domain]
 
-            pp = self.config.preprocessing
-            original_sequences = keys.get("sequence", [])
-            mode = self.config.output.position_ids_mode
-
-            keys = self._inject_doc_reset_position_ids(keys, mode, original_sequences)
-            keys = self._packer.apply(dict(keys), pp.max_packed_len, pp.truncation_mode)
+            keys = prepare_sequences(dict(keys), self.config)
             tensors = self._to_tensors(keys)
-            tensors = self._inject_continuous_position_ids(
-                tensors, mode, keys.get("sequence", [])
-            )
 
             self._validate_record_masks(tensors)
             writer_kwargs = (
@@ -250,48 +225,8 @@ class Pipeline:
             first_key = "sequence" if "sequence" in tensors else next(iter(tensors))
             tqdm.tqdm.write(
                 f"  saved {domain}/shard_{idx:04d}  "
-                f"({tensors[first_key][0].numel():,} tokens)"
+                f"({sum(t.numel() for t in tensors[first_key]):,} tokens)"
             )
-
-    def _inject_doc_reset_position_ids(
-        self,
-        keys: Dict[str, List],
-        mode: str,
-        original_sequences: List[List[int]],
-    ) -> Dict[str, List]:
-        """Attach per-document position_ids before packing (``doc_reset``).
-
-        ``doc_reset`` position ids must enter the packer so that each
-        packed bin concatenates the per-doc ranges in bin order.  The
-        per-record structure ``[range(len(s)) for s in seqs]`` is required
-        by the packer (it concatenates per-record lists per bin); the
-        ``generate_position_ids`` flattens, so it cannot be used
-        directly here — it is only consulted for the ``continuous``
-        post-packing path.
-        """
-        if mode != "doc_reset" or not original_sequences:
-            return keys
-        keys["position_ids"] = [list(range(len(s))) for s in original_sequences]
-        return keys
-
-    def _inject_continuous_position_ids(
-        self,
-        tensors: Dict[str, List[torch.Tensor]],
-        mode: str,
-        packed_sequences: List[List[int]],
-    ) -> Dict[str, List[torch.Tensor]]:
-        """Attach a single continuous position_ids tensor after packing.
-
-        ``continuous`` mode spans the whole shard (post-packing), so it
-        cannot participate in bin packing — it is computed from the
-        packed sequences and appended directly to the tensor dict.
-        """
-        if mode != "continuous" or not packed_sequences:
-            return tensors
-        pos_ids = generate_position_ids(packed_sequences, mode)
-        if pos_ids:
-            tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
-        return tensors
 
     def _to_tensors(self, keys: Dict[str, List]) -> Dict[str, List[torch.Tensor]]:
         """Convert packed per-key id lists to tensors.

@@ -145,12 +145,12 @@ def test_first_retained_section_gets_special_tokens_after_filtering(first):
         max_seq_len=3,
     )
     item = {"first": first, "second": "abcd", "source": 123}
-    expected = {"sequence": [1000, 97, 98], "domain": "__default__"}
+    expected = {"sequence": [1000, 97, 98, 99, 100], "domain": "__default__"}
     builder = SingleOutputMaskBuilder()
     assert_scalar_and_batch(builder, [item], config, [expected])
 
 
-def test_batch_groups_special_policy_and_preserves_mask_truncation():
+def test_batch_groups_special_policy_and_preserves_full_mask():
     config = config_for(
         sections=[
             {"field": "prompt", "action": "mask"},
@@ -161,8 +161,8 @@ def test_batch_groups_special_policy_and_preserves_mask_truncation():
     items = [{"prompt": "ab", "answer": "cd"}, {"prompt": "", "answer": "ef"}]
     expected = [
         {
-            "sequence": [1000, 97, 98, 99],
-            "loss_mask": [0, 0, 0, 1],
+            "sequence": [1000, 97, 98, 99, 100],
+            "loss_mask": [0, 0, 0, 1, 1],
             "domain": "__default__",
         },
         {"sequence": [1000, 101, 102], "domain": "__default__"},
@@ -178,7 +178,7 @@ def test_batch_groups_special_policy_and_preserves_mask_truncation():
     }
 
 
-def test_top_level_template_bos_and_empty_or_truncated_records():
+def test_top_level_template_bos_and_empty_records_before_overflow():
     config = config_for(
         sections=[{"field": "messages", "action": "$role", "template": True}],
         max_seq_len=3,
@@ -190,14 +190,18 @@ def test_top_level_template_bos_and_empty_or_truncated_records():
         {},
     ]
     expected = [
-        {"sequence": [1000, 60, 97], "loss_mask": [0, 1, 1], "domain": "__default__"},
+        {
+            "sequence": [1000] + [ord(c) for c in "<assistant:a>"],
+            "loss_mask": [0] + [1] * len("<assistant:a>"),
+            "domain": "__default__",
+        },
         None,
         None,
     ]
     builder = SingleOutputMaskBuilder()
     assert_scalar_and_batch(builder, items, config, expected)
     config.preprocessing.max_seq_len = 1
-    assert builder.build_batch(items, config, RecordingTokenizer()) == [None] * 3
+    assert builder.build_batch(items, config, RecordingTokenizer()) == expected
 
 
 def test_multi_requires_all_outputs_and_preserves_explicit_masks_and_values():

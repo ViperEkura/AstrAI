@@ -44,10 +44,7 @@ def _pack_bins(pairs, max_len):
 
     Reuses :func:`plan_bfd` so the BFD heuristic stays single-sourced.
     """
-    # Treat each pair as a single sequence of length len(c)+len(r) for
-    # planning purposes; plan_bfd works on pure lengths.
-    fake_sequences = [[0] * (len(c) + len(r)) for c, r in pairs]
-    plan = plan_bfd(fake_sequences, max_len)
+    plan = plan_bfd([len(c) + len(r) for c, r in pairs], max_len)
     return [
         [(i, pairs[i][0], pairs[i][1]) for i in bin_indices] for bin_indices in plan
     ]

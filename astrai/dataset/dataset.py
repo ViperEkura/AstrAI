@@ -10,7 +10,7 @@ Class hierarchy:
     BaseDataset (ABC)         — holds a Store, exposes __len__/keys,
                                  overrides __getitem__
     ├── SEQDataset            — next-token prediction (stream)
-    ├── SFTDataset            — loss-mask + position_ids (stream)
+    ├── SFTDataset            — explicit segment records or legacy stream
     ├── DPODataset            — chosen/rejected pairs (record)
     └── GRPODataset           — prompt + response group (record)
 
@@ -271,6 +271,43 @@ def validate_keys(store: Store, required: List[str]) -> None:
         )
 
 
+def sft_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+    """Pad packs at batch time; never predict across a segment or pack boundary."""
+    from torch.nn.utils.rnn import pad_sequence
+
+    rows = []
+    for sample in batch:
+        if "seq_lengths" not in sample:
+            rows.append(sample)
+            continue
+        tokens = sample["input_ids"]
+        lengths = sample["seq_lengths"].tolist()
+        targets = torch.full_like(tokens, -100)
+        mask = torch.zeros_like(tokens, dtype=torch.bool)
+        targets[:-1] = tokens[1:]
+        mask[:-1] = sample["loss_mask"][1:]
+        ends = sample["seq_lengths"].cumsum(0) - 1
+        targets[ends] = -100
+        mask[ends] = False
+        positions = torch.cat([torch.arange(length) for length in lengths])
+        rows.append(
+            {
+                "input_ids": tokens,
+                "target_ids": targets,
+                "loss_mask": mask,
+                "position_ids": positions,
+            }
+        )
+    return {
+        key: pad_sequence(
+            [row[key] for row in rows],
+            batch_first=True,
+            padding_value=-100 if key == "target_ids" else 0,
+        )
+        for key in ("input_ids", "target_ids", "position_ids", "loss_mask")
+    }
+
+
 class BaseDataset(Dataset, ABC):
     """Abstract base class for dataset types.
 
@@ -452,14 +489,40 @@ class SEQDataset(BaseDataset):
 class SFTDataset(BaseDataset):
     """Dataset for supervised fine-tuning with loss masking.
 
-    Stream mode: ``sequence``/``loss_mask``/``position_ids`` are sliced
-    to the window.  ``loss_mask`` and ``target_ids`` use the +1 shifted
-    slice so they align with the predicted positions.
+    New packs carry sequence/loss_mask/seq_lengths record offsets and use
+    sft_collate_fn for label shifting and padding. Legacy streams retain
+    the fixed-window reader and its shifted target/mask slices.
     """
 
     required_keys = ["sequence", "loss_mask", "position_ids"]
 
+    def __init__(self, store: Store):
+        self.record_mode = "seq_lengths" in store.keys
+        if self.record_mode:
+            self.required_keys = ["sequence", "loss_mask", "seq_lengths"]
+        super().__init__(store)
+        if self.record_mode and isinstance(store, MmapStore):
+            store.validate_record_alignment(["sequence", "loss_mask"])
+            store.validate_record_alignment(["seq_lengths"])
+
+    def __len__(self) -> int:
+        return self.store.num_records if self.record_mode else super().__len__()
+
     def __getitem__(self, index: int):
+        if self.record_mode:
+            sequence = self.store.fetch_record(index, "sequence").long()
+            mask = self.store.fetch_record(index, "loss_mask").bool()
+            lengths = self.store.fetch_record(index, "seq_lengths").long()
+            if (
+                lengths.numel() == 0
+                or (lengths <= 0).any()
+                or lengths.sum().item() != sequence.numel()
+                or mask.numel() != sequence.numel()
+            ):
+                raise ValueError("Invalid SFT record segment lengths or loss mask")
+            if self.store.window_size and sequence.numel() > self.store.window_size:
+                raise ValueError("SFT pack exceeds training window; preprocess again")
+            return {"input_ids": sequence, "loss_mask": mask, "seq_lengths": lengths}
         begin, end = self.store.sample_window(index)
         x = self.store.fetch(begin, end, "sequence")
         y = self.store.fetch(begin + 1, end + 1, "sequence")

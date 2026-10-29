@@ -6,6 +6,7 @@ from astrai.config.preprocess_config import (
     InputConfig,
     OutputConfig,
     PipelineConfig,
+    ProcessingConfig,
 )
 from astrai.preprocessing import Pipeline
 from tests.support.data import INSTRUCTION_SECTIONS, TEXT_SECTIONS, make_dpo_chat_config
@@ -17,6 +18,8 @@ def test_default_values():
     assert config.mask == {}
     assert config.mask_default == "mask"
     assert config.preprocessing.max_seq_len == 2048
+    assert config.preprocessing.overflow == "truncate"
+    assert config.preprocessing.packing == "bfd"
     assert config.output.storage_format == "bin"
     assert config.output.record_keys == []
     assert config.input.sections is None
@@ -96,3 +99,12 @@ def test_pipeline_rejects_unsupported_output_before_loading(storage_format, tmp_
     with pytest.raises(ValueError, match="storage_format"):
         Pipeline(config, [], str(output), tokenizer_path="unused")
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [{"overflow": "reject"}, {"packing": "bfd_split"}, {"packing_strategy": "simple"}],
+)
+def test_reject_obsolete_or_invalid_packing(setting):
+    with pytest.raises(ValueError):
+        ProcessingConfig(**setting)

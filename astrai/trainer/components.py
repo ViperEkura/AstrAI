@@ -19,6 +19,7 @@ from astrai.dataset import (
     RDSampler,
     dpo_collate_fn,
     grpo_collate_fn,
+    sft_collate_fn,
 )
 from astrai.model.automodel import ModelFactory
 from astrai.optimization.optimizer import OptimizerFactory
@@ -250,6 +251,8 @@ def resolve_collate(spec: ComponentSpec):
         return resolve_component(collate)
     if spec.type == "packed":
         train_type = spec.params.get("train_type")
+        if train_type == "sft":
+            return sft_collate_fn
         if train_type == "dpo":
             return dpo_collate_fn
         if train_type == "grpo":

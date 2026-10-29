@@ -98,6 +98,76 @@ def detect_format(load_path: str) -> str:
     raise FileNotFoundError(f"No supported data files found at {load_path}")
 
 
+def _stream_fetch(self, begin: int, end: int, keys: Union[str, List[str]]):
+    if not getattr(self, "_data", None):
+        raise RuntimeError("Store not loaded")
+    if not (0 <= begin < self._length and 0 <= end <= self._length):
+        raise ValueError(
+            f"Index out of bounds: begin={begin}, end={end}, length={self._length}"
+        )
+    if isinstance(keys, str):
+        return _fetch_stream_key(self, keys, begin, end)
+    return {k: _fetch_stream_key(self, k, begin, end) for k in keys}
+
+
+def _fetch_stream_key(self, key: str, begin: int, end: int) -> Tensor:
+    segments = self._data[key]
+    cum = self._cum[key]
+    seg_start = bisect.bisect_right(cum, begin)
+    seg_end = bisect.bisect_left(cum, end)
+
+    results = []
+    for i in range(seg_start, seg_end + 1):
+        prev = cum[i - 1] if i > 0 else 0
+        s = max(begin - prev, 0)
+        e = min(end - prev, segments[i].shape[0])
+        results.append(segments[i][s:e])
+
+    return results[0] if len(results) == 1 else torch.cat(results, dim=0)
+
+
+def _record_fetch(self, index: int, keys: Union[str, List[str]]):
+    num_records = self.num_records
+    if not getattr(self, "_data", None) and num_records == 0:
+        raise RuntimeError("Store not loaded")
+    if not 0 <= index < num_records:
+        raise ValueError(
+            f"Record index out of bounds: {index}, num_records={num_records}"
+        )
+    if isinstance(keys, str):
+        return _fetch_record_key(self, keys, index)
+    return {k: _fetch_record_key(self, k, index) for k in keys}
+
+
+def _fetch_record_key(self, key: str, index: int):
+    offsets = self._offsets.get(key)
+    if offsets:
+        shard_index = bisect.bisect_right(self._record_cum, index)
+        local_index = index - (self._record_cum[shard_index - 1] if shard_index else 0)
+        start, end = offsets[shard_index][local_index : local_index + 2]
+        return self._data[key][shard_index][start:end]
+    if self._offsets:
+        raise ValueError(f"Record field '{key}' requires offsets")
+    return self._data[key][index]
+
+
+def _read_jsonl(root: Path) -> List[Dict]:
+    """Read raw records in file order, skipping empty or malformed lines."""
+    records: List[Dict] = []
+    paths = [root] if root.is_file() else sorted(root.glob("*.jsonl"))
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse JSON line in %s, skipping", path)
+    return records
+
+
 class Store(ABC):
     """Common base for all storage backends.
 
@@ -282,7 +352,8 @@ class Store(ABC):
                 total += t.shape[0]
                 cum.append(total)
             self._cum[key] = cum
-            flat_lengths.append(cum[-1] if cum else 0)
+            if key != "seq_lengths":
+                flat_lengths.append(cum[-1] if cum else 0)
         self._length = min(flat_lengths) if flat_lengths else 0
 
         if self.segments_are_records:
@@ -352,34 +423,6 @@ class Streamable:
         return _stream_fetch(self, begin, end, keys)
 
 
-def _stream_fetch(self, begin: int, end: int, keys: Union[str, List[str]]):
-    if not getattr(self, "_data", None):
-        raise RuntimeError("Store not loaded")
-    if not (0 <= begin < self._length and 0 <= end <= self._length):
-        raise ValueError(
-            f"Index out of bounds: begin={begin}, end={end}, length={self._length}"
-        )
-    if isinstance(keys, str):
-        return _fetch_stream_key(self, keys, begin, end)
-    return {k: _fetch_stream_key(self, k, begin, end) for k in keys}
-
-
-def _fetch_stream_key(self, key: str, begin: int, end: int) -> Tensor:
-    segments = self._data[key]
-    cum = self._cum[key]
-    seg_start = bisect.bisect_right(cum, begin)
-    seg_end = bisect.bisect_left(cum, end)
-
-    results = []
-    for i in range(seg_start, seg_end + 1):
-        prev = cum[i - 1] if i > 0 else 0
-        s = max(begin - prev, 0)
-        e = min(end - prev, segments[i].shape[0])
-        results.append(segments[i][s:e])
-
-    return results[0] if len(results) == 1 else torch.cat(results, dim=0)
-
-
 class Recordable:
     """Mixin granting raw record access via :meth:`fetch_record`.
 
@@ -393,31 +436,6 @@ class Recordable:
         keys: Union[str, List[str]],
     ):
         return _record_fetch(self, index, keys)
-
-
-def _record_fetch(self, index: int, keys: Union[str, List[str]]):
-    num_records = self.num_records
-    if not getattr(self, "_data", None) and num_records == 0:
-        raise RuntimeError("Store not loaded")
-    if not 0 <= index < num_records:
-        raise ValueError(
-            f"Record index out of bounds: {index}, num_records={num_records}"
-        )
-    if isinstance(keys, str):
-        return _fetch_record_key(self, keys, index)
-    return {k: _fetch_record_key(self, k, index) for k in keys}
-
-
-def _fetch_record_key(self, key: str, index: int):
-    offsets = self._offsets.get(key)
-    if offsets:
-        shard_index = bisect.bisect_right(self._record_cum, index)
-        local_index = index - (self._record_cum[shard_index - 1] if shard_index else 0)
-        start, end = offsets[shard_index][local_index : local_index + 2]
-        return self._data[key][shard_index][start:end]
-    if self._offsets:
-        raise ValueError(f"Record field '{key}' requires offsets")
-    return self._data[key][index]
 
 
 class StoreFactory(BaseFactory["Store"]):
@@ -507,23 +525,6 @@ class MmapStore(Store, Streamable, Recordable):
         for key in keys[1:]:
             if self._offsets[key] != self._offsets[keys[0]]:
                 raise ValueError(f"Record lengths for '{key}' must match '{keys[0]}'")
-
-
-def _read_jsonl(root: Path) -> List[Dict]:
-    """Read raw records in file order, skipping empty or malformed lines."""
-    records: List[Dict] = []
-    paths = [root] if root.is_file() else sorted(root.glob("*.jsonl"))
-    for path in paths:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse JSON line in %s, skipping", path)
-    return records
 
 
 @StoreFactory.register("jsonl")

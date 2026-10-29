@@ -290,12 +290,13 @@ When `sources` is set, `sections` is ignored.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_seq_len` | int | `2048` | Truncate sequences to this length |
+| `max_seq_len` | int | `2048` | Maximum single segment length; overflow runs after full tokenization |
 | `min_chars` | int | `50` | Skip text-mode items shorter than this |
 | `max_chars` | int | `2000000` | Skip text-mode items longer than this |
 | `max_items` | int or null | `null` | Stop after N documents |
 | `batch_size` | int | `256` | Records per tokenization batch |
-| `packing_strategy` | str | `"simple"` | Packing is supported for single-output data with a `sequence` key: `"simple"`, `"bfd"`, or `"bfd_split"`. DPO pairs remain independent records; GRPO binary group boundaries are not preserved. |
+| `overflow` | str | `"truncate"` | Long single-output samples: `"truncate"` or `"split"` |
+| `packing` | str | `"bfd"` | `"bfd"` merges segments by best fit; `"none"` keeps each segment separate |
 | `max_packed_len` | int | `8192` | Maximum length of a packed bin |
 | `truncation_mode` | str | `"keep_start"` | How to truncate sequences: `"keep_start"` or `"keep_end"` |
 
@@ -491,3 +492,39 @@ from `astrai.preprocessing`. Record validation and partial-shard cleanup remain
 part of the writer. `output.storage_format` accepts only `"bin"`, including
 when loading a configuration file. This restriction concerns output;
 `JsonlStore` and JSONL input tokenization remain available.
+
+### SFT packs with explicit boundaries
+
+Use the independent defaults `overflow: truncate` and `packing: bfd`.
+Set both `max_seq_len` and `max_packed_len` to the training context length
+(for example, 2048). Overflow uses the smaller limit; BFD uses the packed
+limit as bin capacity. `split` preserves token chunks but does not copy
+previous context or repair incomplete conversation turns. `none` still
+applies the selected overflow policy.
+
+For SFT, set `output.record_keys` to
+`["sequence", "loss_mask", "seq_lengths"]` and keep
+`output.position_ids_mode: doc_reset`. Each bin is one binary record;
+`seq_lengths` holds the lengths of its independent segments. No padding
+or per-token position IDs are stored. SFTDataset reads every record,
+including the final partial pack. The trainer selects `sft_collate_fn`
+automatically for packed SFT datasets; custom DataLoaders must select it too.
+
+The collator pads to the longest pack in the batch, resets positions for
+each segment, and shifts labels within segments. Segment-ending targets
+and padding are ignored by the loss. Token ID zero is a valid masked
+filler, not an assumed tokenizer padding symbol. Existing SFT attention
+constructs a same-segment causal mask from the position resets. Resets
+and EOS tokens alone do not isolate attention. This path uses the
+existing dense attention mask and requires a compatible model/backend;
+packed context parallelism remains unsupported.
+
+The old `packing_strategy` option and strategy classes have been removed.
+Migrate `simple` to `packing: none`, `bfd` to `packing: bfd`, and
+`bfd_split` to `overflow: split, packing: bfd`. Replace the temporary
+`bfd_pad_sft` option with the record format above and regenerate data.
+Old stream datasets remain readable, but cannot recover discarded pack
+boundaries. Single-output builders now return full tokenized samples;
+use `prepare_sequences` to apply length and packing policies.
+DPO/GRPO outputs retain independent per-output truncation and are not
+split or merged by these single-output policies.

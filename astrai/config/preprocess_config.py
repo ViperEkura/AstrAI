@@ -8,12 +8,13 @@ modes, both driven declaratively through ``input.sections`` or
 from dataclasses import field
 from typing import Dict, List, Optional
 
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 from pydantic.dataclasses import dataclass
 
 from astrai.config.base import BaseConfig
 
-_PACKING_STRATEGIES = frozenset({"simple", "bfd", "bfd_split"})
+_PACKING_MODES = frozenset({"bfd", "none"})
+_OVERFLOW_MODES = frozenset({"truncate", "split"})
 _TRUNCATION_MODES = frozenset({"keep_start", "keep_end"})
 _POSITION_IDS_MODES = frozenset({"none", "doc_reset", "continuous"})
 
@@ -42,7 +43,7 @@ class InputConfig(BaseConfig):
     sources: Optional[Dict[str, Dict]] = None
 
 
-@dataclass
+@dataclass(config=ConfigDict(extra="forbid"))
 class ProcessingConfig(BaseConfig):
     """Processing configuration for tokenization and packing.
 
@@ -52,7 +53,8 @@ class ProcessingConfig(BaseConfig):
         max_chars (int): Maximum number of characters to keep. Defaults to 2_000_000.
         max_items (Optional[int]): Maximum number of items to process, None=unlimited. Defaults to None.
         batch_size (int): Number of records tokenized together. Defaults to 256.
-        packing_strategy (str): How to pack sequences: 'simple', 'bfd', or 'bfd_split'. Defaults to "simple".
+        overflow (str): Handle long single-output samples: "truncate" or "split".
+        packing (str): Merge single-output samples with "bfd", or keep "none".
         max_packed_len (int): Maximum length of a packed bin. Defaults to 8192.
         truncation_mode (str): How to truncate over-length sequences: 'keep_start' or 'keep_end'. Defaults to "keep_start".
     """
@@ -62,15 +64,24 @@ class ProcessingConfig(BaseConfig):
     max_chars: int = 2_000_000
     max_items: Optional[int] = None
     batch_size: int = 256
-    packing_strategy: str = "simple"
+    overflow: str = "truncate"
+    packing: str = "bfd"
     max_packed_len: int = 8192
     truncation_mode: str = "keep_start"
 
-    @field_validator("packing_strategy")
-    def _validate_packing_strategy(cls, v: str) -> str:
-        if v not in _PACKING_STRATEGIES:
+    @field_validator("packing")
+    def _validate_packing(cls, v: str) -> str:
+        if v not in _PACKING_MODES:
             raise ValueError(
-                f"packing_strategy must be one of {sorted(_PACKING_STRATEGIES)}, got {v!r}"
+                f"packing must be one of {sorted(_PACKING_MODES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("overflow")
+    def _validate_overflow(cls, v: str) -> str:
+        if v not in _OVERFLOW_MODES:
+            raise ValueError(
+                f"overflow must be one of {sorted(_OVERFLOW_MODES)}, got {v!r}"
             )
         return v
 

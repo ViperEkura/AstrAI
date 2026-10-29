@@ -117,9 +117,15 @@ class SectionRenderer:
         for (_, action, _), ids in zip(plan, encoded, strict=True):
             all_ids.extend(ids)
             loss_mask.extend([1 if action == "train" else 0] * len(ids))
-        max_len = config.preprocessing.max_seq_len
-        all_ids = all_ids[:max_len]
-        loss_mask = loss_mask[: len(all_ids)]
+        # Single-output samples stay intact until the shared overflow stage.
+        # Preference/group outputs keep their independent length limits.
+        if config.input.sources:
+            max_len = config.preprocessing.max_seq_len
+            start = (
+                -max_len if config.preprocessing.truncation_mode == "keep_end" else 0
+            )
+            all_ids = all_ids[start : None if start else max_len]
+            loss_mask = loss_mask[start : None if start else max_len]
         if not all_ids or (prepend_bos and len(all_ids) <= 1):
             return None, None
         return all_ids, loss_mask

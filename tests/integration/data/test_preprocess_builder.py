@@ -6,6 +6,7 @@ from astrai.config.preprocess_config import (
     PipelineConfig,
     ProcessingConfig,
 )
+from astrai.preprocessing.core import prepare_sequences
 from tests.support.data import (
     CHAT_SECTIONS,
     TEXT_SECTIONS,
@@ -157,7 +158,11 @@ def test_chat_truncation(chat_tokenizer, builder):
         ]
     }
     result = builder.build(item, config, chat_tokenizer)
-    assert len(result["sequence"]) <= 10
+    assert len(result["sequence"]) > 10
+    packed = prepare_sequences(
+        {k: [v] for k, v in result.items() if k != "domain"}, config
+    )
+    assert len(packed["sequence"][0]) == 10
     assert len(result["loss_mask"]) == len(result["sequence"])
 
 
@@ -236,7 +241,11 @@ def test_text_truncation(test_tokenizer, builder):
     )
     item = {"text": "This is a very long text that should be truncated"}
     result = builder.build(item, config, test_tokenizer)
-    assert len(result["sequence"]) <= 3
+    assert len(result["sequence"]) > 3
+    packed = prepare_sequences(
+        {k: [v] for k, v in result.items() if k != "domain"}, config
+    )
+    assert len(packed["sequence"][0]) == 3
 
 
 def test_dpo_chat_basic(chat_tokenizer, builder):

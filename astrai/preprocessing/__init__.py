@@ -4,11 +4,7 @@ from astrai.preprocessing.builder import (
     SectionedMaskBuilder,
     SingleOutputMaskBuilder,
 )
-from astrai.preprocessing.packing import (
-    PackingStrategy,
-    PackingStrategyFactory,
-    plan_bfd,
-)
+from astrai.preprocessing.packing import pack_sequences, plan_bfd
 from astrai.preprocessing.pipeline import Pipeline, filter_by_length
 from astrai.preprocessing.position_id import generate_position_ids
 from astrai.preprocessing.transform import TokenizeTransform
@@ -17,8 +13,7 @@ from astrai.preprocessing.writer import BinWriter
 __all__ = [
     "BaseMaskBuilder",
     "MultiOutputMaskBuilder",
-    "PackingStrategy",
-    "PackingStrategyFactory",
+    "pack_sequences",
     "Pipeline",
     "SectionedMaskBuilder",
     "SingleOutputMaskBuilder",

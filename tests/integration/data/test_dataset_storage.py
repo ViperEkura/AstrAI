@@ -255,6 +255,7 @@ def test_jsonl_store_eager_len_returns_token_count(base_test_env):
         [{"text": "hello world"}, {"text": "foo bar"}],
         config_overrides={
             "output": {"position_ids_mode": "none"},
+            "preprocessing": {"packing": "none", "min_chars": 1},
         },
     )
 

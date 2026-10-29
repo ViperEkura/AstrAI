@@ -39,7 +39,6 @@ def test_chat_completions_non_stream(client, loaded_model):
         yield StreamChunk(
             text="Assistant reply",
             delta_token_ids=[1],
-            current_token_ids=[1],
             stopped=False,
         )
 
@@ -69,13 +68,11 @@ def test_chat_completions_stream(client, loaded_model):
         yield StreamChunk(
             text="cumulative1",
             delta_token_ids=[1],
-            current_token_ids=[1],
             stopped=False,
         )
         yield StreamChunk(
             text="cumulative2",
             delta_token_ids=[1],
-            current_token_ids=[1],
             stopped=False,
         )
 
@@ -107,7 +104,6 @@ def test_messages_non_stream(client, loaded_model):
         yield StreamChunk(
             text="Assistant reply",
             delta_token_ids=[1],
-            current_token_ids=[1],
             stopped=False,
         )
 
@@ -139,13 +135,11 @@ def test_messages_stream(client, loaded_model):
         yield StreamChunk(
             text="cumulative1",
             delta_token_ids=[1],
-            current_token_ids=[1],
             stopped=False,
         )
         yield StreamChunk(
             text="cumulative2",
             delta_token_ids=[1],
-            current_token_ids=[1],
             stopped=False,
         )
 
@@ -177,9 +171,7 @@ def test_messages_with_system(client, loaded_model):
     """POST /v1/messages with system prompt."""
 
     async def events_gen():
-        yield StreamChunk(
-            text="Reply", delta_token_ids=[1], current_token_ids=[1], stopped=False
-        )
+        yield StreamChunk(text="Reply", delta_token_ids=[1], stopped=False)
 
     get_app().state.engine = loaded_model
     loaded_model.generate_events.return_value = events_gen()
@@ -203,12 +195,8 @@ def test_chat_completions_stop_sequence(client, loaded_model):
 
     async def events_gen():
         try:
-            yield StreamChunk(
-                text="Hello", delta_token_ids=[1], current_token_ids=[1], stopped=False
-            )
-            yield StreamChunk(
-                text="X", delta_token_ids=[1], current_token_ids=[1], stopped=True
-            )
+            yield StreamChunk(text="Hello", delta_token_ids=[1], stopped=False)
+            yield StreamChunk(text="X", delta_token_ids=[1], stopped=True)
         finally:
             closed.append(True)
 
@@ -237,12 +225,8 @@ def test_chat_completions_stop_sequence_stream(client, loaded_model):
 
     async def events_gen():
         try:
-            yield StreamChunk(
-                text="Hello", delta_token_ids=[1], current_token_ids=[1], stopped=False
-            )
-            yield StreamChunk(
-                text="X", delta_token_ids=[1], current_token_ids=[1], stopped=True
-            )
+            yield StreamChunk(text="Hello", delta_token_ids=[1], stopped=False)
+            yield StreamChunk(text="X", delta_token_ids=[1], stopped=True)
         finally:
             closed.append(True)
 

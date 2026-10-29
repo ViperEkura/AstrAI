@@ -36,7 +36,6 @@ class BaseToolParser(ABC):
     def feed(
         self,
         body: str,
-        current_token_ids: Optional[List[int]] = None,
         delta_token_ids: Optional[List[int]] = None,
     ) -> List[Dict]:
         """Feed the *full* accumulated text each step.
@@ -50,8 +49,6 @@ class BaseToolParser(ABC):
 
         Args:
             body (str): The complete accumulated generated text so far.
-            current_token_ids (list of int, optional): All token IDs decoded
-                into *body* (cumulative).
             delta_token_ids (list of int, optional): Only the token IDs for
                 this chunk.
         """
@@ -273,7 +270,6 @@ class SimpleJsonToolParser(BaseToolParser):
     def feed(
         self,
         body: str,
-        current_token_ids: Optional[List[int]] = None,
         delta_token_ids: Optional[List[int]] = None,
     ) -> List[Dict]:
         deltas: List[Dict] = []

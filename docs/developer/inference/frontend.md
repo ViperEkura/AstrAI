@@ -73,7 +73,7 @@ classDiagram
     }
     class StreamChunk {
         +text
-        +delta_token_ids / current_token_ids
+        +delta_token_ids
         +finish_reason / prompt_tokens / completion_tokens
     }
 
@@ -109,6 +109,8 @@ classDiagram
 - **`EngineCore`** owns the request, scoring, status, event-sink and
   lifecycle operations used directly by the frontend. The engine accepts an
   existing core through `core=`; otherwise it constructs one in-process.
+  Input truncation and event queue capacity use the core's resolved sequence
+  limit, including when `core=` is supplied with different constructor options.
   The frontend attaches its event sink, starts the core and stops it on
   shutdown in either case. Locking and scheduler/KV ownership remain in the
   core. The deprecated frontend `scheduler` property has been removed.

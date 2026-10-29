@@ -75,12 +75,8 @@ class InferenceEngine:
         self._core = core
         self._tracker = RequestTracker()
         self._core.set_event_sink(self._tracker.sink)
-        resolved_len = max_seq_len
-        if resolved_len is None:
-            cfg_len = getattr(model.config, "max_position_embeddings", None)
-            resolved_len = cfg_len if cfg_len is not None else 4096
-        self._max_seq_len = int(resolved_len)
-        self._input_processor = InputProcessor(tokenizer, int(resolved_len))
+        self._max_seq_len = int(core.max_seq_len)
+        self._input_processor = InputProcessor(tokenizer, self._max_seq_len)
 
         self._core.start()
 
@@ -330,6 +326,7 @@ class InferenceEngine:
             request_id = processed.request_id
             tracker = self._tracker
             terminal_chunk = None
+            token_offset = 0
             try:
                 processor = OutputProcessor(
                     request_id,
@@ -345,16 +342,15 @@ class InferenceEngine:
                     pending = []
                     for event in events:
                         text, stopped = processor.push(event)
-                        delta_ids = (
-                            [event.token_id] if isinstance(event, TokenDelta) else []
-                        )
                         if text or stopped or processor.finished:
                             chunk = StreamChunk(
                                 text=text,
-                                delta_token_ids=delta_ids,
-                                current_token_ids=list(processor.state.token_ids),
+                                delta_token_ids=processor.state.token_ids[
+                                    token_offset:
+                                ],
                                 stopped=stopped,
                             )
+                            token_offset = len(processor.state.token_ids)
                             if processor.finished:
                                 self._set_terminal_chunk(chunk, processor)
                                 terminal_chunk = chunk

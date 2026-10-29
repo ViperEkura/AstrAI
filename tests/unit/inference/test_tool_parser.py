@@ -521,9 +521,7 @@ def test_feed_token_ids_do_not_affect_parsing():
     parser_with_ids = SimpleJsonToolParser()
     text = '{"name": "get_weather", "arguments": {"city": "Beijing"}}'
     result_no = parser_no_ids.feed(text)
-    result_with = parser_with_ids.feed(
-        text, current_token_ids=[1, 2, 3], delta_token_ids=[3]
-    )
+    result_with = parser_with_ids.feed(text, delta_token_ids=[3])
     assert len(result_no) == len(result_with)
     assert (
         result_no[0]["tool_calls"][0]["function"]["name"]

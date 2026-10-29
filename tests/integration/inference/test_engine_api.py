@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from astrai.extension import op_backend, snapshot_op_selection
+from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.events import (
     FINISH_LENGTH,
     RequestFinished,
@@ -14,6 +15,7 @@ from astrai.inference.core.events import (
 )
 from astrai.inference.frontend.engine import InferenceEngine, build_engine
 from tests.support.engine import (
+    _collect_async,
     _make_engine_mocks,
 )
 from tests.support.models import make_model
@@ -309,3 +311,16 @@ def test_build_engine_passes_engine_kwargs_through():
 def test_build_engine_rejects_invalid_arguments(kwargs, error, message):
     with pytest.raises(error, match=message):
         build_engine(**kwargs)
+
+
+@pytest.mark.parametrize("frontend_limit", [None, 2, 16])
+def test_injected_core_controls_prompt_truncation_and_usage(frontend_limit):
+    model, _ = make_model("cpu", max_position_embeddings=64)
+    tokenizer = FakeTokenizer()
+    core = EngineCore(model, tokenizer, max_seq_len=4, enable_cuda_graph=False)
+    with InferenceEngine(
+        model, tokenizer, max_seq_len=frontend_limit, core=core
+    ) as engine:
+        chunks = _collect_async(engine.generate_events("abcdefgh", max_tokens=1))
+    assert chunks[-1].prompt_tokens == 4
+    assert chunks[-1].completion_tokens == 0

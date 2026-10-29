@@ -54,7 +54,9 @@ def test_generate_events_text_stop_aborts_before_yielding_final(
     assert final.finish_reason == "stop"
     assert final.prompt_tokens == 32
     assert final.completion_tokens == len("ab" + stop)
-    assert len(final.current_token_ids) == final.completion_tokens
+    assert [token for chunk in chunks for token in chunk.delta_token_ids] == list(
+        ("ab" + stop).encode()
+    )
     assert sum(chunk.is_final for chunk in chunks) == 1
     engine._core.cancel_request.assert_called_once()
 
@@ -69,6 +71,9 @@ def test_generate_events_core_terminal_flushes_tail_without_abort(event_engine, 
     assert final.finish_reason == ("stop" if reason == FINISH_STOP_TOKEN else reason)
     assert final.prompt_tokens == 2
     assert final.completion_tokens == len("hello EN")
+    assert [token for chunk in chunks for token in chunk.delta_token_ids] == list(
+        b"hello EN"
+    )
     assert not final.stopped
     assert sum(chunk.is_final for chunk in chunks) == 1
     event_engine._core.cancel_request.assert_not_called()
@@ -431,3 +436,22 @@ def test_real_cpu_engine_zero_output_boundaries(monkeypatch, method, full_prompt
                 assert chunks == []
         engine._core.cancel_request.assert_not_called()
         _assert_frontend_released(engine)
+
+
+@pytest.mark.parametrize("error", [False, True])
+def test_stream_deltas_keep_tokens_with_delayed_or_empty_text(
+    event_engine, monkeypatch, error
+):
+    decoder = MagicMock()
+    decoder.push.side_effect = ["", "ab", ""]
+    monkeypatch.setattr(
+        "astrai.inference.frontend.output_processor.StreamDecoder",
+        lambda tokenizer: decoder,
+    )
+    _emit_on_submission(event_engine, "abc", FINISH_LENGTH, error=error)
+    chunks = _collect_async(event_engine.generate_events("hi"))
+    assert [chunk.text for chunk in chunks] == ["ab", ""]
+    assert [chunk.delta_token_ids for chunk in chunks] == [[97, 98], [99]]
+    assert chunks[-1].completion_tokens == 3
+    assert chunks[-1].finish_reason == ("aborted" if error else "length")
+    _assert_frontend_released(event_engine)

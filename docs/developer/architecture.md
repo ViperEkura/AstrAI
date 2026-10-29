@@ -1015,7 +1015,7 @@ classDiagram
 
             class BaseToolParser {
                 <<abstract>>
-                +feed(body, current_token_ids, delta_token_ids) List[Dict]
+                +feed(body, delta_token_ids) List[Dict]
                 +parse_complete(body) Optional[Dict]
                 +has_tool_calls (property) bool
             }
@@ -1025,7 +1025,7 @@ classDiagram
             }
 
             class SimpleJsonToolParser {
-                +feed(body, current_token_ids, delta_token_ids) List[Dict]
+                +feed(body, delta_token_ids) List[Dict]
                 +parse_complete(body) Optional[Dict]
             }
         }

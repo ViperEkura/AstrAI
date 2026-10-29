@@ -177,7 +177,10 @@ InferenceEngine (frontend layer)
 `generate_events` is the structured entry for protocol adapters: each chunk
 carries the incremental `text`, `delta_token_ids`, and — on the final chunk —
 exact `usage` and a mapped `finish_reason` (no re-tokenizing text to count
-tokens). Internally the engine mints request ids up front (`InputProcessor`),
+tokens). Token deltas include IDs buffered while decoding or stop matching
+produced no text. Consumers needing the complete history should accumulate
+`delta_token_ids`; chunks no longer carry `current_token_ids` snapshots.
+Internally the engine mints request ids up front (`InputProcessor`),
 folds scheduler events through `OutputProcessor` (detokenize, stop matching,
 usage), and calls the public operations of `EngineCore` directly. Blocking `generate` folds
 the request's events on the caller's thread once the terminal event lands;

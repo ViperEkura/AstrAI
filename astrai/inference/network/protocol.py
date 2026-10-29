@@ -72,9 +72,8 @@ class ResponseBuilder(ABC):
         """SSE events for a single generated token.
 
         ``body`` (the full accumulated text so far) is always provided
-        as a keyword argument. Additional keyword arguments such as
-        ``current_token_ids`` and ``delta_token_ids`` may be included
-        for tool parsers that need token-level information.
+        as a keyword argument. ``delta_token_ids`` contains new token IDs
+        since the previous chunk, including tokens that decoded to no text.
         Returns a list of SSE event strings (may be empty).
         """
 
@@ -142,7 +141,6 @@ class ProtocolHandler:
                         for event in self.builder.format_chunk(
                             chunk.text,
                             body=body,
-                            current_token_ids=chunk.current_token_ids,
                             delta_token_ids=chunk.delta_token_ids,
                         ):
                             yield event

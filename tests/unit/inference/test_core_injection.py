@@ -12,6 +12,7 @@ from tests.support.tokenizers import FakeTokenizer
 def test_engine_operations_use_injected_core():
     core = MagicMock(spec=EngineCore)
     core.max_batch_size = 2
+    core.max_seq_len = 16
     core.op_selection = OpSelection((("attention", "torch"), ("swiglu", "cuda")))
     core.cuda_graph_enabled = False
     core.score_ids.return_value = [0.5]

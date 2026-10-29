@@ -62,7 +62,8 @@ def event_engine(monkeypatch):
     monkeypatch.setattr(
         "astrai.inference.frontend.output_processor.StreamDecoder", _CharacterDecoder
     )
-    with patch("astrai.inference.frontend.engine.EngineCore"):
+    with patch("astrai.inference.frontend.engine.EngineCore") as core_cls:
+        core_cls.return_value.max_seq_len = 32
         engine = InferenceEngine(MagicMock(), FakeTokenizer(), max_seq_len=32)
     engine._core = MagicMock()
     engine._core.cancel_request.side_effect = lambda rid: (

@@ -204,11 +204,10 @@ class RequestTracker:
 
 @dataclass(slots=True, eq=False, repr=False, match_args=False)
 class StreamChunk:
-    """One structured output chunk (text + token ids + terminal facts)."""
+    """Incremental text and token IDs, plus terminal facts on the final chunk."""
 
     text: str
     delta_token_ids: List[int]
-    current_token_ids: List[int]
     stopped: bool
     finish_reason: Optional[str] = field(default=None, init=False)
     prompt_tokens: int = field(default=0, init=False)

@@ -137,7 +137,6 @@ class OpenAIResponseBuilder(ResponseBuilder):
     def _format_tool_chunk(self, body: str, **kwargs) -> List[str]:
         deltas = self._parser.feed(
             body,
-            current_token_ids=kwargs.get("current_token_ids"),
             delta_token_ids=kwargs.get("delta_token_ids"),
         )
         events: List[str] = []

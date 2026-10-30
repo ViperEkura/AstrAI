@@ -184,13 +184,54 @@ def choice_logprobs_batched(
     context_ids_list: List[List[int]],
     device: str,
     max_model_len: int,
+    answer_prefix: str = "",
 ) -> List[Dict[str, float]]:
     """Compute log-probs for multiple questions x 4 answer letters.
 
     Returns a list of dicts: [{A: score, B: score, C: score, D: score}, ...]
     """
     letters = ("A", "B", "C", "D")
-    choice_ids_list = [tokenizer.encode(c, add_special_tokens=False) for c in letters]
+    choice_ids_list = [
+        tokenizer.encode(answer_prefix + c, add_special_tokens=False) for c in letters
+    ]
+    if any(
+        len(ids) + max(map(len, choice_ids_list)) > max_model_len
+        for ids in context_ids_list
+    ):
+        raise ValueError(
+            "MMLU prompt exceeds context; reduce the number of demonstrations"
+        )
+    if all(len(ids) == 1 for ids in choice_ids_list):
+        # One shared context forward suffices for four one-token answers.
+        rows = context_ids_list
+        width = max(map(len, rows))
+        ids = torch.zeros(len(rows), width, dtype=torch.long, device=device)
+        lengths = torch.tensor(list(map(len, rows)), device=device)
+        for i, row in enumerate(rows):
+            ids[i, : len(row)] = torch.tensor(row, device=device)
+        positions = torch.arange(width, device=device)[None].expand(len(rows), -1)
+        mask = torch.tril(torch.ones(width, width, dtype=torch.bool, device=device))[
+            None, None
+        ]
+        mask = mask & (positions < lengths[:, None])[:, None, None, :]
+        with torch.inference_mode():
+            output = model(
+                ids,
+                position_ids=positions,
+                input_mask=mask,
+                skip_lm_head=True,
+                return_lm_head_weight=True,
+            )
+            hidden = output["hidden_states"][
+                torch.arange(len(rows), device=device), lengths - 1
+            ]
+            logits = torch.nn.functional.linear(
+                hidden, output["lm_head_weight"], output.get("lm_head_bias")
+            )
+            scores = torch.log_softmax(logits.float(), dim=-1)[
+                :, [c[0] for c in choice_ids_list]
+            ].tolist()
+        return [dict(zip(letters, row)) for row in scores]
     requests = []
     for ctx_ids in context_ids_list:
         for cid in choice_ids_list:
@@ -230,6 +271,9 @@ def evaluate_subject(
     n_shot: int,
     seed: int = 0,
     batch_size: int = 16,
+    details: Optional[List[Dict]] = None,
+    prompt_format: str = "raw",
+    max_seq_len: Optional[int] = None,
 ) -> Tuple[float, int, int]:
     rng = random.Random(seed) if seed >= 0 else None
     correct = 0
@@ -237,17 +281,44 @@ def evaluate_subject(
 
     context_ids_list = []
     answers = []
+    shot_counts = []
+    max_model_len = min(
+        model.config.max_position_embeddings,
+        max_seq_len or model.config.max_position_embeddings,
+    )
     for item in test_data:
         if rng is not None:
             permuted, answer = _permute_choices(item, rng)
         else:
             permuted, answer = item, item["answer"]
-        raw_prompt = build_prompt(permuted["question"], permuted, subject)
-        context = apply_chat(tokenizer, raw_prompt, n_shot, dev_data or [], subject)
-        context_ids_list.append(tokenizer.encode(context))
+        shots = min(n_shot, len(dev_data or []))
+        while True:
+            if prompt_format == "raw":
+                context = f"The following are multiple choice questions (with answers) about {subject.replace('_', ' ')}.\n\n"
+                for index, row in enumerate((dev_data or [])[:shots] + [permuted]):
+                    context += row["question"] + "\n"
+                    context += (
+                        "\n".join(f"{c}. {row[c]}" for c in ("A", "B", "C", "D"))
+                        + "\nAnswer:"
+                    )
+                    if index < shots:
+                        context += " " + row["answer"] + "\n\n"
+            else:
+                raw_prompt = build_prompt(permuted["question"], permuted, subject)
+                context = apply_chat(
+                    tokenizer, raw_prompt, shots, dev_data or [], subject
+                )
+            ids = tokenizer.encode(context)
+            if len(ids) < max_model_len:
+                break
+            if shots == 0:
+                raise ValueError(
+                    f"Question exceeds context even without demonstrations: {subject}"
+                )
+            shots -= 1
+        context_ids_list.append(ids)
+        shot_counts.append(shots)
         answers.append(answer)
-
-    max_model_len = model.config.max_position_embeddings
 
     num_batches = (len(context_ids_list) + batch_size - 1) // batch_size
     for start in tqdm.tqdm(
@@ -259,10 +330,28 @@ def evaluate_subject(
         batch = context_ids_list[start : start + batch_size]
         batch_answers = answers[start : start + batch_size]
         scores_list = choice_logprobs_batched(
-            model, tokenizer, batch, device, max_model_len
+            model,
+            tokenizer,
+            batch,
+            device,
+            max_model_len,
+            answer_prefix=" " if prompt_format == "raw" else "",
         )
         for scores, answer in zip(scores_list, batch_answers):
-            if max(scores, key=scores.get) == answer:
+            prediction = max(scores, key=scores.get)
+            if details is not None:
+                details.append(
+                    {
+                        "subject": subject,
+                        "index": total,
+                        "prediction": prediction,
+                        "answer": answer,
+                        "scores": scores,
+                        "shots": shot_counts[total],
+                        "prompt_tokens": len(context_ids_list[total]),
+                    }
+                )
+            if prediction == answer:
                 correct += 1
             total += 1
     return correct / total, correct, total
@@ -277,6 +366,8 @@ def main():
         "--data_dir", type=str, default="./mmlu_data", help="MMLU data directory"
     )
     parser.add_argument("--download", action="store_true", help="Download MMLU data")
+    parser.add_argument("--prompt_format", choices=["raw", "chat"], default="raw")
+    parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument(
         "--n_shot", type=int, default=5, help="Few-shot examples (0 for zero-shot)"
     )
@@ -300,8 +391,8 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=0,
-        help="Seed for option permutation (0 to enable, -1 to disable)",
+        default=-1,
+        help="Seed for option permutation (-1 preserves original order)",
     )
     parser.add_argument(
         "--batch_size",
@@ -321,6 +412,7 @@ def main():
     results = {}
     total_correct = 0
     total_questions = 0
+    details = []
 
     for subject in subjects:
         dev_path = os.path.join(args.data_dir, "dev", f"{subject}_dev.csv")
@@ -329,10 +421,9 @@ def main():
         )
 
         if not os.path.exists(test_path):
-            print(f"  Skipping {subject}: test file not found")
-            continue
+            raise FileNotFoundError(test_path)
 
-        dev_data = load_csv(dev_path) if os.path.exists(dev_path) else None
+        dev_data = load_csv(dev_path) if args.n_shot else None
         test_data = load_csv(test_path)
 
         acc, corr, tot = evaluate_subject(
@@ -345,6 +436,9 @@ def main():
             args.n_shot,
             seed=args.seed,
             batch_size=args.batch_size,
+            details=details,
+            prompt_format=args.prompt_format,
+            max_seq_len=args.max_seq_len,
         )
         results[subject] = {"accuracy": round(acc, 4), "correct": corr, "total": tot}
         total_correct += corr
@@ -359,8 +453,14 @@ def main():
         "correct": total_correct,
         "total": total_questions,
     }
+    results["_config"] = vars(args)
 
     if args.output:
+        with open(
+            args.output.replace(".json", "_details.jsonl"), "w", encoding="utf-8"
+        ) as f:
+            for row in details:
+                f.write(json.dumps(row) + "\n")
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to {args.output}")

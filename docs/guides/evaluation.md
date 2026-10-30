@@ -66,6 +66,12 @@ Two invocation patterns exist:
 
 Generates completions for 164 programming problems, executes them against hidden tests, and reports pass@k.
 
+Scoring uses `astrai.bench.execute_one`, shared with MBPP. It explicitly forks the worker function in `bench.py` and returns success through a shared boolean. Each sample gets a temporary working directory, a wall-clock timeout (`--test_timeout`, default 3 seconds), a CPU-time limit, and a 16 MiB per-file size limit. The address-space ceiling is the worker's inherited virtual size plus 512 MiB, capped by any existing hard limit. This permits up to 512 MiB of additional mappings; it is not an RSS/private-memory quota and does not account for copy-on-write growth within inherited mappings. Process groups are cleaned up after execution, and early exits do not count as passes.
+
+Code execution requires Linux (`fork`, `/proc`, and `resource`). Native Windows is rejected explicitly; use WSL2 for this path. Docker, `prlimit`, a separate worker file, and startup code strings are not used. These limits do not isolate the filesystem/network or cap total directory size. The suite launcher also uses Linux-style shell commands; native Windows suite execution has not been ported.
+
+`--generate_only` skips execution; `--test_only` scores saved generations without loading a model. Every generation, including duplicates and empty answers, remains in the sample count.
+
 ```bash
 python scripts/eval/evaluate_humaneval.py \
     --param_path ./params \

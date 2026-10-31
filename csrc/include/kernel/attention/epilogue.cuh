@@ -96,7 +96,7 @@ __global__ void split_kv_combine(const AttentionParams p) {
         }
     }
 
-    // Avoid the block reduction for the smallest merge.
+    // Avoid warp reductions when merging only one or two splits.
     if (active_splits <= 2) {
         if (d >= p.head_dim)
             return;
@@ -117,36 +117,26 @@ __global__ void split_kv_combine(const AttentionParams p) {
         return;
     }
 
-    // One warp computes the split weights shared by every output dimension.
-    __shared__ float weights[MAX_SPLITS];
-    __shared__ float inv_sum;
-    if (d < 32) {
-        const bool valid = d < active_splits;
-        const float mi = valid ? mlp[d * 2] : -FLT_MAX;
-        const float li = valid ? mlp[d * 2 + 1] : 0.0f;
-        float max_m = mi;
+    // Each warp reduces the split weights locally, avoiding shared memory and a block barrier.
+    const int lane = threadIdx.x % 32;
+    const bool valid = lane < active_splits;
+    const float mi = valid ? mlp[lane * 2] : -FLT_MAX;
+    const float li = valid ? mlp[lane * 2 + 1] : 0.0f;
+    float max_m = mi;
 #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2)
-            max_m = fmaxf(max_m, __shfl_xor_sync(0xFFFFFFFF, max_m, offset));
-        const float weight = mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
-        if (valid)
-            weights[d] = weight;
-        float sum_l = li * weight;
+    for (int offset = 16; offset > 0; offset /= 2)
+        max_m = fmaxf(max_m, __shfl_xor_sync(0xFFFFFFFF, max_m, offset));
+    const float weight = mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
+    float sum_l = li * weight;
 #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2)
-            sum_l += __shfl_xor_sync(0xFFFFFFFF, sum_l, offset);
-        if (d == 0)
-            inv_sum = sum_l > 1e-20f ? 1.0f / sum_l : 0.0f;
-    }
-    __syncthreads();
-
-    if (d < p.head_dim) {
-        float acc = 0.0f;
-        for (int s = 0; s < active_splits; s++)
-            acc = fmaf(op[s * p.head_dim + d], weights[s], acc);
-        const int o_off = KV::q_base(p, batch, q_head) + d * p.q_d_stride;
-        static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);
-    }
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum_l += __shfl_xor_sync(0xFFFFFFFF, sum_l, offset);
+    const float inv_sum = sum_l > 1e-20f ? 1.0f / sum_l : 0.0f;
+    float acc = 0.0f;
+    for (int s = 0; s < active_splits; s++)
+        acc = fmaf(op[s * p.head_dim + d], __shfl_sync(0xFFFFFFFF, weight, s), acc);
+    const int o_off = KV::q_base(p, batch, q_head) + d * p.q_d_stride;
+    static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);
 }
 
 } // namespace astrai::attention

@@ -161,9 +161,10 @@ first GQA pass writes the cache; every pass reads new K/V directly, so no
 cross-block write/read dependency is introduced.
 
 Split merges with at most two parts retain the online recurrence. Larger
-merges compute the common maximum, denominator and split weights once per
-head with one warp; output dimensions reuse these weights for FP32
-accumulation. Empty splits contribute zero, including fully masked rows.
+merges compute the common maximum, denominator and split weights independently
+in each warp. Output dimensions read the weights through warp shuffles for FP32
+accumulation, avoiding shared memory and block synchronization. Empty splits
+contribute zero, including fully masked rows.
 
 ## Parameter boundaries
 

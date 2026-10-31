@@ -1,0 +1,37 @@
+# Replace paths and source identities before running. No downloads are implicit.
+model_path: /absolute/path/to/checkpoint
+model_repo: Qwen/Qwen3-0.6B
+model_revision: replace_me
+train_file: /absolute/path/to/countdown-train.jsonl
+dev_file: /absolute/path/to/countdown-dev.jsonl
+dataset_repo: Jiayi-Pan/Countdown-Tasks-3to4
+dataset_revision: replace_me
+output_dir: /absolute/path/to/new-result-directory
+task: countdown
+updates: 400
+seed: 3407
+batch_per_device: 1
+group_size: 8
+prompt_cap: 1024
+response_cap: 512
+eval_interval: 25
+eval_batch_size: 8
+checkpoint_interval: 100
+dtype: bfloat16
+device_type: cuda
+optimizer: muon_adamw
+optimizer_kwargs:
+  lr: 0.0003
+  weight_decay: 0.1
+  momentum: 0.95
+  nesterov: true
+  ns_steps: 5
+  adjust_lr_fn: match_rms_adamw
+kl_coef: 0.01
+clip_eps: 0.2
+loss_aggregation: token
+reward_target: null  # Freeze after an independent baseline pilot.
+noninferiority_margin: 0.02
+save_token_traces: true
+learner_microbatch_prompts: null  # Set only with the A2 implementation.
+overlap_collection: false  # True requires the R1 implementation.

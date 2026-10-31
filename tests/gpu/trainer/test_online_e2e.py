@@ -145,7 +145,7 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:InstructionDataset",
             params={
@@ -195,7 +195,7 @@ def test_async_round_ddp_two_learners_two_workers(base_test_env):
             type="autoregressive_lm",
             params={"config": base_test_env["transformer_config"].to_dict()},
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:InstructionDataset",
             params={
@@ -259,7 +259,7 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:_instruction_subset",
             params={
@@ -329,7 +329,7 @@ def test_async_round_version_commit_failure_checkpoint_resumes_once(
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:_instruction_subset",
             params={

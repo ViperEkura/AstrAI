@@ -4,11 +4,17 @@ from typing import Dict, Union
 import torch
 import torch.nn as nn
 
+from astrai.parallel.executor.gradients import parameter_gradient
+
 
 def grad_norm(
     model: nn.Module, per_param: bool = False
 ) -> Union[float, Dict[str, float]]:
-    grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+    grads = [
+        g.detach()
+        for p in model.parameters()
+        if (g := parameter_gradient(p)) is not None
+    ]
     if not grads:
         return 0.0
 
@@ -16,8 +22,9 @@ def grad_norm(
     if per_param:
         norms = {}
         for name, param in model.named_parameters():
-            if param.grad is not None:
-                norms[name] = param.grad.norm(2).item()
+            gradient = parameter_gradient(param)
+            if gradient is not None:
+                norms[name] = gradient.norm(2).item()
             else:
                 norms[name] = 0.0
         norms["total"] = total_sq.sqrt().item()
@@ -53,10 +60,11 @@ class GradSNRTracker:
         # measured in optimizer steps (intermediate gradients are not observed).
         beta = self.beta**step_span
         for param in model.parameters():
-            if param.grad is None:
+            gradient = parameter_gradient(param)
+            if gradient is None:
                 continue
             pid = id(param)
-            g = param.grad.detach()
+            g = gradient.detach()
             squared_norm = g.square().sum(dtype=torch.float32)
             if pid not in self._first:
                 self._first[pid] = g.clone()

@@ -12,6 +12,7 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from astrai.config.model_config import ConfigFactory
+from astrai.config.precision import PrecisionConfig
 from astrai.config.train_config import ComponentSpec, TrainConfig
 from astrai.dataset import (
     DatasetFactory,
@@ -23,6 +24,7 @@ from astrai.dataset import (
 )
 from astrai.model.automodel import ModelFactory
 from astrai.optimization.optimizer import OptimizerFactory
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.optimization.scheduler import SchedulerFactory
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -48,7 +50,7 @@ def resolve_component(path: str) -> Any:
 
 
 def build_model_component(
-    spec: ComponentSpec, model_dtype: Optional[str], model_config: Dict
+    spec: ComponentSpec, compute_dtype: Optional[str], model_config: Dict
 ) -> nn.Module:
     """Build one model from serializable settings inside the current rank."""
     params = dict(spec.params)
@@ -70,22 +72,44 @@ def build_model_component(
         model = target(**params)
     if not isinstance(model, nn.Module):
         raise TypeError(f"Model target {spec.type!r} must return nn.Module")
-    if model_dtype is not None:
-        model = model.to(dtype=getattr(torch, model_dtype))
+    if compute_dtype is not None:
+        model = model.to(dtype=getattr(torch, compute_dtype))
     return model
 
 
-def build_optimizer_component(spec: ComponentSpec, model: nn.Module):
+def build_optimizer_component(
+    spec: ComponentSpec, model: nn.Module, precision: Optional[PrecisionConfig] = None
+):
+    params = dict(spec.params)
+    cpu_offload = params.pop("cpu_offload", False)
     if OptimizerFactory.is_registered(spec.type):
-        return OptimizerFactory.create(spec.type, model, **spec.params)
-    target = resolve_component(spec.type)
-    parameters = list(inspect.signature(target).parameters.values())
-    first_arg = (
-        model.parameters()
-        if parameters and parameters[0].name in ("params", "parameters")
-        else model
-    )
-    return target(first_arg, **spec.params)
+        optimizer = OptimizerFactory.create(spec.type, model, **params)
+    else:
+        target = resolve_component(spec.type)
+        parameters = list(inspect.signature(target).parameters.values())
+        first_arg = (
+            model.parameters()
+            if parameters and parameters[0].name in ("params", "parameters")
+            else model
+        )
+        optimizer = target(first_arg, **params)
+    policy = precision or PrecisionConfig()
+    master_dtype = getattr(torch, policy.master_dtype)
+    state_dtype = getattr(torch, policy.optimizer_state_dtype)
+    parameters = [p for group in optimizer.param_groups for p in group["params"]]
+    if (
+        cpu_offload
+        or master_dtype != torch.float32
+        or state_dtype != torch.float32
+        or any(p.dtype != master_dtype or hasattr(p, "main_grad") for p in parameters)
+    ):
+        optimizer = PrecisionOptimizer(
+            optimizer,
+            cpu_offload=cpu_offload,
+            master_dtype=master_dtype,
+            state_dtype=state_dtype,
+        )
+    return optimizer
 
 
 def load_optimizer_state_dict(optimizer: Optimizer, state_dict: Dict) -> None:

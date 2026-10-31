@@ -87,7 +87,7 @@ def configure_rollout(
         model_factory = partial(
             build_model_component,
             cfg.model,
-            cfg.model_dtype,
+            cfg.precision.compute_dtype,
             getattr(context, "model_config", {}),
         )
     if not StrategyFactory.capabilities(cfg.strategy).online:

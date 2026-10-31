@@ -531,7 +531,7 @@ def _online_config(base_test_env, **overrides):
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.integration.trainer.test_rl_scheduling:InstructionDataset",
             params={

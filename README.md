@@ -141,13 +141,13 @@ python scripts/demo/download.py                      # model → params/
 
 # Single-turn interactive streaming prompt loop (no conversation history)
 python scripts/demo/stream_chat.py
-# Type your message after >>, type !exit to quit
+# Type your message after >>; press Ctrl+C or Ctrl+D to exit
 
 # Batch generation (5 hardcoded prompts, non-streaming)
 python scripts/demo/generate_batch.py
 
-# Single-prompt autoregressive streaming
-python scripts/demo/generate_ar.py
+# Raw continuation (omit --prompt for interactive input)
+python scripts/demo/stream_chat.py --raw --prompt "Once upon a time"
 ```
 
 All generation demos use `temperature=0.8`, `top_p=0.95`, `top_k=50`, `max_tokens=2048` by default and require `params/` to contain model weights (run `download.py` first).

@@ -147,13 +147,13 @@ python scripts/demo/download.py                      # model → params/
 
 # 单轮交互式流式提示循环（不保留对话历史）
 python scripts/demo/stream_chat.py
-# 在 >> 后输入消息，输入 !exit 退出
+# 在 >> 后输入消息，按 Ctrl+C 或 Ctrl+D 退出
 
 # 批量生成（5 条硬编码提示词，非流式）
 python scripts/demo/generate_batch.py
 
-# 单条提示词自回归流式生成
-python scripts/demo/generate_ar.py
+# 原文续写（省略 --prompt 则进入交互模式）
+python scripts/demo/stream_chat.py --raw --prompt "很久很久以前"
 ```
 
 所有生成演示默认使用 `temperature=0.8`、`top_p=0.95`、`top_k=50`、`max_tokens=2048`，需要 `params/` 目录包含模型权重（请先运行 `download.py`）。

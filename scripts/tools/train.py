@@ -849,7 +849,7 @@ def train(
     if dp_mode == "ddp":
         executor_kwargs.update(
             gradient_as_bucket_view=True,
-            broadcast_buffers=False,
+            forward_sync_buffers=False,
         )
 
     model_raw = kwargs.pop("model_spec", None)

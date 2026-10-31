@@ -19,11 +19,12 @@ logger = logging.getLogger(__name__)
 
 @ExecutorFactory.register("ddp")
 class DDPExecutor(BaseExecutor):
+    """Sync initial state, with separate control of runtime buffer sync."""
+
     def __init__(
         self,
         grad_accum_steps: int = 1,
         dim: int = 0,
-        broadcast_buffers: bool = True,
         init_sync: bool = True,
         process_group=None,
         bucket_cap_mb: int = 25,
@@ -35,11 +36,11 @@ class DDPExecutor(BaseExecutor):
         param_to_hook_all_reduce=None,
         mixed_precision=None,
         device_mesh=None,
+        forward_sync_buffers: bool = True,
     ):
         super().__init__(grad_accum_steps=grad_accum_steps)
         self._ddp_kwargs = dict(
             dim=dim,
-            broadcast_buffers=broadcast_buffers,
             init_sync=init_sync,
             process_group=process_group,
             bucket_cap_mb=bucket_cap_mb,
@@ -51,6 +52,7 @@ class DDPExecutor(BaseExecutor):
             param_to_hook_all_reduce=param_to_hook_all_reduce,
             mixed_precision=mixed_precision,
             device_mesh=device_mesh,
+            forward_sync_buffers=forward_sync_buffers,
         )
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:

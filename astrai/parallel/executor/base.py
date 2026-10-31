@@ -13,6 +13,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from astrai.factory import BaseFactory
+from astrai.parallel.executor.gradients import (
+    FP32GradientAccumulator,
+    parameter_gradient,
+)
 from astrai.parallel.setup import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
@@ -118,9 +122,13 @@ def broadcast_state_dict(
 
 
 class BaseExecutor:
-    def __init__(self, grad_accum_steps: int = 1):
+    def __init__(self, grad_accum_steps: int = 1, grad_accum_dtype: str = "float32"):
         self.grad_accum_steps = max(grad_accum_steps, 1)
         self._sync_gradients = True
+        if grad_accum_dtype not in ("float32", "model"):
+            raise ValueError("grad_accum_dtype must be float32 or model")
+        self.grad_accum_dtype = grad_accum_dtype
+        self._grad_accumulator = None
 
     def prepare(
         self,
@@ -140,12 +148,30 @@ class BaseExecutor:
         scheduler = None
         if optimizer_fn is not None:
             optimizer = optimizer_fn(model)
+            if self._grad_accumulator is not None and not getattr(
+                optimizer, "supports_main_grad", False
+            ):
+                self._grad_accumulator.close()
+                self._grad_accumulator = None
+                raise TypeError(
+                    "FP32 accumulation requires an optimizer supporting main_grad; "
+                    "use FP32Optimizer or grad_accum_dtype='model'"
+                )
             if scheduler_fn is not None:
                 scheduler = scheduler_fn(optimizer)
         return model, optimizer, scheduler
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
+        self._prepare_gradients(model)
         return model
+
+    def _prepare_gradients(self, model: nn.Module, bucket_cap_mb: float = 25) -> None:
+        if self.grad_accum_dtype == "float32" and any(
+            p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters()
+        ):
+            self._grad_accumulator = FP32GradientAccumulator(
+                model, lambda: self.sync_gradients, bucket_cap_mb
+            )
 
     def rollout_capabilities(self) -> RolloutCapabilities:
         """Describe whether an in-process rollout may share this model."""
@@ -174,7 +200,11 @@ class BaseExecutor:
                 yield
 
     def backward(self, loss: torch.Tensor):
+        if self._grad_accumulator is not None:
+            self._grad_accumulator.begin_backward()
         loss.backward()
+        if self._grad_accumulator is not None:
+            self._grad_accumulator.finish_backward()
 
     def model_state_dict(self, model: nn.Module):
         """The checkpoint payload of *model*, without the compile prefix."""
@@ -210,15 +240,33 @@ class BaseExecutor:
         return self._sync_gradients
 
     def scale_gradients(self, model: nn.Module, factor: float) -> None:
-        for parameter in model.parameters():
-            if parameter.grad is not None:
-                parameter.grad.mul_(factor)
+        if self._grad_accumulator is None:
+            for parameter in model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(factor)
+            return
+        gradients = [
+            gradient
+            for parameter in model.parameters()
+            if (gradient := parameter_gradient(parameter)) is not None
+        ]
+        if gradients:
+            torch._foreach_mul_(gradients, factor)
 
     def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
-        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        if isinstance(total_norm, torch.Tensor):
-            return total_norm.item()
-        return total_norm
+        if self._grad_accumulator is None:
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        else:
+            gradients = [
+                gradient
+                for parameter in model.parameters()
+                if (gradient := parameter_gradient(parameter)) is not None
+            ]
+            total_norm = torch.nn.utils.get_total_norm(gradients)
+            if gradients:
+                coefficient = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+                torch._foreach_mul_(gradients, coefficient)
+        return float(total_norm)
 
 
 class ExecutorFactory(BaseFactory[BaseExecutor]):

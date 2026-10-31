@@ -53,7 +53,43 @@ can change on restore. Legacy optimizer checkpoints without masters are rejected
 start a new run from their model weights with `load_state_dict.optimizer=False`.
 Reconstructing masters from rounded BF16 weights cannot recover previous updates.
 
-This is an update-precision fix, not a complete mixed-precision policy: gradient
-accumulation, reduction and clipping still use the model-side gradient dtype.
-DTensor/FSDP/TP master parameters are explicitly unsupported until their layouts
-and checkpoint restore are validated. Do not treat this as resolving all of #109.
+### Gradient accumulation
+
+BF16 training with the none/DDP executors defaults to persistent FP32 main
+gradients. Each backward contribution is copied or added into a parameter view
+of a contiguous FP32 bucket, and the ordinary BF16 gradient is released.
+Optimizer updates, global-objective normalization, clipping and gradient
+metrics all consume the main gradient. FP32-only models keep native autograd
+accumulation. This policy improves accumulation across backward calls; it does
+not turn individual BF16 backward operators into FP32 computations.
+
+Distributed BF16 training uses the same FP32 storage for accumulation and
+asynchronous all-reduce, without additional BF16 DDP reducer buckets or per-step
+packing. Buckets launch in deterministic reverse-parameter order as gradients
+become ready during the synchronized backward. Earlier no_sync contributions
+remain local. Parameters absent from the final microbatch still contribute if
+they were used earlier in the accumulation window. The reduced gradient is
+averaged over the configured process group before trainer normalization.
+
+Set executor_kwargs.grad_accum_dtype to model to retain the previous native
+autograd/DDP path for controlled comparisons. The default is float32. Set
+find_unused_parameters=True for conditional distributed models: gradient
+presence is then agreed across ranks, and globally unused parameters retain
+None gradients so weight decay and momentum do not update them. The FP32 path
+supports dense replicated BF16/FP32 parameters, not DTensor/FSDP/TP, sparse
+gradients, delayed DDP reduction or native DDP mixed_precision/device_mesh.
+DDP gradient_as_bucket_view and static_graph hints need no separate buffers or
+hook-learning phase with this path.
+
+Custom runtime optimizers must declare supports_main_grad=True and consume
+parameter_gradient/main_grad. An unaware optimizer is rejected before training,
+rather than silently seeing empty BF16 gradients.
+
+Optimizer zero_grad clears main-gradient presence (or zeros existing gradients
+for set_to_none=False), while retaining reusable bucket storage. Checkpoints
+remain update-boundary snapshots: save masters and optimizer state, not partial
+gradient accumulation. FP32 master checkpoint and legacy-reset rules above
+still apply. Complete optimizer-state GPU sharding remains separate work.
+
+The design follows Megatron-LM's separation of compute parameters and main_grad
+buffers: https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/distributed/distributed_data_parallel.py

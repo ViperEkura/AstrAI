@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 
+import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -12,6 +13,7 @@ from astrai.parallel.executor.base import (
     ExecutorFactory,
     strip_compile_prefix,
 )
+from astrai.parallel.executor.gradients import FP32DistributedDataParallel
 from astrai.parallel.setup import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
@@ -37,8 +39,11 @@ class DDPExecutor(BaseExecutor):
         mixed_precision=None,
         device_mesh=None,
         forward_sync_buffers: bool = True,
+        grad_accum_dtype: str = "float32",
     ):
-        super().__init__(grad_accum_steps=grad_accum_steps)
+        super().__init__(
+            grad_accum_steps=grad_accum_steps, grad_accum_dtype=grad_accum_dtype
+        )
         self._ddp_kwargs = dict(
             dim=dim,
             init_sync=init_sync,
@@ -56,32 +61,66 @@ class DDPExecutor(BaseExecutor):
         )
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
+        uses_main_gradients = self.grad_accum_dtype == "float32" and any(
+            p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters()
+        )
+        if uses_main_gradients and (
+            self._ddp_kwargs["mixed_precision"] is not None
+            or self._ddp_kwargs["delay_all_reduce_named_params"] is not None
+            or self._ddp_kwargs["param_to_hook_all_reduce"] is not None
+            or self._ddp_kwargs["device_mesh"] is not None
+            or getattr(model, "_ddp_params_and_buffers_to_ignore", None)
+        ):
+            raise NotImplementedError(
+                "FP32 main gradients cannot combine with DDP mixed_precision, "
+                "delayed/ignored parameters or device_mesh"
+            )
+        self._prepare_gradients(model, self._ddp_kwargs["bucket_cap_mb"])
         if not self.use_distributed:
             logger.warning("DDP backend selected but world_size=1, model not wrapped")
             return model
-        local_rank = int(os.environ.get("LOCAL_RANK", get_rank()))
-        cpu_model = next(model.parameters()).device.type == "cpu"
-        model = DDP(
-            model,
-            device_ids=None if cpu_model else [local_rank],
-            output_device=None if cpu_model else local_rank,
-            **self._ddp_kwargs,
+        if self._grad_accumulator is not None:
+            model = FP32DistributedDataParallel(
+                model,
+                self._grad_accumulator,
+                **{
+                    name: self._ddp_kwargs[name]
+                    for name in (
+                        "process_group",
+                        "forward_sync_buffers",
+                        "init_sync",
+                        "find_unused_parameters",
+                    )
+                },
+            )
+        else:
+            local_rank = int(os.environ.get("LOCAL_RANK", get_rank()))
+            cpu_model = next(model.parameters()).device.type == "cpu"
+            model = DDP(
+                model,
+                device_ids=None if cpu_model else [local_rank],
+                output_device=None if cpu_model else local_rank,
+                **self._ddp_kwargs,
+            )
+        logger.info(
+            "Model wrapped with %s (world_size=%d)",
+            type(model).__name__,
+            get_world_size(),
         )
-        logger.info("Model wrapped with DDP (world_size=%d)", get_world_size())
         return model
 
     def _no_sync(self, model: nn.Module):
-        if isinstance(model, DDP):
+        if isinstance(model, (DDP, FP32DistributedDataParallel)):
             return model.no_sync()
         return contextlib.nullcontext()
 
     def model_for_inference(self, model: nn.Module) -> nn.Module:
         model = super().model_for_inference(model)
-        if isinstance(model, DDP):
+        if isinstance(model, (DDP, FP32DistributedDataParallel)):
             return model.module
         return model
 
     def model_state_dict(self, model: nn.Module):
-        if isinstance(model, DDP):
+        if isinstance(model, (DDP, FP32DistributedDataParallel)):
             return strip_compile_prefix(model.module.state_dict())
         return strip_compile_prefix(model.state_dict())

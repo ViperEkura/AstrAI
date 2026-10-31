@@ -9,6 +9,7 @@ from torch.optim import SGD, AdamW, Optimizer
 
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.muon.sharded_update import ShardedMuon
+from astrai.parallel.executor.gradients import parameter_gradient
 
 
 class FP32Optimizer(Optimizer):
@@ -20,6 +21,8 @@ class FP32Optimizer(Optimizer):
     steps. Parameters are staged one at a time for GPU updates; transfers
     are synchronous and are not overlapped with forward/backward.
     """
+
+    supports_main_grad = True
 
     def __init__(self, optimizer: Optimizer, cpu_offload: bool = False):
         groups = optimizer.param_groups
@@ -108,7 +111,8 @@ class FP32Optimizer(Optimizer):
             for group in optimizer.param_groups:
                 for master in group["params"]:
                     model = models[master]
-                    if model.grad is None:
+                    gradient = parameter_gradient(model)
+                    if gradient is None:
                         continue
                     host = master.data
                     state = dict(optimizer.state.get(master, {}))
@@ -120,7 +124,7 @@ class FP32Optimizer(Optimizer):
                             else value
                             for name, value in state.items()
                         }
-                        master.grad = model.grad.detach().float()
+                        master.grad = gradient.detach().float()
                         optimizer.step()
                         model.copy_(master)
                         self._store(master.detach(), host)
@@ -145,7 +149,8 @@ class FP32Optimizer(Optimizer):
             self._offloaded_step()
             return loss
         for model, master in zip(self._model_params, self._master_params):
-            master.grad = None if model.grad is None else model.grad.detach().float()
+            gradient = parameter_gradient(model)
+            master.grad = None if gradient is None else gradient.detach().float()
         result = self.optimizer.step()
         for model, master in zip(self._model_params, self._master_params):
             model.copy_(master)
@@ -154,6 +159,11 @@ class FP32Optimizer(Optimizer):
     def zero_grad(self, set_to_none: bool = True):
         self.optimizer.zero_grad(set_to_none=set_to_none)
         for parameter in self._model_params:
+            if getattr(parameter, "main_grad", None) is not None:
+                if set_to_none:
+                    parameter.main_grad = None
+                else:
+                    parameter.main_grad.zero_()
             if parameter.grad is not None:
                 if set_to_none:
                     parameter.grad = None

@@ -2,7 +2,7 @@
  * GQA prefill flash attention, contiguous K/V — the implementation
  * of the entry declared in api/torch/attention.h (the gated_deltanet_fwd.cu
  * shape). Device-side code (kernels, launchers, dispatchers) is in
- * launcher/attention.cuh + kernel/attention/split_q.cuh.
+ * launcher/attention.cuh + kernel/attention/mainloop.cuh.
  */
 
 #include "entry.h"
@@ -24,7 +24,6 @@ torch::Tensor attn_prefill(torch::Tensor q,
 
     AttentionParams p;
     attn_pack_params(q, k, v, mask, scale, layout, p, is_causal);
-    TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
 
     auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
@@ -34,7 +33,7 @@ torch::Tensor attn_prefill(torch::Tensor q,
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            AttnDispatchPrefill<T>::run(p, stream);
+            launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

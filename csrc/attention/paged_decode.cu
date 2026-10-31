@@ -2,7 +2,7 @@
  * SGLang-style paged GQA decode (flat KV pool + req_to_token + kv_indptr)
  * — the implementation of the entry declared in api/torch/attention.h.
  * Device-side code is in launcher/attention.cuh +
- * kernel/attention/split_kv.cuh.
+ * kernel/attention/mainloop.cuh.
  */
 
 #include "entry.h"
@@ -48,12 +48,11 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
     }
     p.o_ptr = O.data_ptr();
 
-    DecodeCall call{p, q, o_part_buf, ml_part_buf};
     visit_dtype<AttentionTypes>(
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            PagedDecodeEntry<T>::run(call, stream);
+            launch_decode<PagedKV<T>>(p, q, o_part_buf, ml_part_buf, stream);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

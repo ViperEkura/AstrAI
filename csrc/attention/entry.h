@@ -15,15 +15,13 @@ namespace astrai {
 namespace attention {
 
 inline int checked_int(int64_t value, const char* name) {
-    TORCH_CHECK(value >= 0 && value <= std::numeric_limits<int>::max(),
-                name, " exceeds the nonnegative int32 range");
+    TORCH_CHECK(value >= 0 && value <= std::numeric_limits<int>::max(), name,
+                " exceeds the nonnegative int32 range");
     return static_cast<int>(value);
 }
 
 // Q, mask, and contiguous KV bases use int offsets inside the kernels.
-inline void check_int32_offset(const torch::Tensor& tensor,
-                               const char* name,
-                               int dimensions) {
+inline void check_int32_offset(const torch::Tensor& tensor, const char* name, int dimensions) {
     int64_t last_offset = 0;
     for (int dim = 0; dim < dimensions; ++dim) {
         const int64_t last_index = tensor.size(dim) - 1;
@@ -120,26 +118,19 @@ inline SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
     return workspace;
 }
 
-/* One dtype/head dispatch owns planning, scratch lifetime, and execution. */
-struct DecodeCall {
-    AttentionParams& params;
-    const torch::Tensor& q;
-    const c10::optional<torch::Tensor>& o_part;
-    const c10::optional<torch::Tensor>& ml_part;
-};
-
-template <typename KV> struct DecodeEntry {
-    static void run(DecodeCall& call, cudaStream_t stream) {
-        auto& p = call.params;
-        with_decode_kernel<KV>(p, [&](auto kernel) {
-            const auto plan = kernel.plan(p);
-            auto workspace = resolve_split_buffers(call.o_part, call.ml_part, p, plan, call.q);
-            kernel.launch(p, plan, stream);
-        });
-    }
-};
-template <typename T> using ContiguousDecodeEntry = DecodeEntry<ContigKV<T>>;
-template <typename T> using PagedDecodeEntry = DecodeEntry<PagedKV<T>>;
+// Tensor ownership stays at the Torch boundary, outside the native launcher.
+template <typename KV>
+inline void launch_decode(AttentionParams& p,
+                          const torch::Tensor& q,
+                          const c10::optional<torch::Tensor>& o_part,
+                          const c10::optional<torch::Tensor>& ml_part,
+                          cudaStream_t stream) {
+    with_decode_kernel<KV>(p, [&](auto kernel) {
+        const auto plan = kernel.plan(p);
+        auto workspace = resolve_split_buffers(o_part, ml_part, p, plan, q);
+        kernel.launch(p, plan, stream);
+    });
+}
 
 // Shared Q dimensions and stride extraction
 inline void extract_q_dims_and_strides(torch::Tensor& q, int64_t layout, AttentionParams& p) {
@@ -330,9 +321,9 @@ inline void attn_pack_paged_decode_params(torch::Tensor q,
     pack_paged_common(q, k_cache, v_cache, req_to_token, req_pool_indices, kv_indptr, p);
     p.batch = checked_int(q.size(0), "q size(0)");
     p.q_len = 1;
-    TORCH_CHECK(req_pool_indices.size(0) == p.batch && kv_indptr.size(0) == static_cast<int64_t>(p.batch) + 1,
+    TORCH_CHECK(req_pool_indices.size(0) == p.batch &&
+                    kv_indptr.size(0) == static_cast<int64_t>(p.batch) + 1,
                 "decode metadata batch mismatch");
-    TORCH_CHECK(p.head_dim % 32 == 0, "head_dim must be multiple of 32");
     p.qo_indptr = nullptr;
 
     TORCH_CHECK(new_k.has_value() == new_v.has_value(),
@@ -399,9 +390,10 @@ inline void attn_pack_paged_prefill_params(torch::Tensor q,
 
     p.q_len = checked_int(q.size(0), "q size(0)");
     p.batch = checked_int(req_pool_indices.size(0), "req_pool_indices size(0)");
-    TORCH_CHECK(p.head_dim % 16 == 0, "head_dim must be multiple of 16");
-    TORCH_CHECK(kv_indptr.size(0) == static_cast<int64_t>(p.batch) + 1, "kv_indptr must be [batch+1]");
-    TORCH_CHECK(qo_indptr.size(0) == static_cast<int64_t>(p.batch) + 1, "qo_indptr must be [batch+1]");
+    TORCH_CHECK(kv_indptr.size(0) == static_cast<int64_t>(p.batch) + 1,
+                "kv_indptr must be [batch+1]");
+    TORCH_CHECK(qo_indptr.size(0) == static_cast<int64_t>(p.batch) + 1,
+                "qo_indptr must be [batch+1]");
     TORCH_CHECK(q_tile_to_batch.dim() == 1 && q_tile_to_index.dim() == 1,
                 "Q tile mappings must be 1D");
     TORCH_CHECK(q_tile_to_batch.size(0) == q_tile_to_index.size(0),
@@ -415,10 +407,8 @@ inline void attn_pack_paged_prefill_params(torch::Tensor q,
     p.num_q_tiles = checked_int(q_tile_to_batch.size(0), "q_tile_to_batch size(0)");
     TORCH_CHECK(p.num_q_tiles > 0, "paged prefill needs at least one query tile");
     TORCH_CHECK(p.num_q_tiles <=
-                    (std::numeric_limits<int>::max() / HOST_Q_TILE_ROWS) /
-                        (p.q_head / p.kv_head),
+                    (std::numeric_limits<int>::max() / HOST_Q_TILE_ROWS) / (p.q_head / p.kv_head),
                 "paged prefill work grid exceeds int32 range");
-
 
     p.is_causal = is_causal;
     pack_mask(mask, p, q.device(), true);

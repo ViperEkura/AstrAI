@@ -105,13 +105,23 @@ online softmax and tensor-core computation.
 | `AttentionMma` | Load query fragments, compute QK, accumulate PV | Borrows typed fragments |
 | `AttentionMask` | Prepare row bounds and mask addresses once per query tile | Immutable visibility policy |
 | `WarpSoftmax` | Online row maxima/sums and output rescaling | Owns two row states |
-| split-Q / split-KV kernels | Compose the tools and orchestrate the pipeline | Own register/shared-memory storage |
+| `PrefillMainloop` / `DecodeMainloop` | Schedule loads, apply masks, compute QK/softmax/PV | Borrow shared memory and fill a result tile |
+| `OutputEpilogue` / `SplitEpilogue` | Normalize and store final output or FP32 split partials | Borrow the completed tile |
+| `AttentionStorage` / `AttentionTile` | Shared K/V buffers and register results | Owned by the kernel invocation |
 
 The producer and consumer share one shared-memory layout. Fragment array sizes
 come from the selected MMA atom instead of repeating register counts in every
 kernel. Compile-time checks reject incompatible element widths, instruction
 shapes and incomplete tiles. No runtime virtual dispatch or heap allocations
-are introduced in the device path. These tools remain in existing headers.
+are introduced in the device path. The device entry `attention_kernel<Mainloop, Epilogue>` owns storage, runs the
+selected mainloop, and stores valid tiles through its epilogue. Mainloops do
+not include or call epilogues. Decode partials are merged by `split_kv_combine`.
+This follows FA3's compile-time composition while retaining AstrAI's warp MMA,
+copy pipeline, tile schedules and numerical recurrence.
+
+`kernel/attention/mainloop.cuh` contains both prefill and decode mainloops;
+`epilogue.cuh` contains output handling and split combination.
+`kernel.cuh` defines their shared storage/result contract and the device entry.
 
 ## Native launch dispatch
 
@@ -136,6 +146,9 @@ device sequence lengths. Every call plans from its current shape; residual
 split fields in `AttentionParams` do not bypass planning. Paged decode uses
 the host cache capacity, so device lengths can change during graph replay.
 The existing tile recipes, occupancy reference and split limits are retained.
+The native `launch_prefill` and `launch_decode` functions share that selection
+with the Torch entry. The Torch overload retains scratch tensors through
+launch; no call-wrapper object or Dispatch/Entry class is needed.
 Scratch still uses the kernel's `MAX_SPLITS` stride, and caller-supplied
 buffers are validated even when direct output needs no scratch.
 

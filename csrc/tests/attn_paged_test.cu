@@ -397,7 +397,7 @@ static int run_decode_test(int B,
 
     AttentionParams p = rig.base_params();
     p.is_causal = causal;
-    AttnDispatchPagedDecode<bf16>::run(p, 0);
+    launch_decode<PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -454,7 +454,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq, int seed) {
     p.mask_h_stride = 0;
     p.mask_q_stride = 0;
     p.mask_k_stride = 1;
-    AttnDispatchPagedDecode<bf16>::run(p, 0);
+    launch_decode<PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -502,7 +502,7 @@ static int run_prefill_test(int B,
     p.q_tile_to_batch = d_qtb;
     p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
-    AttnDispatchPagedPrefill<bf16>::run(p, 0);
+    launch_prefill<PackedQSchedule, PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
     cudaFree(d_qtb);
     cudaFree(d_qti);
@@ -562,7 +562,7 @@ template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_
     p.q_tile_to_batch = d_qtb;
     p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
-    AttnDispatchPagedPrefill<bf16>::run(p, 0);
+    launch_prefill<PackedQSchedule, PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
     cudaFree(d_qtb);
     cudaFree(d_qti);
@@ -589,7 +589,7 @@ template <int HEAD_DIM> static void bench_decode(int B, int Hq, int Hkv, int seq
 
     AttentionParams p = rig.base_params();
     p.is_causal = true;
-    auto launch = [&]() { AttnDispatchPagedDecode<bf16>::run(p, 0); };
+    auto launch = [&]() { launch_decode<PagedKV<bf16>>(p, 0); };
     /*
      * Decode: q_len=1, query is the last token → attends to all [0, seq_len).
      * FLOPs = 2 * (QK^T + PV) = 4 * B * Hq * seq_len * D.
@@ -621,7 +621,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     p.q_tile_to_index = d_qti;
     p.num_q_tiles = num_q_tiles;
 
-    auto launch = [&]() { AttnDispatchPagedPrefill<bf16>::run(p, 0); };
+    auto launch = [&]() { launch_prefill<PackedQSchedule, PagedKV<bf16>>(p, 0); };
     /*
      * FLOPs = 2 * (QK^T + PV) = 4 * effective_qk_pairs * Hq * D.
      * Non-causal: effective = q_len * kv_len.

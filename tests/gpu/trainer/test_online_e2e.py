@@ -223,7 +223,7 @@ def test_async_round_ddp_two_learners_two_workers(base_test_env):
         reward_model_fn=LengthRewardModel,
     )
     Trainer(config).train(param_path=test_dir)
-    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_1"))
+    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_1"))
     assert checkpoint.meta["policy_version"] == 1
     assert checkpoint.consumed_samples == 4
 
@@ -289,7 +289,7 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
     )
     Trainer(config).train(param_path=test_dir)
 
-    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_3"))
+    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_3"))
     assert checkpoint.meta["policy_version"] == 3
     assert checkpoint.consumed_samples == 10
     assert seen == [0, 0, 1]
@@ -307,9 +307,9 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
 
     resume_config = replace(config, n_epoch=2)
     Trainer(resume_config).train(
-        param_path=os.path.join(test_dir, "ckpt", "epoch_0_step_3"), resume=True
+        param_path=os.path.join(test_dir, "ckpt", "epoch_1_step_3"), resume=True
     )
-    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_6"))
+    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_2_step_6"))
     assert resumed.meta["policy_version"] == 6
     assert resumed.consumed_samples == 20
 
@@ -375,7 +375,7 @@ def test_async_round_version_commit_failure_checkpoint_resumes_once(
 
     monkeypatch.setattr(NCCLWeightChannel, "mark_committed", original_publication)
     Trainer(config).train(param_path=checkpoint_path, resume=True)
-    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_2"))
+    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_2"))
     assert resumed.meta["policy_version"] == 2
     assert resumed.meta["optimizer_step"] == 2
     assert resumed.consumed_samples == 8

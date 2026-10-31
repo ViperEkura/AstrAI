@@ -69,7 +69,7 @@ template <typename Traits> struct KVTileLoader {
     }
 };
 
-struct MaskRows {
+struct AttentionRows {
     int batch, head0, head1;
     int qrow0, qrow1;
 };
@@ -79,7 +79,8 @@ template <bool HasMask, bool MaskCoversShape = false> struct AttentionMask {
     int base0, base1, max_key0, max_key1, key_stride;
     bool valid0, valid1;
     DEVICE_FORCEINLINE
-    AttentionMask(const AttentionParams& p, MaskRows rows, int max0, int max1, bool row0, bool row1)
+    AttentionMask(
+        const AttentionParams& p, AttentionRows rows, int max0, int max1, bool row0, bool row1)
         : mask(p.mask), base0(rows.batch * p.mask_b_stride + rows.head0 * p.mask_h_stride +
                               rows.qrow0 * p.mask_q_stride),
           base1(rows.batch * p.mask_b_stride + rows.head1 * p.mask_h_stride +
@@ -227,7 +228,7 @@ template <typename T> struct ContigKV {
     static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) { return p.kv_len; }
 
     // decode: same offset (q_len == 1, so there is no row stride component)
-    static DEVICE_FORCEINLINE int q_decode_base(const AttentionParams& p, int batch, int q_head) {
+    static DEVICE_FORCEINLINE int q_base(const AttentionParams& p, int batch, int q_head) {
         return batch * p.q_b_stride + q_head * p.q_h_stride;
     }
 
@@ -310,7 +311,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
     }
 
     // decode: Q is [batch, q_head, head_dim], so batch is the outer row
-    static DEVICE_FORCEINLINE int q_decode_base(const AttentionParams& p, int batch, int q_head) {
+    static DEVICE_FORCEINLINE int q_base(const AttentionParams& p, int batch, int q_head) {
         return batch * p.q_l_stride + q_head * p.q_h_stride;
     }
 

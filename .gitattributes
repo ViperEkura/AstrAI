@@ -1,19 +1,4 @@
-# Auto detect text files
-* text=auto
-
-# Files that MUST use LF (Unix/Linux execution)
-*.sh text eol=lf
-*.py text eol=lf
-*.md text eol=lf
-*.yml text eol=lf
-
-Dockerfile text eol=lf
-.dockerignore text eol=lf
-
-.gitignore text eol=lf
-.gitattributes text eol=lf
-
-# Windows scripts - use CRLF
+* text=auto eol=lf
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf

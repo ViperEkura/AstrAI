@@ -9,14 +9,21 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
-from astrai.optimization.optimizer.precision import FP32Optimizer
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.parallel.executor import DDPExecutor, NoneExecutor
 from astrai.parallel.executor.gradients import parameter_gradient
 from astrai.trainer.callbacks.metric_util import GradSNRTracker, grad_norm
 
 
 def _distributed_check(
-    rank, world_size, rendezvous, bucket_view, static_graph, backend="gloo"
+    rank,
+    world_size,
+    rendezvous,
+    bucket_view,
+    static_graph,
+    backend="gloo",
+    compute_dtype=torch.bfloat16,
+    gradient_dtype="float32",
 ):
     torch.set_num_threads(1)
     device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
@@ -31,23 +38,27 @@ def _distributed_check(
             bucket_cap_mb=0.001,
             gradient_as_bucket_view=bucket_view,
             static_graph=static_graph,
+            grad_accum_dtype=gradient_dtype,
         )
         model, optimizer, _ = executor.prepare(
             lambda: (
                 nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16), nn.Linear(16, 1))
                 .to(device)
-                .bfloat16()
+                .to(compute_dtype)
             ),
-            lambda model: FP32Optimizer(torch.optim.SGD(model.parameters(), lr=1e-3)),
+            lambda model: PrecisionOptimizer(
+                torch.optim.SGD(model.parameters(), lr=1e-3)
+            ),
         )
         for window in range(4):
             expected = [
-                torch.zeros_like(p, dtype=torch.float32) for p in model.parameters()
+                torch.zeros_like(p, dtype=getattr(torch, gradient_dtype))
+                for p in model.parameters()
             ]
             micros = 3
             for micro in range(micros):
                 torch.manual_seed(100 + window * 10 + rank * 3 + micro)
-                x = torch.randn(2, 16, device=device).bfloat16()
+                x = torch.randn(2, 16, device=device).to(compute_dtype)
                 reference = copy.deepcopy(model.module)
                 reference(x).float().sum().backward()
                 for total, p in zip(expected, reference.parameters()):
@@ -78,7 +89,7 @@ def test_fp32_accumulation_preserves_cancellation_and_drives_update(executor_typ
     executor = executor_type(grad_accum_steps=3)
     model, optimizer, _ = executor.prepare(
         lambda: nn.Linear(1, 1, bias=False).bfloat16(),
-        lambda model: FP32Optimizer(torch.optim.SGD(model.parameters(), lr=0.1)),
+        lambda model: PrecisionOptimizer(torch.optim.SGD(model.parameters(), lr=0.1)),
     )
     before = optimizer.state_dict()["master_params"][0].clone()
     for index, value in enumerate((1.0, 0.00390625, -1.0)):
@@ -110,7 +121,9 @@ def test_unused_parameters_and_new_windows_do_not_reuse_stale_gradients():
     executor = NoneExecutor()
     model, optimizer, _ = executor.prepare(
         lambda: nn.Sequential(nn.Linear(1, 1), nn.Linear(1, 1)).bfloat16(),
-        lambda model: FP32Optimizer(torch.optim.AdamW(model.parameters(), lr=1e-3)),
+        lambda model: PrecisionOptimizer(
+            torch.optim.AdamW(model.parameters(), lr=1e-3)
+        ),
     )
     executor.backward(model[0](torch.ones(1, 1).bfloat16()).float().sum())
     assert parameter_gradient(model[1].weight) is None
@@ -156,7 +169,7 @@ def _conditional_check(rank, rendezvous):
 
         model, optimizer, _ = executor.prepare(
             build,
-            lambda model: FP32Optimizer(
+            lambda model: PrecisionOptimizer(
                 torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
             ),
         )
@@ -214,7 +227,7 @@ def test_checkpoint_continuity_includes_accumulated_fp32_updates():
     def build():
         return executor.prepare(
             lambda: nn.Linear(1, 1, bias=False).bfloat16(),
-            lambda model: FP32Optimizer(
+            lambda model: PrecisionOptimizer(
                 torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
             ),
         )[:2]
@@ -274,6 +287,23 @@ def test_bf16_initial_buffer_sync_is_separate_from_forward_sync(tmp_path):
     mp.spawn(
         _buffer_sync_check,
         args=(Path(tmp_path / "buffers").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_fp32_compute_bf16_main_gradients_reduce_across_ranks(tmp_path):
+    mp.spawn(
+        _distributed_check,
+        args=(
+            2,
+            Path(tmp_path / "bf16_gradients").as_uri(),
+            True,
+            False,
+            "gloo",
+            torch.float32,
+            "bfloat16",
+        ),
         nprocs=2,
         join=True,
     )

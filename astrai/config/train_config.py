@@ -16,6 +16,7 @@ from pydantic.dataclasses import dataclass
 from pydantic_core import ArgsKwargs
 
 from astrai.config.base import BaseConfig
+from astrai.config.precision import PrecisionConfig
 from astrai.config.rollout import resolve_rollout_devices
 from astrai.model.components.lora import LoRAConfig
 
@@ -158,7 +159,7 @@ class TrainConfig(BaseConfig):
     model: ComponentSpec
     optimizer: ComponentSpec
     scheduler: ComponentSpec
-    model_dtype: Optional[str] = None
+    precision: PrecisionConfig = field(default_factory=PrecisionConfig)
 
     reward_model_fn: Optional[Callable] = None
     critic_model_fn: Optional[Callable] = None
@@ -531,9 +532,10 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
-        if self.model_dtype not in (None, "float32", "float16", "bfloat16"):
-            raise ValueError("model_dtype must be float32, float16, or bfloat16")
-
+        if "grad_accum_dtype" in self.executor_kwargs:
+            raise ValueError(
+                "Set precision.gradient_dtype instead of executor_kwargs.grad_accum_dtype"
+            )
         capabilities = _STRATEGY_CAPABILITIES[self.strategy]
         if self.strategy_kwargs.get("group_size", 4) < capabilities.min_group_size:
             raise ValueError(

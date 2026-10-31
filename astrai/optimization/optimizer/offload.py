@@ -6,14 +6,15 @@ from typing import Dict, Optional
 import torch
 from torch.optim import SGD, AdamW
 
+from astrai.optimization.optimizer.state import state_dtype
 from astrai.parallel.executor.gradients import parameter_gradient
 
 
 def _working_bytes(optimizer, group: Dict, master, state: Dict) -> int:
     """Bound live master/state storage, including lazy first-step moments."""
-    size = master.numel() * master.element_size()
+    size = master.numel() * 4
     stored = sum(
-        value.numel() * value.element_size()
+        value.numel() * (4 if value.is_floating_point() else value.element_size())
         for value in state.values()
         if isinstance(value, torch.Tensor)
     )
@@ -28,13 +29,15 @@ def _working_bytes(optimizer, group: Dict, master, state: Dict) -> int:
     return size + stored
 
 
-def _upload(value: torch.Tensor, device) -> torch.Tensor:
-    return value.to(device, non_blocking=True)
+def _upload(value: torch.Tensor, device, dtype=None) -> torch.Tensor:
+    return value.to(device=device, dtype=dtype, non_blocking=True)
 
 
-def _store(value: torch.Tensor, destination: Optional[torch.Tensor] = None):
+def _store(value: torch.Tensor, destination: Optional[torch.Tensor] = None, dtype=None):
     if destination is None:
-        destination = torch.empty_like(value, device="cpu", pin_memory=True)
+        destination = torch.empty_like(
+            value, dtype=dtype or value.dtype, device="cpu", pin_memory=True
+        )
     destination.copy_(value, non_blocking=True)
     value.record_stream(torch.cuda.current_stream(value.device))
     return destination
@@ -49,9 +52,12 @@ class CPUStateOffload:
     streams; no model parameter is split and Muon still sees full matrices.
     """
 
-    def __init__(self, model_params, master_params, optimizers):
+    def __init__(
+        self, model_params, master_params, optimizers, stored_dtype=torch.float32
+    ):
         self.models = dict(zip(master_params, model_params))
         self.optimizers = optimizers
+        self.stored_dtype = stored_dtype
         self.device = model_params[0].device
         self.upload_stream = torch.cuda.Stream(device=self.device)
         self.download_stream = torch.cuda.Stream(device=self.device)
@@ -61,8 +67,12 @@ class CPUStateOffload:
         for optimizer in self.optimizers:
             for state in optimizer.state.values():
                 for name, value in state.items():
-                    if isinstance(value, torch.Tensor) and not value.is_pinned():
-                        state[name] = value.cpu().pin_memory()
+                    if isinstance(value, torch.Tensor):
+                        value = value.to(
+                            device="cpu",
+                            dtype=state_dtype(name, value, self.stored_dtype),
+                        )
+                        state[name] = value if value.is_pinned() else value.pin_memory()
 
     @torch.no_grad()
     def step(self) -> None:
@@ -98,9 +108,13 @@ class CPUStateOffload:
                             drain()
                         try:
                             with torch.cuda.stream(self.upload_stream):
-                                gpu_master = _upload(host, self.device)
+                                gpu_master = _upload(host, self.device, torch.float32)
                                 gpu_state = {
-                                    name: _upload(value, self.device)
+                                    name: _upload(
+                                        value,
+                                        self.device,
+                                        state_dtype(name, value, torch.float32),
+                                    )
                                     if isinstance(value, torch.Tensor)
                                     else value
                                     for name, value in state.items()
@@ -116,14 +130,18 @@ class CPUStateOffload:
                             optimizer.state[master] = gpu_state
                             master.grad = gradient.detach().float()
                             optimizer.step()
-                            model.copy_(master)
+                            model.copy_(master.to(dtype=host.dtype))
                             computed = torch.cuda.Event()
                             computed.record(compute)
                             with torch.cuda.stream(self.download_stream):
                                 self.download_stream.wait_event(computed)
                                 _store(master.detach(), host)
                                 state = {
-                                    name: _store(value, state.get(name))
+                                    name: _store(
+                                        value,
+                                        state.get(name),
+                                        state_dtype(name, value, self.stored_dtype),
+                                    )
                                     if isinstance(value, torch.Tensor)
                                     else value
                                     for name, value in optimizer.state[master].items()

@@ -1,4 +1,4 @@
-"""Contiguous FP32 main gradients with bucketed asynchronous reduction."""
+"""Contiguous main gradients with bucketed asynchronous reduction."""
 
 import contextlib
 from dataclasses import dataclass, field
@@ -16,9 +16,28 @@ from torch.distributed.utils import (
 
 
 def parameter_gradient(parameter: nn.Parameter) -> Optional[torch.Tensor]:
-    """Return the accumulated FP32 gradient, or the native autograd gradient."""
+    """Return the accumulated main gradient, or the native autograd gradient."""
     main_grad = getattr(parameter, "main_grad", None)
     return main_grad if main_grad is not None else parameter.grad
+
+
+def clip_model_gradients(model, max_norm):
+    parameters = list(model.parameters())
+    if not any(getattr(p, "main_grad", None) is not None for p in parameters):
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    gradients = [g for p in parameters if (g := parameter_gradient(p)) is not None]
+    if not gradients:
+        return torch.tensor(0.0)
+    if all(g.dtype == torch.float32 for g in gradients):
+        total = torch.nn.utils.get_total_norm(gradients)
+    else:
+        total = torch.linalg.vector_norm(
+            torch.stack(
+                [torch.linalg.vector_norm(g, dtype=torch.float32) for g in gradients]
+            )
+        )
+    torch._foreach_mul_(gradients, (max_norm / (total + 1e-6)).clamp(max=1.0))
+    return total
 
 
 def _accumulate_gradient(accumulator, parameter: nn.Parameter) -> None:
@@ -26,7 +45,7 @@ def _accumulate_gradient(accumulator, parameter: nn.Parameter) -> None:
     if gradient is None:
         return
     if gradient.is_sparse:
-        raise NotImplementedError("FP32 main gradients require dense gradients")
+        raise NotImplementedError("Main gradients require dense gradients")
     target = accumulator.views[parameter]
     if parameter.main_grad is None:
         target.copy_(gradient)
@@ -46,12 +65,12 @@ class GradientBucket:
     work: Optional[Any] = None
 
 
-class FP32GradientAccumulator:
-    """Keep BF16 compute weights separate from persistent FP32 main gradients.
+class MainGradientAccumulator:
+    """Keep compute weights separate from persistent main-gradient storage.
 
     Following Megatron's main_grad design, each parameter has a view into one
     contiguous communication bucket. The same storage accumulates backward
-    contributions and participates in FP32 all-reduce. No BF16 reducer buckets
+    contributions and participates in same-dtype all-reduce. No BF16 reducer buckets
     or per-update gradient packing are retained. This preserves precision
     across backward calls, not inside individual BF16 backward operators.
     """
@@ -61,12 +80,17 @@ class FP32GradientAccumulator:
         model: nn.Module,
         synchronize: Callable[[], bool],
         bucket_cap_mb: float = 25,
+        dtype: torch.dtype = torch.float32,
     ):
+        if dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("Gradient dtype must be float32 or bfloat16")
+        self.dtype = dtype
+        self.element_size = torch.empty((), dtype=dtype).element_size()
         self.parameters = [p for p in model.parameters() if p.requires_grad]
         if any(isinstance(p, DTensor) for p in self.parameters):
-            raise NotImplementedError("FP32 main gradients do not support DTensor")
+            raise NotImplementedError("Main gradients do not support DTensor")
         if any(p.dtype not in (torch.float32, torch.bfloat16) for p in self.parameters):
-            raise ValueError("FP32 main gradients support FP32 and BF16 parameters")
+            raise ValueError("Main gradients support FP32 and BF16 parameters")
         if bucket_cap_mb <= 0:
             raise ValueError("bucket_cap_mb must be positive")
         if any(hasattr(p, "main_grad") for p in self.parameters):
@@ -85,13 +109,13 @@ class FP32GradientAccumulator:
         # rank uses the same order, including when local hook order differs.
         for parameter in reversed(self.parameters):
             if chunk and (
-                size + parameter.numel() * 4 > bucket_cap_mb * 1024**2
+                size + parameter.numel() * self.element_size > bucket_cap_mb * 1024**2
                 or chunk[0].device != parameter.device
             ):
                 self._add_bucket(chunk)
                 chunk, size = [], 0
             chunk.append(parameter)
-            size += parameter.numel() * 4
+            size += parameter.numel() * self.element_size
         if chunk:
             self._add_bucket(chunk)
         self.next_bucket = 0
@@ -108,7 +132,7 @@ class FP32GradientAccumulator:
         storage = torch.empty(
             sum(p.numel() for p in parameters),
             device=parameters[0].device,
-            dtype=torch.float32,
+            dtype=self.dtype,
         )
         bucket = GradientBucket(parameters, storage)
         self.buckets.append(bucket)
@@ -193,13 +217,13 @@ class FP32GradientAccumulator:
         self.buckets.clear()
 
 
-class FP32DistributedDataParallel(nn.Module):
-    """Replicated compute module sharing its FP32 accumulation/reduction storage."""
+class GradientDataParallel(nn.Module):
+    """Replicated compute module sharing its accumulation/reduction storage."""
 
     def __init__(
         self,
         module: nn.Module,
-        accumulator: FP32GradientAccumulator,
+        accumulator: MainGradientAccumulator,
         process_group=None,
         forward_sync_buffers: bool = True,
         init_sync: bool = True,
@@ -207,9 +231,7 @@ class FP32DistributedDataParallel(nn.Module):
     ):
         super().__init__()
         if len({p.device for p in module.parameters()}) != 1:
-            raise ValueError(
-                "Replicated FP32 gradient reduction requires one model device"
-            )
+            raise ValueError("Replicated gradient reduction requires one model device")
         self.module = module
         self.training = module.training
         self.accumulator = accumulator

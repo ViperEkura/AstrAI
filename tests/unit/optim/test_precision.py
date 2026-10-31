@@ -9,7 +9,7 @@ from torch import nn
 
 from astrai.config.train_config import ComponentSpec
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
-from astrai.optimization.optimizer.precision import FP32Optimizer
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.trainer.components import (
     build_optimizer_component,
     load_optimizer_state_dict,
@@ -27,7 +27,7 @@ class PrecisionModel(nn.Module):
 
 def test_sub_ulp_updates_and_decay_survive_restart():
     model = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
-    optimizer = FP32Optimizer(torch.optim.SGD([model], lr=1e-5, weight_decay=0.1))
+    optimizer = PrecisionOptimizer(torch.optim.SGD([model], lr=1e-5, weight_decay=0.1))
     reference = nn.Parameter(model.float())
     expected = torch.optim.SGD([reference], lr=1e-5, weight_decay=0.1)
     direct = model.detach().clone()
@@ -43,7 +43,7 @@ def test_sub_ulp_updates_and_decay_survive_restart():
             payload.seek(0)
             saved = torch.load(payload, weights_only=True)
             restored = nn.Parameter(model.clone())
-            optimizer = FP32Optimizer(
+            optimizer = PrecisionOptimizer(
                 torch.optim.SGD([restored], lr=1e-5, weight_decay=0.1)
             )
             optimizer.load_state_dict(saved)
@@ -76,7 +76,7 @@ def test_muon_and_adam_keep_fp32_state_and_resume(reuse_buffers, device, cpu_off
     model.norm = nn.Parameter(model.norm.float())
     reference = copy.deepcopy(model).float()
     kwargs = dict(lr=2e-5, weight_decay=0.1, reuse_ns_buffers=reuse_buffers)
-    optimizer = FP32Optimizer(MuonAdamW(model, **kwargs), cpu_offload=cpu_offload)
+    optimizer = PrecisionOptimizer(MuonAdamW(model, **kwargs), cpu_offload=cpu_offload)
     expected = MuonAdamW(reference, **kwargs)
     update_devices = set()
 
@@ -101,7 +101,7 @@ def test_muon_and_adam_keep_fp32_state_and_resume(reuse_buffers, device, cpu_off
         if step == 59:
             saved = copy.deepcopy(optimizer.state_dict())
             model = copy.deepcopy(model)
-            optimizer = FP32Optimizer(
+            optimizer = PrecisionOptimizer(
                 MuonAdamW(model, **kwargs), cpu_offload=cpu_offload
             )
             optimizer.load_state_dict(saved)
@@ -139,7 +139,7 @@ def test_factory_closure_missing_gradient_and_scheduler_options(cpu_offload):
         ),
         model,
     )
-    assert isinstance(optimizer, FP32Optimizer)
+    assert isinstance(optimizer, PrecisionOptimizer)
     calls = []
 
     def closure():
@@ -170,13 +170,17 @@ def test_factory_closure_missing_gradient_and_scheduler_options(cpu_offload):
     assert torch.count_nonzero(model.weight.grad) == 0
 
 
-def test_legacy_or_low_precision_master_state_is_rejected():
+def test_unversioned_or_mismatched_master_state_is_rejected():
     model = nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
     base = torch.optim.AdamW([model])
     legacy = base.state_dict()
-    optimizer = FP32Optimizer(base)
-    with pytest.raises(ValueError, match="no FP32 master"):
+    optimizer = PrecisionOptimizer(base)
+    with pytest.raises(ValueError, match="no master"):
         optimizer.load_state_dict(legacy)
+    unversioned = optimizer.state_dict()
+    unversioned.pop("precision")
+    with pytest.raises(ValueError, match="explicit optimizer precision"):
+        optimizer.load_state_dict(unversioned)
     saved = optimizer.state_dict()
     saved["master_params"] = [model.detach()]
     with pytest.raises(ValueError, match="do not match"):

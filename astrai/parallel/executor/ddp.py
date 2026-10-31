@@ -4,7 +4,6 @@ import contextlib
 import logging
 import os
 
-import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -13,7 +12,7 @@ from astrai.parallel.executor.base import (
     ExecutorFactory,
     strip_compile_prefix,
 )
-from astrai.parallel.executor.gradients import FP32DistributedDataParallel
+from astrai.parallel.executor.gradients import GradientDataParallel
 from astrai.parallel.setup import get_rank, get_world_size
 
 logger = logging.getLogger(__name__)
@@ -61,9 +60,7 @@ class DDPExecutor(BaseExecutor):
         )
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
-        uses_main_gradients = self.grad_accum_dtype == "float32" and any(
-            p.requires_grad and p.dtype == torch.bfloat16 for p in model.parameters()
-        )
+        uses_main_gradients = self._uses_main_gradients(model)
         if uses_main_gradients and (
             self._ddp_kwargs["mixed_precision"] is not None
             or self._ddp_kwargs["delay_all_reduce_named_params"] is not None
@@ -80,7 +77,7 @@ class DDPExecutor(BaseExecutor):
             logger.warning("DDP backend selected but world_size=1, model not wrapped")
             return model
         if self._grad_accumulator is not None:
-            model = FP32DistributedDataParallel(
+            model = GradientDataParallel(
                 model,
                 self._grad_accumulator,
                 **{
@@ -110,17 +107,17 @@ class DDPExecutor(BaseExecutor):
         return model
 
     def _no_sync(self, model: nn.Module):
-        if isinstance(model, (DDP, FP32DistributedDataParallel)):
+        if isinstance(model, (DDP, GradientDataParallel)):
             return model.no_sync()
         return contextlib.nullcontext()
 
     def model_for_inference(self, model: nn.Module) -> nn.Module:
         model = super().model_for_inference(model)
-        if isinstance(model, (DDP, FP32DistributedDataParallel)):
+        if isinstance(model, (DDP, GradientDataParallel)):
             return model.module
         return model
 
     def model_state_dict(self, model: nn.Module):
-        if isinstance(model, (DDP, FP32DistributedDataParallel)):
+        if isinstance(model, (DDP, GradientDataParallel)):
             return strip_compile_prefix(model.module.state_dict())
         return strip_compile_prefix(model.state_dict())

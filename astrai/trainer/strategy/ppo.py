@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
 
+from astrai.parallel.executor.gradients import clip_model_gradients
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.strategy.base import BaseStrategy
 from astrai.trainer.strategy.factory import StrategyCapabilities, StrategyFactory
@@ -94,9 +95,7 @@ class PPOStrategy(BaseStrategy):
         result = super().optimizer_step(optimizer)
         if self.critic_optimizer is not None:
             if self.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    self.critic.parameters(), self.max_grad_norm
-                )
+                clip_model_gradients(self.critic, self.max_grad_norm)
             self.critic_optimizer.step()
             self.critic_optimizer.zero_grad()
         return result

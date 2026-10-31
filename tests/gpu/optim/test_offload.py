@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
-from astrai.optimization.optimizer.precision import FP32Optimizer
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from tests.support.capabilities import skip_no_cuda
 
 
@@ -40,7 +40,7 @@ def test_pipelined_state_is_complete_on_return_and_restores(kind):
     model = _model()
     reference = copy.deepcopy(model).float()
     reference_by_name = dict(reference.named_parameters())
-    optimizer = FP32Optimizer(_optimizer(model, kind), cpu_offload=True)
+    optimizer = PrecisionOptimizer(_optimizer(model, kind), cpu_offload=True)
     expected = _optimizer(reference, kind)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -82,7 +82,7 @@ def test_pipelined_state_is_complete_on_return_and_restores(kind):
         expected.zero_grad()
         if step == 7:
             model = _model()
-            optimizer = FP32Optimizer(_optimizer(model, kind), cpu_offload=True)
+            optimizer = PrecisionOptimizer(_optimizer(model, kind), cpu_offload=True)
             optimizer.load_state_dict(saved)
         for child in optimizer._optimizers:
             for state in child.state.values():

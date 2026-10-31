@@ -1,4 +1,4 @@
-"""Persistent FP32 optimizer parameters for BF16 compute models."""
+"""Composable update precision and configurable persistent optimizer storage."""
 
 from typing import Dict
 
@@ -10,11 +10,15 @@ from torch.optim import SGD, AdamW, Optimizer
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.muon.sharded_update import ShardedMuon
 from astrai.optimization.optimizer.offload import CPUStateOffload
+from astrai.optimization.optimizer.state import (
+    ResidentOptimizerState,
+    restore_state_precision,
+)
 from astrai.parallel.executor.gradients import parameter_gradient
 
 
-class FP32Optimizer(Optimizer):
-    """Update FP32 masters and copy the rounded result to BF16 parameters.
+class PrecisionOptimizer(Optimizer):
+    """Compute updates in FP32 and persist the configured storage formats.
 
     This owns update precision only. Gradients arrive after model-side
     accumulation/reduction; casting them here cannot recover lost precision.
@@ -26,7 +30,20 @@ class FP32Optimizer(Optimizer):
 
     supports_main_grad = True
 
-    def __init__(self, optimizer: Optimizer, cpu_offload: bool = False):
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        cpu_offload: bool = False,
+        master_dtype: torch.dtype = torch.float32,
+        state_dtype: torch.dtype = torch.float32,
+    ):
+        if master_dtype not in (torch.float32, torch.bfloat16) or state_dtype not in (
+            torch.float32,
+            torch.bfloat16,
+        ):
+            raise ValueError("Master/state storage supports float32 and bfloat16")
+        self.master_dtype = master_dtype
+        self.state_dtype = state_dtype
         groups = optimizer.param_groups
         parameters = [p for group in groups for p in group["params"]]
         if any(isinstance(p, DTensor) for p in parameters):
@@ -35,7 +52,9 @@ class FP32Optimizer(Optimizer):
                 "validated yet; use FP32 model parameters"
             )
         if any(p.dtype not in (torch.float32, torch.bfloat16) for p in parameters):
-            raise ValueError("FP32Optimizer supports FP32 and BF16 parameters")
+            raise ValueError(
+                "PrecisionOptimizer supports FP32 and BF16 compute parameters"
+            )
         self._optimizers = (
             (optimizer.muon, optimizer.adamw)
             if isinstance(optimizer, MuonAdamW)
@@ -64,11 +83,14 @@ class FP32Optimizer(Optimizer):
         for model in self._model_params:
             value = model.detach().to(
                 device="cpu" if cpu_offload else model.device,
-                dtype=torch.float32,
+                dtype=master_dtype,
                 copy=True,
             )
             if stage_on_gpu:
                 value = value.pin_memory()
+            if master_dtype == torch.bfloat16 and model.dtype == torch.float32:
+                with torch.no_grad():
+                    model.copy_(value)
             self._master_params.append(
                 nn.Parameter(value, requires_grad=model.requires_grad)
             )
@@ -80,10 +102,24 @@ class FP32Optimizer(Optimizer):
         self.state = optimizer.state
 
         self._offload = (
-            CPUStateOffload(self._model_params, self._master_params, self._optimizers)
+            CPUStateOffload(
+                self._model_params, self._master_params, self._optimizers, state_dtype
+            )
             if stage_on_gpu
             else None
         )
+        self._storage = self._offload or ResidentOptimizerState(
+            optimizer,
+            self._model_params,
+            self._master_params,
+            self._optimizers,
+            state_dtype,
+        )
+
+    @property
+    def master_parameters(self):
+        """Compute/source pairs for serialization without exposing storage logic."""
+        return tuple(zip(self._model_params, self._master_params))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -91,15 +127,7 @@ class FP32Optimizer(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        if self._offload is not None:
-            self._offload.step()
-            return loss
-        for model, master in zip(self._model_params, self._master_params):
-            gradient = parameter_gradient(model)
-            master.grad = None if gradient is None else gradient.detach().float()
-        result = self.optimizer.step()
-        for model, master in zip(self._model_params, self._master_params):
-            model.copy_(master)
+        result = self._storage.step()
         return loss if closure is not None else result
 
     def zero_grad(self, set_to_none: bool = True):
@@ -124,23 +152,45 @@ class FP32Optimizer(Optimizer):
         return {
             "optimizer": self.optimizer.state_dict(),
             "master_params": [p.detach() for p in self._master_params],
+            "precision": {
+                "master_dtype": str(self.master_dtype).removeprefix("torch."),
+                "optimizer_state_dtype": str(self.state_dtype).removeprefix("torch."),
+            },
         }
 
     @torch.no_grad()
     def load_state_dict(self, state_dict: Dict):
         if "master_params" not in state_dict or "optimizer" not in state_dict:
             raise ValueError(
-                "Checkpoint has no FP32 master weights. Start a new run from "
+                "Checkpoint has no master weights. Start a new run from "
                 "its model weights with load_state_dict.optimizer=False; "
                 "previously rounded updates cannot be recovered."
             )
         saved = state_dict["master_params"]
+        if (
+            "precision" not in state_dict
+            or "master_dtype" not in state_dict["precision"]
+        ):
+            raise ValueError("Checkpoint is missing explicit optimizer precision")
+        saved_dtype = state_dict["precision"]["master_dtype"]
+        if saved_dtype not in ("float32", "bfloat16"):
+            raise ValueError("Checkpoint master precision is unsupported")
         if len(saved) != len(self._master_params) or any(
-            value.dtype != torch.float32 or value.shape != master.shape
+            value.dtype != getattr(torch, saved_dtype) or value.shape != master.shape
             for value, master in zip(saved, self._master_params)
         ):
-            raise ValueError("Checkpoint FP32 master weights do not match the model")
-        self.optimizer.load_state_dict(state_dict["optimizer"])
+            raise ValueError("Checkpoint master weights do not match the model")
+        # Native loaders cast moments to parameter dtype. Present FP32 update
+        # parameters while loading to avoid rounding FP32 state via BF16 masters.
+        stored = [master.data for master in self._master_params]
+        try:
+            for master, value in zip(self._master_params, stored):
+                master.data = value.float()
+            self.optimizer.load_state_dict(state_dict["optimizer"])
+        finally:
+            for master, value in zip(self._master_params, stored):
+                master.data = value
+        restore_state_precision(self._optimizers, self.state_dtype)
         if self._offload is not None:
             self._offload.pin_state()
         self.param_groups = self.optimizer.param_groups

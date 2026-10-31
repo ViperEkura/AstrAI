@@ -27,10 +27,36 @@ rank, rendezvous and tensor-layout data remain in `RolloutWorkerSpec`.
 
 ## Optimizer precision
 
-BF16 models built through the trainer use persistent FP32 master parameters.
-The optimizer updates these masters and keeps its floating-point state in FP32,
-then copies the rounded weights back into the original model. FP32-only models
-keep their existing optimizer unless CPU offload is requested.
+Use one precision policy independently of optimizer placement:
+
+~~~yaml
+precision:
+  compute_dtype: bfloat16
+  gradient_dtype: float32
+  master_dtype: float32
+  optimizer_state_dtype: float32
+  export_dtype: bfloat16
+~~~
+
+Compute, main gradients, persistent master weights and optimizer moments support
+float32 or bfloat16. Gradient dtype model uses native parameter gradients.
+Optimizer update arithmetic remains FP32; selecting BF16 master or moment
+storage rounds those values after every step and can lose small updates.
+Optimizer step counters remain FP32. FP32-only models with default FP32 storage
+keep their native optimizer.
+
+Library defaults preserve the model factory's compute dtype and native export
+dtype (None); the CLI defaults compute to bfloat16. Other defaults are float32.
+CLI flags such as --master_dtype and --export_dtype override individual YAML
+precision fields. Old FP32 class aliases and model_dtype/executor gradient
+configuration bridges have been removed.
+
+An explicit export_dtype controls model.safetensors only. Float32 exports use
+actual master weights when present. Checkpoints also save original compute
+weights in training_model.pt, alongside masters and moments in their actual
+storage formats. Full resume loads the original compute weights and requires
+matching compute, gradient, master and state precision; export precision may
+change. A warm start reads the exported model weights.
 
 Set `optimizer.params.cpu_offload: true` to store masters and optimizer state
 on CPU between steps. For a CUDA model, each parameter and its state are moved
@@ -58,9 +84,9 @@ cross-parameter batching and does not overlap optimizer mutation with
 forward/backward. GPU space must still fit the largest parameter, gradient,
 state and compute scratch.
 
-Optimizer checkpoints contain both the inner optimizer state and FP32 masters;
+Optimizer checkpoints contain both the inner optimizer state and selected-format masters;
 restoring copies the masters back to the compute weights. CPU and GPU placement
-can change on restore. Legacy optimizer checkpoints without masters are rejected:
+can change on restore. Optimizer checkpoints without masters or explicit precision metadata are rejected:
 start a new run from their model weights with `load_state_dict.optimizer=False`.
 Reconstructing masters from rounded BF16 weights cannot recover previous updates.
 
@@ -82,11 +108,11 @@ remain local. Parameters absent from the final microbatch still contribute if
 they were used earlier in the accumulation window. The reduced gradient is
 averaged over the configured process group before trainer normalization.
 
-Set executor_kwargs.grad_accum_dtype to model to retain the previous native
-autograd/DDP path for controlled comparisons. The default is float32. Set
+Set precision.gradient_dtype to model for native autograd/DDP accumulation,
+or bfloat16 for explicit BF16 gradient storage. The default is float32. Set
 find_unused_parameters=True for conditional distributed models: gradient
 presence is then agreed across ranks, and globally unused parameters retain
-None gradients so weight decay and momentum do not update them. The FP32 path
+None gradients so weight decay and momentum do not update them. The main-gradient path
 supports dense replicated BF16/FP32 parameters, not DTensor/FSDP/TP, sparse
 gradients, delayed DDP reduction or native DDP mixed_precision/device_mesh.
 DDP gradient_as_bucket_view and static_graph hints need no separate buffers or

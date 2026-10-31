@@ -16,6 +16,7 @@ from astrai.config.model_config import (
     GQAConfig,
     MLAConfig,
 )
+from astrai.config.precision import PrecisionConfig
 from astrai.config.preprocess_config import (
     InputConfig,
     OutputConfig,
@@ -34,6 +35,7 @@ __all__ = [
     "EncoderConfig",
     "ConfigFactory",
     "TrainConfig",
+    "PrecisionConfig",
     "ComponentSpec",
     "InputConfig",
     "OutputConfig",

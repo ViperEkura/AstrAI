@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
 
 from astrai.serialization import Checkpoint
+from astrai.serialization.precision import export_model_state
 from astrai.trainer.callbacks.base import TrainCallback
 from astrai.trainer.optional_extras import (
     snapshot_component_extras,
@@ -83,11 +85,22 @@ class CheckpointCallback(TrainCallback):
             return
         with context.executor.checkpoint_context(context.model) as state_dict:
             if state_dict is not None:
+                training_state = state_dict
+                state_dict = export_model_state(
+                    training_state,
+                    context.config.precision.export_dtype,
+                    getattr(context.optimizer, "master_parameters", ()),
+                )
                 save_path = os.path.join(
                     self.save_dir,
                     f"epoch_{context.epoch}_step_{context.optimizer_step}",
                 )
                 extra = self.save_extra_fn(context)
+                if context.config.precision.export_dtype is not None:
+                    extra["training_model"] = {
+                        name: value.detach().to(device="cpu", copy=True)
+                        for name, value in training_state.items()
+                    }
                 context.checkpoint = Checkpoint(
                     state_dict=state_dict,
                     epoch=context.epoch,
@@ -123,6 +136,7 @@ class CheckpointCallback(TrainCallback):
         """Run state plus what a report reads; not a copy of the CLI config."""
         cfg = context.config
         meta = {
+            "precision": asdict(cfg.precision),
             "optimizer_step": context.optimizer_step,
             "strategy": cfg.strategy,
             "dp_size": context.dp_size,

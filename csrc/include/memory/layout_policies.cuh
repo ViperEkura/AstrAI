@@ -79,8 +79,12 @@ template <bool HasMask, bool MaskCoversShape = false> struct AttentionMask {
     int base0, base1, max_key0, max_key1, key_stride;
     bool valid0, valid1;
     DEVICE_FORCEINLINE
-    AttentionMask(
-        const AttentionParams& p, AttentionRows rows, int max0, int max1, bool row0, bool row1)
+    AttentionMask(const AttentionParams& p,
+                  AttentionRows rows,
+                  int max0,
+                  int max1,
+                  bool row0,
+                  bool row1)
         : mask(p.mask), base0(rows.batch * p.mask_b_stride + rows.head0 * p.mask_h_stride +
                               rows.qrow0 * p.mask_q_stride),
           base1(rows.batch * p.mask_b_stride + rows.head1 * p.mask_h_stride +
@@ -263,9 +267,8 @@ template <typename T> struct ContigKV {
                                                  int,
                                                  int kc,
                                                  int d,
-                                                 bool valid,
+                                                 int token,
                                                  bool) {
-        int token = resolve_token(p, c, kc, valid);
         return kv_addr_from_token(p, c, token, d);
     }
 };
@@ -353,8 +356,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
 
     template <int VEC>
     static DEVICE_FORCEINLINE void
-    store_new_kv(const AttentionParams& p, const Context& c, int kc, int d, const KVAddr& src) {
-        const int slot = resolve_token(p, c, kc, true);
+    store_new_kv(const AttentionParams& p, const Context& c, int slot, int d, const KVAddr& src) {
         if (slot < 0)
             return;
         const int64_t off = (int64_t)slot * c.pool_stride + c.head_off + d;
@@ -383,15 +385,14 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
                                                  int seq_len,
                                                  int kc,
                                                  int d,
-                                                 bool valid,
+                                                 int token,
                                                  bool persist) {
-        if (p.new_k_ptr && valid && kc == seq_len - 1) {
+        if (p.new_k_ptr && kc < seq_len && kc == seq_len - 1) {
             KVAddr src = new_kv_addr(p, batch, kv_head, d);
             if (persist)
-                store_new_kv<VEC>(p, c, kc, d, src);
+                store_new_kv<VEC>(p, c, token, d, src);
             return src;
         }
-        int token = resolve_token(p, c, kc, valid);
         return kv_addr_from_token(p, c, token, d);
     }
 };

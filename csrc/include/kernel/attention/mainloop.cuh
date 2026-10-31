@@ -229,11 +229,21 @@ struct DecodeMainloop {
                 return false;
         }
 
-        // Only the first GQA pass persists new K/V to the cache.
-        auto load_tile = [&](int ti, int buf) {
+        // Fetch one page per lane ahead of the K/V copies, then share it across columns.
+        auto prefetch_tokens = [&](int ti) {
+            if constexpr (KV::kPaged) {
+                const int kc = ti * Traits::BC + lane;
+                return KV::resolve_token(p, kctx, kc, lane < Traits::BC && kc < seq_len);
+            }
+            return 0;
+        };
+        auto load_tile = [&](int ti, int buf, int tokens) {
             KVTileLoader<Traits>::load(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
+                int token = valid ? kc : -1;
+                if constexpr (KV::kPaged)
+                    token = __shfl_sync(0xffffffff, tokens, kc % Traits::BC);
                 return KV::template decode_addr<Traits::VEC>(p, kctx, batch, kv_head, seq_len, kc,
-                                                             d, valid, pass == 0);
+                                                             d, token, pass == 0);
             });
         };
 
@@ -257,9 +267,11 @@ struct DecodeMainloop {
         if (ntiles >= STAGES) {
 #pragma unroll
             for (int i = 0; i < STAGES; i++)
-                load_tile(ti_begin + i, i);
+                load_tile(ti_begin + i, i, prefetch_tokens(ti_begin + i));
 
             for (int it = 0; it < ntiles; it++) {
+                const int next = ti_begin + it + STAGES;
+                const int tokens = next < ti_end ? prefetch_tokens(next) : -1;
                 if (it + 1 == ntiles)
                     astrai::cp_async_wait_group<0>();
                 else
@@ -268,12 +280,12 @@ struct DecodeMainloop {
                 process_tile(it, it & (STAGES - 1));
                 __syncwarp();
                 if (it + STAGES < ntiles)
-                    load_tile(ti_begin + it + STAGES, (it + STAGES) & (STAGES - 1));
+                    load_tile(next, (it + STAGES) & (STAGES - 1), tokens);
             }
         } else {
             // Fewer tiles than stages: load all, wait for all, process.
             for (int i = 0; i < ntiles; i++)
-                load_tile(ti_begin + i, i);
+                load_tile(ti_begin + i, i, prefetch_tokens(ti_begin + i));
             astrai::cp_async_wait_all();
             __syncwarp();
             for (int it = 0; it < ntiles; it++)

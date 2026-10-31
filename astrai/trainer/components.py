@@ -23,6 +23,7 @@ from astrai.dataset import (
 )
 from astrai.model.automodel import ModelFactory
 from astrai.optimization.optimizer import OptimizerFactory
+from astrai.optimization.optimizer.precision import FP32Optimizer
 from astrai.optimization.scheduler import SchedulerFactory
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -76,16 +77,26 @@ def build_model_component(
 
 
 def build_optimizer_component(spec: ComponentSpec, model: nn.Module):
+    params = dict(spec.params)
+    cpu_offload = params.pop("cpu_offload", False)
     if OptimizerFactory.is_registered(spec.type):
-        return OptimizerFactory.create(spec.type, model, **spec.params)
-    target = resolve_component(spec.type)
-    parameters = list(inspect.signature(target).parameters.values())
-    first_arg = (
-        model.parameters()
-        if parameters and parameters[0].name in ("params", "parameters")
-        else model
-    )
-    return target(first_arg, **spec.params)
+        optimizer = OptimizerFactory.create(spec.type, model, **params)
+    else:
+        target = resolve_component(spec.type)
+        parameters = list(inspect.signature(target).parameters.values())
+        first_arg = (
+            model.parameters()
+            if parameters and parameters[0].name in ("params", "parameters")
+            else model
+        )
+        optimizer = target(first_arg, **params)
+    if cpu_offload or any(
+        p.dtype == torch.bfloat16
+        for group in optimizer.param_groups
+        for p in group["params"]
+    ):
+        optimizer = FP32Optimizer(optimizer, cpu_offload=cpu_offload)
+    return optimizer
 
 
 def load_optimizer_state_dict(optimizer: Optimizer, state_dict: Dict) -> None:

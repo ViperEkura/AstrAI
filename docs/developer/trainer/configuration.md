@@ -36,16 +36,27 @@ Set `optimizer.params.cpu_offload: true` to store masters and optimizer state
 on CPU between steps. For a CUDA model, each parameter and its state are moved
 to GPU, updated there using the GPU gradient, and copied back to CPU; the BF16
 compute weights are refreshed on GPU. There is no CPU optimizer computation.
-Only one parameter's working state is resident on GPU at a time.
+Persistent masters and state are pinned CPU tensors. Upload, GPU updates and
+return copies run in separate CUDA streams, with at most two parameters staged
+at once. A staging budget limits their combined master/state storage to a
+quarter of device memory or half the available allocator headroom; one complete
+parameter is always the minimum working set. Muon still updates complete
+matrices. Device buffers remain alive until their consumer streams finish.
 
-Transfers share one pinned buffer sized for the largest FP32 parameter and run
-synchronously. CPU state storage is disabled by default and currently supports
-AdamW, SGD and MuonAdamW/ShardedMuon with unsharded parameters. Other optimizers
-are rejected because repeated per-parameter steps may change their semantics.
-Parameter staging limits cross-parameter batching and does not overlap transfers
-with computation. Each DDP rank retains its own CPU state. This saves GPU memory
-between steps and reduces full-model step peaks, but still requires GPU space
-for the largest parameter, its FP32 gradient, state and compute scratch.
+The pipeline drains completion events before step returns, so CPU checkpoints
+can be saved immediately. It removes the repeated CPU-to-pinned staging copies
+and the per-transfer stream synchronization. Loading state restores pinned
+storage. The full CPU optimizer state is page-locked, rather than keeping only
+one pinned scratch buffer. Place offload workers and their host memory on the
+GPU-local NUMA node when measuring or launching a CPU-offloaded run.
+
+CPU state storage is disabled by default and supports AdamW, SGD and
+MuonAdamW/ShardedMuon with unsharded parameters. Other optimizers are rejected
+because repeated per-parameter steps may change their semantics. Each DDP rank
+retains its own CPU state; GPU state sharding is separate work. Staging limits
+cross-parameter batching and does not overlap optimizer mutation with
+forward/backward. GPU space must still fit the largest parameter, gradient,
+state and compute scratch.
 
 Optimizer checkpoints contain both the inner optimizer state and FP32 masters;
 restoring copies the masters back to the compute weights. CPU and GPU placement

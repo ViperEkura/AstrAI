@@ -9,6 +9,7 @@ from torch.optim import SGD, AdamW, Optimizer
 
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.muon.sharded_update import ShardedMuon
+from astrai.optimization.optimizer.offload import CPUStateOffload
 from astrai.parallel.executor.gradients import parameter_gradient
 
 
@@ -18,8 +19,9 @@ class FP32Optimizer(Optimizer):
     This owns update precision only. Gradients arrive after model-side
     accumulation/reduction; casting them here cannot recover lost precision.
     CPU offload stores masters and optimizer state in host memory between
-    steps. Parameters are staged one at a time for GPU updates; transfers
-    are synchronous and are not overlapped with forward/backward.
+    steps. Pinned host state uses a bounded upload/compute/return pipeline.
+    Each step completes host copies before returning; forward/backward do
+    not overlap with optimizer mutation.
     """
 
     supports_main_grad = True
@@ -55,32 +57,21 @@ class FP32Optimizer(Optimizer):
         super().__init__(groups, optimizer.defaults)
         self.optimizer = optimizer
         self._model_params = parameters
-        self._master_params = [
-            nn.Parameter(
-                p.detach().to(
-                    device="cpu" if cpu_offload else p.device,
-                    dtype=torch.float32,
-                    copy=True,
-                ),
-                requires_grad=p.requires_grad,
-            )
-            for p in self._model_params
-        ]
-        if (
-            cpu_offload
-            and any(p.is_cuda for p in parameters)
-            and any(p.device != parameters[0].device for p in parameters)
-        ):
+        stage_on_gpu = cpu_offload and any(p.is_cuda for p in parameters)
+        if stage_on_gpu and len({p.device for p in parameters}) != 1:
             raise ValueError("CPU state offload requires one CUDA model device")
-        self._transfer_buffer = (
-            torch.empty(
-                4 * max(p.numel() for p in parameters),
-                dtype=torch.uint8,
-                pin_memory=True,
+        self._master_params = []
+        for model in self._model_params:
+            value = model.detach().to(
+                device="cpu" if cpu_offload else model.device,
+                dtype=torch.float32,
+                copy=True,
             )
-            if cpu_offload and any(p.is_cuda for p in parameters)
-            else None
-        )
+            if stage_on_gpu:
+                value = value.pin_memory()
+            self._master_params.append(
+                nn.Parameter(value, requires_grad=model.requires_grad)
+            )
         masters = dict(zip(self._model_params, self._master_params))
         # Composite optimizers share these group objects with their children.
         for group in groups:
@@ -88,56 +79,11 @@ class FP32Optimizer(Optimizer):
         self.param_groups = optimizer.param_groups
         self.state = optimizer.state
 
-    def _buffer(self, model: nn.Parameter):
-        return (
-            self._transfer_buffer[: model.numel() * model.element_size()]
-            .view(model.dtype)
-            .view(model.shape)
+        self._offload = (
+            CPUStateOffload(self._model_params, self._master_params, self._optimizers)
+            if stage_on_gpu
+            else None
         )
-
-    def _upload(self, value: torch.Tensor, device):
-        buffer = self._buffer(value)
-        buffer.copy_(value)
-        return buffer.to(device)
-
-    def _store(self, value: torch.Tensor, destination=None):
-        buffer = self._buffer(value)
-        buffer.copy_(value)
-        return buffer.clone() if destination is None else destination.copy_(buffer)
-
-    def _offloaded_step(self):
-        models = dict(zip(self._master_params, self._model_params))
-        for optimizer in self._optimizers:
-            for group in optimizer.param_groups:
-                for master in group["params"]:
-                    model = models[master]
-                    gradient = parameter_gradient(model)
-                    if gradient is None:
-                        continue
-                    host = master.data
-                    state = dict(optimizer.state.get(master, {}))
-                    try:
-                        master.data = self._upload(host, model.device)
-                        optimizer.state[master] = {
-                            name: self._upload(value, model.device)
-                            if isinstance(value, torch.Tensor)
-                            else value
-                            for name, value in state.items()
-                        }
-                        master.grad = gradient.detach().float()
-                        optimizer.step()
-                        model.copy_(master)
-                        self._store(master.detach(), host)
-                        state = {
-                            name: self._store(value, state.get(name))
-                            if isinstance(value, torch.Tensor)
-                            else value
-                            for name, value in optimizer.state[master].items()
-                        }
-                    finally:
-                        master.grad = None
-                        master.data = host
-                        optimizer.state[master] = state
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -145,8 +91,8 @@ class FP32Optimizer(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        if self._transfer_buffer is not None:
-            self._offloaded_step()
+        if self._offload is not None:
+            self._offload.step()
             return loss
         for model, master in zip(self._model_params, self._master_params):
             gradient = parameter_gradient(model)
@@ -195,6 +141,8 @@ class FP32Optimizer(Optimizer):
         ):
             raise ValueError("Checkpoint FP32 master weights do not match the model")
         self.optimizer.load_state_dict(state_dict["optimizer"])
+        if self._offload is not None:
+            self._offload.pin_state()
         self.param_groups = self.optimizer.param_groups
         self.state = self.optimizer.state
         for model, master, value in zip(self._model_params, self._master_params, saved):

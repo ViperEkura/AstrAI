@@ -149,9 +149,6 @@ python scripts/demo/download.py                      # model → params/
 python scripts/demo/stream_chat.py
 # 在 >> 后输入消息，按 Ctrl+C 或 Ctrl+D 退出
 
-# 批量生成（5 条硬编码提示词，非流式）
-python scripts/demo/generate_batch.py
-
 # 原文续写（省略 --prompt 则进入交互模式）
 python scripts/demo/stream_chat.py --raw --prompt "很久很久以前"
 ```

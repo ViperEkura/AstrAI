@@ -25,7 +25,7 @@ from astrai.inference import (
     sample,
 )
 from astrai.inference.network import ProtocolHandler
-from astrai.inference.worker.sample import SamplingPipeline
+from astrai.inference.worker.sample import sample
 from astrai.logging import setup_logging
 from astrai.model import (
     AutoModel,
@@ -73,7 +73,7 @@ __all__ = [
     "PipelineConfig",
     "ProtocolHandler",
     "RDSampler",
-    "SamplingPipeline",
+    "sample",
     "Store",
     "StoreFactory",
     "StrategyFactory",

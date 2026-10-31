@@ -28,6 +28,13 @@ def _deliver_async_events(deliveries) -> None:
         queue.put_nowait(events)
 
 
+@dataclass
+class TrackedRequest:
+    events: Deque[Any]
+    finished: threading.Event = field(default_factory=threading.Event)
+    subscriber: Optional[Tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = None
+
+
 class RequestTracker(OutputEventSink):
     """Collect core events and notify blocking or asynchronous consumers.
 
@@ -37,11 +44,7 @@ class RequestTracker(OutputEventSink):
 
     def __init__(self, maxlen: int = 4096):
         self._lock = threading.Lock()
-        self._queues: Dict[str, Deque[Any]] = {}
-        self._finished: Dict[str, threading.Event] = {}
-        self._async_subscribers: Dict[
-            str, Tuple[asyncio.AbstractEventLoop, asyncio.Queue]
-        ] = {}
+        self._requests: Dict[str, TrackedRequest] = {}
         self._maxlen = maxlen
 
     def register(
@@ -49,32 +52,32 @@ class RequestTracker(OutputEventSink):
     ) -> threading.Event:
         with self._lock:
             bound = self._maxlen if maxlen is None else maxlen
-            self._queues[request_id] = deque(maxlen=bound)
-            done = self._finished[request_id] = threading.Event()
-            return done
+            state = TrackedRequest(deque(maxlen=bound))
+            self._requests[request_id] = state
+            return state.finished
 
     def unregister(self, request_id: str) -> None:
         with self._lock:
-            self._queues.pop(request_id, None)
-            self._async_subscribers.pop(request_id, None)
-            self._finished.pop(request_id, None)
+            self._requests.pop(request_id, None)
 
     def subscribe_async(
         self, request_id: str, loop: asyncio.AbstractEventLoop
     ) -> Tuple[asyncio.Queue, List[Any]]:
         queue = asyncio.Queue()
         with self._lock:
-            events = self._queues.get(request_id)
-            if events is None:
+            state = self._requests.get(request_id)
+            if state is None:
                 raise KeyError(f"request {request_id!r} is not registered")
-            pending = list(events)
-            events.clear()
-            self._async_subscribers[request_id] = (loop, queue)
+            pending = list(state.events)
+            state.events.clear()
+            state.subscriber = (loop, queue)
         return queue, pending
 
     def unsubscribe_async(self, request_id: str) -> None:
         with self._lock:
-            self._async_subscribers.pop(request_id, None)
+            state = self._requests.get(request_id)
+            if state is not None:
+                state.subscriber = None
 
     def __call__(self, events: List[Any]) -> None:
         by_loop: Dict[
@@ -83,10 +86,10 @@ class RequestTracker(OutputEventSink):
         with self._lock:
             for event in events:
                 rid = event.request_id
-                queue = self._queues.get(rid)
-                if queue is None or self._finished[rid].is_set():
+                state = self._requests.get(rid)
+                if state is None or state.finished.is_set():
                     continue
-                subscriber = self._async_subscribers.get(rid)
+                subscriber = state.subscriber
                 if subscriber is not None:
                     loop, async_queue = subscriber
                     deliveries = by_loop.setdefault(loop, [])
@@ -95,9 +98,9 @@ class RequestTracker(OutputEventSink):
                     else:
                         deliveries.append((rid, async_queue, [event]))
                 else:
-                    queue.append(event)
+                    state.events.append(event)
                 if isinstance(event, (RequestFinished, RequestError)):
-                    self._finished[rid].set()
+                    state.finished.set()
 
         for loop, deliveries in by_loop.items():
             scheduled = [(queue, batch) for _, queue, batch in deliveries]
@@ -107,36 +110,35 @@ class RequestTracker(OutputEventSink):
                 with self._lock:
                     restored = set()
                     for rid, queue, batch in deliveries:
+                        state = self._requests.get(rid)
+                        if state is None:
+                            continue
                         if rid not in restored:
-                            if self._async_subscribers.get(rid) != (loop, queue):
+                            if state.subscriber != (loop, queue):
                                 continue
-                            self._async_subscribers.pop(rid, None)
+                            state.subscriber = None
                             restored.add(rid)
-                        pending = self._queues.get(rid)
-                        if pending is not None:
-                            pending.extend(batch)
+                        state.events.extend(batch)
 
     def is_finished(self, request_id: str) -> bool:
         with self._lock:
-            done = self._finished.get(request_id)
-            return done is not None and done.is_set()
+            state = self._requests.get(request_id)
+            return state is not None and state.finished.is_set()
 
     def drain(self, request_id: str) -> List[Any]:
         """Pop all pending events for one request (non-blocking)."""
         with self._lock:
-            queue = self._queues.get(request_id)
-            if queue is None:
+            state = self._requests.get(request_id)
+            if state is None:
                 return []
-            out = list(queue)
-            queue.clear()
+            out = list(state.events)
+            state.events.clear()
         return out
 
     def wait(self, request_id: str, timeout: Optional[float] = None) -> bool:
         with self._lock:
-            done = self._finished.get(request_id)
-        if done is None:
-            return True
-        return done.wait(timeout=timeout)
+            state = self._requests.get(request_id)
+        return state is None or state.finished.wait(timeout=timeout)
 
 
 @dataclass(slots=True, eq=False, repr=False, match_args=False)

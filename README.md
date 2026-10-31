@@ -143,9 +143,6 @@ python scripts/demo/download.py                      # model → params/
 python scripts/demo/stream_chat.py
 # Type your message after >>; press Ctrl+C or Ctrl+D to exit
 
-# Batch generation (5 hardcoded prompts, non-streaming)
-python scripts/demo/generate_batch.py
-
 # Raw continuation (omit --prompt for interactive input)
 python scripts/demo/stream_chat.py --raw --prompt "Once upon a time"
 ```

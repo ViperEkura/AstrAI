@@ -131,18 +131,12 @@ the scheduler rejects updates while requests are queued and invalidates reusable
 prefix KV pages before exposing the new version. Synchronous `run_batch()` and
 weight updates are serialized so a generation cannot straddle two versions.
 
-## Sampling (Strategy Pattern)
+## Sampling
 
-```
-BaseSamplingStrategy (ABC)
-  ├── TemperatureStrategy
-  ├── TopKStrategy
-  ├── TopPStrategy
-  └── SamplingPipeline
-```
-
-`SamplingPipeline` composes them: Temperature → Top-K → Top-P → softmax → multinomial.  
-`sample()` is a convenience shortcut for one-shot usage.
+`sample()` applies frequency penalties, temperature, top-k and top-p in order,
+then samples token IDs. `SamplingMeta` caches batch facts on the host to avoid
+GPU synchronization during decode. Optional returned log probabilities use
+the raw model distribution, before penalties and filtering.
 
 ## Protocol Handlers (Strategy Pattern)
 

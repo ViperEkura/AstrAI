@@ -91,8 +91,12 @@ def test_single_tokenized_request_keeps_budget_and_sampling(max_tokens, expected
     tokenizer.encode.assert_not_called()
     request = manager._states[request_id]
     assert request.max_tokens == expected
-    assert (request.temperature, request.top_p, request.top_k) == (0.7, 0.8, 4)
-    assert (request.frequency_penalty, request.rep_window) == (0.2, 7)
+    assert (
+        request.sampling.temperature,
+        request.sampling.top_p,
+        request.sampling.top_k,
+    ) == (0.7, 0.8, 4)
+    assert (request.sampling.frequency_penalty, request.sampling.rep_window) == (0.2, 7)
 
 
 @pytest.mark.parametrize(

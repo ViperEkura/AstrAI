@@ -881,14 +881,7 @@ classDiagram
             }
             class CUDAGraphRunner
             class InferenceWorkspace
-            class SamplingPipeline
-            class BaseSamplingStrategy {
-                <<abstract>>
-            }
-            class TemperatureStrategy
-            class TopKStrategy
-            class TopPStrategy
-            class FrequencyPenaltyStrategy
+
         }
         namespace network {
 
@@ -1121,10 +1114,6 @@ classDiagram
     MmapStore --|> Recordable
     JsonlStore --|> Streamable
     JsonlStore --|> Recordable
-    BaseSamplingStrategy <|-- TemperatureStrategy
-    BaseSamplingStrategy <|-- TopKStrategy
-    BaseSamplingStrategy <|-- TopPStrategy
-    BaseSamplingStrategy <|-- FrequencyPenaltyStrategy
     AutoModel <|-- TransformerModel
     TransformerModel <|-- AutoRegressiveLM
     TransformerModel <|-- ValueModel
@@ -1193,7 +1182,6 @@ classDiagram
     TrainContext o-- LRScheduler : torch.optim.lr_scheduler
     TrainContext o-- Checkpoint
     TrainContext o-- BaseExecutor
-    SamplingPipeline o-- BaseSamplingStrategy
     BaseDataset o-- Store
     Pipeline o-- PipelineConfig
     Pipeline o-- BaseMaskBuilder
@@ -1273,7 +1261,6 @@ classDiagram
     GPUModelRunner --> PendingExecution
     GPUModelRunner *-- CUDAGraphRunner
     GPUModelRunner *-- InferenceWorkspace
-    GPUModelRunner --> SamplingPipeline
 ```
 
 
@@ -1288,7 +1275,7 @@ classDiagram
 | **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, TransformerModel · `components/`: DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding · `kv_cache.py`: KVStorage, ReqToTokenPool, BaseKVCache, PrefillKVCache, DecodeKVCache, KVCache alias | Neural network model and KV layout contract |
 | **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
 | **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model · `strategy/`: BaseStrategy–GRPOStrategy, StrategyFactory · `callbacks/`: TrainCallback, GradientClippingCallback, GradientCheckpointingCallback, CheckpointCallback, ProgressBarCallback, MetricCallback · `backend.py`: RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher · `rollout/`: RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator | Training workflow (online RL rollout via injectable backends) |
-| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, events (TokenDelta/RequestFinished/RequestError) · core: EngineCore, Scheduler, SchedulerStep, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
+| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, events (TokenDelta/RequestFinished/RequestError) · core: EngineCore, Scheduler, SchedulerStep, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (sample + SamplingMeta) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
 | **astrai.extension** | `runtime` context/spec/dispatcher, `backend` per-operator policy, `kernel` exact wrappers, attention, op_backend, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
 | **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
 | **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch and explicit gradient synchronization |
@@ -1301,7 +1288,7 @@ classDiagram
 | **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory` | Decorator-based component creation |
 | **Registry** | `BaseFactory` | Component registration |
 | **Strategy** | `SEQStrategy`, `SFTStrategy`, `DPOStrategy`, `GRPOStrategy` | Training strategy switching |
-| **Strategy (Sampling)** | `TemperatureStrategy`, `TopKStrategy`, `TopPStrategy`, `FrequencyPenaltyStrategy`, `SamplingPipeline` | Composable logit transformations |
+| **Sampling** | `sample()`, `SamplingMeta` | Fixed sampling order with cached host metadata |
 | **Strategy (API)** | `ResponseBuilder`, `OpenAIResponseBuilder`, `AnthropicResponseBuilder` | HTTP API handler with format hooks |
 | **Builder** | `TrainContextBuilder` | Chain-building training context |
 | **Observer** | `TrainCallback`, callback implementations | Training process monitoring |
@@ -1324,7 +1311,7 @@ classDiagram
 2. **Training Flow**: `Trainer` → `TrainContextBuilder` → `TrainContext`, uses `BaseStrategy` for loss, `BaseExecutor` for gradient accumulation + model distribution; with `cp_size > 1` the strategy is wrapped in `CPStrategy` (sequence sharding + ring attention)
 3. **Strategy Selection**: `StrategyFactory` creates strategy by `train_type`
 4. **Executor Selection**: `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
-5. **Inference Flow**: `InferenceEngine` (frontend) → `Scheduler`/`SchedulerStep` (core) → `GPUModelRunner` (worker) → `AutoRegressiveLM`, backed by `KVCacheManager` + `BlockPool` + `SamplingPipeline`; output flows back as events (see [developer/inference/events.md](inference/events.md)). `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.kernel`. Attention uses cuda > flash > torch priority unless selected by `op_backend(attention=...)`; `set_op("attention", ...)` and `ASTR_OPS` provide soft process defaults. Inference snapshots the selection at scheduler creation. Rotary embedding independently selects CUDA when supported or torch complex multiply.
+5. **Inference Flow**: `InferenceEngine` (frontend) → `Scheduler`/`SchedulerStep` (core) → `GPUModelRunner` (worker) → `AutoRegressiveLM`, backed by `KVCacheManager` + `BlockPool` + `sample`; output flows back as events (see [developer/inference/events.md](inference/events.md)). `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.kernel`. Attention uses cuda > flash > torch priority unless selected by `op_backend(attention=...)`; `set_op("attention", ...)` and `ASTR_OPS` provide soft process defaults. Inference snapshots the selection at scheduler creation. Rotary embedding independently selects CUDA when supported or torch complex multiply.
 6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` launch the world; `ParallelTopology` decomposes it into `dp × cp × tp` with one process group per mesh dimension — a singleton for inactive dimensions — `CPStrategy`/`CPState` shard sequences across cp ranks, and `TPState` shards Linear projections over features across tp ranks
 7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`
 8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata; `CheckpointCallback` performs rank-0 training saves, with extra state saved as `{key}.pt`

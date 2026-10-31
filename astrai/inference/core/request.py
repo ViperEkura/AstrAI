@@ -89,12 +89,7 @@ class Request:
         self.prompt_ids = list(prompt_ids)
         self._prompt_snapshot = tuple(prompt_ids)
         self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.top_p = top_p
-        self.top_k = top_k
-        self.frequency_penalty = frequency_penalty
-        self.rep_window = rep_window
-        self._sampling = SamplingParams(
+        self.sampling = SamplingParams(
             temperature, top_p, top_k, frequency_penalty, rep_window, seed
         )
 
@@ -125,8 +120,10 @@ class Request:
             position=position,
             num_tokens=num_tokens,
             phase=phase,
-            sampling=self._sampling,
-            output_ids=tuple(self.output_ids) if self.frequency_penalty else (),
+            sampling=self.sampling,
+            output_ids=tuple(self.output_ids)
+            if self.sampling.frequency_penalty
+            else (),
             cont_len=self.cont_len,
         )
 

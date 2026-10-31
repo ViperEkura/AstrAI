@@ -65,6 +65,11 @@ classDiagram
         +wait(request_id, timeout) bool
         +is_finished(request_id) bool
     }
+    class TrackedRequest {
+        events
+        finished
+        subscriber
+    }
     class OutputEvent {
         <<frozen · core/events.py>>
         TokenDelta(request_id, token_id, sequence_no)
@@ -83,6 +88,7 @@ classDiagram
     InferenceEngine *-- RequestTracker
     InputProcessor ..> ProcessedInput : produces
     OutputProcessor *-- StopSequenceChecker
+    RequestTracker *-- TrackedRequest
     RequestTracker ..> OutputEvent : consumes
     OutputProcessor ..> StreamChunk : frontend maps
 ```

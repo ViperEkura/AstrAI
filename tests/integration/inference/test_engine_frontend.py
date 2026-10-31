@@ -336,7 +336,7 @@ def test_submission_failure_releases_frontend_state(event_engine, method):
 def test_batch_submission_failure_releases_all_registered_consumers(event_engine):
     def submit(**kwargs):
         request_ids = kwargs["request_ids"]
-        assert set(request_ids) == set(event_engine._tracker._finished)
+        assert set(request_ids) == set(event_engine._tracker._requests)
         event_engine._tracker([RequestFinished(request_ids[0], FINISH_LENGTH)])
         raise RuntimeError("submit failed after first completion")
 

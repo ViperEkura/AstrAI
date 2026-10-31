@@ -98,9 +98,7 @@ def _emit_on_submission(engine, text="", reason=None, error=False):
 
 def _assert_frontend_released(engine):
     tracker = engine._tracker
-    assert not tracker._finished
-    assert not tracker._queues
-    assert not tracker._async_subscribers
+    assert not tracker._requests
 
 
 def _collect_async(stream):

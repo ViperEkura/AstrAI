@@ -35,11 +35,10 @@ def test_tracker_accepts_one_terminal_and_reclaims_all_state():
     tracker([RequestError("r", "late", "ignored")])
     assert done.is_set()
     assert tracker.drain("r") == [TokenDelta("r", 11, 1), terminal]
-    assert tracker._queues["r"].maxlen == 4
+    assert tracker._requests["r"].events.maxlen == 4
     tracker.unregister("r")
     tracker([terminal])
-    assert not tracker._finished
-    assert not tracker._queues
+    assert not tracker._requests
     replacement = tracker.register("r")
     assert not replacement.is_set()
     tracker([terminal])
@@ -88,4 +87,4 @@ def test_tracker_closed_loop_preserves_interleaved_terminal_backlog():
             RequestFinished(rid, reason, 2, 1),
         ]
         tracker.unregister(rid)
-    assert not tracker._async_subscribers
+    assert all(state.subscriber is None for state in tracker._requests.values())

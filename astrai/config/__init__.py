@@ -16,14 +16,13 @@ from astrai.config.model_config import (
     GQAConfig,
     MLAConfig,
 )
-from astrai.config.precision import PrecisionConfig
 from astrai.config.preprocess_config import (
     InputConfig,
     OutputConfig,
     PipelineConfig,
     ProcessingConfig,
 )
-from astrai.config.train_config import ComponentSpec, TrainConfig
+from astrai.config.train_config import ComponentSpec, PrecisionConfig, TrainConfig
 
 __all__ = [
     "BaseModelConfig",

@@ -12,8 +12,7 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from astrai.config.model_config import ConfigFactory
-from astrai.config.precision import PrecisionConfig
-from astrai.config.train_config import ComponentSpec, TrainConfig
+from astrai.config.train_config import ComponentSpec, PrecisionConfig, TrainConfig
 from astrai.dataset import (
     DatasetFactory,
     GlobalBatchSampler,

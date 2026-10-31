@@ -6,8 +6,29 @@ from typing import Dict, Optional
 import torch
 from torch.optim import SGD, AdamW
 
-from astrai.optimization.optimizer.state import state_dtype
 from astrai.parallel.executor.gradients import parameter_gradient
+
+
+def state_dtype(name, value, dtype):
+    """Counters retain their range independently of moment storage precision."""
+    if not value.is_floating_point():
+        return value.dtype
+    return torch.float32 if name == "step" else dtype
+
+
+def cast_state(state, dtype):
+    return {
+        name: value.to(dtype=state_dtype(name, value, dtype))
+        if isinstance(value, torch.Tensor)
+        else value
+        for name, value in state.items()
+    }
+
+
+def restore_state_precision(optimizers, dtype):
+    for optimizer in optimizers:
+        for parameter, state in optimizer.state.items():
+            optimizer.state[parameter] = cast_state(state, dtype)
 
 
 def _working_bytes(optimizer, group: Dict, master, state: Dict) -> int:

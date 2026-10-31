@@ -10,10 +10,12 @@ from torch import nn
 from astrai.config.train_config import ComponentSpec
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.precision import PrecisionOptimizer
+from astrai.trainer.callbacks.checkpoint import export_model_state
 from astrai.trainer.components import (
     build_optimizer_component,
     load_optimizer_state_dict,
 )
+from tests.support.precision import check_precision_storage
 
 
 class PrecisionModel(nn.Module):
@@ -185,3 +187,36 @@ def test_unversioned_or_mismatched_master_state_is_rejected():
     saved["master_params"] = [model.detach()]
     with pytest.raises(ValueError, match="do not match"):
         optimizer.load_state_dict(saved)
+
+
+@pytest.mark.parametrize("kind", ["sgd", "adamw", "muon_adamw"])
+@pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("master_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_resident_storage_precision_and_restart(
+    kind, compute_dtype, master_dtype, state_dtype
+):
+    check_precision_storage(
+        kind, compute_dtype, master_dtype, state_dtype, "cpu", False
+    )
+
+
+def test_export_uses_master_without_mutating_training_state():
+    model = nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.weight.fill_(1)
+    optimizer = PrecisionOptimizer(torch.optim.SGD(model.parameters(), lr=1e-5))
+    for _ in range(20):
+        model.weight.main_grad = torch.ones_like(model.weight, dtype=torch.float32)
+        optimizer.step()
+        optimizer.zero_grad()
+    master = optimizer.master_parameters[0][1]
+    assert model.weight.item() == 1
+    assert master.item() < 1
+    state = model.state_dict()
+    fp32 = export_model_state(state, "float32", optimizer.master_parameters)
+    bf16 = export_model_state(state, "bfloat16", optimizer.master_parameters)
+    torch.testing.assert_close(fp32["weight"], master, atol=0, rtol=0)
+    assert bf16["weight"].item() == 1
+    assert master.dtype == torch.float32 and model.weight.dtype == torch.bfloat16
+    assert export_model_state(state, None, optimizer.master_parameters) is state

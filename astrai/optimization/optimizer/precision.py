@@ -9,9 +9,9 @@ from torch.optim import SGD, AdamW, Optimizer
 
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.muon.sharded_update import ShardedMuon
-from astrai.optimization.optimizer.offload import CPUStateOffload
-from astrai.optimization.optimizer.state import (
-    ResidentOptimizerState,
+from astrai.optimization.optimizer.offload import (
+    CPUStateOffload,
+    cast_state,
     restore_state_precision,
 )
 from astrai.parallel.executor.gradients import parameter_gradient
@@ -108,12 +108,8 @@ class PrecisionOptimizer(Optimizer):
             if stage_on_gpu
             else None
         )
-        self._storage = self._offload or ResidentOptimizerState(
-            optimizer,
-            self._model_params,
-            self._master_params,
-            self._optimizers,
-            state_dtype,
+        self._convert_state = (
+            state_dtype != torch.float32 or master_dtype != torch.float32
         )
 
     @property
@@ -127,8 +123,51 @@ class PrecisionOptimizer(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        result = self._storage.step()
+        result = (
+            self._offload.step() if self._offload is not None else self._step_resident()
+        )
         return loss if closure is not None else result
+
+    @torch.no_grad()
+    def _step_resident(self):
+        if not self._convert_state:
+            for model, master in zip(self._model_params, self._master_params):
+                gradient = parameter_gradient(model)
+                master.grad = None if gradient is None else gradient.detach().float()
+            result = self.optimizer.step()
+            for model, master in zip(self._model_params, self._master_params):
+                model.copy_(master)
+            return result
+
+        stored = [master.data for master in self._master_params]
+        try:
+            for model, master, value in zip(
+                self._model_params, self._master_params, stored
+            ):
+                gradient = parameter_gradient(model)
+                master.data = value.float()
+                master.grad = None if gradient is None else gradient.detach().float()
+            for child in self._optimizers:
+                for master in child.state:
+                    if master.grad is not None:
+                        child.state[master] = cast_state(
+                            child.state[master], torch.float32
+                        )
+            result = self.optimizer.step()
+            for model, master, value in zip(
+                self._model_params, self._master_params, stored
+            ):
+                if value.data_ptr() != master.data_ptr():
+                    value.copy_(master)
+                # Publish from persistent storage, including its quantization.
+                model.copy_(value)
+            restore_state_precision(self._optimizers, self.state_dtype)
+            return result
+        finally:
+            for master, value in zip(self._master_params, stored):
+                if master.dtype != value.dtype:
+                    master.grad = None
+                master.data = value
 
     def zero_grad(self, set_to_none: bool = True):
         self.optimizer.zero_grad(set_to_none=set_to_none)

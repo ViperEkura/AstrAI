@@ -74,14 +74,26 @@ def test_muon_and_adam_keep_fp32_state_and_resume(reuse_buffers, device, cpu_off
     torch.manual_seed(9)
     model = PrecisionModel(torch.bfloat16).to(device)
     model.norm = nn.Parameter(model.norm.float())
-    reference = copy.deepcopy(model).cpu().float()
+    reference = copy.deepcopy(model).float()
     kwargs = dict(lr=2e-5, weight_decay=0.1, reuse_ns_buffers=reuse_buffers)
     optimizer = FP32Optimizer(MuonAdamW(model, **kwargs), cpu_offload=cpu_offload)
     expected = MuonAdamW(reference, **kwargs)
+    update_devices = set()
+
+    def observe_update(optimizer, args, kwargs):
+        update_devices.update(
+            p.device.type
+            for group in optimizer.param_groups
+            for p in group["params"]
+            if p.grad is not None
+        )
+
+    for child in optimizer._optimizers:
+        child.register_step_pre_hook(observe_update)
     for step in range(120):
         for p, q in zip(model.parameters(), reference.parameters()):
-            p.grad = torch.full_like(p, 0.125)
-            q.grad = p.grad.cpu().float()
+            p.grad = torch.rand_like(p) * 0.25
+            q.grad = p.grad.float()
         optimizer.step()
         expected.step()
         optimizer.zero_grad()
@@ -94,22 +106,27 @@ def test_muon_and_adam_keep_fp32_state_and_resume(reuse_buffers, device, cpu_off
             )
             optimizer.load_state_dict(saved)
     for p, q in zip(model.parameters(), reference.parameters()):
-        torch.testing.assert_close(p.cpu(), q.to(p.dtype), atol=0, rtol=0)
+        torch.testing.assert_close(p, q.to(p.dtype), atol=0, rtol=0)
     assert torch.all(model.norm < 1)
+    assert update_devices == {device}
     for master in optimizer.state_dict()["master_params"]:
         assert master.dtype == torch.float32
+        if cpu_offload:
+            assert master.device.type == "cpu"
     for child in (optimizer.optimizer.muon, optimizer.optimizer.adamw):
         for state in child.state.values():
             for value in state.values():
                 if isinstance(value, torch.Tensor):
                     assert value.dtype == torch.float32
+                    if cpu_offload:
+                        assert value.device.type == "cpu"
     actual = optimizer.optimizer.state_dict()
     wanted = expected.state_dict()
     for child in ("muon", "adamw"):
         for key, state in actual[child]["state"].items():
             for name, value in state.items():
                 torch.testing.assert_close(
-                    value, wanted[child]["state"][key][name], atol=0, rtol=0
+                    value.cpu(), wanted[child]["state"][key][name].cpu(), atol=0, rtol=0
                 )
 
 

@@ -5,7 +5,10 @@ from typing import Dict
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
-from torch.optim import Optimizer
+from torch.optim import SGD, AdamW, Optimizer
+
+from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
+from astrai.optimization.optimizer.muon.sharded_update import ShardedMuon
 
 
 class FP32Optimizer(Optimizer):
@@ -13,8 +16,9 @@ class FP32Optimizer(Optimizer):
 
     This owns update precision only. Gradients arrive after model-side
     accumulation/reduction; casting them here cannot recover lost precision.
-    CPU offload moves masters, optimizer state and updates to host memory;
-    transfers are synchronous and are not overlapped with forward/backward.
+    CPU offload stores masters and optimizer state in host memory between
+    steps. Parameters are staged one at a time for GPU updates; transfers
+    are synchronous and are not overlapped with forward/backward.
     """
 
     def __init__(self, optimizer: Optimizer, cpu_offload: bool = False):
@@ -27,8 +31,24 @@ class FP32Optimizer(Optimizer):
             )
         if any(p.dtype not in (torch.float32, torch.bfloat16) for p in parameters):
             raise ValueError("FP32Optimizer supports FP32 and BF16 parameters")
-        if optimizer.state:
+        self._optimizers = (
+            (optimizer.muon, optimizer.adamw)
+            if isinstance(optimizer, MuonAdamW)
+            else (optimizer,)
+        )
+        if any(child.state for child in self._optimizers):
             raise ValueError("Wrap the optimizer before its first update")
+        if (
+            cpu_offload
+            and any(p.is_cuda for p in parameters)
+            and any(
+                not isinstance(child, (AdamW, SGD, ShardedMuon))
+                for child in self._optimizers
+            )
+        ):
+            raise NotImplementedError(
+                "CPU state offload supports AdamW, SGD and Muon optimizers"
+            )
         super().__init__(groups, optimizer.defaults)
         self.optimizer = optimizer
         self._model_params = parameters
@@ -43,6 +63,12 @@ class FP32Optimizer(Optimizer):
             )
             for p in self._model_params
         ]
+        if (
+            cpu_offload
+            and any(p.is_cuda for p in parameters)
+            and any(p.device != parameters[0].device for p in parameters)
+        ):
+            raise ValueError("CPU state offload requires one CUDA model device")
         self._transfer_buffer = (
             torch.empty(
                 4 * max(p.numel() for p in parameters),
@@ -66,31 +92,63 @@ class FP32Optimizer(Optimizer):
             .view(model.shape)
         )
 
+    def _upload(self, value: torch.Tensor, device):
+        buffer = self._buffer(value)
+        buffer.copy_(value)
+        return buffer.to(device)
+
+    def _store(self, value: torch.Tensor, destination=None):
+        buffer = self._buffer(value)
+        buffer.copy_(value)
+        return buffer.clone() if destination is None else destination.copy_(buffer)
+
+    def _offloaded_step(self):
+        models = dict(zip(self._master_params, self._model_params))
+        for optimizer in self._optimizers:
+            for group in optimizer.param_groups:
+                for master in group["params"]:
+                    model = models[master]
+                    if model.grad is None:
+                        continue
+                    host = master.data
+                    state = dict(optimizer.state.get(master, {}))
+                    try:
+                        master.data = self._upload(host, model.device)
+                        optimizer.state[master] = {
+                            name: self._upload(value, model.device)
+                            if isinstance(value, torch.Tensor)
+                            else value
+                            for name, value in state.items()
+                        }
+                        master.grad = model.grad.detach().float()
+                        optimizer.step()
+                        model.copy_(master)
+                        self._store(master.detach(), host)
+                        state = {
+                            name: self._store(value, state.get(name))
+                            if isinstance(value, torch.Tensor)
+                            else value
+                            for name, value in optimizer.state[master].items()
+                        }
+                    finally:
+                        master.grad = None
+                        master.data = host
+                        optimizer.state[master] = state
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        if self._transfer_buffer is not None:
+            self._offloaded_step()
+            return loss
         for model, master in zip(self._model_params, self._master_params):
-            if model.grad is None:
-                master.grad = None
-            elif self._transfer_buffer is not None and model.is_cuda:
-                buffer = self._buffer(model.grad)
-                buffer.copy_(model.grad)
-                master.grad = buffer.to(dtype=torch.float32, copy=True)
-            else:
-                master.grad = model.grad.detach().to(
-                    device=master.device, dtype=torch.float32
-                )
+            master.grad = None if model.grad is None else model.grad.detach().float()
         result = self.optimizer.step()
         for model, master in zip(self._model_params, self._master_params):
-            if self._transfer_buffer is not None and model.is_cuda:
-                buffer = self._buffer(model)
-                buffer.copy_(master)
-                model.copy_(buffer)
-            else:
-                model.copy_(master)
+            model.copy_(master)
         return loss if closure is not None else result
 
     def zero_grad(self, set_to_none: bool = True):

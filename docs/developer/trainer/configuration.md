@@ -32,12 +32,20 @@ The optimizer updates these masters and keeps its floating-point state in FP32,
 then copies the rounded weights back into the original model. FP32-only models
 keep their existing optimizer unless CPU offload is requested.
 
-Set `optimizer.params.cpu_offload: true` to keep masters, optimizer state and
-step computation on CPU. CUDA transfers share one pinned buffer sized for the
-largest FP32 parameter and run synchronously. This saves GPU memory at the cost of
-host computation and transfers; it does not overlap with forward/backward.
-CPU offload is disabled by default. It is particularly expensive for Muon's
-Newton-Schulz matrix operations. Each DDP rank owns its own host optimizer.
+Set `optimizer.params.cpu_offload: true` to store masters and optimizer state
+on CPU between steps. For a CUDA model, each parameter and its state are moved
+to GPU, updated there using the GPU gradient, and copied back to CPU; the BF16
+compute weights are refreshed on GPU. There is no CPU optimizer computation.
+Only one parameter's working state is resident on GPU at a time.
+
+Transfers share one pinned buffer sized for the largest FP32 parameter and run
+synchronously. CPU state storage is disabled by default and currently supports
+AdamW, SGD and MuonAdamW/ShardedMuon with unsharded parameters. Other optimizers
+are rejected because repeated per-parameter steps may change their semantics.
+Parameter staging limits cross-parameter batching and does not overlap transfers
+with computation. Each DDP rank retains its own CPU state. This saves GPU memory
+between steps and reduces full-model step peaks, but still requires GPU space
+for the largest parameter, its FP32 gradient, state and compute scratch.
 
 Optimizer checkpoints contain both the inner optimizer state and FP32 masters;
 restoring copies the masters back to the compute weights. CPU and GPU placement

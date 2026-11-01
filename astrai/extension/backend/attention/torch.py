@@ -1,10 +1,12 @@
 """Torch reference attention backend."""
 
+import functools
 from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask, create_mask, flex_attention
 
 from astrai.extension.backend.attention.common import _check_fwd, repeat_kv
 
@@ -56,6 +58,13 @@ def _packed_mask(mask: Optional[Tensor], allowed: Tensor, max_q: int) -> Tensor:
     return _combine_mask(allowed, mask)
 
 
+@functools.lru_cache(maxsize=1)
+def _compiled_flex_attention():
+    # Packed batch shapes change between steps; static compiles would hit the
+    # recompile limit and fall back to eager flex attention.
+    return torch.compile(flex_attention, dynamic=True)
+
+
 def forward(
     q: Tensor,
     k: Tensor,
@@ -69,6 +78,28 @@ def forward(
     scale: Optional[float] = None,
 ) -> Tensor:
     _check_fwd(fwd)
+    if isinstance(attn_mask, BlockMask) and q.size(-1) < 16:
+        # Flex kernels need head_dim >= 16; small heads take the dense path.
+        attn_mask = create_mask(
+            attn_mask.mask_mod,
+            attn_mask.shape[0],
+            None,
+            *attn_mask.seq_lengths,
+            device=q.device,
+        )
+    if isinstance(attn_mask, BlockMask):
+        return (
+            _compiled_flex_attention()(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                block_mask=attn_mask,
+                scale=scale,
+                enable_gqa=q.size(2) != k.size(2),
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )
     if q.ndim == 4:
         n_rep = q.size(2) // k.size(2)
         if n_rep > 1:

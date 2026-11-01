@@ -465,6 +465,29 @@ def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
     return (same_doc & causal).unsqueeze(1)
 
 
+def make_doc_block_mask(position_ids: Tensor):
+    """FlexAttention form of :func:`make_doc_boundary_mask` for CUDA batches.
+
+    Fully masked blocks are skipped instead of materializing an [B, 1, S, S]
+    mask that forces the masked SDPA kernel.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    S = position_ids.size(1)
+    boundaries = position_ids[:, 1:] <= position_ids[:, :-1]
+    doc_ids = torch.cat(
+        [torch.zeros_like(position_ids[:, :1]), boundaries.long().cumsum(dim=1)],
+        dim=1,
+    )
+
+    def same_doc_causal(b, h, q, kv):
+        return (doc_ids[b, q] == doc_ids[b, kv]) & (q >= kv)
+
+    return create_block_mask(
+        same_doc_causal, position_ids.size(0), None, S, S, device=position_ids.device
+    )
+
+
 def _collect_moe_diagnostics(
     router_stats_list: List[RouterStats],
 ) -> Dict[str, float]:

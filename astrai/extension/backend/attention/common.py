@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch as _torch
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask
 
 from astrai.extension.runtime.operation import OpSpec
 
@@ -91,9 +92,13 @@ def _attention_spec(
         and any(t.requires_grad for t in (q, k, v)),
         head_dim=q.size(-1),
         ndim=q.dim(),
-        mask_kind="none" if attn_mask is None else str(attn_mask.dtype),
-        mask_ndim=0 if attn_mask is None else attn_mask.ndim,
-        mask_last_stride=0 if attn_mask is None else attn_mask.stride(-1),
+        mask_kind="none"
+        if attn_mask is None
+        else "block"
+        if isinstance(attn_mask, BlockMask)
+        else str(attn_mask.dtype),
+        mask_ndim=attn_mask.ndim if isinstance(attn_mask, Tensor) else 0,
+        mask_last_stride=attn_mask.stride(-1) if isinstance(attn_mask, Tensor) else 0,
         kv_cache_kind="none" if kv_cache is None else type(kv_cache).__name__,
         is_causal=is_causal,
         fwd=fwd,

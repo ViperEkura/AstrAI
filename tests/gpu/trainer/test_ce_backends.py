@@ -217,3 +217,55 @@ def test_fsdp_head_fused_ce(tmp_path):
     mp.spawn(
         _fsdp_worker, args=(os.fspath(tmp_path / "init_fsdp"),), nprocs=2, join=True
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_sft_uses_block_mask_and_matches_dense(monkeypatch):
+    from astrai.trainer.strategy import ops, supervised
+
+    torch.manual_seed(0)
+    net = model("cuda")
+    positions = torch.cat([torch.arange(40), torch.arange(24)]).repeat(2, 1)
+    batch = {
+        "input_ids": torch.randint(0, 257, (2, 64), device="cuda"),
+        "target_ids": torch.randint(0, 257, (2, 64), device="cuda"),
+        "position_ids": positions.cuda(),
+        "loss_mask": torch.ones(2, 64, dtype=torch.bool, device="cuda"),
+    }
+    masks = []
+    build = supervised.make_doc_block_mask
+    monkeypatch.setattr(
+        supervised, "make_doc_block_mask", lambda p: masks.append(1) or build(p)
+    )
+    flex_loss = SFTStrategy(net, "cuda").compute_loss(dict(batch))
+    flex_loss.backward()
+    flex_grads = [p.grad.clone() for p in net.parameters()]
+    net.zero_grad()
+    monkeypatch.setattr(supervised, "make_doc_block_mask", ops.make_doc_boundary_mask)
+    dense_loss = SFTStrategy(net, "cuda").compute_loss(dict(batch))
+    dense_loss.backward()
+    assert masks == [1]
+    torch.testing.assert_close(flex_loss, dense_loss, rtol=2e-2, atol=2e-2)
+    for a, p in zip(flex_grads, net.parameters()):
+        torch.testing.assert_close(a.float(), p.grad.float(), rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_block_mask_with_small_heads_matches_dense_attention():
+    from torch.nn.attention.flex_attention import create_block_mask, create_mask
+
+    from astrai.extension.backend.attention import torch as backend
+
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 64, 2, 8, device="cuda") for _ in range(3))
+    doc = (torch.arange(64, device="cuda") >= 40).long()
+
+    def same_doc_causal(b, h, q_idx, kv_idx):
+        return (doc[q_idx] == doc[kv_idx]) & (q_idx >= kv_idx)
+
+    block = create_block_mask(same_doc_causal, 2, None, 64, 64, device="cuda")
+    dense = create_mask(same_doc_causal, 2, None, 64, 64, device="cuda")
+    torch.testing.assert_close(
+        backend.forward(q, k, v, None, 0, block),
+        backend.forward(q, k, v, None, 0, dense),
+    )

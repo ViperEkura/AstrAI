@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks.base import TrainCallback
 from astrai.trainer.optional_extras import (
+    component_optimizers,
     snapshot_component_extras,
     snapshot_extras,
 )
@@ -86,6 +87,7 @@ class CheckpointCallback(TrainCallback):
             context.model,
             optimizer=context.optimizer,
             export_dtype=context.config.precision.export_dtype,
+            extra_optimizers=component_optimizers(context.strategy),
         ) as (state_dict, weight_extras):
             if state_dict is not None:
                 save_path = os.path.join(

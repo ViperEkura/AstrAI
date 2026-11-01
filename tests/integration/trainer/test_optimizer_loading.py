@@ -9,7 +9,10 @@ from astrai.config import ComponentSpec, TrainConfig
 from astrai.optimization.optimizer import OptimizerFactory
 from astrai.serialization import Checkpoint
 from astrai.serialization import checkpoint as checkpoint_module
-from astrai.trainer.components import load_optimizer_state_dict
+from astrai.trainer.components import (
+    build_optimizer_component,
+    load_optimizer_state_dict,
+)
 from astrai.trainer.context import TrainContextBuilder
 from tests.support.models import make_model
 from tests.support.trainer import make_resume_metadata
@@ -42,7 +45,12 @@ def _config(**overrides):
 
 def _save_checkpoint(path, *, with_optimizer=True):
     model, config = make_model("cpu")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1, weight_decay=0.01)
+    optimizer = build_optimizer_component(
+        ComponentSpec(
+            type="torch.optim:AdamW", params={"lr": 0.1, "weight_decay": 0.01}
+        ),
+        model,
+    )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
     for _ in range(3):
         for param in model.parameters():
@@ -115,9 +123,11 @@ def test_builder_loads_selected_state_dicts(tmp_path, monkeypatch, flags, resume
             not torch.equal(value, checkpoint.state_dict[name])
             for name, value in context.model.state_dict().items()
         )
-    states = context.optimizer.state_dict()["state"]
+    states = context.optimizer.state_dict()["optimizer"]["state"]
     if options["optimizer"]:
-        saved_states = list(checkpoint.extra["optimizer"]["state"].values())
+        saved_states = list(
+            checkpoint.extra["optimizer"]["optimizer"]["state"].values()
+        )
         current_states = list(states.values())
         assert len(current_states) == len(saved_states)
         for current, saved in zip(current_states, saved_states, strict=True):
@@ -147,7 +157,7 @@ def test_weights_only_checkpoint_starts_with_fresh_optimizer(tmp_path, monkeypat
     _save_checkpoint(tmp_path, with_optimizer=False)
     monkeypatch.setenv("LOCAL_DEVICE", "cpu")
     context = TrainContextBuilder(_config()).with_param_path(str(tmp_path)).build()
-    assert not context.optimizer.state_dict()["state"]
+    assert not context.optimizer.state_dict()["optimizer"]["state"]
     assert context.consumed_samples == 0
 
 
@@ -166,8 +176,8 @@ def test_changing_optimizer_requires_explicit_reset(tmp_path, monkeypatch):
         .with_param_path(str(tmp_path))
         .build()
     )
-    assert isinstance(context.optimizer, torch.optim.SGD)
-    assert not context.optimizer.state_dict()["state"]
+    assert isinstance(context.optimizer.optimizer, torch.optim.SGD)
+    assert not context.optimizer.state_dict()["optimizer"]["state"]
 
 
 def test_unknown_state_dict_component_is_rejected():

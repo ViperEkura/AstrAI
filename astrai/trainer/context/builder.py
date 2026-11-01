@@ -67,7 +67,13 @@ class TrainContextBuilder:
 
     def _instantiate_optimizer(self, model: nn.Module):
         return build_optimizer_component(
-            self.config.optimizer, model, self.config.precision
+            self.config.optimizer,
+            model,
+            self.config.precision,
+            process_group=self.config.executor_kwargs.get(
+                "process_group",
+                self._topology.dp_group if self._topology is not None else None,
+            ),
         )
 
     def _instantiate_scheduler(self, optimizer, dataset_len: int):
@@ -95,6 +101,12 @@ class TrainContextBuilder:
             tp_size=self.config.tp_size,
             device_type=self.config.device_type,
         )
+        if self.config.optimizer.params.get("shard_state", False) and (
+            not self._topology.is_trivial or self.config.dp_mode == "fsdp"
+        ):
+            raise NotImplementedError(
+                "Optimizer state ownership requires replicated none/DDP parameters"
+            )
         if self._topology.tp_size > 1:
             self._validate_tp()
 

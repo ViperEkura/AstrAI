@@ -42,8 +42,9 @@ Compute, main gradients, persistent master weights and optimizer moments support
 float32 or bfloat16. Gradient dtype model uses native parameter gradients.
 Optimizer update arithmetic remains FP32; selecting BF16 master or moment
 storage rounds those values after every step and can lose small updates.
-Optimizer step counters remain FP32. FP32-only models with default FP32 storage
-keep their native optimizer.
+Optimizer step counters remain FP32. Dense FP32-only models use the same
+precision optimizer protocol and reuse their compute parameters as masters;
+the underlying optimizer still performs the native FP32 update.
 
 Library defaults preserve the model factory's compute dtype and native export
 dtype (None); the CLI defaults compute to bfloat16. Other defaults are float32.
@@ -138,7 +139,9 @@ Set optimizer.params.shard_state to true with cpu_offload false to keep FP32
 masters and moments on their owning GPUs. Assignment is deterministic and
 balances estimated state bytes; each Muon matrix stays intact. Every rank
 still accumulates and reduces full FP32 gradients. Only the owner updates a
-parameter, then broadcasts its compute-format weights to all ranks. This
+parameter, then broadcasts its compute-format weights within the supplied
+data-parallel process group. Ownership, state gathering and the checkpoint
+writer use that same group; independent groups never exchange weights. This
 avoids replicated updates and repeated CPU state transfers.
 
 ```yaml
@@ -157,11 +160,20 @@ Muon. It does not add DTensor/FSDP/TP support or change the precision policy.
 CPU offload can also be combined with ownership. All ranks must participate
 in step and load_state_dict, with the same already-reduced gradients.
 
-The executor enters optimizer.checkpoint_context collectively. The optimizer
-gathers masters and moments to rank zero as CPU tensors, streaming tensor
+The executor enters checkpoint contexts for the policy optimizer and all
+declared strategy optimizers, including the PPO critic, collectively before
+the writer snapshots extras. The optimizer
+gathers masters and moments to group rank zero as CPU tensors, streaming tensor
 payloads without staging the complete checkpoint on one GPU. The writer then
 uses the existing full optimizer checkpoint format. Temporary consolidated
 state is released on context exit. Direct distributed optimizer callers must
 enter that context on every rank before calling state_dict or exporting named
 masters on rank zero. An unsharded optimizer can load the resulting checkpoint;
 a sharded optimizer selects the state for its current owners when loading.
+
+Dense training optimizers use the same explicit precision-state format with
+ownership enabled or disabled. Pure FP32 resident updates reuse compute
+parameters as masters, without allocating another weight copy. Changing
+ownership or CPU placement therefore keeps the full-resume state protocol
+unchanged. Native DTensor/FSDP optimizer handling remains separate; ownership
+is rejected for CP/TP/FSDP training until those layouts are supported.

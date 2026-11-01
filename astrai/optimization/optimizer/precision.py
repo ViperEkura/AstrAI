@@ -36,9 +36,11 @@ def _parameter_owners(optimizers, world_size):
     return owners
 
 
-def _gather_tensor_tree(value, source, device):
+def _gather_tensor_tree(value, source, device, group):
     """Collect CPU snapshots on rank zero without a full GPU staging buffer."""
-    rank = dist.get_rank()
+    rank = dist.get_rank(group)
+    source_rank = dist.get_global_rank(group, source)
+    writer_rank = dist.get_global_rank(group, 0)
     if rank == source:
         leaves, spec = tree_flatten(value)
         descriptions = [
@@ -51,7 +53,7 @@ def _gather_tensor_tree(value, source, device):
     else:
         leaves = None
         metadata = [None, None]
-    dist.broadcast_object_list(metadata, src=source)
+    dist.broadcast_object_list(metadata, src=source_rank, group=group)
     spec, descriptions = metadata
     result = []
     for index, description in enumerate(descriptions):
@@ -63,10 +65,14 @@ def _gather_tensor_tree(value, source, device):
             if rank == 0:
                 result.append(leaves[index].detach().to(device="cpu", copy=True))
         elif rank == source:
-            dist.send(leaves[index].detach().to(device=device).contiguous(), dst=0)
+            dist.send(
+                leaves[index].detach().to(device=device).contiguous(),
+                dst=writer_rank,
+                group=group,
+            )
         elif rank == 0:
             received = torch.empty(description[1], dtype=description[2], device=device)
-            dist.recv(received, src=source)
+            dist.recv(received, src=source_rank, group=group)
             result.append(received.to(device="cpu", copy=True))
             del received
     return tree_unflatten(result, spec) if rank == 0 else None
@@ -78,6 +84,35 @@ def _merge_optimizer_state(destination, source):
     else:
         for name in destination:
             _merge_optimizer_state(destination[name], source[name])
+
+
+def _global_optimizer_state(optimizer, model_groups, masters):
+    """Serialize stable full-parameter IDs without changing live groups."""
+    saved = optimizer.state_dict()
+    indices = {
+        model: index
+        for index, model in enumerate(
+            model for models in model_groups for model in models
+        )
+    }
+    master_indices = {
+        master: indices[model] for model, master in masters.items() if model in indices
+    }
+    remap = {
+        index: master_indices[master]
+        for saved_group, live_group in zip(
+            saved["param_groups"], optimizer.param_groups
+        )
+        for index, master in zip(saved_group["params"], live_group["params"])
+    }
+    return {
+        **saved,
+        "state": {remap[index]: value for index, value in saved["state"].items()},
+        "param_groups": [
+            {**group, "params": [indices[model] for model in models]}
+            for group, models in zip(saved["param_groups"], model_groups)
+        ],
+    }
 
 
 def _local_optimizer_state(saved, model_groups, owners, rank):
@@ -125,6 +160,7 @@ class PrecisionOptimizer(Optimizer):
         master_dtype: torch.dtype = torch.float32,
         state_dtype: torch.dtype = torch.float32,
         shard_state: bool = False,
+        process_group=None,
     ):
         if not isinstance(shard_state, bool):
             raise ValueError("shard_state must be a boolean")
@@ -171,7 +207,18 @@ class PrecisionOptimizer(Optimizer):
         ]
         self._owners = None
         self._checkpoint_state = None
-        if shard_state and dist.is_initialized() and dist.get_world_size() > 1:
+        self.process_group = process_group
+        if shard_state and dist.is_initialized():
+            self.process_group = (
+                process_group if process_group is not None else dist.group.WORLD
+            )
+            if dist.get_rank(self.process_group) < 0:
+                raise ValueError("Optimizer rank must belong to its process group")
+        if (
+            shard_state
+            and dist.is_initialized()
+            and dist.get_world_size(self.process_group) > 1
+        ):
             if any(
                 not isinstance(child, (AdamW, SGD, ShardedMuon))
                 for child in self._optimizers
@@ -179,8 +226,10 @@ class PrecisionOptimizer(Optimizer):
                 raise NotImplementedError("State sharding supports AdamW, SGD and Muon")
             if len({parameter.device for parameter in parameters}) != 1:
                 raise ValueError("Sharded optimizer parameters must share one device")
-            self._owners = _parameter_owners(self._optimizers, dist.get_world_size())
-            rank = dist.get_rank()
+            self._owners = _parameter_owners(
+                self._optimizers, dist.get_world_size(self.process_group)
+            )
+            rank = dist.get_rank(self.process_group)
             parameters = [
                 parameter for parameter in parameters if self._owners[parameter] == rank
             ]
@@ -198,6 +247,9 @@ class PrecisionOptimizer(Optimizer):
             raise ValueError("CPU state offload requires one CUDA model device")
         self._master_params = []
         for model in self._model_params:
+            if not cpu_offload and model.dtype == master_dtype == torch.float32:
+                self._master_params.append(model)
+                continue
             value = model.detach().to(
                 device="cpu" if cpu_offload else model.device,
                 dtype=master_dtype,
@@ -278,7 +330,8 @@ class PrecisionOptimizer(Optimizer):
                 master.grad = None if gradient is None else gradient.detach().float()
             result = self.optimizer.step()
             for model, master in zip(self._model_params, self._master_params):
-                model.copy_(master)
+                if model is not master:
+                    model.copy_(master)
             return result
 
         stored = [master.data for master in self._master_params]
@@ -334,7 +387,10 @@ class PrecisionOptimizer(Optimizer):
             return
         pending = [
             dist.broadcast(
-                parameter.detach(), src=self._owners[parameter], async_op=True
+                parameter.detach(),
+                src=dist.get_global_rank(self.process_group, self._owners[parameter]),
+                group=self.process_group,
+                async_op=True,
             )
             for parameter in self._all_model_params
         ]
@@ -348,35 +404,30 @@ class PrecisionOptimizer(Optimizer):
             yield
             return
         masters = dict(zip(self._model_params, self._master_params))
-        stored_groups = []
-        try:
-            for child, model_groups in zip(self._optimizers, self._model_groups):
-                for group, models in zip(child.param_groups, model_groups):
-                    stored_groups.append((group, group["params"]))
-                    group["params"] = [
-                        masters.get(parameter, parameter) for parameter in models
-                    ]
-            local = {
-                "optimizer": self.optimizer.state_dict(),
-                "master_params": {
-                    index: masters[parameter].detach()
-                    for index, parameter in enumerate(self._all_model_params)
-                    if parameter in masters
-                },
-                "precision": {
-                    "master_dtype": str(self.master_dtype).removeprefix("torch."),
-                    "optimizer_state_dtype": str(self.state_dtype).removeprefix(
-                        "torch."
-                    ),
-                },
-            }
-        finally:
-            for group, parameters in stored_groups:
-                group["params"] = parameters
+        states = [
+            _global_optimizer_state(child, groups, masters)
+            for child, groups in zip(self._optimizers, self._model_groups)
+        ]
+        local = {
+            "optimizer": dict(zip(("muon", "adamw"), states))
+            if isinstance(self.optimizer, MuonAdamW)
+            else states[0],
+            "master_params": {
+                index: masters[parameter].detach()
+                for index, parameter in enumerate(self._all_model_params)
+                if parameter in masters
+            },
+            "precision": {
+                "master_dtype": str(self.master_dtype).removeprefix("torch."),
+                "optimizer_state_dtype": str(self.state_dtype).removeprefix("torch."),
+            },
+        }
         full = None
-        for source in range(dist.get_world_size()):
-            part = _gather_tensor_tree(local, source, self._all_model_params[0].device)
-            if dist.get_rank() == 0:
+        for source in range(dist.get_world_size(self.process_group)):
+            part = _gather_tensor_tree(
+                local, source, self._all_model_params[0].device, self.process_group
+            )
+            if dist.get_rank(self.process_group) == 0:
                 if full is None:
                     full = part
                 else:
@@ -433,7 +484,7 @@ class PrecisionOptimizer(Optimizer):
             raise ValueError("Checkpoint master weights do not match the model")
         optimizer_state = state_dict["optimizer"]
         if self._owners is not None:
-            rank = dist.get_rank()
+            rank = dist.get_rank(self.process_group)
             if isinstance(self.optimizer, MuonAdamW):
                 optimizer_state = {
                     name: _local_optimizer_state(

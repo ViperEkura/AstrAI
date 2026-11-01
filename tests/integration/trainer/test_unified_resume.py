@@ -96,10 +96,13 @@ def test_metadata_migration_preserves_resume_and_tensor_files(tmp_path):
     assert resumed.extra["scheduler"] == baseline.extra["scheduler"]
     for name, tensor in baseline.state_dict.items():
         torch.testing.assert_close(tensor, resumed.state_dict[name], rtol=0, atol=0)
-    for index, saved in baseline.extra["optimizer"]["state"].items():
+    for index, saved in baseline.extra["optimizer"]["optimizer"]["state"].items():
         for key, tensor in saved.items():
             torch.testing.assert_close(
-                tensor, resumed.extra["optimizer"]["state"][index][key], rtol=0, atol=0
+                tensor,
+                resumed.extra["optimizer"]["optimizer"]["state"][index][key],
+                rtol=0,
+                atol=0,
             )
 
 
@@ -142,7 +145,7 @@ def test_partial_update_cannot_publish_checkpoint(tmp_path, monkeypatch, failure
     assert saved.meta["optimizer_step"] == 1
     assert all(
         state["step"].item() == 1
-        for state in saved.extra["optimizer"]["state"].values()
+        for state in saved.extra["optimizer"]["optimizer"]["state"].values()
     )
 
 

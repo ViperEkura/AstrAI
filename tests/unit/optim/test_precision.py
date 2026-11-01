@@ -215,3 +215,25 @@ def test_master_state_dict_preserves_aliases_and_filters_unmanaged_parameters():
     torch.testing.assert_close(
         optimizer.state_dict()["master_params"][0], state["weight"], atol=0, rtol=0
     )
+
+
+def test_native_fp32_factory_reuses_compute_parameters_and_keeps_state_protocol():
+    model = nn.Linear(2, 1)
+    reference = copy.deepcopy(model)
+    actual = build_optimizer_component(
+        ComponentSpec(type="torch.optim:SGD", params={"lr": 0.1, "momentum": 0.9}),
+        model,
+    )
+    expected = torch.optim.SGD(reference.parameters(), lr=0.1, momentum=0.9)
+    assert isinstance(actual, PrecisionOptimizer)
+    assert all(p is q for p, q in zip(model.parameters(), actual._master_params))
+    for _ in range(3):
+        model(torch.ones(2)).sum().backward()
+        reference(torch.ones(2)).sum().backward()
+        actual.step()
+        expected.step()
+        actual.zero_grad()
+        expected.zero_grad()
+    for p, q in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(p, q, atol=0, rtol=0)
+    assert set(actual.state_dict()) == {"optimizer", "master_params", "precision"}

@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset, random_split
 
@@ -77,7 +78,11 @@ def build_model_component(
 
 
 def build_optimizer_component(
-    spec: ComponentSpec, model: nn.Module, precision: Optional[PrecisionConfig] = None
+    spec: ComponentSpec,
+    model: nn.Module,
+    precision: Optional[PrecisionConfig] = None,
+    *,
+    process_group=None,
 ):
     params = dict(spec.params)
     cpu_offload = params.pop("cpu_offload", False)
@@ -98,7 +103,8 @@ def build_optimizer_component(
     state_dtype = getattr(torch, policy.optimizer_state_dtype)
     parameters = [p for group in optimizer.param_groups for p in group["params"]]
     if (
-        cpu_offload
+        not any(isinstance(p, DTensor) for p in parameters)
+        or cpu_offload
         or shard_state
         or master_dtype != torch.float32
         or state_dtype != torch.float32
@@ -110,6 +116,7 @@ def build_optimizer_component(
             master_dtype=master_dtype,
             state_dtype=state_dtype,
             shard_state=shard_state,
+            process_group=process_group,
         )
     return optimizer
 

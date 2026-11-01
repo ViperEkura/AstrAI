@@ -1,20 +1,25 @@
 """Export formats must never change resumable training tensors."""
 
 from dataclasses import replace
+from functools import partial
+from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
 
-from astrai.config import PrecisionConfig
+from astrai.config import ComponentSpec, PrecisionConfig, TrainConfig
 from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.parallel.executor import NoneExecutor
 from astrai.serialization import Checkpoint
 from astrai.trainer.context import TrainContextBuilder
 from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.trainer import Trainer
+from tests.integration.trainer.test_online_e2e import LengthRewardModel
 from tests.integration.trainer.test_unified_resume import _config, _StopAfterOne
 from tests.support.precision import assert_precision_state
+from tests.support.tokenizers import CHAT_TEMPLATE
+from tests.support.trainer import make_online_value_model
 
 
 @pytest.mark.parametrize("compute", ["float32", "bfloat16"])
@@ -172,7 +177,7 @@ def test_export_handles_tied_names_unmanaged_weights_and_buffers(
         torch.testing.assert_close(actual[name], value, atol=0, rtol=0)
 
 
-def _sharded_config(path, policy):
+def _sharded_config(path, policy, shard_state=True):
     config = _config(
         path,
         precision=policy,
@@ -184,18 +189,31 @@ def _sharded_config(path, policy):
     return replace(
         config,
         optimizer=replace(
-            config.optimizer, params={**config.optimizer.params, "shard_state": True}
+            config.optimizer,
+            params={**config.optimizer.params, "shard_state": shard_state},
         ),
     )
 
 
-def test_sharded_trainer_export_resume_matches_continuous_training(tmp_path):
-    policy = PrecisionConfig(compute_dtype="bfloat16", export_dtype="float16")
+@pytest.mark.parametrize(
+    "compute,source_sharded,target_sharded",
+    [
+        ("bfloat16", True, True),
+        ("float32", True, False),
+        ("float32", False, True),
+    ],
+)
+def test_sharded_trainer_export_resume_matches_continuous_training(
+    tmp_path, compute, source_sharded, target_sharded
+):
+    policy = PrecisionConfig(compute_dtype=compute, export_dtype="float16")
     baseline_dir, source_dir, resumed_dir = [
         tmp_path / name for name in ("baseline", "source", "resumed")
     ]
-    Trainer(_sharded_config(baseline_dir, policy)).train()
-    Trainer(_sharded_config(source_dir, policy), callbacks=[_StopAfterOne()]).train()
+    Trainer(_sharded_config(baseline_dir, policy, source_sharded)).train()
+    Trainer(
+        _sharded_config(source_dir, policy, source_sharded), callbacks=[_StopAfterOne()]
+    ).train()
     source = source_dir / "epoch_0_step_1"
     saved = Checkpoint.load(str(source))
     assert all(
@@ -204,7 +222,7 @@ def test_sharded_trainer_export_resume_matches_continuous_training(tmp_path):
         if value.is_floating_point()
     )
     assert all(
-        value.dtype == torch.bfloat16
+        value.dtype == getattr(torch, compute)
         for value in saved.extra["training_model"].values()
         if value.is_floating_point()
     )
@@ -219,7 +237,9 @@ def test_sharded_trainer_export_resume_matches_continuous_training(tmp_path):
     loader._load_from_param_path(warm)
     torch.testing.assert_close(warm.state_dict, saved.state_dict, rtol=0, atol=0)
     Trainer(
-        _sharded_config(resumed_dir, replace(policy, export_dtype="float32"))
+        _sharded_config(
+            resumed_dir, replace(policy, export_dtype="float32"), target_sharded
+        )
     ).train(param_path=str(source), resume=True)
     baseline = Checkpoint.load(str(baseline_dir / "epoch_0_step_4"))
     resumed = Checkpoint.load(str(resumed_dir / "epoch_0_step_4"))
@@ -230,3 +250,68 @@ def test_sharded_trainer_export_resume_matches_continuous_training(tmp_path):
         atol=0,
     )
     assert_precision_state(baseline.extra["optimizer"], resumed.extra["optimizer"])
+
+
+def test_sharded_ppo_critic_checkpoint_matches_continuous_training(base_test_env):
+    root = Path(base_test_env["test_dir"])
+    tokenizer = base_test_env["tokenizer"]
+    tokenizer.set_chat_template(CHAT_TEMPLATE)
+    tokenizer.save_pretrained(root)
+    model_config = base_test_env["transformer_config"]
+    config = TrainConfig(
+        strategy="online_ppo",
+        model=ComponentSpec(
+            type="autoregressive_lm", params={"config": model_config.to_dict()}
+        ),
+        precision=PrecisionConfig(compute_dtype="float32", export_dtype="bfloat16"),
+        dataset=ComponentSpec(
+            type="tests.integration.trainer.test_online_e2e:InstructionDataset",
+            params={
+                "collate": "tests.integration.trainer.test_online_e2e:instruction_collate_fn"
+            },
+        ),
+        optimizer=ComponentSpec(
+            type="torch.optim:AdamW", params={"lr": 1e-4, "shard_state": True}
+        ),
+        scheduler=ComponentSpec(
+            type="torch.optim.lr_scheduler:StepLR",
+            params={"step_size": 1, "gamma": 1.0},
+        ),
+        n_epoch=1,
+        batch_per_device=1,
+        grad_accum_steps=1,
+        ckpt_interval=1,
+        random_seed=42,
+        device_type="cpu",
+        backend="gloo",
+        dp_mode="ddp",
+        dp_size=2,
+        strategy_kwargs={"group_size": 2, "kl_coef": 0.01},
+        rollout_interval=1,
+        rollout_max_policy_lag=0,
+        rollout_temperature=1.0,
+        rollout_top_k=1,
+        rollout_max_tokens=4,
+        reward_model_fn=LengthRewardModel,
+        critic_model_fn=partial(make_online_value_model, model_config),
+    )
+    Trainer(replace(config, ckpt_dir=str(root / "continuous"))).train(
+        param_path=str(root)
+    )
+    Trainer(
+        replace(config, ckpt_dir=str(root / "source")), callbacks=[_StopAfterOne()]
+    ).train(param_path=str(root))
+    source = root / "source/epoch_0_step_1"
+    saved = Checkpoint.load(str(source))
+    assert saved.extra["value_optimizer"]["master_params"]
+    assert all(
+        t.dtype == torch.float32
+        for t in saved.extra["value_optimizer"]["master_params"]
+    )
+    Trainer(replace(config, ckpt_dir=str(root / "resumed"))).train(
+        param_path=str(source), resume=True
+    )
+    expected = Checkpoint.load(str(root / "continuous/epoch_0_step_2"))
+    actual = Checkpoint.load(str(root / "resumed/epoch_0_step_2"))
+    for key in ("training_model", "optimizer", "value_model", "value_optimizer"):
+        assert_precision_state(actual.extra[key], expected.extra[key])

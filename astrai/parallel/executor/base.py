@@ -18,7 +18,7 @@ from astrai.parallel.executor.gradients import (
     clip_model_gradients,
     parameter_gradient,
 )
-from astrai.parallel.setup import get_rank, get_world_size
+from astrai.parallel.setup import get_world_size
 
 logger = logging.getLogger(__name__)
 
@@ -219,21 +219,27 @@ class BaseExecutor:
         return strip_compile_prefix(model.state_dict())
 
     @property
+    def checkpoint_group(self):
+        """Communication domain whose leader publishes this model's checkpoint."""
+        return None
+
+    @property
     def writes_checkpoints(self) -> bool:
         """Whether this rank owns the published checkpoint payload."""
-        return not self.use_distributed or get_rank() == 0
+        return not self.use_distributed or dist.get_rank(self.checkpoint_group) == 0
 
     @contextmanager
-    def checkpoint_context(self, model: nn.Module, *, optimizer, export_dtype):
+    def checkpoint_context(
+        self, model: nn.Module, *, optimizer, export_dtype, extra_optimizers=()
+    ):
         """Gather export weights and original training weights at one step boundary."""
         if self.use_distributed:
-            dist.barrier()
-        optimizer_context = getattr(optimizer, "checkpoint_context", None)
-        with (
-            optimizer_context()
-            if optimizer_context is not None
-            else contextlib.nullcontext()
-        ):
+            dist.barrier(group=self.checkpoint_group)
+        with contextlib.ExitStack() as stack:
+            for component in dict.fromkeys((optimizer, *extra_optimizers)):
+                optimizer_context = getattr(component, "checkpoint_context", None)
+                if optimizer_context is not None:
+                    stack.enter_context(optimizer_context())
             # Compile wraps the parallel module; gather its original public keys.
             model = getattr(model, "_orig_mod", model)
             state_dict = self._gather_state_dict(model)
@@ -263,7 +269,7 @@ class BaseExecutor:
                 state_dict = exported
             yield state_dict, weight_extras
         if self.use_distributed:
-            dist.barrier()
+            dist.barrier(group=self.checkpoint_group)
 
     def _gather_state_dict(self, model: nn.Module):
         state_dict = self.model_state_dict(model)

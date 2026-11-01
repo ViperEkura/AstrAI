@@ -59,6 +59,10 @@ class DDPExecutor(BaseExecutor):
             forward_sync_buffers=forward_sync_buffers,
         )
 
+    @property
+    def checkpoint_group(self):
+        return self._ddp_kwargs["process_group"]
+
     def _prepare_model(self, model: nn.Module) -> nn.Module:
         uses_main_gradients = self._uses_main_gradients(model)
         if uses_main_gradients and (

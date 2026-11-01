@@ -1,6 +1,7 @@
 """Accumulation precision, DDP parity and main-gradient consumers."""
 
 import copy
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -9,11 +10,13 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from astrai.config import ComponentSpec, PrecisionConfig
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.parallel.executor import DDPExecutor, NoneExecutor
 from astrai.parallel.executor.gradients import parameter_gradient
 from astrai.trainer.callbacks.metric_util import GradSNRTracker, grad_norm
+from astrai.trainer.components import build_optimizer_component
 from tests.support.precision import assert_precision_state
 
 
@@ -533,5 +536,73 @@ def test_complete_parameter_ownership_export_and_resume(tmp_path, backend, cpu_o
         _owner_state_check,
         args=(Path(tmp_path / "owners").as_uri(), str(tmp_path), backend, cpu_offload),
         nprocs=2,
+        join=True,
+    )
+
+
+def _subgroup_owner_check(rank, rendezvous):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=4,
+        init_method=rendezvous,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
+        group = groups[rank // 2]
+        executor = DDPExecutor(process_group=group, grad_accum_dtype="float32")
+        model = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+        model.weight.data.fill_(1)
+        model = executor._prepare_model(model)
+        raw = executor.model_for_inference(model)
+        optimizer = build_optimizer_component(
+            ComponentSpec(
+                type="torch.optim:SGD", params={"lr": 0.1, "shard_state": True}
+            ),
+            raw,
+            PrecisionConfig(compute_dtype="bfloat16"),
+            process_group=group,
+        )
+        executor.backward(
+            model(torch.full((1, 2), rank // 2 + 1, dtype=torch.bfloat16)).sum()
+        )
+        optimizer.step()
+        expected = torch.full_like(raw.weight, 1 - 0.1 * (rank // 2 + 1))
+        torch.testing.assert_close(raw.weight, expected, atol=0, rtol=0)
+        with executor.checkpoint_context(
+            model, optimizer=optimizer, export_dtype="float32"
+        ) as (state, extra):
+            if rank % 2 == 0:
+                torch.testing.assert_close(
+                    state["weight"], torch.full((2, 2), 1 - 0.1 * (rank // 2 + 1))
+                )
+                saved = copy.deepcopy(optimizer.state_dict())
+                assert extra["training_model"]["weight"].dtype == torch.bfloat16
+            else:
+                assert state is None and extra == {}
+                saved = None
+            data = [saved]
+            dist.broadcast_object_list(data, src=rank // 2 * 2, group=group)
+        optimizer.load_state_dict(data[0])
+        torch.testing.assert_close(raw.weight, expected, atol=0, rtol=0)
+        # Only one group saves here; peers in the other group need not enter it.
+        if rank < 2:
+            with executor.checkpoint_context(
+                model, optimizer=optimizer, export_dtype=None
+            ):
+                pass
+        dist.barrier()
+        executor._grad_accumulator.close()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_optimizer_ownership_and_checkpoints_stay_inside_ddp_group(tmp_path):
+    mp.spawn(
+        _subgroup_owner_check,
+        args=(Path(tmp_path / "subgroups").as_uri(),),
+        nprocs=4,
         join=True,
     )

@@ -225,6 +225,16 @@ def component_extra_keys(*attributes: str) -> Tuple[str, ...]:
     return tuple(e.key for e in COMPONENT_EXTRAS if e.attribute in wanted)
 
 
+def component_optimizers(strategy):
+    """Enumerate all strategy optimizers before any rank starts snapshotting."""
+    return tuple(
+        component
+        for entry in COMPONENT_EXTRAS
+        if entry.kind == "optimizer"
+        and (component := getattr(strategy, entry.attribute, None)) is not None
+    )
+
+
 def snapshot_component_extras(strategy, config: Any = None) -> Dict[str, Any]:
     """Collect every declared component extra the strategy currently owns."""
     extra: Dict[str, Any] = {}

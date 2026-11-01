@@ -318,8 +318,8 @@ def test_grpo_sync_old_model(grpo_strategy):
     assert matches
 
 
-def test_grpo_optimizer_step_syncs_old_model(grpo_strategy):
-    """optimizer_step must refresh old_model after each update."""
+def test_grpo_after_update_syncs_old_model(grpo_strategy):
+    """after_update must refresh old_model after each update."""
     strategy, device = grpo_strategy
 
     class _SteppedOptimizer:
@@ -328,7 +328,8 @@ def test_grpo_optimizer_step_syncs_old_model(grpo_strategy):
                 for p in strategy.model.parameters():
                     p.add_(0.05)
 
-    strategy.optimizer_step(_SteppedOptimizer())
+    _SteppedOptimizer().step()
+    strategy.after_update()
 
     policy_sd = strategy.model.state_dict()
     old_sd = strategy.old_model.state_dict()
@@ -337,7 +338,7 @@ def test_grpo_optimizer_step_syncs_old_model(grpo_strategy):
     )
 
 
-def test_online_grpo_optimizer_step_skips_sync(grpo_strategy):
+def test_online_grpo_after_update_skips_sync(grpo_strategy):
     """old_model=None (online) must not attempt a sync."""
     strategy, device = grpo_strategy
     strategy.old_model = None
@@ -346,4 +347,5 @@ def test_online_grpo_optimizer_step_skips_sync(grpo_strategy):
         def step(self):
             return None
 
-    strategy.optimizer_step(_SteppedOptimizer())
+    _SteppedOptimizer().step()
+    strategy.after_update()

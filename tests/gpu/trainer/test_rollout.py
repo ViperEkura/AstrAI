@@ -6,16 +6,16 @@ import torch
 
 from astrai.inference.core.engine_core import EngineCore
 from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
+from astrai.trainer.context import TrainContext
 from astrai.trainer.rollout import (
     BaseRewardModel,
     RolloutGenerator,
     RolloutRunner,
     SamplingParams,
 )
-from astrai.trainer.strategy import GRPOStrategy
+from astrai.trainer.trainer import Trainer
 from tests.support.capabilities import skip_lt2_cuda
-from tests.support.models import make_frozen, make_model
-from tests.support.rollout import FakeExecutor
+from tests.support.models import make_model
 from tests.support.tokenizers import FakeTokenizer
 
 
@@ -193,7 +193,7 @@ def test_p2p_publisher_copies_weights_and_advances_version():
 
 @skip_lt2_cuda
 def test_online_optimizer_step_syncs_replica_atomically():
-    """strategy.optimizer_step advances the replica's weights and version
+    """Trainer advances the replica's weights and version
     inside one commit — the cross-GPU rollout contract."""
     train_model, replica_model = _make_replica_pair()
     tokenizer = FakeTokenizer(with_chat_template=True)
@@ -213,26 +213,15 @@ def test_online_optimizer_step_syncs_replica_atomically():
         ),
         reward_model=ConstantRewardModel(),
         rollout_interval=2,
+        publishers=[P2PCopyPublisher(backend)],
     )
-    strategy = GRPOStrategy(
-        model=train_model,
-        device="cuda:0",
-        old_model=None,
-        ref_model=make_frozen(train_model, "cuda:0"),
-        clip_eps=0.2,
-        kl_coef=0.01,
-        group_size=2,
-        model_fn=None,
-        executor=FakeExecutor(),
-    )
-    strategy.set_rollout_runner(runner)
-    strategy.set_weight_publishers([P2PCopyPublisher(backend)])
-
     for p in train_model.parameters():
         p.grad = torch.ones_like(p)
     optimizer = torch.optim.SGD(train_model.parameters(), lr=0.1)
     before = next(train_model.parameters()).detach().clone()
-    strategy.optimizer_step(optimizer)
+    Trainer._step_policy(
+        TrainContext(model=train_model, optimizer=optimizer, rollout=runner)
+    )
 
     assert not torch.equal(next(train_model.parameters()), before)
     assert backend.policy_version == 1

@@ -87,7 +87,7 @@ def test_online_batch_changes_preserve_events_and_greedy_tokens(
             # A stop token sampled on the FINAL allowed token is a normal
             # full-length generation that happened to end on a stop id.
             assert len(deltas) <= limits[request_id]
-            assert deltas[-1].token_id in test_tokenizer.stop_ids
+            assert deltas[-1].token_id == test_tokenizer.eos_token_id
         assert terminal.prompt_tokens == len(prompt)
         expected = run_batch(
             scheduler,

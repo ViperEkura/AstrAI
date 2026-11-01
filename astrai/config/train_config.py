@@ -13,9 +13,39 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Type
 
 from pydantic import ConfigDict, field_validator, model_validator
 from pydantic.dataclasses import dataclass
+from pydantic_core import ArgsKwargs
 
 from astrai.config.base import BaseConfig
+from astrai.config.rollout import resolve_rollout_devices
 from astrai.model.components.lora import LoRAConfig
+
+
+@plain_dataclass(frozen=True)
+class PrecisionConfig:
+    """Explicit compute, accumulation, persistent-state and export formats."""
+
+    compute_dtype: Optional[str] = None
+    gradient_dtype: str = "float32"
+    master_dtype: str = "float32"
+    optimizer_state_dtype: str = "float32"
+    export_dtype: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        supported = {"float32", "bfloat16"}
+        for name in ("compute_dtype", "master_dtype", "optimizer_state_dtype"):
+            value = getattr(self, name)
+            if (
+                name != "compute_dtype" or value is not None
+            ) and value not in supported:
+                raise ValueError(f"precision.{name} must be float32 or bfloat16")
+        if self.gradient_dtype not in supported | {"model"}:
+            raise ValueError(
+                "precision.gradient_dtype must be float32, bfloat16 or model"
+            )
+        if self.export_dtype not in supported | {"float16", None}:
+            raise ValueError(
+                "precision.export_dtype must be float32, bfloat16, float16 or None"
+            )
 
 
 @plain_dataclass(frozen=True, kw_only=True)
@@ -84,8 +114,8 @@ class TrainConfig(BaseConfig):
         strategy (str): Training strategy (seq, sft, dpo, grpo, online_*).
         dataset (ComponentSpec): Serializable data constructor and parameters.
         optimizer (ComponentSpec): Serializable optimizer target and parameters.
-        optimizer_name (Optional[str]): Serializable built-in optimizer identifier. Defaults to None.
-        optimizer_hyperparameters (Dict[str, Any]): Serializable optimizer settings. Defaults to {}.
+        optimizer_name (Optional[str]): Legacy input alias used only without an explicit optimizer spec.
+        optimizer_hyperparameters (Dict[str, Any]): Legacy constructor parameters; runtime settings live in optimizer.params.
         scheduler (ComponentSpec): Serializable scheduler target and parameters.
         n_epoch (int): Number of epochs for training. Defaults to 1.
         batch_per_device (int): Batch size per device. Defaults to 4.
@@ -95,7 +125,7 @@ class TrainConfig(BaseConfig):
         gradient_checkpointing_modules (List[type]): Module types to enable activation checkpointing for. Defaults to [].
         compile_mode (Optional[str]): torch.compile mode: 'default', 'reduce-overhead', 'max-autotune', or None. Defaults to None.
         start_epoch (int): Start epoch for training. Defaults to 0.
-        start_samples (int): Start samples count (per rank). Superseded by checkpoint consumed_samples. Defaults to 0.
+        start_samples (int): Committed samples within start_epoch (per rank). Must align with a global update boundary; superseded by checkpoint metadata. Defaults to 0.
         ckpt_dir (str): Checkpoint directory. Defaults to "./checkpoint".
         ckpt_interval (int): Number of optimizer steps between checkpoints. Defaults to 5000.
         lora (Optional[LoRAConfig]): LoRA config. None means full fine-tuning. Defaults to None.
@@ -158,13 +188,11 @@ class TrainConfig(BaseConfig):
     model: ComponentSpec
     optimizer: ComponentSpec
     scheduler: ComponentSpec
-    model_dtype: Optional[str] = None
+    precision: PrecisionConfig = field(default_factory=PrecisionConfig)
 
     reward_model_fn: Optional[Callable] = None
     critic_model_fn: Optional[Callable] = None
     critic_optimizer_fn: Optional[Callable] = None
-    optimizer_name: Optional[str] = None
-    optimizer_hyperparameters: Dict[str, Any] = field(default_factory=dict)
     load_state_dict: Dict[str, bool] = field(default_factory=dict)
     n_epoch: int = 1
     batch_per_device: int = 4
@@ -235,6 +263,42 @@ class TrainConfig(BaseConfig):
     executor_kwargs: Dict[str, Any] = field(default_factory=dict)
     strategy_kwargs: Dict[str, Any] = field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_optimizer_input(cls, value):
+        """Consume legacy metadata at the input boundary; explicit specs win."""
+        args = value.args if isinstance(value, ArgsKwargs) else ()
+        values = (
+            dict(value.kwargs or {}) if isinstance(value, ArgsKwargs) else dict(value)
+        )
+        name = values.pop("optimizer_name", None)
+        params = values.pop("optimizer_hyperparameters", None)
+        if "optimizer" not in values and len(args) < 4 and name is not None:
+            params = dict(params or {})
+            # These were descriptive constants, never constructor arguments.
+            if name == "nora_nadamw":
+                for key in ("nadamw_betas", "nadamw_eps", "nora_eps"):
+                    params.pop(key, None)
+            elif name == "mano_adamw":
+                for key in ("adamw_betas", "adamw_eps"):
+                    params.pop(key, None)
+                for old, new in (
+                    ("mano_momentum", "momentum"),
+                    ("mano_nesterov", "nesterov"),
+                ):
+                    if old in params:
+                        params.setdefault(new, params.pop(old))
+            values["optimizer"] = ComponentSpec(type=name, params=params)
+        return ArgsKwargs(args, values) if isinstance(value, ArgsKwargs) else values
+
+    @property
+    def optimizer_name(self) -> str:
+        return self.optimizer.type
+
+    @property
+    def optimizer_hyperparameters(self) -> Dict[str, Any]:
+        return dict(self.optimizer.params)
+
     def to_dict(self) -> Dict[str, Any]:
         """Capture checkpoint settings without copying runtime dependencies."""
         runtime_names = {item.name for item in fields(_TrainRuntimeDependencies)}
@@ -252,6 +316,8 @@ class TrainConfig(BaseConfig):
             except (TypeError, ValueError):
                 continue
             values[item.name] = value
+        values["optimizer_name"] = self.optimizer_name
+        values["optimizer_hyperparameters"] = self.optimizer_hyperparameters
         return values
 
     @field_validator("strategy")
@@ -503,9 +569,10 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
-        if self.model_dtype not in (None, "float32", "float16", "bfloat16"):
-            raise ValueError("model_dtype must be float32, float16, or bfloat16")
-
+        if "grad_accum_dtype" in self.executor_kwargs:
+            raise ValueError(
+                "Set precision.gradient_dtype instead of executor_kwargs.grad_accum_dtype"
+            )
         capabilities = _STRATEGY_CAPABILITIES[self.strategy]
         if self.strategy_kwargs.get("group_size", 4) < capabilities.min_group_size:
             raise ValueError(
@@ -530,27 +597,9 @@ class TrainConfig(BaseConfig):
                     "async_round uses rollout_devices, not rollout_device "
                     "or rollout_val_device"
                 )
-            if not self.rollout_devices:
-                raise ValueError("async_round requires at least one rollout device")
-            if any(
-                not device.startswith("cuda:") or not device[5:].isdigit()
-                for device in self.rollout_devices
-            ):
-                raise ValueError(
-                    "async_round rollout_devices must be indexed CUDA devices"
-                )
-            if len({int(device[5:]) for device in self.rollout_devices}) != len(
-                self.rollout_devices
-            ):
-                raise ValueError("async_round requires distinct rollout_devices")
-            if len(self.rollout_devices) < self.nprocs:
-                raise ValueError(
-                    "async_round requires at least one rollout device per learner"
-                )
-            if {int(device[5:]) for device in self.rollout_devices}.intersection(
-                range(self.nprocs)
-            ):
-                raise ValueError("rollout_devices must exclude all learner devices")
+            self.rollout_devices = list(
+                resolve_rollout_devices(self.rollout_devices, self.nprocs)
+            )
             if self.rollout_interval != 1 or self.rl_update_epochs != 1:
                 raise ValueError(
                     "async_round requires rollout_interval=1 and rl_update_epochs=1"

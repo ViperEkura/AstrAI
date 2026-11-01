@@ -98,6 +98,76 @@ def detect_format(load_path: str) -> str:
     raise FileNotFoundError(f"No supported data files found at {load_path}")
 
 
+def _stream_fetch(self, begin: int, end: int, keys: Union[str, List[str]]):
+    if not getattr(self, "_data", None):
+        raise RuntimeError("Store not loaded")
+    if not (0 <= begin < self._length and 0 <= end <= self._length):
+        raise ValueError(
+            f"Index out of bounds: begin={begin}, end={end}, length={self._length}"
+        )
+    if isinstance(keys, str):
+        return _fetch_stream_key(self, keys, begin, end)
+    return {k: _fetch_stream_key(self, k, begin, end) for k in keys}
+
+
+def _fetch_stream_key(self, key: str, begin: int, end: int) -> Tensor:
+    segments = self._data[key]
+    cum = self._cum[key]
+    seg_start = bisect.bisect_right(cum, begin)
+    seg_end = bisect.bisect_left(cum, end)
+
+    results = []
+    for i in range(seg_start, seg_end + 1):
+        prev = cum[i - 1] if i > 0 else 0
+        s = max(begin - prev, 0)
+        e = min(end - prev, segments[i].shape[0])
+        results.append(segments[i][s:e])
+
+    return results[0] if len(results) == 1 else torch.cat(results, dim=0)
+
+
+def _record_fetch(self, index: int, keys: Union[str, List[str]]):
+    num_records = self.num_records
+    if not getattr(self, "_data", None) and num_records == 0:
+        raise RuntimeError("Store not loaded")
+    if not 0 <= index < num_records:
+        raise ValueError(
+            f"Record index out of bounds: {index}, num_records={num_records}"
+        )
+    if isinstance(keys, str):
+        return _fetch_record_key(self, keys, index)
+    return {k: _fetch_record_key(self, k, index) for k in keys}
+
+
+def _fetch_record_key(self, key: str, index: int):
+    offsets = self._offsets.get(key)
+    if offsets:
+        shard_index = bisect.bisect_right(self._record_cum, index)
+        local_index = index - (self._record_cum[shard_index - 1] if shard_index else 0)
+        start, end = offsets[shard_index][local_index : local_index + 2]
+        return self._data[key][shard_index][start:end]
+    if self._offsets:
+        raise ValueError(f"Record field '{key}' requires offsets")
+    return self._data[key][index]
+
+
+def _read_jsonl(root: Path) -> List[Dict]:
+    """Read raw records in file order, skipping empty or malformed lines."""
+    records: List[Dict] = []
+    paths = [root] if root.is_file() else sorted(root.glob("*.jsonl"))
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse JSON line in %s, skipping", path)
+    return records
+
+
 class Store(ABC):
     """Common base for all storage backends.
 
@@ -136,7 +206,8 @@ class Store(ABC):
     ):
         self._data: Dict[str, List[Tensor]] = {}
         self._cum: Dict[str, List[int]] = {}
-        self._offsets: Dict[str, List[int]] = {}
+        self._offsets: Dict[str, List[List[int]]] = {}
+        self._record_cum: List[int] = []
         self._length: int = 0
         self._num_records: int = 0
         self._window_size: int = int(window_size)
@@ -189,7 +260,7 @@ class Store(ABC):
             if total <= w:
                 return 0
             return (total - 1 - w) // self._stride + 1
-        return self._num_records
+        return self.num_records
 
     def __len__(self) -> int:
         return self.num_samples
@@ -245,7 +316,6 @@ class Store(ABC):
     def _normalize(
         self,
         raw: Dict[str, List],
-        offsets: Optional[Dict[str, List[int]]] = None,
     ):
         """Register segments and pre-compute indices for both access modes.
 
@@ -253,16 +323,19 @@ class Store(ABC):
         ``Streamable._fetch_stream_key`` can bisect across segments
         without concatenation.
 
-        Record mode: if *offsets* is provided (bin layout),
-        ``_offsets[key]`` stores cumulative per-record offsets into the
-        single concatenated segment.  Otherwise, when
-        ``segments_are_records`` is True (JSONL), ``_data[key]`` is
-        a per-record list and ``fetch_record`` indexes it directly.
+        Record mode: when ``segments_are_records`` is True (JSONL),
+        ``_data[key]`` is a per-record list and ``fetch_record`` indexes
+        it directly. Binary offsets are indexed lazily by MmapStore.
 
         Nested keys (GRPO ``responses``/``masks`` as
         ``List[List[Tensor]]``) are stored as-is and excluded from both
         cumulative bookkeepings — they are only accessed record-by-record.
         """
+        self._data = {}
+        self._cum = {}
+        self._offsets = {}
+        self._record_cum = []
+        self._num_records = 0
         flat_lengths = []
         for key, tensors in raw.items():
             self._data[key] = tensors
@@ -279,28 +352,11 @@ class Store(ABC):
                 total += t.shape[0]
                 cum.append(total)
             self._cum[key] = cum
-            flat_lengths.append(cum[-1] if cum else 0)
+            if key != "seq_lengths":
+                flat_lengths.append(cum[-1] if cum else 0)
         self._length = min(flat_lengths) if flat_lengths else 0
 
-        valid_offsets: Dict[str, List[int]] = {}
-        if offsets:
-            for key, off in offsets.items():
-                segs = self._data.get(key, [])
-                if len(segs) == 1 and len(off) > 1:
-                    valid_offsets[key] = off
-                elif len(segs) > 1:
-                    logger.warning(
-                        "Key '%s' has %d segments with offsets — record mode "
-                        "disabled for this key (multi-shard bin+offsets not "
-                        "supported). Merge shards or use JSONL.",
-                        key,
-                        len(segs),
-                    )
-        self._offsets = valid_offsets
-        if valid_offsets:
-            record_counts = [len(v) - 1 for v in valid_offsets.values()]
-            self._num_records = min(record_counts) if record_counts else 0
-        elif self.segments_are_records:
+        if self.segments_are_records:
             per_record_counts = []
             for key, tensors in self._data.items():
                 if tensors and isinstance(tensors[0], list):
@@ -309,6 +365,43 @@ class Store(ABC):
             self._num_records = min(per_record_counts) if per_record_counts else 0
         else:
             self._num_records = 0
+
+    def _build_record_index(self, shards: List[Dict[str, List[int]]]) -> None:
+        keys = {key for shard in shards for key in shard}
+        indexed: Dict[str, List[List[int]]] = {key: [] for key in sorted(keys)}
+        cumulative = []
+        total = 0
+        for shard_index, shard in enumerate(shards):
+            if set(shard) != keys:
+                raise ValueError(
+                    f"Shard {shard_index} has inconsistent record offsets fields"
+                )
+            counts = set()
+            for key in indexed:
+                segments = self._data.get(key, [])
+                if len(segments) != len(shards):
+                    raise ValueError(f"Record field '{key}' is missing from a shard")
+                offsets = shard[key]
+                if (
+                    not isinstance(offsets, list)
+                    or len(offsets) < 2
+                    or any(type(offset) is not int for offset in offsets)
+                    or offsets[0] != 0
+                    or offsets[-1] != segments[shard_index].shape[0]
+                    or any(begin > end for begin, end in zip(offsets, offsets[1:]))
+                ):
+                    raise ValueError(
+                        f"Invalid offsets for '{key}' in shard {shard_index}"
+                    )
+                indexed[key].append(offsets)
+                counts.add(len(offsets) - 1)
+            if len(counts) != 1:
+                raise ValueError(f"Inconsistent record count in shard {shard_index}")
+            total += counts.pop()
+            cumulative.append(total)
+        self._offsets = indexed
+        self._record_cum = cumulative
+        self._num_records = total
 
 
 class Streamable:
@@ -330,34 +423,6 @@ class Streamable:
         return _stream_fetch(self, begin, end, keys)
 
 
-def _stream_fetch(self, begin: int, end: int, keys: Union[str, List[str]]):
-    if not getattr(self, "_data", None):
-        raise RuntimeError("Store not loaded")
-    if not (0 <= begin < self._length and 0 <= end <= self._length):
-        raise ValueError(
-            f"Index out of bounds: begin={begin}, end={end}, length={self._length}"
-        )
-    if isinstance(keys, str):
-        return _fetch_stream_key(self, keys, begin, end)
-    return {k: _fetch_stream_key(self, k, begin, end) for k in keys}
-
-
-def _fetch_stream_key(self, key: str, begin: int, end: int) -> Tensor:
-    segments = self._data[key]
-    cum = self._cum[key]
-    seg_start = bisect.bisect_right(cum, begin)
-    seg_end = bisect.bisect_left(cum, end)
-
-    results = []
-    for i in range(seg_start, seg_end + 1):
-        prev = cum[i - 1] if i > 0 else 0
-        s = max(begin - prev, 0)
-        e = min(end - prev, segments[i].shape[0])
-        results.append(segments[i][s:e])
-
-    return results[0] if len(results) == 1 else torch.cat(results, dim=0)
-
-
 class Recordable:
     """Mixin granting raw record access via :meth:`fetch_record`.
 
@@ -371,31 +436,6 @@ class Recordable:
         keys: Union[str, List[str]],
     ):
         return _record_fetch(self, index, keys)
-
-
-def _record_fetch(self, index: int, keys: Union[str, List[str]]):
-    if not getattr(self, "_data", None) and self._num_records == 0:
-        raise RuntimeError("Store not loaded")
-    if not 0 <= index < self._num_records:
-        raise ValueError(
-            f"Record index out of bounds: {index}, num_records={self._num_records}"
-        )
-    if isinstance(keys, str):
-        return _fetch_record_key(self, keys, index)
-    return {k: _fetch_record_key(self, k, index) for k in keys}
-
-
-def _fetch_record_key(self, key: str, index: int):
-    offsets = self._offsets.get(key)
-    if offsets:
-        start = offsets[index]
-        end = (
-            offsets[index + 1]
-            if index + 1 < len(offsets)
-            else self._data[key][0].shape[0]
-        )
-        return self._data[key][0][start:end]
-    return self._data[key][index]
 
 
 class StoreFactory(BaseFactory["Store"]):
@@ -419,6 +459,9 @@ class MmapStore(Store, Streamable, Recordable):
       offsets have ``num_records == 0`` and ``len(store)`` reflects the
       windowed sample count when ``window_size > 0``.
 
+    Record offsets are validated lazily on record access or count queries.
+    Token-stream access does not depend on the validity of record metadata.
+
     ``segments_are_records`` is ``False`` here (bin segments are
     contiguous streams, not per-record) — record access is driven
     purely by ``_offsets``.
@@ -433,12 +476,26 @@ class MmapStore(Store, Streamable, Recordable):
     ):
         super().__init__(window_size=window_size, stride=stride)
         self._mmap_refs: List[Tensor] = []
+        self._record_shards: List[Dict[str, List[int]]] = []
+        self._record_index_ready = False
+
+    @property
+    def num_records(self) -> int:
+        self._ensure_record_index()
+        return self._num_records
+
+    def _ensure_record_index(self) -> None:
+        if self._record_index_ready:
+            return
+        if any(self._record_shards):
+            self._build_record_index(self._record_shards)
+        self._record_index_ready = True
 
     def load(self, path: str, **kwargs):
         self._mmap_refs = []
         root = Path(path)
         all_raw: Dict[str, List[Tensor]] = {}
-        all_offsets: Dict[str, List[int]] = {}
+        all_offsets: List[Dict[str, List[int]]] = []
         meta_paths = [
             Path(p) for p in glob.glob(str(root / "**" / "meta.json"), recursive=True)
         ]
@@ -449,32 +506,25 @@ class MmapStore(Store, Streamable, Recordable):
                 if key not in all_raw:
                     all_raw[key] = []
                 all_raw[key].extend(tensors)
-            for key, o in off.items():
-                if key not in all_offsets:
-                    all_offsets[key] = []
-                all_offsets[key].extend(o)
+            all_offsets.append(off)
         if not meta_paths:
             raise FileNotFoundError(f"No meta.json found under {path}")
-        self._normalize(all_raw, offsets=all_offsets or None)
+        self._normalize(all_raw)
+        self._record_shards = all_offsets
+        self._record_index_ready = False
         for tensors in self._data.values():
             self._mmap_refs.extend(tensors)
 
-
-def _read_jsonl(root: Path) -> List[Dict]:
-    """Read raw records in file order, skipping empty or malformed lines."""
-    records: List[Dict] = []
-    paths = [root] if root.is_file() else sorted(root.glob("*.jsonl"))
-    for path in paths:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse JSON line in %s, skipping", path)
-    return records
+    def validate_record_alignment(self, keys: List[str]) -> None:
+        self._ensure_record_index()
+        for key in keys:
+            if key not in self._offsets:
+                raise ValueError(
+                    f"Binary record field '{key}' requires offsets; preprocess the data again"
+                )
+        for key in keys[1:]:
+            if self._offsets[key] != self._offsets[keys[0]]:
+                raise ValueError(f"Record lengths for '{key}' must match '{keys[0]}'")
 
 
 @StoreFactory.register("jsonl")

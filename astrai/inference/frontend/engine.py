@@ -11,7 +11,7 @@ import asyncio
 import gc
 import logging
 import time
-import warnings
+from functools import partial
 from pathlib import Path
 from typing import (
     Any,
@@ -30,8 +30,6 @@ from astrai.extension.runtime.context import OpSelection
 from astrai.inference.core.cache.pool import BlockPool
 from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.events import RequestError, TokenDelta
-from astrai.inference.core.scheduler import Scheduler
-from astrai.inference.frontend.core_client import EngineCoreClient, InprocClient
 from astrai.inference.frontend.input_processor import InputProcessor, ProcessedInput
 from astrai.inference.frontend.output_processor import OutputProcessor
 from astrai.inference.frontend.tracking import (
@@ -60,11 +58,12 @@ class InferenceEngine:
         cache: Optional[BlockPool] = None,
         enable_cuda_graph: bool = True,
         enable_overlap: bool = False,
-        core_client: Optional[EngineCoreClient] = None,
+        core: Optional[EngineCore] = None,
+        generation_config=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
-        if core_client is None:
+        if core is None:
             core = EngineCore(
                 model=self.model,
                 tokenizer=self.tokenizer,
@@ -73,31 +72,15 @@ class InferenceEngine:
                 cache=cache,
                 enable_cuda_graph=enable_cuda_graph,
                 enable_overlap=enable_overlap,
+                generation_config=generation_config,
             )
-            core_client = InprocClient(core)
-        self._core = core_client
+        self._core = core
         self._tracker = RequestTracker()
-        self._core.set_event_sink(self._tracker.sink)
-        resolved_len = max_seq_len
-        if resolved_len is None:
-            cfg_len = getattr(model.config, "max_position_embeddings", None)
-            resolved_len = cfg_len if cfg_len is not None else 4096
-        self._max_seq_len = int(resolved_len)
-        self._input_processor = InputProcessor(tokenizer, int(resolved_len))
+        self._core.set_event_sink(self._tracker)
+        self._max_seq_len = int(core.max_seq_len)
+        self._input_processor = InputProcessor(tokenizer, self._max_seq_len)
 
         self._core.start()
-
-    @property
-    def scheduler(self) -> Scheduler:
-        warnings.warn(
-            "InferenceEngine.scheduler is deprecated; use EngineCoreClient "
-            "for request, scoring, status and lifecycle operations",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if not isinstance(self._core, InprocClient):
-            raise AttributeError("The injected core client has no local scheduler")
-        return self._core.scheduler
 
     def __enter__(self):
         return self
@@ -108,9 +91,9 @@ class InferenceEngine:
 
     # ---- frontend internals ----
 
-    def _submit_prompt(
+    def _submit_processed(
         self,
-        prompt: str,
+        processed: List[ProcessedInput],
         *,
         max_tokens: Optional[int],
         temperature: float,
@@ -118,26 +101,28 @@ class InferenceEngine:
         top_k: int,
         frequency_penalty: float,
         rep_window: int,
-    ) -> ProcessedInput:
-        """Tokenize + submit one prompt; the id exists before the core does."""
-        processed = self._input_processor.process(prompt)
-        self._tracker.register(processed.request_id, maxlen=self._max_seq_len + 1)
+        **generation_kwargs,
+    ) -> None:
+        """Register every consumer before admitting the prepared requests."""
+        request_ids = [item.request_id for item in processed]
+        for request_id in request_ids:
+            self._tracker.register(request_id, maxlen=self._max_seq_len + 1)
         try:
-            self._core.send_request(
-                prompt=prompt,
+            self._core.add_requests(
+                prompts=[item.prompt_text or "" for item in processed],
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
-                request_id=processed.request_id,
-                prompt_ids=processed.prompt_ids,
+                **generation_kwargs,
+                request_ids=request_ids,
+                prompts_ids=[item.prompt_ids for item in processed],
             )
         except BaseException:
-            self._release_requests([processed.request_id])
+            self._release_requests(request_ids)
             raise
-        return processed
 
     def _release_requests(self, request_ids: List[str]) -> None:
         """Cancel unfinished core work and always discard frontend bookkeeping."""
@@ -147,24 +132,25 @@ class InferenceEngine:
                 # a terminal already queued by the core needs no extra abort,
                 # even if the consumer has not folded that event yet.
                 if not self._tracker.is_finished(request_id):
-                    self._core.abort_request(request_id)
+                    self._core.cancel_request(request_id)
             except Exception:
                 logger.exception("request cancellation failed for %s", request_id)
             finally:
                 self._tracker.unregister(request_id)
 
-    # ---- public API (signatures unchanged) ----
+    # ---- public API ----
 
     def generate(
         self,
         prompt: Union[str, List[str]],
         stream: bool = False,
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
+        **generation_kwargs,
     ) -> Union[Generator, str, List[str]]:
         is_batch = isinstance(prompt, list)
         prompts = prompt if is_batch else [prompt]
@@ -185,6 +171,7 @@ class InferenceEngine:
             top_k,
             frequency_penalty,
             rep_window,
+            **generation_kwargs,
         )
 
     def score(
@@ -278,11 +265,12 @@ class InferenceEngine:
         self,
         prompt: str,
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
+        **generation_kwargs,
     ) -> AsyncGenerator[str, None]:
         chunks = self.generate_events(
             prompt,
@@ -292,6 +280,7 @@ class InferenceEngine:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             rep_window=rep_window,
+            **generation_kwargs,
         )
 
         async def _agen():
@@ -316,12 +305,13 @@ class InferenceEngine:
         prompt: str,
         *,
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         stop_sequences: Optional[List[str]] = None,
+        **generation_kwargs,
     ) -> AsyncGenerator["StreamChunk", None]:
         """Async generation yielding structured chunks (vLLM OutputProcessor).
 
@@ -332,18 +322,21 @@ class InferenceEngine:
         """
 
         async def _agen():
-            processed = self._submit_prompt(
-                prompt,
+            processed = self._input_processor.process(prompt)
+            self._submit_processed(
+                [processed],
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
+                **generation_kwargs,
             )
             request_id = processed.request_id
             tracker = self._tracker
             terminal_chunk = None
+            token_offset = 0
             try:
                 processor = OutputProcessor(
                     request_id,
@@ -359,16 +352,15 @@ class InferenceEngine:
                     pending = []
                     for event in events:
                         text, stopped = processor.push(event)
-                        delta_ids = (
-                            [event.token_id] if isinstance(event, TokenDelta) else []
-                        )
                         if text or stopped or processor.finished:
                             chunk = StreamChunk(
                                 text=text,
-                                delta_token_ids=delta_ids,
-                                current_token_ids=list(processor.state.token_ids),
+                                delta_token_ids=processor.state.token_ids[
+                                    token_offset:
+                                ],
                                 stopped=stopped,
                             )
+                            token_offset = len(processor.state.token_ids)
                             if processor.finished:
                                 self._set_terminal_chunk(chunk, processor)
                                 terminal_chunk = chunk
@@ -437,6 +429,7 @@ class InferenceEngine:
 
     def _fold_events_incrementally(self, request_id: str, events: List[Any]) -> str:
         proc = OutputProcessor(request_id, self.tokenizer)
+        parts = []
         for event in events:
             if isinstance(event, RequestError):
                 logger.error(
@@ -446,8 +439,9 @@ class InferenceEngine:
                     event.message,
                 )
                 break
-            proc.push(event)
-        return proc.state.text
+            text, _ = proc.push(event)
+            parts.append(text)
+        return "".join(parts)
 
     def _generate(
         self,
@@ -460,6 +454,7 @@ class InferenceEngine:
         top_k: int,
         frequency_penalty: float,
         rep_window: int,
+        **generation_kwargs,
     ) -> Union[Generator, str, List[str]]:
         n = len(prompts)
         # One batched tokenize on the caller's thread, ids minted up front;
@@ -470,24 +465,17 @@ class InferenceEngine:
         processed = self._input_processor.process_batch(prompts)
         request_ids = [item.request_id for item in processed]
 
-        def submit():
-            for rid in request_ids:
-                self._tracker.register(rid, maxlen=self._max_seq_len + 1)
-            try:
-                self._core.send_requests(
-                    prompts=prompts,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    frequency_penalty=frequency_penalty,
-                    rep_window=rep_window,
-                    request_ids=request_ids,
-                    prompts_ids=[item.prompt_ids for item in processed],
-                )
-            except BaseException:
-                self._release_requests(request_ids)
-                raise
+        submit = partial(
+            self._submit_processed,
+            processed,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+            rep_window=rep_window,
+            **generation_kwargs,
+        )
 
         if not stream:
             submit()
@@ -528,7 +516,7 @@ class InferenceEngine:
         return gen()
 
     def get_stats(self) -> Dict[str, Any]:
-        return self._core.stats()
+        return self._core.get_stats()
 
     @property
     def op_selection(self) -> OpSelection:
@@ -539,7 +527,7 @@ class InferenceEngine:
         return self._core.cuda_graph_enabled
 
     def shutdown(self):
-        self._core.shutdown()
+        self._core.stop()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()

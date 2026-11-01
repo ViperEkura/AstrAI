@@ -212,7 +212,7 @@ def test_optimizer_and_scheduler_resume_matches_uninterrupted_step():
     assert scheduler_a.get_last_lr() == pytest.approx(scheduler_b.get_last_lr())
 
 
-def test_train_config_serializes_optimizer_metadata():
+def test_train_config_serializes_the_actual_optimizer_spec():
     config = TrainConfig(
         model=ComponentSpec(
             type="torch.nn:Linear", params={"in_features": 2, "out_features": 2}
@@ -232,11 +232,8 @@ def test_train_config_serializes_optimizer_metadata():
 
     metadata = config.to_dict()
 
-    assert metadata["optimizer_name"] == "nora_nadamw"
-    assert metadata["optimizer_hyperparameters"] == {
-        "lr": 3e-4,
-        "nora_lr": 5e-3,
-    }
+    assert metadata["optimizer_name"] == "torch.optim:AdamW"
+    assert metadata["optimizer_hyperparameters"] == {}
 
 
 def test_nora_nadamw_rejects_legacy_muon_state():

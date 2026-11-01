@@ -4,6 +4,8 @@ from astrai.config import ComponentSpec, TrainConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.value import ValueModel
 from astrai.optimization.scheduler import SchedulerFactory
+from astrai.trainer.callbacks import CheckpointCallback
+from astrai.trainer.context import TrainContext
 from tests.support.models import TINY_CONFIG
 
 
@@ -75,3 +77,15 @@ def create_train_config(
         device_type=device,
         **kwargs,
     )
+
+
+def make_resume_metadata(config, dataset_len, offset=0, step=0):
+    """Build the same resume contract the checkpoint callback publishes."""
+    context = TrainContext(
+        config=config,
+        dataset=range(dataset_len),
+        world_size=config.nprocs,
+        epoch_sample_offset=offset,
+        optimizer_steps_completed=step,
+    )
+    return CheckpointCallback._meta(context)

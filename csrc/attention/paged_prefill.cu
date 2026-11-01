@@ -2,7 +2,7 @@
  * SGLang-style paged GQA prefill (flat KV pool, ragged batch via
  * qo_indptr/kv_indptr) — the implementation of the entry declared in
  * api/torch/attention.h. Device-side code is in launcher/attention.cuh
- * + kernel/attention/split_q.cuh.
+ * + kernel/attention/mainloop.cuh.
  */
 
 #include "entry.h"
@@ -39,7 +39,7 @@ torch::Tensor attn_paged_prefill(torch::Tensor q,
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            AttnDispatchPagedPrefill<T>::run(p, stream);
+            launch_prefill<PackedQSchedule, PagedKV<T>>(p, stream);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

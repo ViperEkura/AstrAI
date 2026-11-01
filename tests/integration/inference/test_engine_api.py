@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from astrai.extension import op_backend, snapshot_op_selection
+from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.events import (
     FINISH_LENGTH,
     RequestFinished,
@@ -14,6 +15,7 @@ from astrai.inference.core.events import (
 )
 from astrai.inference.frontend.engine import InferenceEngine, build_engine
 from tests.support.engine import (
+    _collect_async,
     _make_engine_mocks,
 )
 from tests.support.models import make_model
@@ -46,9 +48,9 @@ def test_engine_generate_non_streaming_single():
         def inject():
             deadline = time.time() + 5
             while time.time() < deadline:
-                if eng._tracker._sink._queues:
-                    rid = next(iter(eng._tracker._sink._queues))
-                    eng._tracker.sink(
+                if eng._tracker._requests:
+                    rid = next(iter(eng._tracker._requests))
+                    eng._tracker(
                         [
                             TokenDelta(rid, 11, 1),
                             TokenDelta(rid, 12, 2),
@@ -85,9 +87,9 @@ def test_engine_generate_streaming_yields_token_ids():
         def inject():
             deadline = time.time() + 5
             while time.time() < deadline:
-                if eng._tracker._sink._queues:
-                    rid = next(iter(eng._tracker._sink._queues))
-                    eng._tracker.sink(
+                if eng._tracker._requests:
+                    rid = next(iter(eng._tracker._requests))
+                    eng._tracker(
                         [
                             TokenDelta(rid, 11, 1),
                             TokenDelta(rid, 12, 2),
@@ -121,7 +123,7 @@ def test_engine_generate_non_streaming_batch():
         def inject():
             deadline = time.time() + 5
             while time.time() < deadline:
-                queues = eng._tracker._sink._queues
+                queues = eng._tracker._requests
                 if len(queues) >= 2:
                     ids = list(queues)
                     events = []
@@ -132,7 +134,7 @@ def test_engine_generate_non_streaming_batch():
                                 RequestFinished(rid, FINISH_LENGTH, 3, 1),
                             ]
                         )
-                    eng._tracker.sink(events)
+                    eng._tracker(events)
                     return
                 time.sleep(0.01)
 
@@ -213,12 +215,10 @@ def test_generate_does_not_send_per_request_attention_choice():
             # Terminate via the event protocol (the mock core has no loop).
             def inject():
                 for _ in range(500):
-                    qs = engine._tracker._sink._queues
+                    qs = engine._tracker._requests
                     if qs:
                         rid = next(iter(qs))
-                        engine._tracker.sink(
-                            [RequestFinished(rid, FINISH_LENGTH, 1, 0)]
-                        )
+                        engine._tracker([RequestFinished(rid, FINISH_LENGTH, 1, 0)])
                         return
                     time.sleep(0.01)
 
@@ -243,7 +243,7 @@ def test_build_engine_from_live_objects_starts_scheduler():
     try:
         assert isinstance(engine, InferenceEngine)
         assert engine.tokenizer is tokenizer
-        assert engine._core._core.stop_event.is_set() is False
+        assert engine._core.stop_event.is_set() is False
     finally:
         engine.shutdown()
 
@@ -276,10 +276,10 @@ def test_build_engine_passes_engine_kwargs_through():
 
         def inject():
             for _ in range(500):
-                qs = engine._tracker._sink._queues
+                qs = engine._tracker._requests
                 if qs:
                     rid = next(iter(qs))
-                    engine._tracker.sink([RequestFinished(rid, FINISH_LENGTH, 1, 0)])
+                    engine._tracker([RequestFinished(rid, FINISH_LENGTH, 1, 0)])
                     return
                 time.sleep(0.01)
 
@@ -309,3 +309,16 @@ def test_build_engine_passes_engine_kwargs_through():
 def test_build_engine_rejects_invalid_arguments(kwargs, error, message):
     with pytest.raises(error, match=message):
         build_engine(**kwargs)
+
+
+@pytest.mark.parametrize("frontend_limit", [None, 2, 16])
+def test_injected_core_controls_prompt_truncation_and_usage(frontend_limit):
+    model, _ = make_model("cpu", max_position_embeddings=64)
+    tokenizer = FakeTokenizer()
+    core = EngineCore(model, tokenizer, max_seq_len=4, enable_cuda_graph=False)
+    with InferenceEngine(
+        model, tokenizer, max_seq_len=frontend_limit, core=core
+    ) as engine:
+        chunks = _collect_async(engine.generate_events("abcdefgh", max_tokens=1))
+    assert chunks[-1].prompt_tokens == 4
+    assert chunks[-1].completion_tokens == 0

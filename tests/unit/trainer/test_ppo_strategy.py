@@ -290,8 +290,8 @@ def test_ppo_uses_supplied_advantages_without_recomputation(ppo_strategy):
     assert torch.isfinite(loss).item()
 
 
-def test_ppo_optimizer_step_updates_policy_and_critic(ppo_strategy):
-    """optimizer_step steps the policy optimizer and then the critic's."""
+def test_ppo_after_update_updates_policy_and_critic(ppo_strategy):
+    """Actor update precedes the algorithm-owned critic step."""
     strategy, device = ppo_strategy
     batch = _make_batch(device=device)
     loss = strategy.compute_loss(batch)
@@ -301,7 +301,8 @@ def test_ppo_optimizer_step_updates_policy_and_critic(ppo_strategy):
     policy_before = next(strategy.model.parameters()).detach().clone()
     critic_before = next(strategy.critic.parameters()).detach().clone()
 
-    strategy.optimizer_step(policy_optimizer)
+    policy_optimizer.step()
+    strategy.after_update()
 
     assert not torch.equal(next(strategy.model.parameters()), policy_before)
     assert not torch.equal(next(strategy.critic.parameters()), critic_before)
@@ -309,7 +310,7 @@ def test_ppo_optimizer_step_updates_policy_and_critic(ppo_strategy):
     assert all(p.grad is None for p in strategy.critic.parameters())
 
 
-def test_ppo_optimizer_step_clips_critic_gradients(ppo_strategy):
+def test_ppo_after_update_clips_critic_gradients(ppo_strategy):
     strategy, device = ppo_strategy
     batch = _make_batch(device=device)
     loss = strategy.compute_loss(batch)
@@ -318,7 +319,7 @@ def test_ppo_optimizer_step_clips_critic_gradients(ppo_strategy):
     strategy.max_grad_norm = 1e-8
     before = next(strategy.critic.parameters()).detach().clone()
 
-    strategy.optimizer_step(torch.optim.SGD(strategy.model.parameters(), lr=0.0))
+    strategy.after_update()
 
     # Clipped-to-zero critic gradients under SGD (no momentum) leave the
     # parameters unchanged.
@@ -449,22 +450,8 @@ def test_compute_advantages_folds_kl_penalty_into_rewards(ppo_strategy, monkeypa
 def test_online_call_returns_finite_loss(ppo_strategy):
     strategy, device = ppo_strategy
 
-    class _RecordingRunner:
-        policy_version = 0
-
-        def __call__(self, batch):
-            return _make_rollout_result(device=device), True
-
-        def step(self):
-            pass
-
-        def apply_weight_update(self, policy_version, update):
-            if policy_version is None:
-                policy_version = self.policy_version + 1
-            return update(policy_version)
-
-    strategy.set_rollout_runner(_RecordingRunner())
-    out = strategy({"instruction": ["x"]})
+    batch = strategy.prepare_from_rollout(_make_rollout_result(device=device))
+    out = strategy(batch)
     assert torch.isfinite(out["loss"]).item()
     assert "policy_loss" in out["metrics"]
     assert "value_loss" in out["metrics"]

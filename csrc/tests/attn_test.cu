@@ -23,8 +23,9 @@ static bool same_decode_plan(const DecodeLaunchPlan& a, const DecodeLaunchPlan& 
            a.direct_output == b.direct_output;
 }
 
-template <int D, typename KV, bool HasMask>
-static bool decode_type_matches(DecodeKernel<D, KV, HasMask>, int dim, bool has_mask) {
+template <int D, typename KV, bool HasMask, bool SkipEmptySplits>
+static bool
+decode_type_matches(DecodeKernel<D, KV, HasMask, SkipEmptySplits>, int dim, bool has_mask) {
     return D == dim && HasMask == has_mask;
 }
 
@@ -188,9 +189,9 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int cau
         setup_scratch(p, sc);
         p.o_part = sc.o_part;
         p.ml_part = sc.ml_part;
-        AttnDispatchDecode<bf16>::run(p, 0);
+        launch_decode<ContigKV<bf16>>(p, 0);
     } else {
-        AttnDispatchPrefill<bf16>::run(p, 0);
+        launch_prefill<DenseQSchedule, ContigKV<bf16>>(p, 0);
     }
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
@@ -285,9 +286,10 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causa
     double flops = 4.0 * B * Hq * (double)ql * kl * D;
     if (causal)
         flops *= 0.5;
-    BenchResult r = decode
-                        ? bench_kernel([&] { AttnDispatchDecode<bf16>::run(p, 0); }, 3, 10, flops)
-                        : bench_kernel([&] { AttnDispatchPrefill<bf16>::run(p, 0); }, 3, 10, flops);
+    BenchResult r =
+        decode ? bench_kernel([&] { launch_decode<ContigKV<bf16>>(p, 0); }, 3, 10, flops)
+               : bench_kernel([&] { launch_prefill<DenseQSchedule, ContigKV<bf16>>(p, 0); }, 3, 10,
+                              flops);
 
     char cfg[64];
     snprintf(cfg, sizeof(cfg), "B=%2d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d causal=%d", B, Hq, Hk, ql, kl,

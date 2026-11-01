@@ -1,4 +1,11 @@
-# Hugging Face config mapping
+# Hugging Face file conventions
+
+Native AstrAI directories use their saved configuration and weights directly.
+Importing external HF weights additionally requires a compatible model-owned mapping.
+Tokenizer and generation files follow the separate conventions below; these
+file names alone do not imply Transformers model-loader compatibility.
+
+## External model config mapping
 
 Place `hf_mapping.json` beside `config.json` in each model directory. AstrAI
 reads this file only when loading that directory; it does not select mappings
@@ -94,3 +101,45 @@ are explicitly listed. Image and video inputs require a separate vision
 implementation. Paged inference for GDN layers also requires recurrent
 cache integration; the dense training forward supports autoregressive
 text generation by recomputing the prompt.
+
+## Tokenizer and generation files
+
+AstrAI reads HF tokenizer files: `tokenizer.json`, `tokenizer_config.json`,
+optional `special_tokens_map.json`, and `chat_template.jinja`. Named tokens
+use `bos_token`, `eos_token`, `pad_token`, and `additional_special_tokens`;
+their IDs come from the vocabulary. Private `special_tokens` and
+`stop_token_ids` fields are rejected and must be migrated before loading.
+Saving exports the chat template as `chat_template.jinja`. When both inline and
+standalone templates are present, the standalone file takes precedence.
+
+Generation defaults belong to the model's `generation_config.json`. If it
+is absent, HF generation fields in `config.json` are used. The tokenizer's
+EOS declaration does not implicitly set the generation stop conditions.
+Per-call keyword arguments override the supplied `generation_config`, which
+overrides the model defaults. Both a dictionary and a Transformers
+`GenerationConfig` instance are accepted. Omitting `eos_token_id` inherits
+the default; explicitly passing `None` or `[]` disables EOS stopping.
+Length limits still apply. `max_new_tokens` takes precedence over `max_length`;
+the latter includes the prompt. With neither configured, AstrAI allows up to
+20 new tokens, bounded by the engine sequence limit.
+
+```python
+engine.generate(
+    prompt,
+    max_new_tokens=512,
+    do_sample=True,
+    temperature=0.8,
+)
+```
+
+As in HF, `do_sample=False` selects greedy decoding; setting `temperature`
+alone does not enable sampling. AstrAI supports greedy and multinomial
+sampling, not every Transformers generation algorithm. Unsupported beam,
+repetition-penalty and minimum-length settings raise errors. The
+`max_tokens` argument remains the frontend alias for `max_new_tokens`;
+passing both is an error.
+
+Training checkpoints export tokenizer and generation files into staging
+before manifest creation. This file convention does not convert AstrAI's
+native model architecture, weight names or optimizer state into a
+Transformers model.

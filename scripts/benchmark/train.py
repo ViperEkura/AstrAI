@@ -17,17 +17,23 @@ import time
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.extension.kernel.cross_entropy import linear_cross_entropy
 from astrai.model import AutoRegressiveLM
 from astrai.optimization.optimizer.muon import MuonAdamW
 from astrai.parallel.executor import FSDPExecutor
+from astrai.trainer.callbacks.metric_util import GradSNRTracker
+from astrai.trainer.callbacks.metrics import MetricCallback
+from astrai.trainer.strategy.ops import _collect_moe_diagnostics
 
 SMOKE_CASES = [
     {
@@ -197,13 +203,6 @@ def _case_config(case):
 
 
 def _run_case(case, torch):
-    import torch.nn.functional as F
-
-    from astrai.config.model_config import AutoRegressiveLMConfig
-    from astrai.model import AutoRegressiveLM
-    from astrai.trainer.callbacks.metric_util import GradSNRTracker
-    from astrai.trainer.strategy.ops import _collect_moe_diagnostics
-
     config = AutoRegressiveLMConfig(
         vocab_size=case["vocab_size"],
         hidden_size=case["hidden_size"],
@@ -313,16 +312,6 @@ def _run_case(case, torch):
 
 def _run_stats(args, torch):
     """Measure SNR and MoE diagnostic costs on the selected idle GPU."""
-    from types import SimpleNamespace
-
-    import torch.nn as nn
-    import torch.nn.functional as F
-
-    from astrai.config.model_config import AutoRegressiveLMConfig
-    from astrai.model import AutoRegressiveLM
-    from astrai.trainer.callbacks.metric_util import GradSNRTracker
-    from astrai.trainer.callbacks.metrics import MetricCallback
-    from astrai.trainer.strategy.ops import _collect_moe_diagnostics
 
     device = "cuda"
     result = {}
@@ -580,8 +569,6 @@ def _run_stats(args, torch):
 
 def _run_muon(args, torch):
     """Measure single-stream Muon and optionally compare NS buffer reuse."""
-    from astrai.model import AutoRegressiveLM
-    from astrai.optimization.optimizer.muon import MuonAdamW
 
     result = {
         "model_path": str(args.model_path),
@@ -1112,7 +1099,6 @@ def main():
         return
     gpu = _require_idle_gpu(args.gpu)
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    import torch
 
     torch.cuda.set_per_process_memory_fraction(args.memory_fraction)
     torch.manual_seed(7)

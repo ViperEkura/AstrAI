@@ -38,14 +38,8 @@ class _ConfigModel(nn.Module):
 
 
 class _OnlineStrategy:
-    def __init__(self):
-        self.runner = None
-
     def supports_online(self):
         return True
-
-    def set_rollout_runner(self, runner):
-        self.runner = runner
 
 
 class _ConfigDataset(Dataset):
@@ -97,6 +91,7 @@ def _init_single_rank_process_group(tmp_path, backend):
 
 def _rollout_config(*, compile_mode=None, enable_overlap=False):
     return SimpleNamespace(
+        optimizer=ComponentSpec(type="torch.optim:SGD"),
         strategy="online_grpo",
         rollout_mode="sync",
         compile_mode=compile_mode,
@@ -160,6 +155,7 @@ def test_train_context_passes_ddp_inference_view_to_rollout(
     )
     try:
         model = _ConfigModel()
+        model.generation_config = {"eos_token_id": [1, 2]}
         wrapped = DDP(model)
         context = _rollout_context(wrapped, DDPExecutor())
         builder = TrainContextBuilder(_rollout_config(enable_overlap=enable_overlap))
@@ -167,13 +163,11 @@ def test_train_context_passes_ddp_inference_view_to_rollout(
         builder._configure_rollout(context, {"group_size": 2})
 
         assert captured["model"] is model
+        assert captured["model"].generation_config == {"eos_token_id": [1, 2]}
         assert captured["max_seq_len"] == 32
         assert captured["max_batch_size"] == 2
         assert captured["enable_overlap"] is enable_overlap
-        assert (
-            context.strategy.runner.generator.backend.engine_core.__class__
-            is _EngineCore
-        )
+        assert context.rollout.generator.backend.engine_core.__class__ is _EngineCore
     finally:
         dist.destroy_process_group()
 
@@ -401,9 +395,7 @@ def test_effective_grpo_defaults_and_all_worker_parameters(monkeypatch):
     context = SimpleNamespace(
         model=model,
         executor=SimpleNamespace(model_for_inference=lambda m: m),
-        strategy=SimpleNamespace(
-            group_size=4, supports_online=lambda: True, set_rollout_runner=Mock()
-        ),
+        strategy=SimpleNamespace(group_size=4, supports_online=lambda: True),
         consumed_samples=10,
         checkpoint=None,
         optimizer_step=2,
@@ -417,23 +409,22 @@ def test_effective_grpo_defaults_and_all_worker_parameters(monkeypatch):
         context, cfg, "tokenizer", {}, Mock(), lambda _: None, Mock(), Mock()
     )
     values = coordinator.call_args.kwargs
-    assert values["params"] == SamplingParams(
+    resolved = values["config"]
+    assert resolved.params == SamplingParams(
         group_size=4, max_tokens=16, temperature=0.8, top_k=7, top_p=0.75
     )
-    assert values["max_batch_size"] == 12
-    assert values["max_prompts_per_worker"] == 3
-    assert values["startup_timeout_s"] == 73
-    assert values["worker_timeout_s"] == 91
-    assert values["weight_timeout_s"] == 123
-    assert values["random_seed"] == 42
-    assert values["sample_cursor"] == 10
-    assert cfg.rollout_max_policy_lag == values["max_policy_lag"] == 1
+    assert resolved.max_batch_size == 12
+    assert resolved.max_prompts_per_worker == 3
+    assert resolved.startup_timeout_s == 73
+    assert resolved.generation_timeout_s == 91
+    assert resolved.weight_timeout_s == 123
+    assert resolved.random_seed == 42
+    assert resolved.sample_cursor == 10
+    assert cfg.rollout_max_policy_lag == resolved.max_policy_lag == 1
     assert values["model_dtype"] == torch.bfloat16
-    assert values["devices"] == ["cuda:1", "cuda:2"]
-    assert (
-        context.async_rollout is context.strategy.set_rollout_runner.call_args.args[0]
-    )
-    assert context.async_rollout.coordinator is coordinator.return_value
+    assert resolved.devices == ("cuda:1", "cuda:2")
+    assert resolved.learner_rank is None
+    assert context.rollout.coordinator is coordinator.return_value
 
 
 @pytest.mark.parametrize("devices", [["cuda:0"], ["cuda:3"]])
@@ -473,6 +464,7 @@ def test_ddp_rollout_devices_are_partitioned_by_learner_rank(monkeypatch):
     assert resolved[1].devices == ("cuda:3", "cuda:5")
     assert all(item.sample_cursor == 6 for item in resolved)
     assert all(item.max_prompts_per_worker == 3 for item in resolved)
+    assert [item.learner_rank for item in resolved] == [0, 1]
 
 
 def test_ddp_rollout_rejects_shared_or_missing_worker_devices():
@@ -480,3 +472,37 @@ def test_ddp_rollout_rejects_shared_or_missing_worker_devices():
         _config(dp_size=2, dp_mode="ddp", rollout_devices=["cuda:1", "cuda:2"])
     with pytest.raises(ValueError, match="at least one rollout device per learner"):
         _config(dp_size=2, dp_mode="ddp", rollout_devices=["cuda:2"])
+
+
+@pytest.mark.parametrize(
+    "devices, message",
+    [
+        ([], "at least one rollout device"),
+        (["cpu"], "indexed CUDA"),
+        (["cuda"], "indexed CUDA"),
+        (["cuda:-1"], "indexed CUDA"),
+        (["cuda:1", "cuda:01"], "distinct"),
+        (["cuda:0"], "exclude all learner"),
+    ],
+)
+def test_async_layout_rules_match_at_config_and_runtime(devices, message):
+    with pytest.raises(ValueError, match=message):
+        _config(rollout_devices=devices)
+    # Setup may be invoked directly, so it enforces the same pure rules.
+    with pytest.raises(ValueError, match=message):
+        resolve_async_rollout(
+            SimpleNamespace(rollout_devices=devices),
+            torch.device("cuda:0"),
+            SamplingParams(group_size=4),
+            256,
+            0,
+        )
+
+
+def test_async_runtime_rechecks_available_devices(monkeypatch):
+    config = _config(rollout_devices=["cuda:1", "cuda:2"])
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 2)
+    with pytest.raises(ValueError, match="exceed available CUDA devices"):
+        resolve_async_rollout(
+            config, torch.device("cuda:0"), SamplingParams(group_size=4), 256, 0
+        )

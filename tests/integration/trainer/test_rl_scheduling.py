@@ -10,14 +10,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from astrai.config import ComponentSpec, TrainConfig
+from astrai.dataset import GlobalBatchSampler
+from astrai.parallel.executor import BaseExecutor
 from astrai.parallel.setup import find_free_port
 from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks import TrainCallback
 from astrai.trainer.context import TrainContext, TrainContextBuilder
-from astrai.trainer.rollout import BaseRewardModel, RolloutResult
+from astrai.trainer.rollout import BaseRewardModel, RolloutResult, RolloutRunner
 from astrai.trainer.strategy import (
     GRPOStrategy,
     PPOStrategy,
@@ -67,6 +69,7 @@ class FakeRunner:
         self.result = result
         self.calls = 0
         self.steps = 0
+        self.policy_version = 0
 
     def __call__(self, batch):
         self.calls += 1
@@ -75,12 +78,12 @@ class FakeRunner:
     def step(self):
         self.steps += 1
 
-    def apply_weight_update(self, policy_version, update):
-        return update(0)
+    def publish_weights(self, version, model):
+        pass
 
-    @property
-    def policy_version(self):
-        return 0
+    def apply_weight_update(self, policy_version, update):
+        update(self.policy_version + 1)
+        self.policy_version += 1
 
 
 def _rollout_result(
@@ -113,14 +116,47 @@ def _grpo_strategy(result, **kwargs):
         group_size=2,
         **kwargs,
     )
-    strategy._rollout_runner = FakeRunner(result)
     return strategy
+
+
+def _run_replay(strategy, result, epochs=1, minibatch=None):
+    """Exercise Trainer's real global-window scheduling with a fixed rollout."""
+    total = result.prompts.shape[0]
+    config = SimpleNamespace(
+        rollout_mode="sync",
+        batch_per_device=total,
+        grad_accum_steps=1,
+        rl_update_epochs=epochs,
+        rl_minibatch_prompts=minibatch,
+        epoch_tail_policy="flush",
+        cp_size=1,
+    )
+    dataset = list(range(total))
+    runner = FakeRunner(result)
+    context = TrainContext(
+        model=strategy.model,
+        strategy=strategy,
+        config=config,
+        dataset=dataset,
+        dataloader=DataLoader(
+            dataset,
+            batch_sampler=GlobalBatchSampler(dataset, 1, 0, total, 1, 42, "flush"),
+        ),
+        executor=BaseExecutor(),
+        rollout=runner,
+        optimizer=torch.optim.SGD(strategy.model.parameters(), lr=0.01),
+    )
+    context.scheduler = torch.optim.lr_scheduler.StepLR(context.optimizer, 1, gamma=0.9)
+    trainer = Trainer.__new__(Trainer)
+    trainer.callbacks = []
+    trainer._train_global_epoch(context, 0)
+    return context
 
 
 # --------------- Feature 1: rollout -> minibatch x epochs ---------------
 
 
-def test_offline_training_steps_yield_once():
+def test_offline_loss_outputs_yield_once():
     """No runner: the historical one-call-per-batch contract holds."""
     torch.manual_seed(1)
     strategy = GRPOStrategy(StubLM(), "cpu", old_model=None, ref_model=StubLM())
@@ -132,7 +168,7 @@ def test_offline_training_steps_yield_once():
         "rewards": torch.randn(2, 2),
         "logprobs_old": torch.randn(2, 2, 3) * 0.1,
     }
-    outputs = list(strategy.training_steps(batch))
+    outputs = list(strategy.loss_outputs(batch))
     assert len(outputs) == 1
     assert torch.isfinite(outputs[0]["loss"])
 
@@ -143,16 +179,16 @@ def test_async_grpo_microbatches_share_one_update_and_full_batch_gradient(
 ):
     result = _rollout_result(b=3)
     result.response_mask[0, :, -1] = False
-    result.response_mask[1, 1, :] = False
+    result.response_mask[1, :, :] = False
     full = _grpo_strategy(result, loss_aggregation=aggregation)
     micro = _grpo_strategy(result, loss_aggregation=aggregation)
 
     full_loss = full.compute_loss_output(full.prepare_from_rollout(result))["loss"]
     full_loss.backward()
-    updates = list(micro.training_updates(result, microbatch_prompts=1))
-    assert len(updates) == 1
-    outputs = list(updates[0])
-    assert len(outputs) == 3
+    outputs = list(
+        micro.loss_outputs(micro.prepare_from_rollout(result), microbatch_prompts=1)
+    )
+    assert len(outputs) == 2
     micro_loss = sum(output["loss"] for output in outputs)
     micro_loss.backward()
 
@@ -163,24 +199,24 @@ def test_async_grpo_microbatches_share_one_update_and_full_batch_gradient(
         torch.testing.assert_close(micro_param.grad, full_param.grad)
 
 
-def test_default_training_updates_keep_ppo_update_count():
+def test_ppo_replay_updates_actor_and_critic_once_per_minibatch():
     result = _rollout_result()
+    critic = StubCritic()
     strategy = PPOStrategy(
         StubLM(),
         "cpu",
-        critic=StubCritic(),
-        critic_optimizer=None,
+        critic=critic,
+        critic_optimizer=torch.optim.SGD(critic.parameters(), lr=0.01),
         ref_model=None,
-        rl_update_epochs=2,
-        rl_minibatch_prompts=2,
     )
-    strategy._rollout_runner = FakeRunner(result)
-    updates = [
-        list(update) for update in strategy.training_updates({"instruction": ["x"] * 4})
-    ]
-    assert len(updates) == 4
-    assert all(len(update) == 1 for update in updates)
-    assert strategy._rollout_runner.calls == 1
+    updates = []
+    strategy.critic_optimizer.register_step_post_hook(lambda *args: updates.append(1))
+    context = _run_replay(strategy, result, epochs=2, minibatch=2)
+    assert len(updates) == context.optimizer_step == context.rollout.policy_version == 4
+    assert context.rollout.calls == 1
+    assert context.scheduler.last_epoch == 4
+    assert context.consumed_samples == context.epoch_sample_offset == 4
+    assert all(p.grad is None for p in critic.parameters())
 
 
 def test_shared_train_batch_commits_async_round_once():
@@ -199,7 +235,8 @@ def test_shared_train_batch_commits_async_round_once():
         grad_accum_steps = 1
         sync_gradients = True
 
-        def accumulate(self, _model):
+        def accumulate_explicit(self, _model, sync):
+            assert sync
             return nullcontext()
 
         def backward(self, loss):
@@ -208,19 +245,18 @@ def test_shared_train_batch_commits_async_round_once():
     result = _rollout_result(b=3)
     strategy = _grpo_strategy(result)
     coordinator = Coordinator()
-    strategy._rollout_runner = coordinator
     optimizer = torch.optim.SGD(strategy.model.parameters(), lr=0.01)
     before = strategy.model.embed.weight.detach().clone()
-    context = SimpleNamespace(
+    context = TrainContext(
         model=strategy.model,
         strategy=strategy,
         executor=Executor(),
         config=SimpleNamespace(async_train_microbatch_prompts=1),
-        async_rollout=coordinator,
-        dp_size=1,
+        rollout=RolloutRunner(coordinator=coordinator),
         optimizer=optimizer,
         scheduler=None,
         consumed_samples=0,
+        epoch_sample_offset=0,
         optimizer_steps_completed=0,
         loss=0.0,
         metrics={},
@@ -239,20 +275,20 @@ def test_online_minibatch_and_epoch_step_counts():
     """One rollout round fans out into minibatches × update epochs, with a
     single generation call and one runner step per learner update."""
     result = _rollout_result()
-    strategy = _grpo_strategy(result, rl_update_epochs=2, rl_minibatch_prompts=2)
-    outputs = list(strategy.training_steps({"instruction": ["x"] * 4}))
-
-    assert len(outputs) == 4  # 2 prompts/minibatch × 2 epochs on B=4
-    assert strategy._rollout_runner.calls == 1
-    assert all(torch.isfinite(out["loss"]) for out in outputs)
-    assert all("truncation_rate" not in out["metrics"] for out in outputs)
+    strategy = _grpo_strategy(result)
+    context = _run_replay(strategy, result, epochs=2, minibatch=2)
+    assert context.optimizer_step == context.rollout.steps == 4
+    assert context.rollout.calls == 1
+    assert context.consumed_samples == 4
+    assert context.scheduler.last_epoch == 4
+    assert context.checkpoint_safe
 
 
 def test_minibatch_slices_keep_prompt_groups_intact():
     """Slices are row ranges of the prepared batch: whole groups, shared
     non-tensor payloads, and rewards in the original order."""
     result = _rollout_result(finish_reasons=[["stop", "length"]] * 4)
-    strategy = _grpo_strategy(result, rl_minibatch_prompts=2)
+    strategy = _grpo_strategy(result)
 
     captured = []
     original_prepare = strategy.prepare_from_rollout
@@ -260,26 +296,39 @@ def test_minibatch_slices_keep_prompt_groups_intact():
     strategy.compute_loss_output = lambda batch: (
         captured.append(batch)
         or {
-            "loss": torch.tensor(0.5),
+            "loss": sum(p.sum() for p in strategy.model.parameters()) * 0 + 0.5,
             "metrics": {},
         }
     )
-    list(strategy.training_steps({"instruction": ["x"] * 4}))
+    _run_replay(strategy, result, minibatch=2)
 
     assert len(captured) == 2
     for i, chunk in enumerate(captured):
         begin = i * 2
         assert torch.equal(chunk["rewards"], prepared["rewards"][begin : begin + 2])
         assert torch.equal(chunk["responses"], prepared["responses"][begin : begin + 2])
-        assert chunk["finish_reasons"] == prepared["finish_reasons"]
+        assert chunk["finish_reasons"] == prepared["finish_reasons"][begin : begin + 2]
 
 
 def test_rollout_truncation_metric_reaches_grpo_metrics():
     result = _rollout_result(finish_reasons=[["stop", "length"]] * 4)
     strategy = _grpo_strategy(result)
-    (output,) = list(strategy.training_steps({"instruction": ["x"] * 4}))
+    (output,) = list(strategy.loss_outputs(strategy.prepare_from_rollout(result)))
     assert output["metrics"]["truncation_rate"] == pytest.approx(0.5)
     assert output["metrics"]["stop_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("minibatch", [None, 2])
+def test_replay_accepts_scalar_metadata_before_prompt_tensors(minibatch):
+    result = _rollout_result()
+    strategy = _grpo_strategy(result)
+    prepare = strategy.prepare_from_rollout
+    strategy.prepare_from_rollout = lambda result: {
+        "temperature": torch.tensor(1.0),
+        **prepare(result),
+    }
+    context = _run_replay(strategy, result, minibatch=minibatch)
+    assert context.optimizer_step == (1 if minibatch is None else 2)
 
 
 def test_ppo_advantages_pinned_once_across_minibatches_and_epochs():
@@ -294,10 +343,8 @@ def test_ppo_advantages_pinned_once_across_minibatches_and_epochs():
         ref_model=None,
         clip_eps=0.2,
         kl_coef=0.0,
-        rl_update_epochs=2,
-        rl_minibatch_prompts=2,
     )
-    strategy._rollout_runner = FakeRunner(_rollout_result())
+    result = _rollout_result()
 
     calls = []
     original = strategy._compute_advantages
@@ -307,19 +354,22 @@ def test_ppo_advantages_pinned_once_across_minibatches_and_epochs():
         return original(*args, **kwargs)
 
     strategy._compute_advantages = counting
-    outputs = list(strategy.training_steps({"instruction": ["x"] * 4}))
+    context = _run_replay(strategy, result, epochs=2, minibatch=2)
 
-    assert len(outputs) == 4
+    assert context.optimizer_step == 4
     assert len(calls) == 1
 
 
-def test_rl_scheduling_fields_validated():
-    with pytest.raises(ValueError, match="rl_update_epochs"):
-        _grpo_strategy(_rollout_result(), rl_update_epochs=0)
-    with pytest.raises(ValueError, match="rl_minibatch_prompts"):
-        _grpo_strategy(_rollout_result(), rl_minibatch_prompts=0)
-    with pytest.raises(ValueError, match="rl_minibatch_prompts"):
-        _grpo_strategy(_rollout_result(), rl_minibatch_prompts=True)
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"rl_update_epochs": 0},
+        {"rl_minibatch_prompts": 0},
+    ],
+)
+def test_rl_scheduling_fields_validated(base_test_env, options):
+    with pytest.raises(ValueError, match=next(iter(options))):
+        _online_config(base_test_env, **options)
 
 
 # --------------- Feature 2: gradient-path chunked logprobs ---------------
@@ -517,7 +567,7 @@ def _online_config(base_test_env, **overrides):
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.integration.trainer.test_rl_scheduling:InstructionDataset",
             params={
@@ -584,7 +634,13 @@ def test_online_minibatch_round_publication_and_reference_resume(base_test_env):
     stripped = Checkpoint.load(checkpoint_dir)
     stripped.extra.pop("reference_model")
     stripped.save(stripped_dir)
-    for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ):
         src = os.path.join(checkpoint_dir, name)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(stripped_dir, name))
@@ -734,3 +790,11 @@ def test_online_ddp_flushes_tail_with_empty_rank(base_test_env):
     assert checkpoint.meta["policy_version"] == 3
     assert checkpoint.consumed_samples == 5
     assert checkpoint.meta["epoch_sample_offset"] == 5
+
+
+def test_async_grpo_rejects_round_without_training_targets():
+    result = _rollout_result()
+    result.response_mask.zero_()
+    strategy = _grpo_strategy(result)
+    with pytest.raises(RuntimeError, match="no valid response tokens"):
+        list(strategy.loss_outputs(strategy.prepare_from_rollout(result), 1))

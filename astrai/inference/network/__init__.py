@@ -18,7 +18,6 @@ from astrai.inference.network.protocol import GenContext, ProtocolHandler
 from astrai.inference.network.tool_parser import (
     BaseToolParser,
     SimpleJsonToolParser,
-    ToolParserFactory,
 )
 
 __all__ = [
@@ -32,7 +31,6 @@ __all__ = [
     "ProtocolHandler",
     "SimpleJsonToolParser",
     "ToolDef",
-    "ToolParserFactory",
     "get_app",
     "run_server",
 ]

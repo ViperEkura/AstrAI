@@ -7,12 +7,12 @@ subsystem-level layout as the [inference internals](../inference/README.md).
 
 ```text
 astrai/trainer/
-  trainer.py, session.py, train_context.py   loop, lifetime, construction
+  trainer.py, session.py, context/   loop, lifetime, construction
   components.py                            model, dataset, loader, optimizer, scheduler
   strategy/                                  objectives and loss contracts
   rollout/, backend.py                       generation and reward path
   callbacks/, optional_extras.py             hooks and checkpoint extras
-  schedule.py                                 learning-rate policies
+  ../optimization/scheduler/                learning-rate policies
 ```
 
 The dependency direction is Trainer -> TrainSession -> TrainContextBuilder ->
@@ -24,6 +24,7 @@ rather than owning the optimizer loop.
 
 | Document | Scope |
 | --- | --- |
+| [configuration.md](configuration.md) | Canonical optimizer settings and resolved rollout configuration |
 | [lifecycle.md](lifecycle.md) | Trainer, session, context, configuration and scheduler |
 | [strategy.md](strategy.md) | Strategy protocol, registration, capabilities and objectives |
 | [rollout.md](rollout.md) | Backend, generation, scoring, worker protocol and weight transport |

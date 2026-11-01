@@ -83,12 +83,10 @@ class GlobalBatchSampler(Sampler[List[int]]):
 
 
 class RDSampler(Sampler[int]):
-    """Resumable Distributed Sampler.
+    """Padded rank shards for validation and asynchronous rollout rounds.
 
-    A distributed sampler that supports checkpoint-based resume: iteration
-    state (epoch, position) is tracked so training can continue from the
-    exact sample after a restart.  Shards the dataset across
-    ``dist.world_size`` replicas with optional shuffling.
+    Worker prefetch can advance this iterator ahead of the learner. Checkpoints
+    use the committed TrainContext cursor, never this mutable read position.
     """
 
     def __init__(

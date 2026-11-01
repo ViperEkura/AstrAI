@@ -34,10 +34,6 @@ classDiagram
         execute_model(plan)
         execute_score()
     }
-    class RequestManager {
-        waiting / running
-        request lookup
-    }
     class KVCacheManager {
         alloc_slots() / extend_slots_batch()
         record_block_hashes(materialized_end)
@@ -53,15 +49,25 @@ classDiagram
     EngineCore *-- GPUModelRunner
     EngineCore *-- PolicyVersionGuard
     Scheduler *-- StepPlanner
-    Scheduler *-- RequestManager
     Scheduler *-- KVCacheManager
 ```
+
+The scheduler owns one request registry, waiting/running queues and terminal
+accounting. EngineCore's operation lock serializes mutations. Scoring requests
+use the same registry without entering generation queues. Cancelled in-flight
+requests remain registered until execution retires, protecting their IDs and KV.
 
 The mutable `Request` belongs to the core. Planning captures an execution
 snapshot; worker execution must not read a changing request or append to its
 output. Result application validates execution/request identity and policy
 version, then advances the corresponding live request. Reapplying a result
 must not append the same token twice.
+
+`Scheduler.add_request` preserves scalar tokenization and delegates its
+prepared tokens to the batch construction path. Token budgets and request
+construction have one implementation. Batch tokenization still runs once,
+and all requests are validated before a single atomic enqueue, so a bad
+request cannot leave a valid prefix registered.
 
 `astrai.trainer.backend.run_batch` is the synchronous token-ID API used by
 training rollout. It validates and formats the batch, then calls

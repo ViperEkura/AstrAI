@@ -287,7 +287,9 @@ class GenerationBenchmark:
         try:
             # Capture graphs and populate the allocator before timing. The
             # first request also includes model/scheduler startup effects.
-            engine.generate(prompts, max_tokens=gen_length, temperature=0.0)
+            engine.generate(
+                prompts, max_tokens=gen_length, temperature=0.0, do_sample=False
+            )
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
 
@@ -298,14 +300,16 @@ class GenerationBenchmark:
             # overcount of the prefill share — and report the per-step
             # decode cost with and without it.
             t_probe = time.perf_counter()
-            engine.generate(prompts, max_tokens=1, temperature=0.0)
+            engine.generate(prompts, max_tokens=1, temperature=0.0, do_sample=False)
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
             prefill_ms = (time.perf_counter() - t_probe) * 1000
 
             t0 = time.perf_counter()
             for _ in range(num_trials):
-                engine.generate(prompts, max_tokens=gen_length, temperature=0.0)
+                engine.generate(
+                    prompts, max_tokens=gen_length, temperature=0.0, do_sample=False
+                )
             if self.device.startswith("cuda"):
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0

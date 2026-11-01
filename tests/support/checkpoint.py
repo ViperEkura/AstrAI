@@ -29,7 +29,5 @@ def load_shard_meta(out_dir):
 
 
 def assert_state_dicts_equal(a, b):
-    """Assert two state dicts have identical keys and equal tensor values."""
-    assert set(a.keys()) == set(b.keys()), f"Key mismatch: {set(a) ^ set(b)}"
-    for key in a:
-        assert torch.equal(a[key], b[key]), f"Tensor mismatch at key: {key}"
+    """Compare keys and exact tensor values, including shapes, dtypes and devices."""
+    torch.testing.assert_close(a, b, rtol=0, atol=0)

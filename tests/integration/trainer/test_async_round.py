@@ -19,7 +19,12 @@ from astrai.trainer.rollout.protocol import (
     recv_message,
     send_message,
 )
-from astrai.trainer.rollout.types import RawRollout, RolloutVersionError, SamplingParams
+from astrai.trainer.rollout.types import (
+    RawRollout,
+    ResolvedAsyncRolloutConfig,
+    RolloutVersionError,
+    SamplingParams,
+)
 
 
 def _fake_worker(conn, spec):
@@ -159,31 +164,41 @@ class _Reward:
         return torch.ones(len(prompts), 1)
 
 
-def _coordinator(
+def _resolved_config(
     devices=None,
     timeout=3.0,
     max_prompts_per_worker=1,
     learner_rank=None,
     sample_cursor=0,
 ):
+    return ResolvedAsyncRolloutConfig(
+        learner_device="cpu",
+        devices=tuple(devices or ["a", "b", "c", "d"]),
+        params=SamplingParams(max_tokens=1, group_size=1),
+        max_seq_len=8,
+        max_prompts_per_worker=max_prompts_per_worker,
+        startup_timeout_s=300.0,
+        generation_timeout_s=timeout,
+        weight_timeout_s=timeout,
+        max_policy_lag=1,
+        random_seed=3407,
+        sample_cursor=sample_cursor,
+        learner_rank=learner_rank,
+    )
+
+
+def _coordinator(**kwargs):
     source = torch.nn.Linear(2, 2)
     return source, AsyncRoundCoordinator(
+        config=_resolved_config(**kwargs),
         source=source,
         model_fn=partial(torch.nn.Linear, 2, 2),
         param_path="unused",
-        devices=devices or ["a", "b", "c", "d"],
-        params=SamplingParams(max_tokens=1, group_size=1),
         reward_model=_Reward(),
         policy_version=0,
-        max_batch_size=1,
-        max_seq_len=8,
         model_dtype=torch.float32,
-        worker_timeout_s=timeout,
-        max_prompts_per_worker=max_prompts_per_worker,
         worker_target=_fake_worker,
         weight_channel=_FakeWeightChannel(source, 0),
-        learner_rank=learner_rank,
-        sample_cursor=sample_cursor,
     )
 
 
@@ -367,15 +382,12 @@ def test_version_commit_failure_marks_optimizer_commit():
 def test_model_factory_must_be_pickleable():
     with pytest.raises(ValueError, match="model_fn must be pickleable"):
         AsyncRoundCoordinator(
+            config=_resolved_config(),
             source=torch.nn.Linear(2, 2),
             model_fn=lambda: torch.nn.Linear(2, 2),
             param_path="unused",
-            devices=["a", "b", "c", "d"],
-            params=SamplingParams(max_tokens=1, group_size=1),
             reward_model=_Reward(),
             policy_version=0,
-            max_batch_size=1,
-            max_seq_len=8,
             model_dtype=torch.float32,
             worker_target=_fake_worker,
         )
@@ -409,7 +421,7 @@ def test_prefetch_resume_cursor_and_retry_keep_response_seeds():
     finally:
         pool.close()
 
-    assert next_round.seeds == _response_seeds(pool.random_seed, 4, 2, 1)
+    assert next_round.seeds == _response_seeds(pool.config.random_seed, 4, 2, 1)
 
 
 def test_two_learners_keep_local_order_and_distinct_response_seeds():

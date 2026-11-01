@@ -4,9 +4,7 @@ import pytest
 
 from astrai.inference.network.tool_parser import (
     _TOOL_CALL_HEAD_RE,
-    BaseToolParser,
     SimpleJsonToolParser,
-    ToolParserFactory,
     _find_partial_tool_call,
     _find_tool_calls,
     _scan_json,
@@ -218,12 +216,9 @@ def test_feed_text_before_tool_call():
     assert any("Let me check" in d.get("content", "") for d in content_deltas)
 
 
-def test_has_tool_calls_false_by_default():
-    assert SimpleJsonToolParser().has_tool_calls is False
-
-
 def test_has_tool_calls_true_after_detection():
     parser = SimpleJsonToolParser()
+    assert parser.has_tool_calls is False
     parser.feed('{"name": "f", "arguments": {}}')
     assert parser.has_tool_calls is True
 
@@ -502,29 +497,22 @@ def test_pattern_regex(text, matches):
         assert result is None
 
 
-def test_factory_register_and_create():
-    parser = ToolParserFactory.create("simple_json")
-    assert isinstance(parser, BaseToolParser)
-    assert isinstance(parser, SimpleJsonToolParser)
-
-
-def test_factory_create_passes_tools():
-    parser = ToolParserFactory.create(
-        "simple_json", tools=[{"type": "function"}], tool_choice="required"
-    )
-    assert parser.tool_choice == "required"
-
-
-def test_factory_create_with_tools_only():
-    tools = [
-        {
-            "type": "function",
-            "function": {"name": "test", "parameters": {"type": "object"}},
-        }
-    ]
-    parser = ToolParserFactory.create("simple_json", tools=tools)
+@pytest.mark.parametrize(
+    "options, expected_choice",
+    [({}, "auto"), ({"tool_choice": "required"}, "required")],
+)
+def test_factory_parser_preserves_options_and_parses_calls(options, expected_choice):
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+    parser = SimpleJsonToolParser(tools=tools, **options)
     assert parser.tools == tools
-    assert parser.tool_choice == "auto"
+    assert parser.tool_choice == expected_choice
+    result = parser.parse_complete(
+        '{"name": "get_weather", "arguments": {"city": "BJ"}}'
+    )
+    assert result["tool_calls"][0]["function"] == {
+        "name": "get_weather",
+        "arguments": '"city": "BJ"',
+    }
 
 
 def test_feed_token_ids_do_not_affect_parsing():
@@ -532,9 +520,7 @@ def test_feed_token_ids_do_not_affect_parsing():
     parser_with_ids = SimpleJsonToolParser()
     text = '{"name": "get_weather", "arguments": {"city": "Beijing"}}'
     result_no = parser_no_ids.feed(text)
-    result_with = parser_with_ids.feed(
-        text, current_token_ids=[1, 2, 3], delta_token_ids=[3]
-    )
+    result_with = parser_with_ids.feed(text, delta_token_ids=[3])
     assert len(result_no) == len(result_with)
     assert (
         result_no[0]["tool_calls"][0]["function"]["name"]

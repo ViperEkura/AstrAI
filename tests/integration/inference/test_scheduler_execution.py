@@ -348,7 +348,7 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(device):
     # the tokenizer stops nothing, so every request runs to max_tokens on
     # every build.
     tokenizer = FakeTokenizer()
-    tokenizer.stop_ids = []
+    tokenizer.eos_token_id = None
 
     prompts = [[10, 11, 12, 13, 14, 15, 16, 17], [40, 41, 42, 43], [5, 6, 7]]
 
@@ -407,7 +407,7 @@ def test_chunked_prefill_budget_caps_forward_tokens(device):
     # budget being tested, and a random-init argmax onto the stop id would
     # truncate the exact-length assert on some torch builds.
     tokenizer = FakeTokenizer()
-    tokenizer.stop_ids = []
+    tokenizer.eos_token_id = None
     scheduler = EngineCore(
         model=model,
         tokenizer=tokenizer,

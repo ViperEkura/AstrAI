@@ -20,6 +20,7 @@ from astrai.trainer.callbacks.checkpoint import (
 from astrai.trainer.trainer import Trainer
 from tests.support.checkpoint import load_checkpoint_meta
 from tests.support.rollout import RandomTokenDataset
+from tests.support.tokenizers import build_test_tokenizer
 
 
 def test_gradient_checkpointing_enable_disable(test_model):
@@ -257,8 +258,8 @@ def test_checkpoint_snapshots_tokenizer_files(
     """Checkpoints copy tokenizer files from param_path so resume works."""
     param_dir = tmp_path / "model"
     param_dir.mkdir()
-    (param_dir / "tokenizer.json").write_text("{}")
-    (param_dir / "tokenizer_config.json").write_text("{}")
+    build_test_tokenizer().save_pretrained(param_dir)
+    (param_dir / "generation_config.json").write_text('{"eos_token_id": [0, 1]}')
 
     train_config = train_config_factory(
         dataset=RandomTokenDataset(length=2),
@@ -274,7 +275,12 @@ def test_checkpoint_snapshots_tokenizer_files(
     assert (ckpt_dir / "tokenizer.json").is_file()
     assert (ckpt_dir / "tokenizer_config.json").is_file()
     files = json.loads((ckpt_dir / "manifest.json").read_text())["files"]
-    assert {"tokenizer.json", "tokenizer_config.json"} <= set(files)
+    assert {"tokenizer.json", "tokenizer_config.json", "generation_config.json"} <= set(
+        files
+    )
+    assert json.loads((ckpt_dir / "generation_config.json").read_text())[
+        "eos_token_id"
+    ] == [0, 1]
 
     # Resuming with param_path == checkpoint dir must not raise
     # (samefile guard).

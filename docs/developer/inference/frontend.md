@@ -165,3 +165,50 @@ subsequent duplicate/late events. Single-character stop strings retain no
 ambiguous suffix, while a natural terminal flushes the unmatched suffix.
 Prompt usage is initialized from the already-tokenized input so an early
 text stop still reports the correct prompt length.
+
+## Tokenizer and generation configuration
+
+AstrAI reads HF tokenizer files: `tokenizer.json`, `tokenizer_config.json`,
+optional `special_tokens_map.json`, and `chat_template.jinja`. Named tokens
+use `bos_token`, `eos_token`, `pad_token`, and `additional_special_tokens`;
+their IDs come from the vocabulary. Private `special_tokens` and
+`stop_token_ids` fields are rejected and must be migrated before loading.
+Saving exports the chat template as `chat_template.jinja`.
+
+Generation defaults belong to the model's `generation_config.json`. If it
+is absent, HF generation fields in `config.json` are used. The tokenizer's
+EOS declaration does not implicitly set the generation stop conditions.
+For AstrAI V1-2B, the actual vocabulary maps
+`<｜end▁of▁sentence｜>` to 1 and `<｜im▁end｜>` to 130817:
+
+```json
+{"bos_token_id": 0, "pad_token_id": 2, "eos_token_id": [1, 130817]}
+```
+
+Per-call keyword arguments override the supplied `generation_config`, which
+overrides the model defaults. Both a dictionary and a Transformers
+`GenerationConfig` instance are accepted. Omitting `eos_token_id` inherits
+the default; explicitly passing `None` or `[]` disables EOS stopping.
+Length limits still apply.
+
+```python
+engine.generate(
+    prompt,
+    max_new_tokens=512,
+    do_sample=True,
+    temperature=0.8,
+    eos_token_id=[1, 130817],
+)
+```
+
+As in HF, `do_sample=False` selects greedy decoding; setting `temperature`
+alone does not enable sampling. AstrAI supports greedy and multinomial
+sampling, not every Transformers generation algorithm. Unsupported beam,
+repetition-penalty and minimum-length settings raise errors. The
+`max_tokens` argument remains the frontend alias for `max_new_tokens`;
+passing both is an error.
+
+Training checkpoints export tokenizer and generation files into staging
+before manifest creation. This file convention does not convert AstrAI's
+native model architecture, weight names or optimizer state into a
+Transformers model.

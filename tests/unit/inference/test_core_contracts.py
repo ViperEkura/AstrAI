@@ -300,7 +300,7 @@ def test_overlap_rebuilds_shrunken_plan_after_committing_old_history():
 
         model.forward = forward
         tokenizer = FakeTokenizer()
-        tokenizer.stop_ids = []
+        tokenizer.eos_token_id = None
         sched = make_cpu_scheduler(
             model,
             tokenizer,

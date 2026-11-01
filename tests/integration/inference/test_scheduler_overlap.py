@@ -138,10 +138,14 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
 
     try:
         scheduler.start()
-        rid_a = scheduler.add_request("a" * 8, max_tokens=12)
+        rid_a = scheduler.add_request(
+            "a" * 8, max_tokens=12, generation_config={"eos_token_id": None}
+        )
         sink_rids["a" * 8] = rid_a
         time.sleep(0.2)  # let the first request enter steady decode
-        rid_b = scheduler.add_request("b" * 8, max_tokens=12)
+        rid_b = scheduler.add_request(
+            "b" * 8, max_tokens=12, generation_config={"eos_token_id": None}
+        )
         sink_rids["b" * 8] = rid_b
         assert done["first"].wait(timeout=10)
         assert done["second"].wait(timeout=10)

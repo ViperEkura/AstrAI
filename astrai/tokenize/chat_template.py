@@ -1,9 +1,30 @@
+import json
+from datetime import datetime
 from functools import cached_property
 from typing import Any, Dict, List, Optional
 
-from jinja2 import Template
+from jinja2 import Template, TemplateError
+from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 MessageType = Dict[str, Any]
+
+
+def _raise_exception(message):
+    raise TemplateError(message)
+
+
+def _tojson(value, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+    return json.dumps(
+        value,
+        ensure_ascii=ensure_ascii,
+        indent=indent,
+        separators=separators,
+        sort_keys=sort_keys,
+    )
+
+
+def _strftime_now(format):
+    return datetime.now().strftime(format)
 
 
 class ChatTemplate:
@@ -42,7 +63,14 @@ class ChatTemplate:
         that pickle serialises only ``template_str``; each worker rebuilds
         the cache on first render.
         """
-        return Template(self.template_str)
+        environment = ImmutableSandboxedEnvironment(
+            trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"]
+        )
+        environment.filters["tojson"] = _tojson
+        environment.globals.update(
+            raise_exception=_raise_exception, strftime_now=_strftime_now
+        )
+        return environment.from_string(self.template_str)
 
     def __getstate__(self) -> Dict[str, Any]:
         """Exclude the cached Jinja2 template from pickling.

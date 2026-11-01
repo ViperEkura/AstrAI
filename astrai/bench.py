@@ -82,6 +82,7 @@ def generate_batch(
             stream=False,
             max_tokens=max_tokens,
             temperature=temperature,
+            do_sample=temperature > 0,
             top_p=top_p,
             top_k=top_k,
         )

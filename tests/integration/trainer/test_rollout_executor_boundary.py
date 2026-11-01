@@ -157,6 +157,7 @@ def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatc
     )
     try:
         model = _ConfigModel()
+        model.generation_config = {"eos_token_id": [1, 2]}
         wrapped = DDP(model)
         context = _rollout_context(wrapped, DDPExecutor())
         builder = TrainContextBuilder(_rollout_config())
@@ -164,6 +165,7 @@ def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatc
         builder._configure_rollout(context, {"group_size": 2})
 
         assert captured["model"] is model
+        assert captured["model"].generation_config == {"eos_token_id": [1, 2]}
         assert captured["max_seq_len"] == 32
         assert captured["max_batch_size"] == 2
         assert (

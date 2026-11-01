@@ -1,9 +1,11 @@
 """Unit tests for Request and Scheduler."""
 
+import json
 from unittest.mock import Mock, call
 
 import pytest
 
+from astrai.config.inference_config import load_generation_config
 from astrai.inference import (
     Request,
     RequestStatus,
@@ -82,6 +84,7 @@ def test_single_tokenized_request_keeps_budget_and_sampling(max_tokens, expected
         prompt_ids=[1, 2, 3],
         max_tokens=max_tokens,
         temperature=0.7,
+        do_sample=True,
         top_p=0.8,
         top_k=4,
         frequency_penalty=0.2,
@@ -274,3 +277,95 @@ def test_scoring_and_generation_share_duplicate_id_validation():
     assert not scheduler._states
     assert scheduler.kv_manager.request_count == 0
     scheduler.add_request("generation", request_id="scored")
+
+
+def test_generation_defaults_overrides_and_eos_are_per_request():
+    manager = _make_scheduler(_make_mock_tokenizer(), max_seq_len=50)
+    manager.generation_config = {
+        "do_sample": True,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "max_new_tokens": 9,
+        "eos_token_id": [7, 8],
+    }
+    manager.refresh_stop_ids()
+    first = manager.add_request(
+        "a",
+        prompt_ids=[1, 2],
+        top_p=1.0,
+        eos_token_id=[9],
+        max_new_tokens=3,
+    )
+    second = manager.add_request(
+        "b",
+        prompt_ids=[1, 2],
+        eos_token_id=None,
+        do_sample=False,
+    )
+    a, b = manager._states[first], manager._states[second]
+    assert (
+        a.max_tokens == 3 and a.sampling.temperature == 0.7 and a.sampling.top_p == 1.0
+    )
+    assert b.max_tokens == 9 and b.sampling.temperature == 0
+    a.output_ids = [9]
+    b.output_ids = [7]
+    assert a.is_finished(a.eos_token_ids)
+    assert not b.is_finished(b.eos_token_ids)
+    assert manager.generation_config["eos_token_id"] == [7, 8]
+    third = manager.add_request("c", prompt_ids=[1, 2])
+    assert manager._states[third].eos_token_ids == frozenset([7, 8])
+
+
+def test_generation_request_mapping_overrides_model_defaults():
+    manager = _make_scheduler(_make_mock_tokenizer(), max_seq_len=50)
+    manager.generation_config = {
+        "do_sample": True,
+        "temperature": 0.7,
+        "max_new_tokens": 9,
+    }
+    config = {"max_new_tokens": 6, "temperature": 0.9, "eos_token_id": 11}
+    rid = manager.add_request(
+        "a",
+        prompt_ids=[1],
+        generation_config=config,
+        max_new_tokens=2,
+        temperature=1.0,
+        eos_token_id=[12],
+    )
+    request = manager._states[rid]
+    assert (request.max_tokens, request.sampling.temperature) == (2, 1.0)
+    assert request.eos_token_ids == frozenset([12])
+    assert config["max_new_tokens"] == 6
+
+
+@pytest.mark.parametrize("value", [True, -1, [True], [-1], "2"])
+def test_invalid_eos_never_partially_enqueues_a_batch(value):
+    manager = _make_scheduler(_make_mock_tokenizer(), max_seq_len=50)
+    with pytest.raises(ValueError, match="eos_token_id"):
+        manager.add_requests(
+            ["a", "b"],
+            prompts_ids=[[1], [2]],
+            eos_token_id=value,
+        )
+    assert not manager._states
+
+
+def test_generation_config_file_and_model_config_fallback(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "test", "text_config": {"eos_token_id": [2, 3]}})
+    )
+    assert load_generation_config(tmp_path) == {"eos_token_id": [2, 3]}
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": None, "max_new_tokens": 7})
+    )
+    assert load_generation_config(tmp_path) == {
+        "eos_token_id": None,
+        "max_new_tokens": 7,
+    }
+
+
+@pytest.mark.parametrize("limit,expected", [(None, 20), (8, 6)])
+def test_hf_default_length_and_explicit_max_length(limit, expected):
+    manager = _make_scheduler(_make_mock_tokenizer(), max_seq_len=50)
+    rid = manager.add_request("a", prompt_ids=[1, 2], max_length=limit)
+    assert manager._states[rid].max_tokens == expected

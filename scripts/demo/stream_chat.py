@@ -101,6 +101,7 @@ def chat():
                         stream=True,
                         max_tokens=args.max_tokens,
                         temperature=args.temperature,
+                        do_sample=args.temperature > 0,
                         top_p=args.top_p,
                         top_k=args.top_k,
                         frequency_penalty=args.frequency_penalty,

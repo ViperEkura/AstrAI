@@ -18,7 +18,7 @@ class _UnwrappingTokenizer:
 
     def __init__(self, inner):
         object.__setattr__(self, "_inner", inner)
-        object.__setattr__(self, "stop_ids", inner.stop_ids)
+        object.__setattr__(self, "eos_token_id", inner.eos_token_id)
 
     def encode(self, prompt, **kw):
         out = self._inner.encode(prompt, **kw)
@@ -32,6 +32,7 @@ class _UnwrappingTokenizer:
 def mock_model_and_tokenizer():
     """Create mock model and tokenizer."""
     mock_model = MagicMock()
+    mock_model.generation_config = {"eos_token_id": 0}
     mock_model.config = MagicMock()
     mock_model.config.num_key_value_heads = 8
     mock_model.config.num_attention_heads = 8
@@ -45,7 +46,7 @@ def mock_model_and_tokenizer():
     mock_tokenizer = MagicMock()
     mock_tokenizer.encode.return_value = [1, 2, 3, 4, 5]
     mock_tokenizer.decode.return_value = "token"
-    mock_tokenizer.stop_ids = [0]
+    mock_tokenizer.eos_token_id = 0
     mock_tokenizer.pad_id = None
 
     return mock_model, mock_tokenizer
@@ -86,6 +87,7 @@ def _make_real_scheduler(device):
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
     tokenizer = FakeTokenizer()
+    model.generation_config = {"eos_token_id": tokenizer.eos_token_id}
     scheduler = EngineCore(
         model=model,
         tokenizer=tokenizer,

@@ -10,6 +10,7 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 
+from astrai.config.inference_config import load_generation_config
 from astrai.config.model_config import BaseModelConfig, ConfigFactory
 from astrai.factory import BaseFactory
 from astrai.model.components.initialization import skip_parameter_init
@@ -20,6 +21,7 @@ from astrai.serialization import (
     load_model_config,
     load_model_weights,
     looks_like_hf_state_dict,
+    save_json,
     save_model,
 )
 
@@ -67,6 +69,7 @@ class AutoModel(nn.Module):
     def __init__(self, config: BaseModelConfig):
         super().__init__()
         self.config = config
+        self.generation_config = {}
 
     @classmethod
     def from_pretrained(
@@ -150,6 +153,7 @@ class AutoModel(nn.Module):
                     unexpected[:10],
                 )
 
+        model.generation_config = load_generation_config(model_path)
         return model
 
     def save_pretrained(
@@ -160,4 +164,10 @@ class AutoModel(nn.Module):
             config=self.config.to_dict(),
             state_dict=self.state_dict(),
             save_directory=str(save_directory),
+        )
+        save_json(
+            self.generation_config.to_dict()
+            if hasattr(self.generation_config, "to_dict")
+            else self.generation_config,
+            Path(save_directory) / "generation_config.json",
         )

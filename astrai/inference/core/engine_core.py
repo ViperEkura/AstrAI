@@ -57,6 +57,7 @@ class EngineCore:
         page_size: Optional[int] = None,
         kv_tokens: Optional[int] = None,
         token_budget: Optional[int] = None,
+        generation_config=None,
     ):
         if (
             isinstance(policy_version, bool)
@@ -96,6 +97,9 @@ class EngineCore:
             cache,
             token_budget,
             policy_version,
+            generation_config=generation_config
+            if generation_config is not None
+            else getattr(model, "generation_config", {}),
         )
         self.op_selection = snapshot_op_selection()
         with use_op_selection(self.op_selection):

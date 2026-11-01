@@ -55,7 +55,7 @@ def build_test_tokenizer(
 class FakeTokenizer:
     """Minimal stub tokenizer with optional chat-template support."""
 
-    stop_ids = [2]
+    eos_token_id = 2
 
     def __init__(self, *, with_chat_template=False):
         if with_chat_template:

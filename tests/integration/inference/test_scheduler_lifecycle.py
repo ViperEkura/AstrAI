@@ -403,7 +403,7 @@ def test_run_batch_stop_id_terminates(device):
     try:
         # Make every token a stop id: generation must end after exactly
         # one token (the stop token itself) instead of running to max_tokens.
-        scheduler.scheduler.tokenizer.stop_ids = list(range(200))
+        scheduler.scheduler.generation_config["eos_token_id"] = list(range(200))
         prompts = [[10, 20, 30]]
         results = run_batch(scheduler, prompts, max_tokens=32, temperature=1.0)
         assert len(results[0]) == 1

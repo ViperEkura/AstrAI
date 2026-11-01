@@ -59,6 +59,7 @@ class InferenceEngine:
         enable_cuda_graph: bool = True,
         enable_overlap: bool = False,
         core: Optional[EngineCore] = None,
+        generation_config=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -71,6 +72,7 @@ class InferenceEngine:
                 cache=cache,
                 enable_cuda_graph=enable_cuda_graph,
                 enable_overlap=enable_overlap,
+                generation_config=generation_config,
             )
         self._core = core
         self._tracker = RequestTracker()
@@ -99,6 +101,7 @@ class InferenceEngine:
         top_k: int,
         frequency_penalty: float,
         rep_window: int,
+        **generation_kwargs,
     ) -> None:
         """Register every consumer before admitting the prepared requests."""
         request_ids = [item.request_id for item in processed]
@@ -113,6 +116,7 @@ class InferenceEngine:
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
+                **generation_kwargs,
                 request_ids=request_ids,
                 prompts_ids=[item.prompt_ids for item in processed],
             )
@@ -134,18 +138,19 @@ class InferenceEngine:
             finally:
                 self._tracker.unregister(request_id)
 
-    # ---- public API (signatures unchanged) ----
+    # ---- public API ----
 
     def generate(
         self,
         prompt: Union[str, List[str]],
         stream: bool = False,
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
+        **generation_kwargs,
     ) -> Union[Generator, str, List[str]]:
         is_batch = isinstance(prompt, list)
         prompts = prompt if is_batch else [prompt]
@@ -166,6 +171,7 @@ class InferenceEngine:
             top_k,
             frequency_penalty,
             rep_window,
+            **generation_kwargs,
         )
 
     def score(
@@ -259,11 +265,12 @@ class InferenceEngine:
         self,
         prompt: str,
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
+        **generation_kwargs,
     ) -> AsyncGenerator[str, None]:
         chunks = self.generate_events(
             prompt,
@@ -273,6 +280,7 @@ class InferenceEngine:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             rep_window=rep_window,
+            **generation_kwargs,
         )
 
         async def _agen():
@@ -297,12 +305,13 @@ class InferenceEngine:
         prompt: str,
         *,
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         stop_sequences: Optional[List[str]] = None,
+        **generation_kwargs,
     ) -> AsyncGenerator["StreamChunk", None]:
         """Async generation yielding structured chunks (vLLM OutputProcessor).
 
@@ -322,6 +331,7 @@ class InferenceEngine:
                 top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
+                **generation_kwargs,
             )
             request_id = processed.request_id
             tracker = self._tracker
@@ -444,6 +454,7 @@ class InferenceEngine:
         top_k: int,
         frequency_penalty: float,
         rep_window: int,
+        **generation_kwargs,
     ) -> Union[Generator, str, List[str]]:
         n = len(prompts)
         # One batched tokenize on the caller's thread, ids minted up front;
@@ -463,6 +474,7 @@ class InferenceEngine:
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             rep_window=rep_window,
+            **generation_kwargs,
         )
 
         if not stream:

@@ -7,7 +7,11 @@ import uuid
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-from astrai.config.inference_config import InferenceConfig
+from astrai.config.inference_config import (
+    InferenceConfig,
+    normalize_eos_token_ids,
+    resolve_generation_parameters,
+)
 from astrai.inference.contracts import ModelRunnerOutput, SchedulerOutput
 from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
 from astrai.inference.core.events import (
@@ -46,6 +50,7 @@ class Scheduler:
         cache: BlockPool,
         token_budget: Optional[int] = None,
         policy_version: int = 0,
+        generation_config: Optional[Dict] = None,
     ):
         self.max_seq_len = max_seq_len
         self._cache = cache
@@ -59,7 +64,12 @@ class Scheduler:
         self._total_requests = 0
         self._total_tokens = 0
         self._cancelled_total = 0
-        self._stop_ids = frozenset(tokenizer.stop_ids)
+        self.generation_config = (
+            generation_config.to_dict()
+            if hasattr(generation_config, "to_dict")
+            else dict(generation_config or {})
+        )
+        self.refresh_stop_ids()
         effective_budget = token_budget or _config.max_num_batched_tokens or None
         self._planner = StepPlanner(self._kv_manager, effective_budget)
         self._event_sink: Optional[OutputEventSink] = None
@@ -104,7 +114,9 @@ class Scheduler:
         self._policy_version = policy_version
 
     def refresh_stop_ids(self):
-        self._stop_ids = frozenset(self.tokenizer.stop_ids)
+        self._stop_ids = frozenset(
+            normalize_eos_token_ids(self.generation_config.get("eos_token_id"))
+        )
 
     def set_event_sink(self, sink):
         self._event_sink = sink
@@ -121,6 +133,8 @@ class Scheduler:
         current = self._states.get(request.request_id)
         if current is not None and current is not request:
             raise ValueError(f"duplicate live request id: {request.request_id}")
+        if request.eos_token_ids is None:
+            request.eos_token_ids = self._stop_ids
         self._states[request.request_id] = request
         request.input_tokens = len(request.prompt_ids)
 
@@ -128,13 +142,19 @@ class Scheduler:
         self,
         prompt: str,
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         request_id: Optional[str] = None,
         prompt_ids: Optional[List[int]] = None,
+        *,
+        generation_config: Optional[Dict] = None,
+        max_new_tokens: Optional[int] = None,
+        max_length: Optional[int] = None,
+        do_sample: Optional[bool] = None,
+        **generation_kwargs,
     ) -> str:
         request_id = request_id or f"req_{int(time.time())}_{uuid.uuid4().hex[:8]}"
         if prompt_ids is None:
@@ -158,21 +178,47 @@ class Scheduler:
             rep_window=rep_window,
             request_ids=[request_id],
             prompts_ids=[prompt_ids],
+            generation_config=generation_config,
+            max_new_tokens=max_new_tokens,
+            max_length=max_length,
+            do_sample=do_sample,
+            **generation_kwargs,
         )[0]
 
     def add_requests(
         self,
         prompts: List[str],
         max_tokens: Optional[int] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = 50,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
         frequency_penalty: float = 0.0,
         rep_window: int = 64,
         request_ids: Optional[List[str]] = None,
         prompts_ids: Optional[List[List[int]]] = None,
+        *,
+        generation_config: Optional[Dict] = None,
+        max_new_tokens: Optional[int] = None,
+        max_length: Optional[int] = None,
+        do_sample: Optional[bool] = None,
+        **generation_kwargs,
     ) -> List[str]:
-        """Encode a batch once and validate it before registering any request."""
+        """Encode and validate a batch before registering any request.
+
+        Explicit keyword arguments override generation_config, which overrides
+        model defaults. eos_token_id=None or [] disables EOS stopping.
+        """
+        unknown = generation_kwargs.keys() - {
+            "eos_token_id",
+            "num_beams",
+            "num_return_sequences",
+            "repetition_penalty",
+            "min_length",
+            "min_new_tokens",
+            "stop_strings",
+        }
+        if unknown:
+            raise TypeError(f"Unexpected generation parameters: {sorted(unknown)}")
         if not prompts:
             return []
         if prompts_ids is not None:
@@ -186,6 +232,27 @@ class Scheduler:
         if request_ids is not None and len(request_ids) != len(prompts):
             raise ValueError("request_ids must match prompts in length")
 
+        overrides = (
+            generation_config.to_dict()
+            if hasattr(generation_config, "to_dict")
+            else dict(generation_config or {})
+        )
+        for name, value in (
+            ("temperature", temperature),
+            ("top_p", top_p),
+            ("top_k", top_k),
+            ("do_sample", do_sample),
+            ("max_new_tokens", max_new_tokens),
+            ("max_length", max_length),
+        ):
+            if value is not None:
+                overrides[name] = value
+        if max_tokens is not None:
+            if max_new_tokens is not None:
+                raise ValueError("pass max_new_tokens or max_tokens, not both")
+            overrides["max_new_tokens"] = max(0, max_tokens)
+        overrides.update(generation_kwargs)
+        defaults = self.generation_config
         request_ids_out: List[str] = []
         requests: List[Request] = []
         stamp = time.time()
@@ -201,20 +268,15 @@ class Scheduler:
             )
             if len(prompt_ids) > self.max_seq_len:
                 prompt_ids = prompt_ids[-self.max_seq_len :]
-            task_max = (
-                self.max_seq_len - len(prompt_ids)
-                if max_tokens is None
-                else min(max_tokens, self.max_seq_len - len(prompt_ids))
+            params = resolve_generation_parameters(
+                defaults, overrides, len(prompt_ids), self.max_seq_len
             )
             request = Request(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
-                max_tokens=task_max,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
                 frequency_penalty=frequency_penalty,
                 rep_window=rep_window,
+                **params,
             )
             requests.append(request)
             request_ids_out.append(request_id)
@@ -272,7 +334,7 @@ class Scheduler:
     def finish_reason(self, request):
         return (
             FINISH_STOP_TOKEN
-            if request.output_ids and request.output_ids[-1] in self.stop_ids
+            if request.output_ids and request.output_ids[-1] in request.eos_token_ids
             else FINISH_LENGTH
         )
 
@@ -372,7 +434,7 @@ class Scheduler:
             if request.terminal_emitted:
                 continue
             request.input_tokens = len(request.prompt_ids)
-            if request.is_finished(self.stop_ids):
+            if request.is_finished(request.eos_token_ids):
                 self.finish(request, self.finish_reason(request))
             elif request.prefill_complete and request.next_pos >= self.max_seq_len:
                 self.finish(request, FINISH_LENGTH)
@@ -469,7 +531,7 @@ class Scheduler:
                                 request.output_tokens,
                             )
                         )
-                    if request.is_finished(self.stop_ids):
+                    if request.is_finished(request.eos_token_ids):
                         self.finish(request, self.finish_reason(request), events=events)
             if not order:
                 self._pending_order.pop(identity, None)

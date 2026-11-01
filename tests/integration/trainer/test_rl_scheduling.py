@@ -598,7 +598,13 @@ def test_online_minibatch_round_publication_and_reference_resume(base_test_env):
     stripped = Checkpoint.load(checkpoint_dir)
     stripped.extra.pop("reference_model")
     stripped.save(stripped_dir)
-    for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ):
         src = os.path.join(checkpoint_dir, name)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(stripped_dir, name))

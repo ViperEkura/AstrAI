@@ -20,7 +20,7 @@ def _make_engine_mocks(decode=None):
     mock_model = MagicMock()
     mock_tokenizer = MagicMock()
     mock_tokenizer.encode.return_value = [1, 2, 3]
-    mock_tokenizer.stop_ids = [0]
+    mock_tokenizer.eos_token_id = 0
     if decode is not None:
         mock_tokenizer.decode.return_value = decode
     return mock_model, mock_tokenizer

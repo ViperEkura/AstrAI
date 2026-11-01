@@ -106,7 +106,7 @@ def tokenizer_dir(temp_dir, test_tokenizer):
     _write_tokenizer_dir(
         d,
         test_tokenizer,
-        {"special_tokens": {"pad_token": "<|_pad_|>", "unk_token": "<|_unk_|>"}},
+        {"pad_token": "<|_pad_|>", "unk_token": "<|_unk_|>"},
     )
     return d
 
@@ -118,6 +118,10 @@ def chat_tokenizer_dir(temp_dir, chat_tokenizer):
     _write_tokenizer_dir(
         d,
         chat_tokenizer,
-        {"special_tokens": _SPECIAL_TOKENS_CONFIG, "chat_template": _CHAT_TEMPLATE},
+        {
+            **_CHAT_TOKENIZER_MAP,
+            "additional_special_tokens": ["<|im_start|>", "<|im_end|>"],
+            "chat_template": _CHAT_TEMPLATE,
+        },
     )
     return d

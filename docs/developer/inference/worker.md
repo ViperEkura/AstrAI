@@ -44,14 +44,12 @@ classDiagram
         pinned input staging
     }
     class CUDAGraphRunner
-    class SamplingPipeline
 
     GPUModelRunner *-- InferenceWorkspace
     GPUModelRunner *-- CUDAGraphRunner
     GPUModelRunner *-- ResultRing
     GPUModelRunner *-- DecodeSteadyState
     GPUModelRunner --> PendingExecution
-    GPUModelRunner --> SamplingPipeline
     ResultRing --> PendingExecution : output copy
 ```
 
@@ -86,7 +84,7 @@ batch, the previous sampled token fills the next input device-to-device.
 Sampling metadata and fixed-address workspace are reused rather than rebuilt
 from GPU predicates each step.
 
-`SamplingPipeline` applies frequency penalties before temperature/top-k/top-p.
+`sample()` applies frequency penalties before temperature/top-k/top-p.
 Raw-model logprobs are computed before those sampling transformations, preserving
 the rollout contract. Frequency-history changes may require a drain or metadata
 refresh; the zero-host-synchronization claim applies to the supported steady

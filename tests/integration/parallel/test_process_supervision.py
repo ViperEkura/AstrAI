@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from astrai.parallel import setup as parallel_setup
 from astrai.parallel.setup import (
     SHUTDOWN_GRACE_SECONDS,
     agree_stop,
@@ -124,9 +125,7 @@ def test_rank_signal_stops_every_rank(tmp_path):
 
 
 def test_graceful_stop_waits_for_slow_rank_shutdown(tmp_path, monkeypatch):
-    from astrai.parallel import setup as setup_module
-
-    monkeypatch.setattr(setup_module, "SHUTDOWN_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(parallel_setup, "SHUTDOWN_GRACE_SECONDS", 0.1)
     killer = _signal_rank(tmp_path, 1, signal.SIGTERM)
     with pytest.raises(SystemExit) as info:
         spawn_parallel_fn(

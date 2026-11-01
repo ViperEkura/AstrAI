@@ -127,6 +127,7 @@ def test_elastic_contract_and_rejections(tmp_path):
     new = _contract_config(tmp_path, 8, 1, 2)
     meta = {
         "resume_contract_version": 1,
+        "optimizer_step": 1,
         "dataset_len": 35,
         "epoch_sample_offset": 16,
         "random_seed": old.random_seed,
@@ -160,9 +161,9 @@ def test_elastic_contract_and_rejections(tmp_path):
         consumed_samples=16,
         meta={"dp_size": 4, "epoch_tail_policy": "flush"},
     )
-    with pytest.raises(ValueError, match="Legacy checkpoint"):
-        _take_contract(new, legacy)
-    assert _take_contract(old, legacy).global_cursor is False
+    for config in (old, new):
+        with pytest.raises(ValueError, match="migrate checkpoint metadata"):
+            _take_contract(config, legacy)
 
 
 def test_cpu_ddp_short_tail_and_single_rank_resume(tmp_path):

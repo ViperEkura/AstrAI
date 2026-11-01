@@ -18,16 +18,14 @@ from astrai.dataset import (
 )
 from astrai.factory import BaseFactory
 from astrai.inference import (
-    EngineCoreClient,
     InferenceEngine,
-    InprocClient,
     build_engine,
     get_app,
     run_server,
     sample,
 )
 from astrai.inference.network import ProtocolHandler
-from astrai.inference.worker.sample import SamplingPipeline
+from astrai.inference.worker.sample import sample
 from astrai.logging import setup_logging
 from astrai.model import (
     AutoModel,
@@ -48,7 +46,6 @@ from astrai.serialization import Checkpoint
 from astrai.tokenize import AutoTokenizer, ChatTemplate
 from astrai.trainer import (
     BaseStrategy,
-    CallbackFactory,
     StrategyFactory,
     TrainCallback,
     Trainer,
@@ -63,7 +60,6 @@ __all__ = [
     "BaseFactory",
     "BaseModelConfig",
     "BaseStrategy",
-    "CallbackFactory",
     "ChatTemplate",
     "Checkpoint",
     "ConfigFactory",
@@ -77,7 +73,7 @@ __all__ = [
     "PipelineConfig",
     "ProtocolHandler",
     "RDSampler",
-    "SamplingPipeline",
+    "sample",
     "Store",
     "StoreFactory",
     "StrategyFactory",

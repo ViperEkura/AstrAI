@@ -5,10 +5,13 @@ from threading import Barrier
 import torch
 from safetensors.torch import save_file
 
-from astrai.model.automodel import AutoModel
+from astrai.model.automodel import AutoModel, ModelFactory
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.components.conv import Conv1d
-from astrai.model.components.initialization import skip_parameter_init
+from astrai.model.components.initialization import (
+    should_initialize,
+    skip_parameter_init,
+)
 from astrai.model.components.linear import Linear
 from tests.support.models import make_tiny_config
 
@@ -38,7 +41,7 @@ def test_missing_and_partial_weights_initialize_missing_parameters(tmp_path):
     torch.manual_seed(91)
     expected = AutoRegressiveLM(config)
     torch.manual_seed(91)
-    without_weights = AutoModel.from_pretrained(tmp_path)
+    without_weights = AutoModel.from_pretrained(tmp_path, strict=False)
     for key, value in expected.state_dict().items():
         torch.testing.assert_close(
             without_weights.state_dict()[key], value, rtol=0, atol=0
@@ -96,9 +99,6 @@ def test_local_conv1d_matches_torch_convolution():
 
 
 def test_custom_model_uses_scoped_fast_load_for_astrai_layers(tmp_path, monkeypatch):
-    from astrai.model.automodel import ModelFactory
-    from astrai.model.components.initialization import should_initialize
-
     config = make_tiny_config()
     observations = []
 

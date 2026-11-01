@@ -1,113 +1,11 @@
-"""Unit tests for inference sampling strategies."""
+"""Behavioral tests for the sampling entry point."""
 
+from unittest.mock import patch
+
+import pytest
 import torch
 
-from astrai.inference.worker.sample import (
-    BaseSamplingStrategy,
-    FrequencyPenaltyStrategy,
-    SamplingPipeline,
-    TemperatureStrategy,
-    TopKStrategy,
-    TopPStrategy,
-    sample,
-)
-
-
-def test_temperature_scalar():
-    logits = torch.tensor([[1.0, 2.0, 3.0]])
-    s = TemperatureStrategy(0.5)
-    result = s.apply(logits.clone())
-    assert torch.allclose(result, logits / 0.5)
-
-
-def test_temperature_skip_when_one():
-    logits = torch.tensor([[1.0, 2.0, 3.0]])
-    s = TemperatureStrategy(1.0)
-    result = s.apply(logits.clone())
-    assert torch.equal(result, logits)
-
-
-def test_temperature_per_sample_tensor():
-    logits = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    s = TemperatureStrategy(torch.tensor([0.5, 0.5]))
-    result = s.apply(logits.clone())
-    assert torch.allclose(result, logits / 0.5)
-
-
-def test_top_k_keeps_top():
-    logits = torch.tensor([[0.1, 0.5, 0.3, 0.9, 0.2]])
-    s = TopKStrategy(top_k=2)
-    result = s.apply(logits.clone(), filter_value=-1e9)
-    kept = (result > -1e9).sum().item()
-    assert kept == 2
-
-
-def test_top_k_skip_when_zero():
-    logits = torch.tensor([[1.0, 2.0, 3.0]])
-    s = TopKStrategy(top_k=0)
-    result = s.apply(logits.clone())
-    assert torch.equal(result, logits)
-
-
-def test_top_k_batch_tensor():
-    """Each row respects its own top_k."""
-    logits = torch.tensor([[0.1, 0.5, 0.3], [0.9, 0.2, 0.1]])
-    s = TopKStrategy(top_k=torch.tensor([2, 1]))
-    result = s.apply(logits.clone(), filter_value=-1e9)
-    assert (result[0] > -1e9).sum() == 2
-    assert (result[1] > -1e9).sum() == 1
-
-
-def test_top_p_nucleus_filtering():
-    logits = torch.tensor([[10.0, 1.0, 1.0, 1.0, 1.0]])
-    s = TopPStrategy(top_p=0.5)
-    result = s.apply(logits.clone(), filter_value=-1e9)
-    # The dominant logit alone exceeds the nucleus mass; the rest are filtered.
-    kept = (result > -1e9).sum().item()
-    assert kept == 1
-
-
-def test_top_p_skip_when_one():
-    logits = torch.tensor([[1.0, 2.0, 3.0]])
-    s = TopPStrategy(top_p=1.0)
-    result = s.apply(logits.clone())
-    assert torch.equal(result, logits)
-
-
-def test_top_p_filter_all_except_max_when_zero():
-    logits = torch.tensor([[0.1, 0.5, 0.3, 0.9, 0.2]])
-    s = TopPStrategy(top_p=0.0)
-    result = s.apply(logits.clone(), filter_value=-1e9)
-    kept = (result > -1e9).sum().item()
-    assert kept == 1
-
-
-def test_sampling_pipeline_composes_strategies():
-    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
-    pipeline = SamplingPipeline(
-        [
-            TemperatureStrategy(0.8),
-            TopKStrategy(3),
-            TopPStrategy(0.95),
-        ]
-    )
-    result = pipeline.apply(logits.clone(), filter_value=-1e9)
-    kept = (result > -1e9).sum().item()
-    assert 1 <= kept <= 3
-
-
-def test_sampling_pipeline_sample_returns_valid_token():
-    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
-    pipeline = SamplingPipeline(
-        [
-            TemperatureStrategy(0.8),
-            TopKStrategy(3),
-            TopPStrategy(0.95),
-        ]
-    )
-    tokens = pipeline.sample(logits)
-    assert tokens.shape == (1,)
-    assert 0 <= tokens[0] < logits.size(-1)
+from astrai.inference.worker.sample import SamplingMeta, sample
 
 
 def test_module_sample_shortcut():
@@ -128,94 +26,6 @@ def test_module_sample_batch():
     assert tokens.shape == (2,)
     for t in tokens:
         assert 0 <= t < logits.size(-1)
-
-
-def test_frequency_penalty_noop_when_zero():
-    logits = torch.tensor([[1.0, 2.0, 3.0]])
-    input_ids = torch.tensor([[0, 2]])
-    s = FrequencyPenaltyStrategy(penalty=0.0)
-    result = s.apply(logits.clone(), input_ids=input_ids)
-    assert torch.equal(result, logits)
-
-
-def test_frequency_penalty_noop_when_no_input_ids():
-    logits = torch.tensor([[1.0, 2.0, 3.0]])
-    s = FrequencyPenaltyStrategy(penalty=0.5)
-    result = s.apply(logits.clone())
-    assert torch.equal(result, logits)
-
-
-def test_frequency_penalty_single_occurrence():
-    logits = torch.tensor([[4.0, 1.0, 2.0]])
-    input_ids = torch.tensor([[0, 2]])
-    input_mask = torch.tensor([[True, True]])
-    s = FrequencyPenaltyStrategy(penalty=0.5)
-    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
-    assert result[0, 0] == 3.5
-    assert result[0, 1] == 1.0
-    assert result[0, 2] == 1.5
-
-
-def test_frequency_penalty_multiple_occurrences():
-    logits = torch.tensor([[4.0, 1.0, 2.0]])
-    input_ids = torch.tensor([[0, 2, 0]])
-    input_mask = torch.tensor([[True, True, True]])
-    s = FrequencyPenaltyStrategy(penalty=0.5)
-    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
-    assert result[0, 0] == 3.0
-    assert result[0, 1] == 1.0
-    assert result[0, 2] == 1.5
-
-
-def test_frequency_penalty_respects_padding_mask():
-    logits = torch.tensor([[4.0, 1.0, 2.0]])
-    input_ids = torch.tensor([[0, 2, 0]])
-    input_mask = torch.tensor([[True, True, False]])
-    s = FrequencyPenaltyStrategy(penalty=0.5)
-    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
-    assert result[0, 0] == 3.5
-    assert result[0, 1] == 1.0
-    assert result[0, 2] == 1.5
-
-
-def test_frequency_penalty_batch_tensor():
-    logits = torch.tensor(
-        [
-            [4.0, 1.0, 2.0],
-            [3.0, 5.0, 1.0],
-        ]
-    )
-    input_ids = torch.tensor([[0, 2, 0], [1, 1, 0]])
-    input_mask = torch.tensor([[True, True, True], [True, True, False]])
-    s = FrequencyPenaltyStrategy(penalty=torch.tensor([0.5, 1.0]))
-    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
-    assert result[0, 0] == 3.0
-    assert result[0, 2] == 1.5
-    assert result[1, 1] == 3.0
-
-
-def test_frequency_penalty_negative_penalty_boosts_repeats():
-    logits = torch.tensor([[4.0, 1.0, 2.0]])
-    input_ids = torch.tensor([[0, 0]])
-    input_mask = torch.tensor([[True, True]])
-    s = FrequencyPenaltyStrategy(penalty=-0.5)
-    result = s.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
-    assert result[0, 0] == 5.0
-
-
-def test_frequency_penalty_in_pipeline():
-    logits = torch.tensor([[5.0, 1.0, 2.0, 3.0]])
-    input_ids = torch.tensor([[0, 2, 0]])
-    input_mask = torch.tensor([[True, True, True]])
-    pipeline = SamplingPipeline(
-        [
-            TemperatureStrategy(1.0),
-            FrequencyPenaltyStrategy(0.5),
-        ]
-    )
-    result = pipeline.apply(logits.clone(), input_ids=input_ids, input_mask=input_mask)
-    assert result[0, 0] == 4.0
-    assert result[0, 2] == 1.5
 
 
 def test_sample_with_frequency_penalty():
@@ -299,48 +109,6 @@ def test_greedy_respects_frequency_penalty():
     assert penalized.tolist() == [1]
 
 
-class _ArgmaxMovingStrategy(BaseSamplingStrategy):
-    """Custom strategy that can move the argmax — must disable greedy."""
-
-    def apply(
-        self, logits, filter_value=-float("inf"), input_ids=None, input_mask=None
-    ):
-        return torch.roll(logits, shifts=1, dims=-1)
-
-
-def test_greedy_detection_is_polymorphic():
-    """Greedy detection asks strategies polymorphically, no isinstance."""
-    base = [TemperatureStrategy(0.0), TopKStrategy(50), TopPStrategy(0.9)]
-    assert SamplingPipeline(list(base)).is_greedy is True
-    assert SamplingPipeline(base + [FrequencyPenaltyStrategy(0.5)]).is_greedy is False
-
-    # A custom argmax-moving strategy disables greedy even though the
-    # pipeline contains a greedy temperature — this is what isinstance
-    # bookkeeping in the old implementation could not see.
-    assert SamplingPipeline(base + [_ArgmaxMovingStrategy()]).is_greedy is False
-
-
-def test_greedy_detection_position_independent():
-    """Greedy temperature anywhere in the pipeline is detected."""
-    pipeline = SamplingPipeline([TopKStrategy(50), TemperatureStrategy(0.0)])
-    assert pipeline.is_greedy is True
-
-
-def test_greedy_detection_composes_across_nested_pipelines():
-    """A nested pipeline participates through the same interface."""
-    inner = SamplingPipeline([TemperatureStrategy(0.0), TopKStrategy(20)])
-    assert inner.is_greedy is True
-    assert SamplingPipeline([TopPStrategy(0.9), inner]).is_greedy is True
-    assert SamplingPipeline([inner, FrequencyPenaltyStrategy(0.5)]).is_greedy is False
-
-
-def test_nongreedy_temperature_is_not_greedy():
-    pipeline = SamplingPipeline(
-        [TemperatureStrategy(0.7), TopKStrategy(0), TopPStrategy(1.0)]
-    )
-    assert pipeline.is_greedy is False
-
-
 def test_seeded_sampling_is_independent_of_global_rng_and_order():
     logits = torch.randn(4, 128)
     seeds = [11, 22, 33, 44]
@@ -356,3 +124,47 @@ def test_seeded_sampling_is_independent_of_global_rng_and_order():
     torch.testing.assert_close(other_logprobs, logprobs[order])
     single = sample(logits[2:3].clone(), seeds=[33])
     assert single.item() == tokens[2].item()
+
+
+@pytest.mark.parametrize("meta_cached", [False, True])
+def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
+    logits = torch.tensor([[5.0, 4.0, 3.0, 2.0], [1.0, 2.0, 3.0, 4.0]])
+    ids = torch.tensor([[0, 0, 1], [3, 3, 0]])
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+    captured = []
+
+    def draw(probabilities, num_samples):
+        captured.append(probabilities.clone())
+        return probabilities.argmax(-1, keepdim=True)
+
+    with patch("torch.multinomial", side_effect=draw):
+        tokens, logprobs = sample(
+            logits.clone(),
+            temperature=torch.tensor([0.5, 1.0]),
+            top_k=torch.tensor([2, 0]),
+            top_p=torch.tensor([1.0, 0.0]),
+            frequency_penalty=torch.tensor([1.0, -1.0]),
+            input_ids=ids,
+            input_mask=mask,
+            return_logprobs=True,
+            meta=SamplingMeta(False, True, 2, True, True) if meta_cached else None,
+        )
+    # Top-k preserves ties at the cutoff: all three first-row candidates remain.
+    expected = torch.softmax(
+        torch.tensor(
+            [
+                [6.0, 8.0, 6.0, -float("inf")],
+                [-float("inf"), -float("inf"), -float("inf"), 5.0],
+            ]
+        ),
+        -1,
+    )
+    torch.testing.assert_close(captured[0], expected)
+    torch.testing.assert_close(
+        logprobs, logits.log_softmax(-1).gather(-1, tokens[:, None]).squeeze(-1)
+    )
+
+
+def test_seed_count_must_match_batch():
+    with pytest.raises(ValueError, match="seeds"):
+        sample(torch.zeros(2, 4), seeds=[1])

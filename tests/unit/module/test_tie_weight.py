@@ -1,6 +1,7 @@
 import json
 import os
 
+import pytest
 import safetensors.torch as st
 import torch
 
@@ -78,8 +79,18 @@ def test_model_save_load_with_tie_weight(base_test_env):
 
     loaded_config = AutoRegressiveLMConfig.from_file(config_path)
     model = AutoRegressiveLM(loaded_config)
-    model.load_state_dict(st.load_file(model_path))
+    saved_weights = st.load_file(model_path)
+    initial_head = model.lm_head.weight.detach().clone()
 
-    assert torch.equal(model.lm_head.weight, model.model.embed_tokens.weight)
+    with pytest.raises(RuntimeError, match="lm_head.weight"):
+        model.load_state_dict(saved_weights)
+
+    incompatible = model.load_state_dict(saved_weights, strict=False)
+    assert incompatible.missing_keys == ["lm_head.weight"]
+    assert incompatible.unexpected_keys == []
+    assert torch.equal(model.lm_head.weight, initial_head)
+    assert torch.equal(
+        model.model.embed_tokens.weight, saved_weights["model.embed_tokens.weight"]
+    )
     assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
     assert "lm_head.weight" in model.state_dict()

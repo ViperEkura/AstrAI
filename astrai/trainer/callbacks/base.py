@@ -1,10 +1,8 @@
-"""Shared callback protocol and registry."""
+"""Shared callback protocol and optional lifecycle hooks."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
-
-from astrai.factory import BaseFactory
 
 if TYPE_CHECKING:
     from astrai.trainer.context import TrainContext
@@ -47,15 +45,3 @@ class TrainCallback(Protocol):
         failure both arrive here.  The callbacks must be idempotent, because a
         normal end also passes through it.
         """
-
-
-class CallbackFactory(BaseFactory[TrainCallback]):
-    """Factory for registering and creating training callbacks.
-
-    Example:
-        @CallbackFactory.register("my_callback")
-        class MyCallback(TrainCallback):
-            ...
-
-        callback = CallbackFactory.create("my_callback", **kwargs)
-    """

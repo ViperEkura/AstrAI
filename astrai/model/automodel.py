@@ -2,11 +2,15 @@
 AutoModel base class for model loading and saving.
 """
 
+import logging
+from collections.abc import Collection, Mapping
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 
+import torch
 import torch.nn as nn
 
+from astrai.config.inference_config import load_generation_config
 from astrai.config.model_config import BaseModelConfig, ConfigFactory
 from astrai.factory import BaseFactory
 from astrai.model.components.initialization import skip_parameter_init
@@ -17,8 +21,42 @@ from astrai.serialization import (
     load_model_config,
     load_model_weights,
     looks_like_hf_state_dict,
+    save_json,
     save_model,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def validate_model_state_dict(
+    model: nn.Module,
+    state_dict: Mapping[str, Any],
+    *,
+    strict: bool = True,
+    allowed_missing_keys: Collection[str] = (),
+):
+    """Check source coverage and shapes without changing model parameters."""
+    expected = model.state_dict()
+    targets = dict(model.named_parameters(remove_duplicate=False))
+    targets.update(expected)
+    missing = sorted(set(expected) - set(state_dict) - set(allowed_missing_keys))
+    unexpected = sorted(set(state_dict) - set(targets))
+    mismatched = [
+        name
+        for name in set(state_dict) & set(targets)
+        if isinstance(targets[name], torch.Tensor)
+        and (
+            not isinstance(state_dict[name], torch.Tensor)
+            or state_dict[name].shape != targets[name].shape
+        )
+    ]
+    if mismatched or (strict and (missing or unexpected)):
+        raise RuntimeError(
+            "Model state dict mismatch: "
+            f"missing={missing[:10]}, unexpected={unexpected[:10]}, "
+            f"shape_mismatch={sorted(mismatched)[:10]}"
+        )
+    return missing, unexpected
 
 
 class ModelFactory(BaseFactory[nn.Module]):
@@ -31,6 +69,7 @@ class AutoModel(nn.Module):
     def __init__(self, config: BaseModelConfig):
         super().__init__()
         self.config = config
+        self.generation_config = {}
 
     @classmethod
     def from_pretrained(
@@ -47,7 +86,8 @@ class AutoModel(nn.Module):
                 ``model.safetensors``.
             disable_random_init: Skip AstrAI parameter initialization when a
                 complete checkpoint is loaded into a supported model.
-            strict: Passed to ``load_state_dict``.
+            strict: Require complete model weights and reject unmapped HF keys.
+                False permits missing/unexpected keys, but never shape mismatches.
             weights_format: ``"auto"`` reads a model-directory mapping and
                 detects compatible HF weight keys; ``"astrai"`` skips conversion;
                 ``"hf"`` requires a mapping and forces weight conversion.
@@ -90,15 +130,30 @@ class AutoModel(nn.Module):
         with skip_parameter_init(fast_load):
             model = actual_cls(config)
 
+        if not has_weights and strict:
+            raise FileNotFoundError(f"No model weights found in {model_path}")
         if has_weights:
             state_dict = load_model_weights(str(model_path))
-            is_hf_weights = weights_format == "hf" or (
+            if weights_format == "hf" or (
                 weights_format == "auto" and looks_like_hf_state_dict(state_dict)
+            ):
+                state_dict = convert_hf_weights(
+                    state_dict, config, mapping=mapping, strict=strict
+                )
+            missing, unexpected = validate_model_state_dict(
+                model, state_dict, strict=strict
             )
-            if is_hf_weights:
-                state_dict = convert_hf_weights(state_dict, config, mapping=mapping)
-            model.load_state_dict(state_dict, strict=strict)
+            result = model.load_state_dict(state_dict, strict=strict)
+            missing = sorted(set(missing) | set(result.missing_keys))
+            unexpected = sorted(set(unexpected) | set(result.unexpected_keys))
+            if missing or unexpected:
+                logger.warning(
+                    "Partial model loading: missing=%s, unexpected=%s",
+                    missing[:10],
+                    unexpected[:10],
+                )
 
+        model.generation_config = load_generation_config(model_path)
         return model
 
     def save_pretrained(
@@ -109,4 +164,10 @@ class AutoModel(nn.Module):
             config=self.config.to_dict(),
             state_dict=self.state_dict(),
             save_directory=str(save_directory),
+        )
+        save_json(
+            self.generation_config.to_dict()
+            if hasattr(self.generation_config, "to_dict")
+            else self.generation_config,
+            Path(save_directory) / "generation_config.json",
         )

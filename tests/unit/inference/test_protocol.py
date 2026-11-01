@@ -133,14 +133,13 @@ def test_output_processor_flushes_unmatched_tail_on_core_terminal(reason):
     tail, stopped = processor.push(terminal)
     assert not stopped
     assert tail == "EN"
-    assert "".join(chunks) + tail == processor.state.text == "hello EN"
+    assert "".join(chunks) + tail == "hello EN"
     assert processor.finished
     assert processor.state.finish_reason == reason
     assert processor.state.stop_sequence is None
     assert processor.usage() == (7, 3)
     assert processor.push(terminal) == ("", False)
     assert processor.push(TokenDelta("r", 4, 4)) == ("", False)
-    assert processor.state.text == "hello EN"
 
 
 def test_output_processor_text_stop_keeps_prompt_usage_without_core_terminal():
@@ -153,7 +152,7 @@ def test_output_processor_text_stop_keeps_prompt_usage_without_core_terminal():
     last, stopped = processor.push(TokenDelta("r", 12, 2))
     assert stopped
     assert processor.finished
-    assert first + last == processor.state.text == "hello "
+    assert first + last == "hello "
     assert processor.state.stop_sequence == "END"
     assert processor.usage() == (7, 2)
     assert processor.push(RequestFinished("r", FINISH_CANCELLED, 7, 2)) == (
@@ -161,7 +160,6 @@ def test_output_processor_text_stop_keeps_prompt_usage_without_core_terminal():
         False,
     )
     assert processor.state.finish_reason == FINISH_STOP_TOKEN
-    assert processor.state.text == "hello "
 
 
 def test_output_processor_error_is_terminal_and_preserves_partial_text():
@@ -304,26 +302,22 @@ def test_anthropic_format_stream_end_no_stop():
     assert payloads[1]["delta"]["stop_reason"] == "end_turn"
 
 
-def test_anthropic_format_stream_end_with_stop_trims_and_emits_remaining():
+def test_anthropic_format_stream_end_with_stop_emits_only_terminal_facts():
     builder = _make_anthropic_builder()
     ctx = _make_ctx(completion_tokens=7)
     stop = StopInfo(
         matched="END",
-        body="Hello world ",
-        yielded="Hello ",
     )
     events = builder.format_stream_end(ctx, stop)
     payloads = _sse_payloads(events)
     types = [p["type"] for p in payloads]
     assert types == [
-        "content_block_delta",
         "content_block_stop",
         "message_delta",
         "message_stop",
     ]
-    assert payloads[0]["delta"]["text"] == "world "
-    assert payloads[2]["delta"]["stop_reason"] == "stop_sequence"
-    assert payloads[2]["delta"]["stop_sequence"] == "END"
+    assert payloads[1]["delta"]["stop_reason"] == "stop_sequence"
+    assert payloads[1]["delta"]["stop_sequence"] == "END"
 
 
 def test_anthropic_format_stream_end_stop_trimmed_already_yielded():
@@ -331,8 +325,6 @@ def test_anthropic_format_stream_end_stop_trimmed_already_yielded():
     ctx = _make_ctx()
     stop = StopInfo(
         matched="END",
-        body="Hello ",
-        yielded="Hello ",
     )
     events = builder.format_stream_end(ctx, stop)
     payloads = _sse_payloads(events)
@@ -343,7 +335,7 @@ def test_anthropic_format_stream_end_stop_trimmed_already_yielded():
 def test_anthropic_format_response_with_stop_preserves_trimmed_content():
     builder = _make_anthropic_builder()
     ctx = _make_ctx()
-    stop = StopInfo(matched="STOP", body="text ", yielded="text ")
+    stop = StopInfo(matched="STOP")
     resp = builder.format_response(ctx, "text ", stop)
     assert resp["content"][0]["text"] == "text "
     assert resp["stop_reason"] == "stop_sequence"

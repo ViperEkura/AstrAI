@@ -72,16 +72,17 @@ class _StopAndRecordWorkers(TrainCallback):
         self.kill_workers = kill_workers
         self.worker_pids = []
 
-    def on_batch_end(self, context):
+    def after_optimizer_step(self, context):
         if self.worker_pids or context.optimizer_step < self.steps:
             return
         self.worker_pids = [
             worker.pid for worker in getattr(context.train_iterator, "_workers", [])
         ]
+        # Stop at a committed window before a worker's SIGCHLD can interrupt us.
+        context.request_stop()
         if self.kill_workers:
             for pid in self.worker_pids:
                 os.kill(pid, signal.SIGKILL)
-        context.request_stop()
 
 
 def _checkpoints(directory):
@@ -120,6 +121,7 @@ def _assert_emergency_checkpoint(directory, config, stopper):
     paths = _checkpoints(directory)
     assert paths, "no emergency checkpoint was written"
     meta = json.loads((paths[-1] / "meta.json").read_text())
+    assert meta["optimizer_step"] == stopper.steps
     per_step = config.batch_per_device * config.grad_accum_steps
     assert meta["consumed_samples"] == meta["optimizer_step"] * per_step
     Checkpoint.load(str(paths[-1]))

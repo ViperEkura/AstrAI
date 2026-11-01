@@ -1,1443 +1,333 @@
-# AstrAI Architecture
+# Architecture
 
-## Contents
+This page describes module boundaries, ownership and execution flow.
+Boxes group classes by responsibility; arrows show calls, ownership or data
+contracts. Detailed fields and signatures remain in source.
 
-- [Class Diagram](#class-diagram) — Mermaid class diagram grouped by package and submodule
-- [Module Overview](#module-overview) — Component inventory per module
-- [Design Patterns](#design-patterns) — 16 documented patterns with classes
-- [Core Relationships](#core-relationships) — 11 key inter-component relationships
+## Entrypoints and layers
 
-## Class Diagram
+CLI tools resolve configuration and call the same Python components used by
+applications. Training owns updates; inference owns request execution. They share
+model, tokenizer, serialization and kernel infrastructure.
+
+```mermaid
+flowchart TB
+    Prep["preprocess.py"] --> Pipeline["Preprocessing pipeline"]
+    Pipeline --> Data["Binary records and metadata"]
+    TrainCLI["train.py / Python"] --> Trainer["Trainer"]
+    Data --> Loader["Dataset and DataLoader"]
+    Loader --> Trainer
+    HTTP["server.py / HTTP"] --> Protocol["Protocol adapters"]
+    Python["Python / demos"] --> Frontend["Inference frontend"]
+    Protocol --> Frontend
+    Frontend --> Core["EngineCore and Scheduler"]
+    Core --> Worker["GPUModelRunner"]
+    Trainer --> Model["Model execution"]
+    Worker --> Model
+    Trainer --> Rollout["Rollout backend"]
+    Rollout --> Core
+    Model --> Extension["Backend dispatch and kernels"]
+    Trainer --> Checkpoint["Checkpoint publication"]
+```
+
+The arrows show calls or data flow, not separate processes. A local training
+launcher creates one process per configured distributed rank. Within an
+inference instance, frontend, core and worker are in-process layers. Async rollout
+creates separate replica processes, each with its own inference instance.
+
+## Configuration and construction
+
+The CLI merges defaults, YAML and explicit flags into validated configuration.
+`ComponentSpec(type, params)` selects training components; construction occurs
+inside each rank, after device and topology setup. `TrainContextBuilder` loads
+the selected state and assembles runtime objects. `TrainSession` takes ownership
+only once a context exists.
+
+This separates serializable settings from live resources such as loaders,
+process groups and rollout workers. A builder failure cleans up partially created
+rollout resources; a session failure follows the normal shutdown plan.
+See [construction lifecycle](trainer/lifecycle.md) for the exact order.
+
+## Training ownership
 
 ```mermaid
 classDiagram
-    namespace config {
-        class BaseConfig {
-            +to_dict() Dict
-            +from_dict(d) Self
-            +from_file(path) Self
-            +to_file(path)
-        }
-
-        class BaseModelConfig {
-            +Optional[str] model_type
-            +float neftune_alpha
-            +from_file(config_path) Self
-            +to_file(config_path)
-        }
-
-        class AutoRegressiveLMConfig {
-            +Optional[int] vocab_size
-            +Optional[int] hidden_size
-            +Optional[int] num_hidden_layers
-            +Optional[float] rms_norm_eps
-            +Optional[int] intermediate_size
-            +Optional[bool] tie_word_embeddings
-            +Optional[dict] rope_scaling
-            +Optional[int] max_position_embeddings
-            +Optional[float] rope_theta
-            +AttentionConfig attention
-            +Optional[str] source_model_type
-            +str ffn_type
-            +Optional[int] n_routed_experts
-            +Optional[int] n_shared_experts
-            +Optional[int] n_activated_experts
-            +Optional[str] topk_method
-            +Optional[int] moe_intermediate_size
-            +Optional[int] shared_expert_intermediate_size
-            +bool norm_topk_prob
-            +int decoder_sparse_step
-            +Optional[List[int]] mlp_only_layers
-        }
-
-        class AttentionConfig {
-            +str default_type
-            +Optional[List[str]] layers
-            +Optional[int] num_heads
-            +Optional[int] num_kv_heads
-            +GQAConfig gqa
-            +GDNConfig gdn
-            +MLAConfig mla
-        }
-
-        class GQAConfig {
-            +Optional[int] head_dim
-            +Optional[int] rotary_dim
-        }
-
-        class GDNConfig {
-            +Optional[int] num_key_heads
-            +Optional[int] num_value_heads
-            +Optional[int] key_head_dim
-            +Optional[int] value_head_dim
-            +int conv_kernel_size
-        }
-
-        class MLAConfig {
-            +Optional[int] kv_lora_rank
-            +Optional[int] qk_nope_head_dim
-            +Optional[int] qk_rope_head_dim
-        }
-
-        class EncoderConfig {
-            +Optional[int] vocab_size
-            +Optional[int] hidden_size
-            +Optional[int] num_hidden_layers
-            +Optional[float] rms_norm_eps
-            +Optional[int] intermediate_size
-            +Optional[int] max_position_embeddings
-            +Optional[float] rope_theta
-            +str attn_type
-            +Optional[int] num_attention_heads
-            +Optional[int] num_key_value_heads
-            +Optional[bool] use_qk_norm
-            +Optional[bool] use_gated_attention
-            +str ffn_type
-            +Optional[dict] rope_scaling
-            +Optional[str] pooling_type
-            +Optional[bool] normalize_embeddings
-        }
-
-        class ConfigFactory {
-            +Dict _entries
-            +register(name) decorator
-            +load(raw) BaseConfig
-        }
-
-        class InputConfig {
-            +Optional[List[Dict]] sections
-            +Optional[Dict[str, Dict]] sources
-        }
-
-        class ProcessingConfig {
-            +int max_seq_len
-            +int min_chars
-            +int max_chars
-            +Optional[int] max_items
-            +str packing_strategy
-            +int max_packed_len
-            +str truncation_mode
-        }
-
-        class OutputConfig {
-            +Optional[str] domain_key
-            +str storage_format
-            +int max_tokens_per_shard
-            +Dict[str, str] dtype
-            +str position_ids_mode
-        }
-
-        class PipelineConfig {
-            +int version
-            +InputConfig input
-            +dict mask
-            +str mask_default
-            +ProcessingConfig preprocessing
-            +OutputConfig output
-            +from_dict(d) Self
-        }
-
-        class TrainConfig {
-            +str strategy
-            +ComponentSpec model
-            +ComponentSpec dataset
-            +ComponentSpec optimizer
-            +ComponentSpec scheduler
-            +Optional[str] optimizer_name
-            +Dict[str, Any] optimizer_hyperparameters
-            +int n_epoch
-            +int batch_per_device
-            +int grad_accum_steps
-            +Optional[float] max_grad_norm
-            +list gradient_checkpointing_modules
-            +Optional[str] compile_mode
-            +int start_epoch
-            +int start_samples
-            +str ckpt_dir
-            +int ckpt_interval
-            +List[str] metrics
-            +Optional[LoRAConfig] lora
-            +int random_seed
-            +int num_workers
-            +Optional[int] prefetch_factor
-            +bool pin_memory
-            +int dp_size
-            +int cp_size
-            +str backend
-            +str master_addr
-            +str master_port
-            +str start_method
-            +str device_type
-            +Optional[Dataset] val_dataset
-            +Optional[float] val_split
-            +int val_step
-            +float neftune_alpha
-            +float moe_aux_loss_coef
-            +str dp_mode
-            +int rollout_interval
-            +float rollout_temperature
-            +int rollout_top_k
-            +float rollout_top_p
-            +int rollout_max_tokens
-            +Optional[Callable] reward_model_fn
-            +dict executor_kwargs
-            +dict extra_kwargs
-        }
-
+    direction TB
+    namespace Construction {
+        class TrainSession
+        class TrainContextBuilder
+    }
+    namespace TrainingLoop {
+        class Trainer
+        class TrainContext
+    }
+    namespace Strategy {
+        class BaseStrategy
+    }
+    namespace Rollout {
+        class RolloutRunner
+        class RolloutEvaluator
+        class WeightPublisher
+    }
+    namespace Parallel {
+        class BaseExecutor
+    }
+    namespace Optimization {
+        class Optimizer
+        class LRScheduler
+    }
+    namespace Callbacks {
+        class MetricCallback
+        class CheckpointCallback
+        class GradientClippingCallback
+    }
+    namespace Persistence {
+        class MetricHistory
+        class Checkpoint
     }
 
-    namespace dataset {
-        class BaseDataset {
-            +int window_size
-            +int stride
-            +Optional[Store] storage
-            +load(load_path, storage_type)
-            +__getitem__(index)
-            +__len__()
-        }
-
-        class SEQDataset {
-            +__getitem__(index) Dict
-        }
-
-        class SFTDataset {
-            +__getitem__(index) Dict
-        }
-
-        class DPODataset {
-            +__getitem__(index) Dict
-        }
-
-        class GRPODataset {
-            +__getitem__(index) Dict
-        }
-
-        class Store {
-            +Dict[str, List[Tensor]] _data
-            +Dict[str, List[int]] _cum
-            +Dict[str, List[int]] _offsets
-            +int _length
-            +int _num_records
-            +keys (property)
-            +load(path)
-            +__len__()
-            -_normalize(raw, offsets)
-        }
-
-        class Streamable {
-            <<mixin>>
-            +fetch(begin, end, keys)
-            -_fetch_stream_key(key, begin, end) Tensor
-        }
-
-        class Recordable {
-            <<mixin>>
-            +num_records (property)
-            +fetch_record(index, keys)
-            -_fetch_record_key(key, index) Tensor
-        }
-
-        class MmapStore {
-            +List _mmap_refs
-            +load(path)
-        }
-
-        class JsonlStore {
-            +List _records
-            +Callable _processor
-            +load(path, transform, processor)
-            +fetch_record(index, keys)
-        }
-
-        class RDSampler {
-            +int epoch
-            +int iter
-        }
-
-        class StoreFactory {
-            +Dict _entries
-            +register(name) decorator
-            +create(storage_type) Store
-        }
-
-        class DatasetFactory {
-            +Dict _entries
-            +register(name) decorator
-            +create(train_type, window_size, stride) BaseDataset
-            +load(train_type, load_path, window_size, stride, storage_type, tokenizer_path, max_len, store) BaseDataset
-        }
-    }
-
-    namespace serialization {
-        class Checkpoint {
-            +dict state_dict
-            +int epoch
-            +int consumed_samples
-            +dict extra
-            +dict meta
-            +dict config
-            +save(save_dir)
-            +load(save_dir, broadcast, verify_checksums) Checkpoint
-            +load_any(save_dir, broadcast, verify_checksums) Optional[Checkpoint]
-        }
-    }
-
-    namespace model {
-        class ModelFactory {
-            +Dict _entries
-            +register(name) decorator
-            +get_component_class(name) Type
-        }
-        class AutoModel {
-            <<nn.Module>>
-            +BaseModelConfig config
-            +from_pretrained(path, disable_random_init, strict) nn.Module
-            +save_pretrained(save_directory)
-            +to(*args, **kwargs) Self
-        }
-        class TransformerModel {
-            +AutoRegressiveLMConfig config
-            +RotaryEmbedding rotary_embedding
-            +Embedding embed_tokens
-            +ModuleList layers
-            +RMSNorm norm
-            +_trunk_hidden(input_ids, input_mask, kv_cache, position_ids) Tuple[Tensor, Optional]
-        }
-        class AutoRegressiveLM {
-            +AutoRegressiveLMConfig config
-            +Linear lm_head
-            +forward(input_ids, input_mask, kv_cache, position_ids) Dict[str, Tensor]
-            +load_state_dict(state_dict, strict, assign)
-            +state_dict()
-        }
-        class EmbeddingEncoder {
-            +EncoderConfig config
-            +RotaryEmbedding rotary_embedding
-            +Embedding embed_tokens
-            +ModuleList layers
-            +RMSNorm norm
-            +str pooling_type
-            +bool normalize_embeddings
-            +forward(input_ids, input_mask, position_ids) Tensor
-            +load_state_dict(state_dict)
-        }
-        namespace kv_cache {
-            class KVStorage
-            class ReqToTokenPool
-            class BaseKVCache {
-                <<dataclass>>
-            }
-            class PrefillKVCache {
-                <<dataclass>>
-            }
-            class DecodeKVCache {
-                <<dataclass>>
-            }
-            class KVCache {
-                <<type alias>>
-            }
-        }
-        namespace components {
-            class DecoderBlock {
-                +nn.Module attention  # GQA or MLA via AttnFactory
-                +RMSNorm input_norm
-                +nn.Module mlp        # MLP or DeepSeekMoE via FFNFactory
-                +RMSNorm post_attention_norm
-                +forward(x, rotary_emb, attention_mask, kv_cache, is_causal) DecoderOutput
-            }
-            class DecoderOutput {
-                <<TypedDict>>
-                +Tensor hidden_states
-                +Optional[Tensor] aux_loss
-                +Optional[RouterStats] router_stats
-            }
-            class GQA {
-                +int dim
-                +int n_heads
-                +int n_kv_heads
-                +int head_dim
-                +int n_rep
-                +int layer_id
-                +bool use_qk_norm
-                +bool use_gated_attention
-                +Linear q_proj, k_proj, v_proj, o_proj
-                +Linear gate  # only if use_gated_attention
-                +RMSNorm q_norm, k_norm  # only if use_qk_norm
-                +forward(x, rotary_emb, attn_mask, kv_cache, is_causal) Tensor
-            }
-            class MLA {
-                +int dim
-                +int n_heads
-                +int n_kv_heads
-                +int head_dim
-                +int kv_lora_rank
-                +int qk_nope_head_dim
-                +int qk_rope_head_dim
-                +int n_rep
-                +int layer_id
-                +bool use_qk_norm
-                +bool use_gated_attention
-                +Linear q_proj, kv_a_proj, kv_b_proj
-                +Linear o_proj
-                +Linear gate  # only if use_gated_attention
-                +RMSNorm kv_norm
-                +RMSNorm q_norm, k_norm  # only if use_qk_norm
-                +forward(x, rotary_emb, attn_mask, kv_cache, is_causal) Tensor
-            }
-            class MLP {
-                +Linear up, gate, down
-                +forward(x) FFNOutput
-            }
-            class FFNOutput {
-                <<TypedDict>>
-                +Tensor hidden_states
-                +Optional[Tensor] aux_loss
-                +Optional[RouterStats] router_stats
-            }
-            class DeepSeekMoE {
-                +int dim
-                +int n_routed_experts
-                +int n_shared_experts
-                +int n_activated_experts
-                +str topk_method
-                +Linear router
-                +ModuleList shared_experts
-                +ModuleList routed_experts
-                +forward(x) FFNOutput
-            }
-            class AttnFactory {
-                +create(attn_type, **kwargs) nn.Module
-            }
-            class FFNFactory {
-                +create(ffn_type, dim, dim_ffn, **kwargs) nn.Module
-            }
-            class RMSNorm {
-                +Parameter weight
-                +float norm_eps
-                +tuple normalized_shape
-                +forward(x) Tensor
-            }
-            class Linear {
-                +Parameter weight
-                +Optional[Parameter] bias  # only if bias=True
-                +forward(x) Tensor
-            }
-            class RotaryEmbedding {
-                +int dim
-                +int max_len
-                +float base
-                +Optional[Dict] rope_scaling
-                +Tensor freqs_cis
-                +forward(x, position_ids=None) Tensor
-            }
-            class Embedding {
-                +Parameter weight
-                +float neftune_noise_alpha
-                +forward(x) Tensor
-                +set_neftune_alpha(alpha)
-            }
-            class LoRAConfig {
-                +int r
-                +int alpha
-                +tuple target_modules
-            }
-            class LoRALinear {
-                +Linear weight
-                +Parameter lora_A, lora_B
-                +forward(x) Tensor
-                +merge()
-            }
-        }
-    }
-
-    namespace preprocessing {
-        class SectionRenderer {
-            +process_sections(item, sections, config, tokenizer) Tuple
-            +process_list_field(item, sections, config, tokenizer) Tuple
-        }
-        class BaseMaskBuilder {
-            <<abstract>>
-            +build(item, config, tokenizer) Optional[dict]
-        }
-        class MaskBuilderFactory {
-            +Dict _entries
-            +register(name) decorator
-            +create(name, *args, **kwargs) BaseMaskBuilder
-        }
-        class SingleOutputMaskBuilder {
-            +SectionRenderer renderer
-            +build(item, config, tokenizer) Optional[dict]
-        }
-        class MultiOutputMaskBuilder {
-            +SectionRenderer renderer
-            +build(item, config, tokenizer) Optional[dict]
-        }
-        class SectionedMaskBuilder {
-            +build(item, config, tokenizer) Optional[dict]
-        }
-        class PackingStrategy {
-            <<abstract>>
-            +apply(keys, max_packed_len, truncation_mode) Dict
-        }
-        class PackingStrategyFactory {
-            +create(name, *args, **kwargs) PackingStrategy
-        }
-        class SimplePacking {
-            +apply(keys, max_packed_len, truncation_mode) Dict
-        }
-        class BFDPacking {
-            +apply(keys, max_packed_len, truncation_mode) Dict
-        }
-        class BFDSplitPacking {
-            +apply(keys, max_packed_len, truncation_mode) Dict
-        }
-        class PositionIdStrategy {
-            <<abstract>>
-            +generate(sequences) List[int]
-        }
-        class PositionIdStrategyFactory {
-            +create(name, *args, **kwargs) PositionIdStrategy
-        }
-        class NoPositionId {
-            +generate(sequences) List[int]
-        }
-        class DocResetPositionId {
-            +generate(sequences) List[int]
-        }
-        class ContinuousPositionId {
-            +generate(sequences) List[int]
-        }
-        class StoreWriter {
-            <<abstract>>
-            +save(output_dir, domain, shard_idx, tensors)
-        }
-        class StoreWriterFactory {
-            +create(name, *args, **kwargs) StoreWriter
-        }
-        class BinWriter {
-            +save(output_dir, domain, shard_idx, tensors)
-        }
-        class Pipeline {
-            +PipelineConfig config
-            +List[str] paths
-            +str output_dir
-            +str tokenizer_path
-            +AutoTokenizer tokenizer
-            +BaseMaskBuilder mask_builder
-            +PackingStrategy _packer
-            +PositionIdStrategy _position_id
-            +StoreWriter _writer
-            +transform(item) Optional[dict]
-            +run()
-            +_flush(domains, shard_idx)
-            +_inject_doc_reset_position_ids(keys, mode, seqs) Dict
-            +_inject_continuous_position_ids(tensors, mode, seqs) Dict
-            +_to_tensors(keys) Dict
-        }
-        class TokenizeTransform {
-            +PipelineConfig config
-            +AutoTokenizer tokenizer
-            +BaseMaskBuilder mask_builder
-            +PositionIdStrategy position_strategy
-            +from_config_file(path) TokenizeTransform
-            +apply(records) Dict[str, list]
-        }
-    }
-
-    namespace tokenize {
-        class AutoTokenizer {
-            +vocab_size int
-            +encode(tokens, out_ids, is_pretokenized, add_special_tokens) List
-            +decode(tokens, skip_special_tokens) str
-            +__getattr__(name) Any (bos_id, eos_id, pad_id, stop_ids)
-            +apply_chat_template(messages, system_prompt, tokenize, add_generation_prompt) Union[str, List[int]]
-            +set_chat_template(template)
-            +load(path)
-            +from_pretrained(path) AutoTokenizer
-            +save_pretrained(save_path)
-        }
-
-        class ChatTemplate {
-            +str template_str
-            +render(messages, system_prompt, **extra_variables) str
-            +from_string(template) ChatTemplate
-        }
-    }
-
-
-    namespace trainer {
-        class Trainer {
-            +TrainConfig train_config
-            +List[TrainCallback] callbacks
-            +train(param_path=None, resume=False)
-            -_get_default_callbacks() List[TrainCallback]
-        }
-        class TrainContext {
-            +nn.Module model
-            +BaseStrategy strategy
-            +DataLoader dataloader
-            +OptimizerProtocol optimizer
-            +SchedulerProtocol scheduler
-            +Checkpoint checkpoint
-            +TrainConfig config
-            +dict model_config
-            +BaseExecutor executor
-            +int epoch
-            +int consumed_samples
-            +float loss
-            +Dict[str, float] metrics
-            +Optional[float] grad_norm
-            +GradSNRTracker grad_snr_tracker
-            +DataLoader val_dataloader
-            +Optional[float] val_loss
-            +Optional[RolloutEvaluator] val_evaluator
-            +int world_size
-            +int rank
-            +ParallelTopology topology
-            +dict kwargs
-            +dp_size (property) int
-            +stop_requested (property) bool
-            +optimizer_step (property) int
-            +request_stop()
-        }
-        class TrainContextBuilder {
-            +TrainConfig config
-            +with_param_path(param_path, resume) TrainContextBuilder
-            +build() TrainContext
-        }
-        namespace strategy {
-            class BaseStrategy {
-                +Callable model
-                +Optional[BaseExecutor] executor
-                +float moe_aux_loss_coef
-                +dict extra_kwargs
-                +str device
-                +__call__(batch) LossOutput
-                +compute_loss(batch) Tensor
-                +compute_loss_output(batch) LossOutput
-                +supports_online() bool
-                +set_rollout_runner(runner)
-                +set_weight_publishers(publishers)
-                +prepare_from_rollout(result) Dict
-                +validate_online(batch) Optional[LossOutput]
-                +optimizer_step(optimizer)
-            }
-            class LossOutput {
-                <<TypedDict>>
-                +Tensor loss
-                +Dict[str, float] metrics
-            }
-            class StrategyFactory {
-                +Dict _entries
-                +register(name) decorator
-                +create(train_type, model, device, **kwargs) BaseStrategy
-            }
-            class SEQStrategy {
-                +float label_smoothing
-                +compute_loss(batch) Tensor
-            }
-            class SFTStrategy {
-                +float label_smoothing
-                +compute_loss(batch) Tensor
-            }
-            class DPOStrategy {
-                +nn.Module ref_model
-                +float beta
-                +str reduction
-                +compute_loss(batch) Tensor
-            }
-            class GRPOStrategy {
-                +nn.Module old_model
-                +nn.Module ref_model
-                +float clip_eps
-                +float kl_coef
-                +int group_size
-                +compute_loss(batch) Tensor
-                +sync_old_model()
-            }
-        }
-        namespace backend {
-            class RolloutBackend {
-                <<protocol>>
-                +device
-                +int policy_version
-                +generate(prompt_ids_list, **kwargs)
-                +update_weights(policy_version) int
-                +apply_weight_update(policy_version, update)
-                +with_policy_snapshot(inspect)
-            }
-            class ColocatedBackend {
-                +Scheduler scheduler
-                +generate(prompt_ids_list, **kwargs)
-            }
-            class ReplicaBackend {
-                +nn.Module model
-                +torch.device device
-                +Scheduler scheduler
-                +generate(prompt_ids_list, **kwargs)
-            }
-            class WeightPublisher {
-                <<protocol>>
-                +publish(policy_version, source)
-            }
-            class P2PCopyPublisher {
-                +ReplicaBackend backend
-                +publish(policy_version, source)
-            }
-        }
-        namespace rollout {
-            class RawRollout {
-                +Tensor prompts
-                +Tensor prompt_mask
-                +Tensor responses
-                +Tensor response_mask
-                +Tensor logprobs_old
-                +int policy_version
-                +List[str] prompt_texts
-                +List[List[str]] response_texts
-            }
-            class RolloutResult {
-                +Tensor rewards
-            }
-            class BaseRewardModel {
-                <<abstract>>
-                +score(List[str] prompts, List[List[str]] responses) Tensor
-            }
-            class SamplingParams {
-                +float temperature
-                +float top_p
-                +int top_k
-                +int max_tokens
-                +int group_size
-                +float frequency_penalty
-                +int rep_window
-            }
-            class RolloutGenerator {
-                +RolloutBackend backend
-                +SamplingParams params
-                +output_device
-                +int policy_version
-                +update_weights(policy_version) int
-                +apply_weight_update(policy_version, update)
-                +generate(batch, params) RawRollout
-            }
-            class RolloutRunner {
-                +int policy_version
-                +int max_policy_lag
-                +update_weights(policy_version) int
-                +apply_weight_update(policy_version, update)
-                +step()
-                +clear_cache()
-                +__call__(batch) Tuple[RolloutResult, bool]
-            }
-            class RolloutEvaluator {
-                +RolloutGenerator generator
-                +BaseRewardModel reward_model
-                +SamplingParams params
-                +evaluate(batch) Dict[str, float]
-            }
-        }
-        namespace callbacks {
-            class TrainCallback {
-                <<protocol>>
-                +on_train_begin(context)
-                +on_train_end(context)
-                +on_epoch_begin(context)
-                +on_epoch_end(context)
-                +on_batch_begin(context)
-                +on_batch_end(context)
-                +before_optimizer_step(context)
-                +after_optimizer_step(context)
-                +on_error(context)
-            }
-            class GradientClippingCallback {
-                +Optional[float] max_grad_norm
-                +before_optimizer_step(context)
-            }
-            class GradientCheckpointingCallback {
-                +Optional[List[type]] modules
-                +on_train_begin(context)
-                +on_train_end(context)
-            }
-            class CheckpointCallback {
-                +str save_dir
-                +int interval
-                +bool weight_only
-                +Callable save_extra_fn
-                -_save_checkpoint(context)
-                +after_optimizer_step(context)
-                +on_train_end(context)
-                +on_error(context)
-                +save_extra(context) dict
-            }
-            class ProgressBarCallback {
-                +int num_epoch
-                +int log_interval
-                +IO file
-                +tqdm progress_bar
-                +on_epoch_begin(context)
-                +before_optimizer_step(context)
-                +on_epoch_end(context)
-            }
-            class MetricCallback {
-                +Path ckpt_dir
-                +int save_interval
-                +List[str] metrics
-                +int val_step
-                +before_optimizer_step(context)
-                +on_epoch_end(context)
-                +on_train_end(context)
-                +on_error(context)
-                -_run_validation(context)
-                -_run_rollout_validation(context) Dict[str, float]
-            }
-            class CallbackFactory {
-                +Dict _entries
-                +register(name) decorator
-                +create(name, **kwargs) TrainCallback
-            }
-        }
-    }
-
-    namespace optimization {
-        namespace optimizer {
-            class OptimizerFactory {
-                +register(name) decorator
-                +create(name, *args, **kwargs) Optimizer
-            }
-            class OptimizerParameterGroups
-            class Mano
-            class ManoAdamW
-            class Nora
-            class NAdamW
-            class NoraNAdamW
-            namespace muon {
-                class MuonAdamW
-                class _ShardedMuon {
-                    +step()
-                }
-                namespace strategies {
-                    class DTensorTransferPolicy {
-                        <<protocol>>
-                        +gather(tensor)
-                        +redistribute(tensor, like)
-                    }
-                    class FullTensorTransferPolicy
-                    class TorchOrthogonalizer
-                    class KernelOrthogonalizer
-                }
-            }
-        }
-        namespace scheduler {
-            class BaseScheduler {
-                <<abstract>>
-                +get_lr() List[float]
-                +step()
-                +state_dict() dict
-                +load_state_dict(d)
-            }
-            class SchedulerFactory {
-                +register(name) decorator
-                +create(name, *args, **kwargs) BaseScheduler
-            }
-            class CosineScheduler {
-                +int warmup_steps
-                +int lr_decay_steps
-                +int total_steps
-                +float min_rate
-            }
-            class SGDRScheduler {
-                +int warmup_steps
-                +int cycle_length
-                +float min_rate
-                +int t_mult
-            }
-            class WSDScheduler {
-                +int warmup_steps
-                +int stable_steps
-                +int decay_steps
-                +float min_rate
-            }
-        }
-        namespace protocols {
-            class OptimizerProtocol {
-                <<protocol>>
-                +step(closure)
-                +zero_grad()
-                +state_dict() dict
-                +load_state_dict(d)
-            }
-            class SchedulerProtocol {
-                <<protocol>>
-                +step()
-                +state_dict() dict
-                +load_state_dict(d)
-                +get_last_lr()
-            }
-        }
-    }
-
-    namespace inference {
-        namespace frontend {
-            class InferenceEngine {
-                +generate() / generate_async() / generate_events() / score()
-            }
-            class EngineCoreClient {
-                <<abstract>>
-            }
-            class InprocClient
-            class InputProcessor
-            class OutputProcessor
-        }
-        namespace core {
-            class Scheduler {
-                +run_busy_loop()
-                +run_batch() / score_ids()
-            }
-            class RequestManager {
-                waiting / running
-            }
-            class Request {
-                +num_computed_tokens
-            }
-            class RequestStatus {
-                <<enumeration>>
-                PENDING
-                RUNNING
-                FINISHED
-                ABORTED
-            }
-            class SchedulerStep
-            class PolicyVersionGuard
-            class StreamDecoder
-            namespace cache {
-                namespace pool {
-                    class BlockPool
-                    class KVCacheManager
-                }
-                namespace strategy {
-                    class RequestCacheState
-                    class Allocator {
-                        bitmap free-set + LRU
-                    }
-                    class RadixCache
-                    class RadixNode
-                    class AllocationStrategy {
-                        <<abstract>>
-                    }
-                    class ContiguousStrategy
-                    class PagedStrategy
-                }
-            }
-        }
-        namespace worker {
-            class GPUModelRunner {
-                +execute_prefill() / submit_decode()
-            }
-            class PendingExecution {
-                +commit()
-            }
-            class CUDAGraphRunner
-            class InferenceWorkspace
-            class SamplingPipeline
-            class BaseSamplingStrategy {
-                <<abstract>>
-            }
-            class TemperatureStrategy
-            class TopKStrategy
-            class TopPStrategy
-            class FrequencyPenaltyStrategy
-        }
-        namespace network {
-
-            class ChatMessage {
-                +str role
-                +Optional[str] content
-                +Optional[List[Dict]] tool_calls
-                +Optional[str] tool_call_id
-            }
-
-            class FunctionDef {
-                +str name
-                +Optional[str] description
-                +Optional[Dict] parameters
-            }
-
-            class ToolDef {
-                +str type
-                +FunctionDef function
-            }
-
-            class ChatCompletionRequest {
-                +str model
-                +List[ChatMessage] messages
-                +Optional[float] temperature
-                +Optional[float] top_p
-                +Optional[int] top_k
-                +Optional[int] max_tokens
-                +Optional[bool] stream
-                +Optional[Union[str, List[str]]] stop
-                +Optional[int] n
-                +Optional[float] presence_penalty
-                +Optional[float] frequency_penalty
-                +Optional[Dict[int, float]] logit_bias
-                +Optional[str] user
-                +Optional[List[ToolDef]] tools
-                +Optional[Union[str, Dict]] tool_choice
-            }
-
-            class AnthropicMessage {
-                +str role
-                +Union[str, List[Dict]] content
-            }
-
-            class MessagesRequest {
-                +str model
-                +List[AnthropicMessage] messages
-                +Optional[str] system
-                +Optional[float] temperature
-                +Optional[float] top_p
-                +Optional[int] top_k
-                +int max_tokens
-                +Optional[bool] stream
-                +Optional[List[str]] stop_sequences
-            }
-
-            class ResponseBuilder {
-                <<abstract>>
-                +prepare(request, engine) Tuple[str, GenContext, List[str]]
-                +format_stream_start(ctx) List[str]
-                +format_chunk(token, **kwargs) List[str]
-                +format_stream_end(ctx, stop) List[str]
-                +format_response(ctx, content, stop) Dict
-            }
-
-            class OpenAIResponseBuilder {
-                +prepare(request, engine) Tuple
-                +format_stream_start(ctx) List[str]
-                +format_chunk(token, **kwargs) List[str]
-                +format_stream_end(ctx, stop) List[str]
-                +format_response(ctx, content, stop) Dict
-            }
-
-            class AnthropicResponseBuilder {
-                +prepare(request, engine) Tuple
-                +format_stream_start(ctx) List[str]
-                +format_chunk(token, **kwargs) List[str]
-                +format_stream_end(ctx, stop) List[str]
-                +format_response(ctx, content, stop) Dict
-            }
-
-            class ProtocolHandler {
-                +request
-                +engine
-                +builder: ResponseBuilder
-                +async handle() Union[StreamingResponse, Dict]
-                -_handle_stream(agen, ctx, stop_sequences) StreamingResponse
-                -async _handle_non_stream(agen, ctx, stop_sequences) Dict
-            }
-
-            class StopSequenceChecker {
-                +push(text) Tuple[str, bool]
-                incremental windowed stop matching
-            }
-
-            class GenContext {
-                +str resp_id
-                +int created
-                +str model
-                +int prompt_tokens
-                +int completion_tokens
-            }
-
-            class StopInfo {
-                +Optional[str] matched
-                +str body
-                +str yielded
-            }
-
-            class BaseToolParser {
-                <<abstract>>
-                +feed(body, current_token_ids, delta_token_ids) List[Dict]
-                +parse_complete(body) Optional[Dict]
-                +has_tool_calls (property) bool
-            }
-
-            class ToolParserFactory {
-                +create(name, *args, **kwargs) BaseToolParser
-            }
-
-            class SimpleJsonToolParser {
-                +feed(body, current_token_ids, delta_token_ids) List[Dict]
-                +parse_complete(body) Optional[Dict]
-            }
-        }
-    }
-
-
-
-    namespace parallel {
-        class ParallelTopology {
-            +int world_size
-            +int dp_size
-            +int cp_size
-            +int tp_size
-            +Optional[DeviceMesh] cp_mesh
-            +Optional[ProcessGroup] dp_group
-            +Optional[ProcessGroup] cp_group
-            +Optional[ProcessGroup] tp_group
-            +is_trivial (property) bool
-            +is_dp_leader() bool
-            +samples_per_replica(dataset_len) int
-            +reduce_sum(values) Tensor
-            +reduce_mean(values) Tensor
-        }
-
-        class CPState {
-            +ParallelTopology topology
-            +shard(buffers, seq_dims) ContextManager
-            +mean_loss(loss_sum, token_count) tuple
-        }
-
-        class CPStrategy {
-            +TokenMeanStrategy inner
-            +CPState cp
-            +compute_loss_output(batch) LossOutput
-        }
-
-        class TPState {
-            +ParallelTopology topology
-            +shard(model, plan) ContextManager
-        }
-
-        class LaunchStrategy {
-            <<abstract>>
-            +launch(func, **kwargs)
-        }
-
-        class TorchrunStrategy {
-            +launch(func, **kwargs)
-        }
-
-        class LocalStrategy {
-            +launch(func, **kwargs)
-        }
-
-        class GradientState {
-            +int num_steps
-            +sync_gradients (property) bool
-        }
-
-        class AccumOptimizer {
-            +Optimizer optimizer
-            +GradientState gradient_state
-            +param_groups (property)
-            +step(closure)
-            +zero_grad()
-            +state_dict() dict
-            +load_state_dict(d)
-        }
-
-        class AccumScheduler {
-            +LRScheduler scheduler
-            +GradientState gradient_state
-            +step()
-            +state_dict() dict
-            +load_state_dict(d)
-            +get_last_lr()
-        }
-
-        class BaseExecutor {
-            +GradientState gradient_state
-            +prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap, after_wrap) tuple
-            +accumulate(model) context manager
-            +backward(loss)
-            +unwrap_model(model) dict
-            +checkpoint_context(model) context manager
-            +clip_grad_norm(model, max_norm) float
-            +use_distributed (property) bool
-            +sync_gradients (property) bool
-            +grad_accum_steps (property) int
-        }
-
-        class NoneExecutor {
-        }
-
-        class DDPExecutor {
-            -_prepare_model(model) nn.Module
-            -_no_sync(model) context manager
-            +unwrap_model(model) dict
-        }
-
-        class FSDPExecutor {
-            -_prepare_model(model) nn.Module
-            -_no_sync(model) context manager
-            +unwrap_model(model) Optional[dict]
-            +clip_grad_norm(model, max_norm) float
-        }
-
-        class ExecutorFactory {
-            +Dict _entries
-            +register(name) decorator
-            +create(dp_mode, **kwargs) BaseExecutor
-        }
-
-    }
-
-    %% Relationships — UML notation: <|-- generalization, *-- composition, o-- aggregation, --> association, ..> dependency
-
-    %% --- Generalization (inheritance) ---
-    BaseStrategy <|-- SEQStrategy
-    BaseStrategy <|-- SFTStrategy
-    BaseStrategy <|-- DPOStrategy
-    BaseStrategy <|-- GRPOStrategy
-    BaseScheduler <|-- CosineScheduler
-    BaseScheduler <|-- SGDRScheduler
-    BaseScheduler <|-- WSDScheduler
-    TrainCallback <|-- GradientClippingCallback
-    TrainCallback <|-- GradientCheckpointingCallback
-    TrainCallback <|-- CheckpointCallback
-    TrainCallback <|-- ProgressBarCallback
-    TrainCallback <|-- MetricCallback
-    BaseDataset <|-- SEQDataset
-    BaseDataset <|-- SFTDataset
-    BaseDataset <|-- DPODataset
-    BaseDataset <|-- GRPODataset
-    Store <|-- MmapStore
-    Store <|-- JsonlStore
-    MmapStore --|> Streamable
-    MmapStore --|> Recordable
-    JsonlStore --|> Streamable
-    JsonlStore --|> Recordable
-    BaseSamplingStrategy <|-- TemperatureStrategy
-    BaseSamplingStrategy <|-- TopKStrategy
-    BaseSamplingStrategy <|-- TopPStrategy
-    BaseSamplingStrategy <|-- FrequencyPenaltyStrategy
-    AutoModel <|-- TransformerModel
-    TransformerModel <|-- AutoRegressiveLM
-    TransformerModel <|-- ValueModel
-    AutoModel <|-- EmbeddingEncoder
-    BaseConfig <|-- BaseModelConfig
-    BaseConfig <|-- TrainConfig
-    BaseConfig <|-- InputConfig
-    BaseConfig <|-- ProcessingConfig
-    BaseConfig <|-- OutputConfig
-    BaseConfig <|-- PipelineConfig
-    BaseModelConfig <|-- AutoRegressiveLMConfig
-    AutoRegressiveLMConfig *-- AttentionConfig
-    AttentionConfig *-- GQAConfig
-    AttentionConfig *-- GDNConfig
-    AttentionConfig *-- MLAConfig
-    BaseModelConfig <|-- EncoderConfig
-    BaseExecutor <|-- NoneExecutor
-    BaseExecutor <|-- DDPExecutor
-    BaseExecutor <|-- FSDPExecutor
-    ResponseBuilder <|-- OpenAIResponseBuilder
-    ResponseBuilder <|-- AnthropicResponseBuilder
-    BaseToolParser <|-- SimpleJsonToolParser
-    BaseMaskBuilder <|-- SectionedMaskBuilder
-    BaseMaskBuilder <|-- SingleOutputMaskBuilder
-    BaseMaskBuilder <|-- MultiOutputMaskBuilder
-    PackingStrategy <|-- SimplePacking
-    PackingStrategy <|-- BFDPacking
-    BFDPacking <|-- BFDSplitPacking
-    PositionIdStrategy <|-- NoPositionId
-    PositionIdStrategy <|-- DocResetPositionId
-    PositionIdStrategy <|-- ContinuousPositionId
-    StoreWriter <|-- BinWriter
-    AllocationStrategy <|-- ContiguousStrategy
-    BaseKVCache <|-- PrefillKVCache
-    BaseKVCache <|-- DecodeKVCache
-    KVCache ..> PrefillKVCache
-    KVCache ..> DecodeKVCache
-    AllocationStrategy <|-- PagedStrategy
-    RawRollout <|-- RolloutResult
-    LaunchStrategy <|-- TorchrunStrategy
-    LaunchStrategy <|-- LocalStrategy
-    %% --- Composition (strong ownership, part destroyed with whole) ---
-    BlockPool *-- KVStorage
-    BlockPool *-- ReqToTokenPool
-    BlockPool *-- AllocationStrategy
-    PagedStrategy *-- Allocator
-    PagedStrategy *-- RadixCache
-    KVCacheManager --> BlockPool
-    RadixCache *-- RadixNode
-    InferenceEngine *-- Scheduler
-    Scheduler *-- BlockPool
-    Scheduler *-- KVCacheManager
-    SchedulerStep --> GPUModelRunner
-    GPUModelRunner *-- InferenceWorkspace
-    Scheduler *-- RequestManager
-    TransformerModel *-- DecoderBlock
-    TransformerModel *-- RotaryEmbedding
-    TransformerModel *-- Embedding
-    EmbeddingEncoder *-- DecoderBlock
-    EmbeddingEncoder *-- RotaryEmbedding
-    EmbeddingEncoder *-- Embedding
-    DecoderBlock *-- RMSNorm
-    ChatCompletionRequest *-- ChatMessage
-    ChatCompletionRequest *-- ToolDef
-    ToolDef *-- FunctionDef
-    MessagesRequest *-- AnthropicMessage
-    BaseExecutor *-- GradientState
-    AccumOptimizer o-- GradientState
-    AccumScheduler o-- GradientState
-
-    %% --- Aggregation (weak ownership) ---
-    AutoModel o-- BaseModelConfig
-    AutoTokenizer o-- ChatTemplate
-    Trainer o-- TrainCallback
-    TrainContext o-- BaseStrategy
-    TrainContext o-- OptimizerProtocol
-    TrainContext o-- SchedulerProtocol
-    TrainContext o-- Checkpoint
-    TrainContext o-- BaseExecutor
-    SamplingPipeline o-- BaseSamplingStrategy
-    BaseDataset o-- Store
-    Pipeline o-- PipelineConfig
-    Pipeline o-- BaseMaskBuilder
-    Pipeline o-- AutoTokenizer
-    Pipeline o-- PackingStrategy
-    Pipeline o-- PositionIdStrategy
-    Pipeline o-- StoreWriter
-    TokenizeTransform o-- AutoTokenizer
-    TokenizeTransform o-- BaseMaskBuilder
-
-    %% --- Dependency (uses temporarily) ---
-    TrainConfig ..> BaseStrategy : selects
-    PipelineConfig ..> MaskBuilderFactory : selects
-    MaskBuilderFactory ..> BaseMaskBuilder : creates
-    PackingStrategyFactory ..> PackingStrategy : creates
-    PositionIdStrategyFactory ..> PositionIdStrategy : creates
-    StoreWriterFactory ..> StoreWriter : creates
-    StrategyFactory ..> BaseStrategy : creates
-    SchedulerFactory ..> BaseScheduler : creates
-    DatasetFactory ..> BaseDataset : creates
-    CallbackFactory ..> TrainCallback : creates
-    AttnFactory ..> GQA : creates
-    AttnFactory ..> MLA : creates
-    FFNFactory ..> MLP : creates
-    FFNFactory ..> DeepSeekMoE : creates
-    DecoderBlock ..> AttnFactory : uses
-    DecoderBlock ..> FFNFactory : uses
-    StoreFactory ..> MmapStore : creates
-    StoreFactory ..> JsonlStore : creates
-    ConfigFactory ..> AutoRegressiveLMConfig : creates
-    ConfigFactory ..> EncoderConfig : creates
-    ModelFactory ..> AutoRegressiveLM : creates
-    ModelFactory ..> EmbeddingEncoder : creates
-    ExecutorFactory ..> NoneExecutor : creates
-    ExecutorFactory ..> DDPExecutor : creates
-    ExecutorFactory ..> FSDPExecutor : creates
-    ToolParserFactory ..> BaseToolParser : creates
-    TrainContextBuilder ..> ExecutorFactory : creates
-    Trainer ..> TrainContextBuilder : uses
-    TrainContextBuilder ..> TrainContext : creates
-    TrainContextBuilder ..> StrategyFactory : uses
-    TrainContextBuilder ..> DatasetFactory : opens in rank
-    TrainContextBuilder ..> RDSampler : creates loader
-    Checkpoint ..> Checkpoint : serializes
-    CheckpointCallback ..> Checkpoint : creates
-    BlockPool ..> KVCache : binds
-    BlockPool ..> InferenceWorkspace : fills
-    OpenAIResponseBuilder ..> ChatCompletionRequest : receives
-    AnthropicResponseBuilder ..> MessagesRequest : receives
-    ProtocolHandler ..> StopSequenceChecker : uses
-    ProtocolHandler ..> GenContext : creates
-    RolloutGenerator ..> RolloutBackend : generates via
-    ColocatedBackend ..> Scheduler : wraps
-    ReplicaBackend ..> Scheduler : owns
-    P2PCopyPublisher ..> ReplicaBackend : syncs weights
-    BaseStrategy ..> WeightPublisher : commits publish
-    RolloutRunner ..> RolloutGenerator : uses
-    RolloutRunner ..> BaseRewardModel : uses
-    RolloutEvaluator ..> RolloutGenerator : uses
-    RolloutEvaluator ..> BaseRewardModel : uses
-
-    %% --- Association (general usage) ---
-    Trainer --> TrainConfig
-    DPOStrategy --> AutoModel
-    GRPOStrategy --> AutoModel : policy/old/ref
-    Scheduler --> Request
-    Scheduler --> RequestStatus
-    Request --> RequestStatus
-    InferenceEngine --> AutoModel
-    GPUModelRunner --> AutoModel
-    GPUModelRunner ..> KVCacheManager : TYPE_CHECKING only
-    RequestManager --> AutoTokenizer
-
-    InferenceEngine *-- EngineCoreClient
-    EngineCoreClient <|.. InprocClient
-    InferenceEngine --> InputProcessor
-    InferenceEngine --> OutputProcessor
-    InprocClient ..> Scheduler : direct call
-    Scheduler *-- RequestManager
-    Scheduler *-- SchedulerStep
-    Scheduler *-- KVCacheManager
-    Scheduler *-- PolicyVersionGuard
-    RequestManager o-- Request
-    KVCacheManager --> BlockPool
-    SchedulerStep --> GPUModelRunner
-    GPUModelRunner --> PendingExecution
-    GPUModelRunner *-- CUDAGraphRunner
-    GPUModelRunner *-- InferenceWorkspace
-    GPUModelRunner --> SamplingPipeline
+    Trainer --> TrainSession : run lifetime
+    TrainSession --> TrainContextBuilder : construct
+    TrainContextBuilder --> TrainContext : assemble and restore
+    Trainer --> TrainContext : update state
+    Trainer --> BaseStrategy : prepare, loss and after_update
+    Trainer --> BaseExecutor : backward and synchronization
+    TrainContext *-- RolloutRunner : sync or async generation
+    TrainContext *-- RolloutEvaluator : online validation
+    Trainer --> RolloutRunner : collect and publish
+    RolloutRunner --> WeightPublisher : copy replicas inside version lock
+    Trainer --> Optimizer : actor update
+    Trainer --> LRScheduler : advance after update
+    Trainer --> MetricCallback : pre-update hook
+    Trainer --> GradientClippingCallback : pre-update hook
+    Trainer --> CheckpointCallback : publication hooks
+    GradientClippingCallback --> BaseExecutor : clip gradients
+    TrainContext *-- MetricHistory : run-owned history
+    MetricCallback --> MetricHistory : stage measurements
+    CheckpointCallback --> MetricHistory : snapshot and acknowledge
+    CheckpointCallback --> Checkpoint : publish
 ```
 
+- `Trainer` owns global data windows, optimizer updates and committed counters.
+- `TrainContextBuilder` resolves components inside each rank; `TrainSession`
+  owns startup and ordered cleanup.
+- Strategies compute objectives. Executors perform requested parallel operations;
+  they do not hide an independent optimizer-step counter.
+- Metric and checkpoint callbacks share context-owned history, with no references
+  to each other. A checkpoint publishes only at a safe committed boundary.
+- Optimizers and schedulers are ordinary PyTorch-compatible objects.
+  Precision wrappers and state placement are described in
+  [configuration](trainer/configuration.md), not encoded in callback order.
 
-## Module Overview
+See [lifecycle](trainer/lifecycle.md), [strategies](trainer/strategy.md),
+[callbacks](trainer/callbacks.md) and [rollout](trainer/rollout.md).
 
-| Module | Components | Description |
-|--------|------------|-------------|
-| **astrai.config** | BaseConfig, BaseModelConfig, AutoRegressiveLMConfig, AttentionConfig, GQAConfig, GDNConfig, MLAConfig, EncoderConfig, ConfigFactory, TrainConfig, PipelineConfig, InputConfig, ProcessingConfig, OutputConfig | Configuration management (to_dict/from_dict, to_file/from_file) |
-| **astrai.preprocessing** | SectionRenderer, BaseMaskBuilder, MaskBuilderFactory, SectionedMaskBuilder, SingleOutputMaskBuilder, MultiOutputMaskBuilder, Pipeline, TokenizeTransform, PackingStrategy, PackingStrategyFactory, SimplePacking, BFDPacking, BFDSplitPacking, PositionIdStrategy, PositionIdStrategyFactory, NoPositionId, DocResetPositionId, ContinuousPositionId, StoreWriter, StoreWriterFactory, BinWriter | Declarative JSON-driven data preprocessing |
-| **astrai.dataset** | BaseDataset, SEQDataset, SFTDataset, DPODataset, GRPODataset, Store, Streamable, Recordable, MmapStore, JsonlStore, StoreFactory, RDSampler, DatasetFactory | Dataset loading and management |
-| **astrai.serialization** | Checkpoint | Model serialization |
-| **astrai.model** | ModelFactory, AutoModel, AutoRegressiveLM, EmbeddingEncoder, TransformerModel · `components/`: DecoderBlock, GQA, MLA, MLP, DeepSeekMoE, AttnFactory, FFNFactory, RMSNorm, Linear, LoRAConfig, LoRALinear, RotaryEmbedding, Embedding · `kv_cache.py`: KVStorage, ReqToTokenPool, BaseKVCache, PrefillKVCache, DecodeKVCache, KVCache alias | Neural network model and KV layout contract |
-| **astrai.tokenize** | AutoTokenizer, ChatTemplate | Tokenizer and chat template |
-| **astrai.trainer** | Trainer, TrainContext, TrainContextBuilder, create_ref_model · `strategy/`: BaseStrategy–GRPOStrategy, StrategyFactory · `callbacks/`: TrainCallback, GradientClippingCallback, GradientCheckpointingCallback, CheckpointCallback, ProgressBarCallback, MetricCallback, CallbackFactory · `backend.py`: RolloutBackend, ColocatedBackend, ReplicaBackend, WeightPublisher, P2PCopyPublisher · `rollout/`: RawRollout, RolloutResult, BaseRewardModel, SamplingParams, RolloutGenerator, RolloutRunner, RolloutEvaluator | Training workflow (online RL rollout via injectable backends) |
-| **astrai.inference** | frontend: InferenceEngine, InputProcessor, OutputProcessor, EngineCoreClient/InprocClient, events (TokenDelta/RequestFinished/RequestError) · core: Scheduler, SchedulerStep, RequestManager, Request/RequestStatus · `core.cache.pool`: BlockPool, KVCacheManager · `core.cache.strategy`: RequestCacheState, Allocator, RadixCache/RadixNode, AllocationStrategy/ContiguousStrategy/PagedStrategy · core: PolicyVersionGuard, MetricsCollector · worker: GPUModelRunner, PendingExecution, CUDAGraphRunner, InferenceWorkspace, sampler (BaseSamplingStrategy–SamplingPipeline) · network: ProtocolHandler, ResponseBuilder (OpenAI/Anthropic), StopSequenceChecker, GenContext, StopInfo, ChatMessage/FunctionDef/ToolDef, ChatCompletionRequest, AnthropicMessage/MessagesRequest, BaseToolParser, ToolParserFactory, SimpleJsonToolParser | Inference service (see [developer/inference/](inference/)) |
-| **astrai.extension** | `runtime` context/spec/dispatcher, `backend` per-operator policy, `kernel` exact wrappers, attention, op_backend, apply_rotary_emb, is_available | Stable API over attention/rotary/FP8 execution policy and optional CUDA kernels |
-| **astrai.optimization** | `optimizer/`: OptimizerFactory, Mano/ManoAdamW, Nora/NAdamW/NoraNAdamW, OptimizerParameterGroups, composite helpers, parameter partitioning · `optimizer/muon/`: MuonAdamW, _ShardedMuon · `optimizer/muon/strategies/`: DTensorTransferPolicy, FullTensorTransferPolicy, TorchOrthogonalizer, KernelOrthogonalizer · `scheduler/`: SchedulerFactory, BaseScheduler–WSDScheduler · `protocols.py`: OptimizerProtocol, SchedulerProtocol | Training optimizers and learning-rate schedulers; Muon sharding uses batching, orthogonalization and DTensor strategies |
-| **astrai.parallel** | spawn_parallel_fn, setup_parallel, get_rank/get_world_size/get_current_device, only_on_rank, LaunchStrategy, TorchrunStrategy, LocalStrategy, ParallelTopology, build_topology, CPState, CPStrategy, TPState, LossReduction, TokenLoss, BaseExecutor, ExecutorFactory, NoneExecutor, DDPExecutor, FSDPExecutor, GradientState, AccumOptimizer, AccumScheduler, broadcast_state_dict | Rank-layout topology (dp x cp x tp), context-parallel composition, distributed launch, executors & gradient accumulation |
-| **astrai.factory** | BaseFactory | Component registration |
+### Update and publication flow
 
-## Design Patterns
+```mermaid
+sequenceDiagram
+    participant T as Trainer
+    participant S as Strategy
+    participant R as RolloutRunner
+    participant E as Executor
+    participant B as Callbacks
+    participant O as Optimizer / Scheduler
+    participant H as MetricHistory
+    participant C as CheckpointCallback
+    opt Online training
+        T->>R: Collect scored rollout
+        R-->>T: Versioned result
+        T->>S: Prepare rollout batch
+    end
+    Note over T,S: Trainer selects replay and minibatches
+    T->>S: Iterate losses for one update
+    T->>E: Backward and synchronize selected boundary
+    T->>E: Normalize accumulated gradients
+    T->>B: Dispatch pre-update hooks
+    B->>H: MetricCallback stages measurements
+    B->>E: GradientClippingCallback clips gradients
+    T->>O: Update actor (inside rollout lock when online)
+    opt Online training
+        T->>R: Publish replicas, advance version and update count
+    end
+    T->>S: after_update (critic or old policy)
+    T->>O: Clear actor gradients and advance schedule
+    T->>H: Commit records and counters after success
+    Note over T,C: Publish only at a checkpoint-safe boundary
+    T->>C: Dispatch post-update hooks
+    C->>H: Capture history snapshot
+    C->>C: Write staging files and atomically publish
+    C->>H: Acknowledge successful publication
+```
 
-| Pattern | Classes | Purpose |
-|---------|---------|---------|
-| **Factory** | `ModelFactory`, `AttnFactory`, `FFNFactory`, `StrategyFactory`, `DatasetFactory`, `SchedulerFactory`, `CallbackFactory`, `StoreFactory`, `ConfigFactory`, `ExecutorFactory`, `MaskBuilderFactory`, `StoreWriterFactory`, `PackingStrategyFactory`, `PositionIdStrategyFactory`, `ToolParserFactory` | Decorator-based component creation |
-| **Registry** | `BaseFactory` | Component registration |
-| **Strategy** | `SEQStrategy`, `SFTStrategy`, `DPOStrategy`, `GRPOStrategy` | Training strategy switching |
-| **Strategy (Sampling)** | `TemperatureStrategy`, `TopKStrategy`, `TopPStrategy`, `FrequencyPenaltyStrategy`, `SamplingPipeline` | Composable logit transformations |
-| **Strategy (API)** | `ResponseBuilder`, `OpenAIResponseBuilder`, `AnthropicResponseBuilder` | HTTP API handler with format hooks |
-| **Builder** | `TrainContextBuilder` | Chain-building training context |
-| **Observer** | `TrainCallback`, callback implementations | Training process monitoring |
-| **Context** | `TrainContext` | Unified training state bag |
-| **Object Pool** | `Allocator`, `BlockPool` | Page-based KV cache with LRU eviction |
-| **Dispatch (Attention)** | `AttentionSpec`, `AttentionDispatcher` | Select CUDA, FlashAttention, or torch functions per forward call |
-| **Auto-dispatch (Rotary)** | `apply_rotary_emb`, `backend/rotary.py`, `kernel/rotary.py` | Rotary embedding CUDA kernel auto-dispatch with torch fallback |
-| **Executor** | `BaseExecutor`, `NoneExecutor`, `DDPExecutor`, `FSDPExecutor` | Gradient accumulation & model distribution |
-| **Storage** | `Store`, `MmapStore`, `JsonlStore` | Format-agnostic data access with multi-segment support |
-| **Producer-Consumer** | `Scheduler`, `Request`, waiting/running queues | Continuous batching |
-| **Observer (events)** | `OutputEventSink`, `EventQueueSink` | Scheduler loop pushes token-id events through the installed sink; consumers run off the loop thread |
-| **Command** | `PendingExecution` submit/commit | Deferred, idempotent result materialization (decode overlap) |
-| **Facade (KV)** | `KVCacheManager` over `BlockPool`/strategies | Single accounting surface for the scheduler |
-| **Model Registry** | `ModelFactory`, `AutoRegressiveLM`, `EmbeddingEncoder` | Model-type dynamic loading |
-| **Optimizer Routing** | `OptimizerFactory`, `MuonAdamW`, `NoraNadamW`, `ManoAdamW` | Route parameter groups (matrices vs. embeddings/heads/norms) through different optimizers |
+The sequence shows one successful update reaching a publication boundary.
+Online replay can contain several updates before a data window becomes safe.
+If an update mutates weights and then fails, counters alone cannot repair the
+model; publication remains disabled and the previous checkpoint remains valid.
 
-## Core Relationships
+`MetricHistory` belongs to the run because both measurement and persistence need
+the same committed prefix. The callbacks communicate through that state, so
+neither callback controls the other. Full-resume state and exported inference
+weights serve different purposes; see the [checkpoint contract](../guides/training.md#checkpoint).
 
-1. **Config → Training**: `TrainConfig` holds serializable model, data, optimizer and scheduler specs, plus `dp_mode` and `executor_kwargs`; legacy Python factories remain accepted
-2. **Training Flow**: `Trainer` → `TrainContextBuilder` → `TrainContext`, uses `BaseStrategy` for loss, `BaseExecutor` for gradient accumulation + model distribution; with `cp_size > 1` the strategy is wrapped in `CPStrategy` (sequence sharding + ring attention)
-3. **Strategy Selection**: `StrategyFactory` creates strategy by `train_type`
-4. **Executor Selection**: `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)` → `NoneExecutor` / `DDPExecutor` / `FSDPExecutor`
-5. **Inference Flow**: `InferenceEngine` (frontend) → `Scheduler`/`SchedulerStep` (core) → `GPUModelRunner` (worker) → `AutoRegressiveLM`, backed by `KVCacheManager` + `BlockPool` + `SamplingPipeline`; output flows back as events (see [developer/inference/events.md](inference/events.md)). `astrai.extension.backend` owns attention/rotary dispatch, fallback, and KV cache policy; it calls the stateless compiled-kernel wrappers in `astrai.extension.kernel`. Attention uses cuda > flash > torch priority unless selected by `op_backend(attention=...)`; `set_op("attention", ...)` and `ASTR_OPS` provide soft process defaults. Inference snapshots the selection at scheduler creation. Rotary embedding independently selects CUDA when supported or torch complex multiply.
-6. **Distributed**: `spawn_parallel_fn` + `setup_parallel` launch the world; `ParallelTopology` decomposes it into `dp × cp × tp` with one process group per mesh dimension — a singleton for inactive dimensions — `CPStrategy`/`CPState` shard sequences across cp ranks, and `TPState` shards Linear projections over features across tp ranks
-7. **Dataset Loading**: `DatasetFactory` creates datasets, `Store` (`MmapStore`/`JsonlStore`) loads data with explicit `_length` and multi-segment `_data`
-8. **Checkpoint**: `Checkpoint` saves/loads safetensors + metadata; `CheckpointCallback` performs rank-0 training saves, with extra state saved as `{key}.pt`
-9. **Scheduler**: `SchedulerFactory` creates `CosineScheduler`/`SGDRScheduler`/`WSDScheduler`
-10. **AutoModel**: `from_pretrained()` loads `config.json` + `model.safetensors`, `_disable_random_init` replaces `nn.init.*` with no-ops
-11. **Protocols**: `OptimizerProtocol` / `SchedulerProtocol` define the structural contracts used by `TrainContext`
+## Inference ownership
 
-> Document Update Time: 2026-10-12
+```mermaid
+classDiagram
+    direction TB
+    namespace Frontend {
+        class InferenceEngine
+        class InputProcessor
+        class OutputProcessor
+        class RequestTracker
+    }
+    namespace Core {
+        class EngineCore
+        class PolicyVersionGuard
+    }
+    namespace Scheduling {
+        class Scheduler
+        class StepPlanner
+        class KVCacheManager
+    }
+    namespace Runner {
+        class GPUModelRunner
+        class InferenceWorkspace
+        class CUDAGraphRunner
+    }
+    namespace Contracts {
+        class SchedulerOutput
+        class ModelRunnerOutput
+    }
+    namespace ModelExecution {
+        class Module
+        class BaseKVCache
+    }
+
+    InferenceEngine --> InputProcessor : tokenize
+    InferenceEngine --> OutputProcessor : decode events
+    InferenceEngine *-- RequestTracker : track consumers
+    InferenceEngine --> EngineCore : submit and cancel
+    EngineCore *-- PolicyVersionGuard : serialize operations
+    EngineCore *-- Scheduler : plan and apply results
+    Scheduler *-- StepPlanner : execution planning
+    Scheduler *-- KVCacheManager : allocation and reuse
+    Scheduler ..> SchedulerOutput : produce plan
+    EngineCore --> GPUModelRunner : submit execution
+    GPUModelRunner ..> SchedulerOutput : consume plan
+    GPUModelRunner ..> ModelRunnerOutput : produce result
+    Scheduler ..> ModelRunnerOutput : apply result
+    GPUModelRunner *-- InferenceWorkspace : device buffers
+    GPUModelRunner *-- CUDAGraphRunner : capture and replay
+    GPUModelRunner --> Module : forward
+    Module --> BaseKVCache : read and write cache
+```
+
+**Frontend** owns inputs and output consumers. **Core** drives execution and
+serializes policy operations. **Scheduling** owns requests, plans and KV
+allocation; it lives in the core package but has no model runner dependency.
+**Runner** owns GPU execution, workspace and graph replay.
+**Contracts** carries immutable plans and results between scheduling and execution.
+The model execution layer consumes tensors and cache views without knowing
+about request queues.
+
+
+Runtime dependencies point **frontend → core → worker → model/cache layout**.
+The worker consumes immutable execution contracts and does not retain mutable
+scheduler requests. The model-side cache types describe tensors; the inference
+core owns allocation and prefix reuse.
+
+The engine is an in-process driver. Colocated rollout shares the learner's model
+and serializes generation with policy updates. Async rollout uses separate frozen
+replicas; that placement is owned by the rollout backend, not the frontend.
+
+For cancellation, terminal events and resource lifetime, see
+[inference events](inference/events.md). For allocation and scheduling limits,
+see [inference core](inference/core.md).
+
+### Request execution flow
+
+```mermaid
+sequenceDiagram
+    participant F as Frontend
+    participant C as EngineCore
+    participant S as Scheduler
+    participant W as GPUModelRunner
+    participant P as PendingExecution
+    F->>F: Tokenize and register consumer
+    F->>C: Submit request IDs and tokens
+    C->>S: Admit requests
+    loop Until terminal state
+        C->>S: Schedule execution
+        S-->>C: Immutable SchedulerOutput
+        C->>W: Execute plan
+        W-->>C: PendingExecution
+        C->>P: Commit completed execution
+        P-->>C: ModelRunnerOutput
+        C->>S: Validate and apply result
+        S-->>F: Token and terminal events through event sink
+    end
+    F->>F: Detokenize, match text stops and report usage
+```
+
+The diagram shows one logical iteration. Decode overlap can leave multiple
+executions in flight. Their identity and policy version travel with the results,
+so request mutation or cancellation cannot silently attach output to another
+request. Cancellation does not free resources still used by an execution;
+retirement and result application own that boundary.
+
+The frontend owns text processing and consumers. The scheduler owns mutable
+requests and logical KV accounting. The runner owns device workspace, CUDA graph
+capture and model execution. Immutable plans separate those responsibilities
+without giving the worker access to live scheduler state.
+
+## State and lifetime
+
+| State | Owner | Lifetime / boundary |
+| --- | --- | --- |
+| Settings and component specifications | Configuration | Validated before rank-local construction |
+| Model, optimizer, loaders and counters | TrainContext | One training run; counters follow committed updates |
+| Pending and committed metric records | MetricHistory | Pending until update commit; retained until successful save |
+| Requests and KV allocation | Scheduler | Admission through terminal state and in-flight retirement |
+| Execution buffers and CUDA graphs | GPUModelRunner | Reused within an inference instance |
+| Weight version and mutation lock | PolicyVersionGuard | Serializes shared-model generation, scoring and updates |
+| Published checkpoint files | Checkpoint | Immutable step directory after atomic publication |
+
+Colocated rollout shares the learner model, so generation and weight mutation
+must use the same version boundary. Replica rollout owns a separate model and
+publishes weights through its backend. Async replicas use control messages and
+NCCL weight transfer; the [rollout guide](trainer/rollout.md) describes placement
+without changing frontend ownership.
+
+## Design choices
+
+| Choice | Reason |
+| --- | --- |
+| One trainer-owned update boundary | Counters, gradients and persistence agree on which update committed |
+| Separate construction and session lifetime | Partial initialization and normal shutdown need different cleanup owners |
+| Context-owned metric history | Measurements and checkpoint publication share state without callback coupling |
+| Immutable execution contracts | Overlapped work remains attributable after requests change or are cancelled |
+| Model-owned cache tensor layouts | Model and kernel code do not depend on inference scheduling policies |
+| Backend-owned rollout placement | Objective code consumes scored results independently of where generation runs |
+
+These are the current boundaries. Global token-budget scheduling, progressive
+prompt-page admission and recompute preemption remain outside the current
+inference implementation; see [inference internals](inference/README.md).
+Changing a boundary should update its focused contract rather than adding an
+independent state owner.
+
+## Extension boundaries
+
+Use `Factory.create(name, ...)` for registered components and
+`create_from_config()` when selecting constructor fields from a broad config.
+Top-level training components use `ComponentSpec(type, params)`; callbacks are
+passed as instances. Custom constructors accepting `**kwargs` own their validation.
+
+Operation selection belongs to `astrai.extension`. Exact CUDA wrappers live in
+`extension/kernel`; they do not choose fallback implementations. A strict
+`op_backend(...)` scope raises for unsupported calls, while automatic dispatch
+may choose another compatible backend.
+
+Keep CLI parsing and examples in `scripts/`. Shared execution and validation
+belong in `astrai/`. See [testing](testing.md) for the checks that guard these
+boundaries.

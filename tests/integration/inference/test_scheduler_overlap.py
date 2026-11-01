@@ -113,7 +113,7 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
         enable_overlap=True,
     )
 
-    scheduler.scheduler._requests.tokenizer = _UnwrappingTokenizer(tok)
+    scheduler.scheduler.tokenizer = _UnwrappingTokenizer(tok)
 
     token_counts: Dict = {"first": 0, "second": 0}
     done: Dict = {"first": threading.Event(), "second": threading.Event()}
@@ -138,10 +138,14 @@ def test_online_loop_overlap_generates_and_admits_midstream(device):
 
     try:
         scheduler.start()
-        rid_a = scheduler.add_request("a" * 8, max_tokens=12)
+        rid_a = scheduler.add_request(
+            "a" * 8, max_tokens=12, generation_config={"eos_token_id": None}
+        )
         sink_rids["a" * 8] = rid_a
         time.sleep(0.2)  # let the first request enter steady decode
-        rid_b = scheduler.add_request("b" * 8, max_tokens=12)
+        rid_b = scheduler.add_request(
+            "b" * 8, max_tokens=12, generation_config={"eos_token_id": None}
+        )
         sink_rids["b" * 8] = rid_b
         assert done["first"].wait(timeout=10)
         assert done["second"].wait(timeout=10)
@@ -185,7 +189,7 @@ def test_overlap_loop_matches_synchronous_tokens(device):
         enable_overlap=True,
     )
 
-    scheduler.scheduler._requests.tokenizer = _UnwrappingTokenizer(tokenizer)
+    scheduler.scheduler.tokenizer = _UnwrappingTokenizer(tokenizer)
 
     prompts = ["a" * 8, "b" * 8, "c" * 8]
     scheduler.start()
@@ -226,7 +230,7 @@ def test_overlap_loop_matches_synchronous_tokens(device):
                     len(stream.get(tid, [])) >= 12
                     or (
                         stream.get(tid, [None])[-1] in stop_ids
-                        and not scheduler.scheduler._requests.get_request(tid)
+                        and tid not in scheduler.scheduler._states
                     )
                     for tid in request_ids
                 )
@@ -287,5 +291,5 @@ def test_stop_clears_state_when_loop_drains_normally():
     scheduler.loop_thread.join.side_effect = join_side_effect
     assert scheduler.stop() is True
     assert scheduler.loop_thread is None
-    assert not scheduler.scheduler._requests.has_requests()
+    assert not scheduler.scheduler.has_requests()
     assert not scheduler.scheduler._states

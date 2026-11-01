@@ -1,10 +1,11 @@
 """Score, cache, and evaluate online training rollouts."""
 
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterator, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
 
+from astrai.trainer.backend import WeightPublisher
 from astrai.trainer.rollout.generator import RolloutGenerator
 from astrai.trainer.rollout.types import (
     BaseRewardModel,
@@ -48,6 +49,7 @@ class RolloutRunner:
         rollout_interval: int = 512,
         max_policy_lag: Optional[int] = None,
         coordinator: Optional["AsyncRoundCoordinator"] = None,
+        publishers: Sequence[WeightPublisher] = (),
     ):
         if (coordinator is None and (generator is None or reward_model is None)) or (
             coordinator is not None
@@ -55,6 +57,7 @@ class RolloutRunner:
         ):
             raise ValueError("provide either generator and reward_model or coordinator")
         self.coordinator = coordinator
+        self._publishers = tuple(publishers)
         if rollout_interval <= 0:
             raise ValueError("rollout_interval must be positive")
         if max_policy_lag is not None and max_policy_lag < 0:
@@ -91,6 +94,11 @@ class RolloutRunner:
         if self.coordinator is not None:
             return self.coordinator.apply_weight_update(policy_version, update)
         return self.generator.apply_weight_update(policy_version, update)
+
+    def publish_weights(self, version: int, model) -> None:
+        """Copy replicas inside the caller's apply_weight_update lock."""
+        for publisher in self._publishers:
+            publisher.publish(version, model)
 
     def step(self):
         """Advance the internal counter (call once per optimizer step)."""

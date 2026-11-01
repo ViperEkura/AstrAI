@@ -23,7 +23,6 @@ def test_grouped_overlap_gpu_parity_and_dispatch(tmp_path, concurrency, graphs, 
     torch.manual_seed(3407)
     source = make_cpu_model().to(device="cuda", dtype=torch.bfloat16)
     tokenizer = FakeTokenizer(with_chat_template=True)
-    tokenizer.stop_ids = list(range(64)) if seeded else []
     group = 4
     outputs, evidence = [], []
     for overlap in (False, True):
@@ -36,6 +35,7 @@ def test_grouped_overlap_gpu_parity_and_dispatch(tmp_path, concurrency, graphs, 
             enable_cuda_graph=graphs,
             device="cuda",
             max_seq_len=64,
+            generation_config={"eos_token_id": list(range(64)) if seeded else []},
         )
         generator = RolloutGenerator(
             ColocatedBackend(scheduler),

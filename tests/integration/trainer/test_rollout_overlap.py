@@ -52,13 +52,13 @@ def test_fixed_batch_tokens_logprobs_finish_and_pipeline_order(frequency, stop, 
     prompts = [[1, 2], [3, 4, 5], [6], [196]]
     for overlap in (False, True):
         tokenizer = FakeTokenizer()
-        tokenizer.stop_ids = stop
         scheduler = make_cpu_scheduler(
             _deterministic_model(),
             tokenizer,
             max_batch_size=4,
             enable_overlap=overlap,
             token_budget=budget,
+            generation_config={"eos_token_id": stop},
         )
         pipeline = []
         original = scheduler.submit
@@ -98,7 +98,6 @@ def test_real_kv_model_grouped_sampling_mask_logprob_parity(group):
     torch.manual_seed(3407)
     original = make_cpu_model()
     tokenizer = FakeTokenizer(with_chat_template=True)
-    tokenizer.stop_ids = []
     outputs = []
     for overlap in (False, True):
         model = deepcopy(original).train()
@@ -108,6 +107,7 @@ def test_real_kv_model_grouped_sampling_mask_logprob_parity(group):
             max_batch_size=group * 2,
             enable_overlap=overlap,
             max_seq_len=64,
+            generation_config={"eos_token_id": []},
         )
         generator = RolloutGenerator(
             ColocatedBackend(scheduler),
@@ -140,9 +140,12 @@ def test_real_kv_model_grouped_sampling_mask_logprob_parity(group):
 
 def test_repeated_batches_and_version_updates_release_all_owners():
     tokenizer = FakeTokenizer()
-    tokenizer.stop_ids = []
     scheduler = make_cpu_scheduler(
-        _deterministic_model(), tokenizer, max_batch_size=2, enable_overlap=True
+        _deterministic_model(),
+        tokenizer,
+        max_batch_size=2,
+        enable_overlap=True,
+        generation_config={"eos_token_id": []},
     )
     try:
         for version in range(1, 101):
@@ -165,9 +168,12 @@ def test_overlapped_forward_failure_fences_before_release(monkeypatch):
     model = _deterministic_model()
     original = model.forward
     tokenizer = FakeTokenizer()
-    tokenizer.stop_ids = []
     scheduler = make_cpu_scheduler(
-        model, tokenizer, max_batch_size=2, enable_overlap=True
+        model,
+        tokenizer,
+        max_batch_size=2,
+        enable_overlap=True,
+        generation_config={"eos_token_id": []},
     )
     calls = []
     forward_count = 0
@@ -226,7 +232,6 @@ def test_explicit_head_dimension_real_kv_matches_full_forward(overlap):
         use_qk_norm=True,
     )
     tokenizer = FakeTokenizer()
-    tokenizer.stop_ids = []
     prompts = [[3, 7, 8], [9, 11, 12, 13]]
     expected = []
     with torch.no_grad():
@@ -237,7 +242,11 @@ def test_explicit_head_dimension_real_kv_matches_full_forward(overlap):
                 ids.append(logits.argmax().item())
             expected.append(ids[len(prompt) :])
     scheduler = make_cpu_scheduler(
-        model, tokenizer, max_batch_size=2, enable_overlap=overlap
+        model,
+        tokenizer,
+        max_batch_size=2,
+        enable_overlap=overlap,
+        generation_config={"eos_token_id": []},
     )
     try:
         actual = run_batch(scheduler, prompts, max_tokens=4, temperature=0)
@@ -255,7 +264,6 @@ def test_request_seeded_variable_eos_survives_overlap_compaction_and_reordering(
     torch.manual_seed(3407)
     source = make_cpu_model()
     tokenizer = FakeTokenizer(with_chat_template=True)
-    tokenizer.stop_ids = list(range(64))
     prompts = ["a", "abcd", "xyz", "longer"]
     results, lengths = [], []
 
@@ -274,6 +282,7 @@ def test_request_seeded_variable_eos_survives_overlap_compaction_and_reordering(
             enable_overlap=overlap,
             max_seq_len=64,
             token_budget=budget,
+            generation_config={"eos_token_id": list(range(64))},
         )
         generator = RolloutGenerator(
             ColocatedBackend(scheduler),
@@ -336,9 +345,12 @@ def test_seeded_queue_beyond_capacity_preserves_response_streams(
 ):
     torch.manual_seed(731)
     tokenizer = FakeTokenizer()
-    tokenizer.stop_ids = list(range(64))
     engine = make_cpu_scheduler(
-        make_cpu_model(), tokenizer, max_batch_size=2, enable_overlap=overlap
+        make_cpu_model(),
+        tokenizer,
+        max_batch_size=2,
+        enable_overlap=overlap,
+        generation_config={"eos_token_id": list(range(64))},
     )
     prompts = [[10, 20 + index] for index in range(5)]
     seeds = list(range(100, 105))
@@ -402,8 +414,9 @@ def test_explicit_round_seeds_override_configured_replay_seed(monkeypatch):
 def test_overlapped_failed_fence_quarantines_kv_until_recovery(monkeypatch):
     model = _deterministic_model()
     tokenizer = FakeTokenizer()
-    tokenizer.stop_ids = []
-    engine = make_cpu_scheduler(model, tokenizer, enable_overlap=True)
+    engine = make_cpu_scheduler(
+        model, tokenizer, enable_overlap=True, generation_config={"eos_token_id": []}
+    )
     original = model.forward
     count = 0
 

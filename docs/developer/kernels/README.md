@@ -531,5 +531,3 @@ gains a directory when it gains a second file; single-file families
 (`rotary_emb.cu`) stay at the top level.
 
 Compiled `.so` modules are placed directly in `astrai/extension/`.
-
-> Document Update Time: 2026-10-05

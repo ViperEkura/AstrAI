@@ -1,5 +1,8 @@
 # CLI Parameter Reference
 
+This reference covers common options and their interactions. Run each script
+with `--help` for the complete current option list.
+
 ## Contents
 
 - [Training Parameters](#training-parameters)
@@ -68,11 +71,8 @@ Newton-Schulz iteration with a cheaper normalization.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--mano_momentum` | Accepted by the CLI but currently ignored by optimizer construction | 0.95 |
-| `--mano_nesterov`, `--no-mano_nesterov` | Accepted by the CLI but currently ignored by optimizer construction | enabled |
-
-The two Mano-specific flags are reserved for future wiring; do not rely on them
-to change optimizer behavior in the current release.
+| `--mano_momentum` | Mano momentum factor | 0.95 |
+| `--mano_nesterov`, `--no-mano_nesterov` | Enable or disable Mano Nesterov momentum | enabled |
 
 Optimizer identity and hyperparameters are saved in checkpoint metadata. Optimizer
 states are intentionally not interchangeable: resume older MuonAdamW checkpoints
@@ -92,7 +92,7 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--ckpt_interval` | Iterations between checkpoints | 5000 |
+| `--ckpt_interval` | Optimizer steps between checkpoints | 5000 |
 | `--ckpt_dir` | Checkpoint save directory | checkpoint |
 | `--start_epoch` | Resume from epoch (0 = from scratch) | 0 |
 | `--start_samples` | Resume from sample count per rank | 0 |
@@ -110,7 +110,7 @@ with `--optimizer=muon_adamw`.
 |-----------|-------------|---------|
 | `--metrics` | Repeatable metric option (for example, `--metrics loss --metrics lr --metrics val_loss`) | `loss`, `lr`, `grad_norm` |
 
-`grad_snr` is opt-in. To enable it, include `--metrics grad_snr` alongside the other desired metrics. Its persistent gradient EMA uses one model-sized tensor set per GPU, approximately 7.44 GiB for 2B FP32 gradients.
+`grad_snr` is opt-in. To enable it, include `--metrics grad_snr` alongside the other desired metrics. Its persistent gradient EMA uses one model-sized tensor set per GPU, with storage proportional to the number of parameters.
 
 ### Gradient Checkpointing
 
@@ -166,9 +166,10 @@ than separate strategy subclasses. `online_ppo` is a dedicated actor-critic
 strategy: a `ValueModel` critic supplies GAE advantages, and its state persists
 as `value_model.pt`/`value_optimizer.pt` checkpoint extras (required for
 resume). These options apply to the online strategies.
-Online strategies require
-a `BaseRewardModel` factory in `TrainConfig`; `train.py` does not currently
-provide a command-line option for configuring one.
+Online strategies require a reward factory. Use `--reward_model module:qualified_name`
+or `training.reward_model` in YAML; Python callers use `TrainConfig.reward_model_fn`.
+Async mode also exposes `--rollout_mode async_round` and repeatable
+`--rollout_devices cuda:N`; see the [rollout example](training.md#configuring-asynchronous-rollout-from-the-cli).
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -185,7 +186,7 @@ provide a command-line option for configuring one.
 | `--rollout_val_group_size` | Validation responses per prompt; unset inherits the strategy's group size | None |
 | `--rollout_device` | Device for the training rollout backend (e.g. `cuda:1`): a frozen replica with its own scheduler/KV pool, synced inside the policy-version lock each step; unset keeps the in-process colocated backend | None |
 | `--rollout_val_device` | Device for a dedicated validation rollout backend; unset shares the training backend | None |
-| `--rollout_pool_seq_len` | Sequence budget per rollout request when sizing the scheduler's KV pool (must cover longest prompt + `rollout_max_tokens`); unset uses the model's `max_position_embeddings`. Right-sizing is GBs: for the 1B policy the default 32768 window allocates ~3.2 GB of KV vs ~400 MB at 4096 | None |
+| `--rollout_pool_seq_len` | Sequence budget per rollout request when sizing the scheduler's KV pool (must cover longest prompt + `rollout_max_tokens`); unset uses the model's `max_position_embeddings` | None |
 
 ### Scheduler
 
@@ -198,32 +199,20 @@ provide a command-line option for configuring one.
 | `--stable_steps` | WSD stable plateau steps | None (80% of post-warmup steps) |
 | `--decay_steps` | WSD decay steps | None (total_steps - warmup_steps - stable_steps) |
 
-### Usage Example
+### Precision
 
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+| Parameter | CLI default | Description |
+| --- | --- | --- |
+| `--compute_dtype` | `bfloat16` | Computation dtype |
+| `--gradient_dtype` | `float32` | Accumulated gradients; `model` uses native gradients |
+| `--master_dtype` | `float32` | Persistent optimizer master weights |
+| `--optimizer_state_dtype` | `float32` | Optimizer moment storage |
+| `--export_dtype` | native compute dtype | Exported weights, independently of full-resume state |
 
-nohup python scripts/tools/train.py \
-    --dp_size=4 \
-    --dp_mode=ddp \
-    --train_type=seq \
-    --data_root_path=/path/to/dataset \
-    --param_path=/path/to/model \
-    --batch_per_device=4 \
-    --grad_accum_steps=8 \
-    --warmup_ratio=0.05 \
-    --max_lr=1e-4 \
-    --max_grad_norm=1.0 \
-    --weight_decay=0.1 \
-    --window_size=2048 \
-    --ckpt_interval=10000 \
-    --ckpt_dir=./checkpoint \
-    --random_seed=3407 \
-    --label_smoothing=0.05 \
-    > out.log 2> err.log &
-```
-
----
+These override fields in the top-level YAML `precision` section.
+For layout restrictions and CPU state placement, see
+[precision configuration](../developer/trainer/configuration.md#optimizer-precision).
+For launch examples, see [training](training.md) and [distributed training](distributed.md).
 
 ## Inference Server (`server.py`)
 
@@ -306,5 +295,3 @@ python scripts/tools/preprocess.py data/part-000.jsonl data/part-001.jsonl -o ou
 See [Preprocessing Guide](preprocessing.md) for config file format and examples.
 
 ---
-
-> Document Update Time: 2026-09-20

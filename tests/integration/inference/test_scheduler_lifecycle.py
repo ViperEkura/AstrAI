@@ -64,7 +64,7 @@ def test_generation_loop_activates_full_selection_in_worker_thread():
         )
         scheduler.stop_event.set()
 
-    scheduler.scheduler._requests.wait_for_requests = observe_backend
+    scheduler.scheduler.wait_for_requests = observe_backend
     scheduler.start()
     scheduler.loop_thread.join(timeout=5)
     assert not scheduler.loop_thread.is_alive()
@@ -167,11 +167,7 @@ def test_cancel_active_task_releases_metrics_and_kv(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
     try:
         request_id = scheduler.add_request("active", max_tokens=32)
-        request = scheduler.scheduler._requests.pull_waiting(1)[0]
-        assert scheduler.scheduler.kv_manager.alloc_slots(
-            request.request_id, request.prompt_ids
-        )
-        assert scheduler.scheduler._requests.activate(request)
+        scheduler.scheduler.admit_requests()
 
         before = scheduler.get_stats()
         assert before["running"] == 1
@@ -302,7 +298,7 @@ def test_run_batch_queues_beyond_active_capacity(device):
 
 def test_run_batch_execution_failure_releases_queued_kv(device):
     scheduler, _tok, _model = _make_real_scheduler(device)
-    scheduler.scheduler._requests.max_batch_size = 2
+    scheduler.scheduler.max_batch_size = 2
     try:
         with patch.object(
             scheduler.model_runner,
@@ -407,7 +403,7 @@ def test_run_batch_stop_id_terminates(device):
     try:
         # Make every token a stop id: generation must end after exactly
         # one token (the stop token itself) instead of running to max_tokens.
-        scheduler.scheduler._requests.tokenizer.stop_ids = list(range(200))
+        scheduler.scheduler.tokenizer.stop_ids = list(range(200))
         prompts = [[10, 20, 30]]
         results = run_batch(scheduler, prompts, max_tokens=32, temperature=1.0)
         assert len(results[0]) == 1
@@ -545,8 +541,8 @@ def test_admission_rejects_requests_that_can_never_fit(device):
             pytest.fail("oversized request was never rejected")
         # And the queue drained: no spinning leftovers.
         deadline = time.time() + 5
-        while time.time() < deadline and scheduler.scheduler._requests.waiting:
+        while time.time() < deadline and scheduler.scheduler.waiting:
             time.sleep(0.05)
-        assert not scheduler.scheduler._requests.waiting
+        assert not scheduler.scheduler.waiting
     finally:
         scheduler.stop()

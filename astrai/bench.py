@@ -16,15 +16,19 @@ sequences, extraction); only mechanism lives here.
 """
 
 import collections
+import contextlib
 import json
+import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from math import prod
+from math import ceil, prod
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,6 +37,9 @@ import tqdm
 
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
+
+if sys.platform == "linux":
+    import resource
 
 
 def load_jsonl(path: str) -> List[Dict]:
@@ -83,19 +90,53 @@ def generate_batch(
     return deduplicate(completions)
 
 
+def _execute_worker(code: str, timeout: float, directory: str, passed) -> None:
+    os.setsid()
+    os.chdir(directory)
+    with open("/proc/self/statm") as memory:
+        baseline = int(memory.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+    limits = (
+        (resource.RLIMIT_AS, baseline + 512 * 1024**2),
+        (resource.RLIMIT_FSIZE, 16 * 1024**2),
+        (resource.RLIMIT_CPU, max(1, ceil(timeout))),
+        (resource.RLIMIT_CORE, 0),
+        (resource.RLIMIT_NOFILE, 64),
+    )
+    for kind, limit in limits:
+        hard = resource.getrlimit(kind)[1]
+        limit = limit if hard == resource.RLIM_INFINITY else min(limit, hard)
+        resource.setrlimit(kind, (limit, limit))
+    with open(os.devnull, "w") as output:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            try:
+                exec(code, {})
+            except BaseException:
+                return
+    passed.value = True
+
+
 def execute_one(args: Tuple) -> bool:
+    """Fork a worker with 512 MiB additional address space and 16 MiB/file limits."""
     full_code, timeout = args
-    try:
-        r = subprocess.run(
-            [sys.executable, "-c", full_code],
-            capture_output=True,
-            timeout=timeout,
+    context = multiprocessing.get_context("fork")
+    passed = context.Value("b", False, lock=False)
+    with tempfile.TemporaryDirectory(prefix="eval-") as directory:
+        proc = context.Process(
+            target=_execute_worker, args=(full_code, timeout, directory, passed)
         )
-        return r.returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
-    except Exception:
-        return False
+        proc.start()
+        try:
+            proc.join(timeout)
+            return proc.exitcode == 0 and bool(passed.value)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if proc.is_alive():
+                proc.kill()
+            proc.join()
+            proc.close()
 
 
 def test_all(
@@ -298,6 +339,13 @@ def extract_metrics(payload: Dict, bench_key: str) -> Dict[str, Optional[float]]
         s = payload.get("_summary", {})
         return {"acc": s.get("acc"), "acc_norm": s.get("acc_norm")}
     if bench_key == "ifeval":
+        summary = payload.get("_summary", {})
+        if "strict" in summary and "loose" in summary:
+            return {
+                f"{mode}_{level}_acc": summary[mode].get(f"{level}_accuracy")
+                for mode in ("strict", "loose")
+                for level in ("prompt", "instruction")
+            }
         sub: Dict[str, List[int]] = {}
         total_passed = total_constraints = 0
         for v in payload.values():

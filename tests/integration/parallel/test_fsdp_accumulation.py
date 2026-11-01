@@ -56,8 +56,8 @@ def _compare_accumulation(rank, port):
         for step in range(2):
             for model, executor, optimizer in zip(models, executors, optimizers):
                 optimizer.zero_grad(set_to_none=True)
-                for x, target in batches[step * 3 : (step + 1) * 3]:
-                    with executor.accumulate(model):
+                for index, (x, target) in enumerate(batches[step * 3 : (step + 1) * 3]):
+                    with executor.accumulate_explicit(model, sync=index == 2):
                         ((model(x) - target).square().mean() / 3).backward()
             for expected, actual in zip(models[0].parameters(), models[1].parameters()):
                 assert isinstance(expected.grad, DTensor)
@@ -74,6 +74,25 @@ def _compare_accumulation(rank, port):
                 torch.testing.assert_close(
                     actual.full_tensor(), expected.full_tensor(), atol=1e-6, rtol=1e-6
                 )
+        model, executor, optimizer = models[0], executors[0], optimizers[0]
+        expected = {
+            name: parameter.full_tensor().detach().cpu()
+            for name, parameter in model.named_parameters()
+        }
+        with executor.checkpoint_context(
+            model, optimizer=optimizer, export_dtype="bfloat16"
+        ) as (exported, extra):
+            if rank == 0:
+                assert set(exported) == set(expected)
+                for name, value in expected.items():
+                    torch.testing.assert_close(
+                        exported[name], value.bfloat16(), atol=0, rtol=0
+                    )
+                    torch.testing.assert_close(
+                        extra["training_model"][name], value, atol=0, rtol=0
+                    )
+            else:
+                assert exported is None and extra == {}
     finally:
         dist.destroy_process_group()
 

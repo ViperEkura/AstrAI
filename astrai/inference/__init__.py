@@ -3,7 +3,7 @@
 Layering (mirrors vLLM v1's process topology, in-process):
 
 - ``frontend/``  user-facing: engine facade, input/output processors,
-                 output events, engine-core client seam   (vLLM: API proc)
+                 output events, direct engine-core calls   (vLLM: API proc)
 - ``core/``      engine core: scheduler, request lifecycle, stepper,
                  KV cache accounting, policy versioning   (vLLM: EngineCore)
 - ``worker/``    model execution: model runner, pending steps, CUDA
@@ -24,11 +24,9 @@ from astrai.inference.core.events import (
 from astrai.inference.core.request import (
     GenerationResult,
     Request,
-    RequestManager,
     RequestStatus,
 )
 from astrai.inference.core.scheduler import Scheduler
-from astrai.inference.frontend.core_client import EngineCoreClient, InprocClient
 from astrai.inference.frontend.engine import InferenceEngine, build_engine
 from astrai.inference.frontend.input_processor import InputProcessor
 from astrai.inference.frontend.output_processor import OutputProcessor
@@ -38,18 +36,15 @@ from astrai.inference.worker.sample import sample
 
 __all__ = [
     "EngineCore",
-    "EngineCoreClient",
     "GPUModelRunner",
     "GenerationResult",
     "InferenceEngine",
-    "InprocClient",
     "InputProcessor",
     "ModelRunnerOutput",
     "OutputProcessor",
     "Request",
     "RequestError",
     "RequestFinished",
-    "RequestManager",
     "RequestStatus",
     "Scheduler",
     "SchedulerOutput",

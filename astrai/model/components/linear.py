@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.extension.kernel.cross_entropy import is_available, linear_cross_entropy
 from astrai.model.components.initialization import should_initialize
 
 
@@ -49,10 +50,6 @@ class LinearCrossEntropyHead(Linear):
             return super().forward(x)
         if targets.shape != x.shape[:-1]:
             raise ValueError("targets must match the training token shape")
-        from astrai.extension.kernel.cross_entropy import (
-            is_available,
-            linear_cross_entropy,
-        )
 
         if self.bias is None and x.is_cuda and is_available():
             return linear_cross_entropy(

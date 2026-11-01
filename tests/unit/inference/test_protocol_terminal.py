@@ -1,7 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -19,10 +19,8 @@ def test_protocol_delivers_terminal_text_and_authoritative_usage(
     protocol, stream, reason
 ):
     state = {"closed": False}
-    first = StreamChunk("Hello ", [1], [1], False)
-    final = StreamChunk(
-        "world" if reason == "stop" else "EN", [2], [1, 2], reason == "stop"
-    )
+    first = StreamChunk("Hello ", [1], False)
+    final = StreamChunk("world" if reason == "stop" else "EN", [2], reason == "stop")
     final.finish_reason = reason
     final.prompt_tokens = 3
     final.completion_tokens = 2
@@ -113,11 +111,14 @@ def test_openai_tool_parser_receives_terminal_body_once():
     builder._resp_id = "response"
     builder._model = "test"
     builder._content_started = False
-    builder._parser = SimpleNamespace(feed=Mock(return_value=[{"content": "tail"}]))
-    events = builder.format_chunk(
-        "tail", body="full tail", current_token_ids=[1, 2], delta_token_ids=[2]
+    builder._body = ""
+    builder._parser = SimpleNamespace(
+        feed=Mock(side_effect=[[], [{"content": "tail"}]])
     )
+    assert not builder.format_chunk("full ", delta_token_ids=[1])
+    events = builder.format_chunk("tail", delta_token_ids=[2])
     assert events
-    builder._parser.feed.assert_called_once_with(
-        "full tail", current_token_ids=[1, 2], delta_token_ids=[2]
-    )
+    assert builder._parser.feed.call_args_list == [
+        call("full ", delta_token_ids=[1]),
+        call("full tail", delta_token_ids=[2]),
+    ]

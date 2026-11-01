@@ -46,8 +46,6 @@ class StopInfo:
     """Terminal metadata; body has already been trimmed by OutputProcessor."""
 
     matched: Optional[str] = None
-    body: str = ""
-    yielded: str = ""
     finish_reason: Optional[str] = None
 
 
@@ -71,10 +69,8 @@ class ResponseBuilder(ABC):
     def format_chunk(self, token: str, **kwargs) -> List[str]:
         """SSE events for a single generated token.
 
-        ``body`` (the full accumulated text so far) is always provided
-        as a keyword argument. Additional keyword arguments such as
-        ``current_token_ids`` and ``delta_token_ids`` may be included
-        for tool parsers that need token-level information.
+        ``delta_token_ids`` contains new token IDs
+        since the previous chunk, including tokens that decoded to no text.
         Returns a list of SSE event strings (may be empty).
         """
 
@@ -120,33 +116,27 @@ class ProtocolHandler:
         )
 
         if self.request.stream:
-            return self._handle_stream(agen, ctx, stop_sequences)
+            return self._handle_stream(agen, ctx)
         else:
-            return await self._handle_non_stream(agen, ctx, stop_sequences)
+            return await self._handle_non_stream(agen, ctx)
 
     def _handle_stream(
-        self, agen: AsyncGenerator, ctx: GenContext, stop_sequences: List[str]
+        self, agen: AsyncGenerator, ctx: GenContext
     ) -> StreamingResponse:
         async def event_stream():
             for event in self.builder.format_stream_start(ctx):
                 yield event
 
-            body = ""
-            yielded = ""
             final = None
             try:
                 async for chunk in agen:
-                    body += chunk.text
                     ctx.completion_tokens += len(chunk.delta_token_ids)
                     if chunk.text or chunk.delta_token_ids:
                         for event in self.builder.format_chunk(
                             chunk.text,
-                            body=body,
-                            current_token_ids=chunk.current_token_ids,
                             delta_token_ids=chunk.delta_token_ids,
                         ):
                             yield event
-                    yielded += chunk.text
                     if chunk.stopped or chunk.is_final:
                         final = chunk
                         break
@@ -158,14 +148,12 @@ class ProtocolHandler:
             if final is not None:
                 stop = StopInfo(
                     matched=final.stop_sequence,
-                    body=body,
-                    yielded=yielded,
                     finish_reason=final.finish_reason,
                 )
                 ctx.prompt_tokens = final.prompt_tokens
                 ctx.completion_tokens = final.completion_tokens
             else:
-                stop = StopInfo(matched=None, body=body, yielded=yielded)
+                stop = StopInfo()
             for event in self.builder.format_stream_end(ctx, stop):
                 yield event
             yield sse_done()
@@ -177,14 +165,14 @@ class ProtocolHandler:
         )
 
     async def _handle_non_stream(
-        self, agen: AsyncGenerator, ctx: GenContext, stop_sequences: List[str]
+        self, agen: AsyncGenerator, ctx: GenContext
     ) -> Dict[str, Any]:
-        body = ""
+        parts = []
         final = None
 
         try:
             async for chunk in agen:
-                body += chunk.text
+                parts.append(chunk.text)
                 ctx.completion_tokens += len(chunk.delta_token_ids)
                 if chunk.stopped or chunk.is_final:
                     final = chunk
@@ -195,13 +183,12 @@ class ProtocolHandler:
         stop = (
             StopInfo(
                 matched=final.stop_sequence,
-                body=body,
                 finish_reason=final.finish_reason,
             )
             if final is not None
-            else StopInfo(matched=None, body=body)
+            else StopInfo()
         )
         if final is not None:
             ctx.prompt_tokens = final.prompt_tokens
             ctx.completion_tokens = final.completion_tokens
-        return self.builder.format_response(ctx, body, stop)
+        return self.builder.format_response(ctx, "".join(parts), stop)

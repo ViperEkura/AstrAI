@@ -1,176 +1,95 @@
-"""Sequence packing strategies for shard-level reordering and truncation.
+"""Independent overflow handling and length-only BFD planning.
 
-Each strategy receives the accumulated ``{key: [list of token lists]}``
-dict for a shard and returns a reordered / truncated version.  The
-pipeline later flattens the result into contiguous tensors.
+All token-aligned fields follow the same slices and bin plan. No padding,
+label shifting, or model-specific attention logic belongs in this module.
 """
 
-from abc import ABC, abstractmethod
-from typing import Dict, List
 
-from astrai.factory import BaseFactory
+def plan_bfd(lengths: list[int], capacity: int) -> list[list[int]]:
+    """Best-fit decreasing: return bins of input indices, without truncation.
 
-
-def _truncate(seq: List[int], max_len: int, mode: str) -> List[int]:
-    if len(seq) <= max_len:
-        return seq
-    if mode == "keep_end":
-        return seq[-max_len:]
-    return seq[:max_len]
-
-
-def plan_bfd(
-    sequences: List[List[int]], max_packed_len: int, truncation_mode: str = "keep_start"
-) -> List[List[int]]:
-    """Best-Fit Decreasing bin packing of *sequences* into bins.
-
-    Returns a list of bins, each bin a list of original indices into
-    *sequences*.  Bin capacities are respected on the *truncated*
-    length of each sequence (so a sequence longer than
-    *max_packed_len* counts at *max_packed_len*).
-
-    Pure index-based so callers can apply the same plan to any
-    aligned key (``loss_mask``, ``position_ids``…).
+    A bitset finds the smallest available capacity that fits each item.
+    Bins are returned in first-source-index order to avoid a length curriculum.
     """
-    n = len(sequences)
-    order = sorted(range(n), key=lambda i: len(sequences[i]), reverse=True)
-    bins: List[List[int]] = []
-    bin_lengths: List[int] = []
-
-    for orig_idx in order:
-        seq_len = len(_truncate(sequences[orig_idx], max_packed_len, truncation_mode))
-        best_bin = None
-        best_remain = max_packed_len + 1
-        for i, bl in enumerate(bin_lengths):
-            remain = max_packed_len - bl
-            if seq_len <= remain < best_remain:
-                best_remain = remain
-                best_bin = i
-        if best_bin is not None:
-            bins[best_bin].append(orig_idx)
-            bin_lengths[best_bin] += seq_len
+    if capacity <= 0 or any(n <= 0 or n > capacity for n in lengths):
+        raise ValueError("BFD lengths must be positive and fit the positive capacity")
+    bins = []
+    by_remaining = [[] for _ in range(capacity + 1)]
+    available = 0
+    for index in sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True):
+        length = lengths[index]
+        candidates = available >> length
+        if candidates:
+            remaining = length + (candidates & -candidates).bit_length() - 1
+            bin_id = by_remaining[remaining].pop()
+            if not by_remaining[remaining]:
+                available &= ~(1 << remaining)
         else:
-            bins.append([orig_idx])
-            bin_lengths.append(seq_len)
-
-    return bins
-
-
-class PackingStrategy(ABC):
-    """Reorder and truncate sequences within a shard."""
-
-    @abstractmethod
-    def apply(
-        self,
-        keys: Dict[str, List[List[int]]],
-        max_packed_len: int,
-        truncation_mode: str,
-    ) -> Dict[str, List[List[int]]]:
-        raise NotImplementedError
+            bin_id = len(bins)
+            bins.append([])
+            remaining = capacity
+        bins[bin_id].append(index)
+        remaining -= length
+        if remaining:
+            by_remaining[remaining].append(bin_id)
+            available |= 1 << remaining
+    return sorted(bins, key=min)
 
 
-class PackingStrategyFactory(BaseFactory["PackingStrategy"]):
-    pass
+def pack_sequences(
+    keys: dict[str, list[list[int]]],
+    max_seq_len: int,
+    max_packed_len: int,
+    *,
+    overflow: str = "truncate",
+    packing: str = "bfd",
+    truncation_mode: str = "keep_start",
+) -> dict[str, list[list[int]]]:
+    """Normalize lengths once, then assemble bins and their segment lengths.
 
-
-@PackingStrategyFactory.register("simple")
-class SimplePacking(PackingStrategy):
-    def apply(
-        self,
-        keys: Dict[str, List[List[int]]],
-        max_packed_len: int,
-        truncation_mode: str,
-    ) -> Dict[str, List[List[int]]]:
-        return {
-            k: [_truncate(v, max_packed_len, truncation_mode) for v in vals]
-            for k, vals in keys.items()
-        }
-
-
-@PackingStrategyFactory.register("bfd")
-class BFDPacking(PackingStrategy):
-    """Best-Fit Decreasing bin packing.
-
-    Assigns sequences to bins using a best-fit heuristic (sorted by
-    decreasing length) and concatenates sequences within each bin into
-    a single packed sequence.  Packed sequences are truncated to
-    *max_packed_len* so that each packed bin fits within one context
-    window during training.
+    Split chunks are independent segments and do not inherit earlier context.
+    Multi-output records (without a sequence key) are not packed or split.
     """
-
-    def apply(
-        self,
-        keys: Dict[str, List[List[int]]],
-        max_packed_len: int,
-        truncation_mode: str,
-    ) -> Dict[str, List[List[int]]]:
-        sequences = keys.get("sequence", [])
-        if not sequences:
-            return keys
-        bins = plan_bfd(sequences, max_packed_len, truncation_mode)
-
-        packed: Dict[str, List[List[int]]] = {}
-        for k, vals in keys.items():
-            packed[k] = [
-                _truncate(
-                    self._concat_bin(vals, bin_indices),
-                    max_packed_len,
-                    truncation_mode,
+    if overflow not in {"truncate", "split"} or packing not in {"bfd", "none"}:
+        raise ValueError("Expected overflow=truncate|split and packing=bfd|none")
+    if truncation_mode not in {"keep_start", "keep_end"}:
+        raise ValueError("Expected truncation_mode=keep_start|keep_end")
+    limit = min(max_seq_len, max_packed_len)
+    if limit <= 0:
+        raise ValueError("Sequence and packed lengths must be positive")
+    if "sequence" not in keys:
+        return keys
+    if "seq_lengths" in keys:
+        raise ValueError("seq_lengths is generated after packing")
+    sequences = keys["sequence"]
+    for name, rows in keys.items():
+        if len(rows) != len(sequences) or any(
+            len(row) != len(seq) for row, seq in zip(rows, sequences)
+        ):
+            raise ValueError(f"Packing field {name!r} is not token-aligned")
+    chunks = {key: [] for key in keys}
+    for index, seq in enumerate(sequences):
+        if not seq:
+            continue
+        if overflow == "split":
+            starts = range(0, len(seq), limit)
+        else:
+            starts = [max(0, len(seq) - limit) if truncation_mode == "keep_end" else 0]
+        for start in starts:
+            for name, rows in keys.items():
+                chunk = rows[index][start : start + limit]
+                chunks[name].append(
+                    list(range(len(chunk))) if name == "position_ids" else chunk
                 )
-                for bin_indices in bins
-            ]
-        return packed
-
-    @staticmethod
-    def _concat_bin(vals: List[List[int]], indices: List[int]) -> List[int]:
-        result: List[int] = []
-        for i in indices:
-            result.extend(vals[i])
-        return result
-
-
-@PackingStrategyFactory.register("bfd_split")
-class BFDSplitPacking(BFDPacking):
-    """BFD packing with over-length sequences split into chunks.
-
-    Sequences longer than *max_packed_len* are split into consecutive
-    chunks of at most *max_packed_len* tokens instead of being
-    truncated.  Each chunk becomes an independent sequence that enters
-    BFD planning.  All keys (``loss_mask``, ``position_ids``, …) are
-    split in lockstep so per-token alignment is preserved.
-
-    Note: because each chunk is treated as a separate document, the
-    second chunk of a split sequence loses the preceding context.
-    """
-
-    def apply(
-        self,
-        keys: Dict[str, List[List[int]]],
-        max_packed_len: int,
-        truncation_mode: str,
-    ) -> Dict[str, List[List[int]]]:
-        sequences = keys.get("sequence", [])
-        if not sequences:
-            return keys
-        if max_packed_len <= 0:
-            return super().apply(keys, max_packed_len, truncation_mode)
-
-        split_keys = self._split_all(keys, max_packed_len)
-        return super().apply(split_keys, max_packed_len, truncation_mode)
-
-    @staticmethod
-    def _split_all(
-        keys: Dict[str, List[List[int]]], max_packed_len: int
-    ) -> Dict[str, List[List[int]]]:
-        """Split every sequence exceeding *max_packed_len* into chunks,
-        applying the same chunk boundaries to all keys."""
-        sequences = keys["sequence"]
-        chunk_bounds = [list(range(0, len(s), max_packed_len)) for s in sequences]
-        result: Dict[str, List[List[int]]] = {}
-        for key, vals in keys.items():
-            split_vals: List[List[int]] = []
-            for val, starts in zip(vals, chunk_bounds):
-                for start in starts:
-                    split_vals.append(val[start : start + max_packed_len])
-            result[key] = split_vals
-        return result
+    lengths = [len(seq) for seq in chunks["sequence"]]
+    bins = (
+        plan_bfd(lengths, max_packed_len)
+        if packing == "bfd"
+        else [[index] for index in range(len(lengths))]
+    )
+    packed = {
+        key: [[token for index in indices for token in rows[index]] for indices in bins]
+        for key, rows in chunks.items()
+    }
+    packed["seq_lengths"] = [[lengths[index] for index in indices] for indices in bins]
+    return packed

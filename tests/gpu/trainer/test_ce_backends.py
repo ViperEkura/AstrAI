@@ -189,7 +189,7 @@ def _fsdp_worker(rank, init_file):
         fully_shard(sharded.lm_head, reshard_after_forward=False)
         data = batch("cuda:" + str(rank))
         with patch(
-            "astrai.extension.kernel.cross_entropy.linear_cross_entropy",
+            "astrai.model.components.linear.linear_cross_entropy",
             wraps=linear_cross_entropy,
         ) as fused:
             actual = SEQStrategy(

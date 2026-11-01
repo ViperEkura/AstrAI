@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor, optim
-from torch.distributed.tensor import DTensor, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from torch.optim._muon import (
     _adjust_lr,
     _single_tensor_muon,
@@ -96,8 +96,22 @@ def _single_tensor_muon_reuse_buffers(
                 param.add_(update, alpha=-adjusted_lr)
 
 
+def _validate_sharded_matrix(param: DTensor) -> None:
+    if param.ndim != 2 or param.device_mesh.ndim != 1 or len(param.placements) != 1:
+        raise ValueError("sharded Muon requires a 2D logical matrix on a 1D mesh")
+    placement = param.placements[0]
+    if not isinstance(placement, (Shard, Replicate)) or (
+        isinstance(placement, Shard) and placement.dim not in (0, 1)
+    ):
+        raise ValueError("sharded Muon supports only Shard(0), Shard(1) or Replicate")
+
+
 def step_sharded_muon(
-    chunks: Iterable[List[MatrixTriple]], group: Mapping, backend: str
+    chunks: Iterable[List[MatrixTriple]],
+    group: Mapping,
+    backend: str,
+    *,
+    reuse_ns_buffers: bool = False,
 ) -> None:
     """Apply gathered Newton-Schulz updates and restore parameter shards."""
     lr = group["lr"].item() if isinstance(group["lr"], Tensor) else group["lr"]
@@ -113,8 +127,8 @@ def step_sharded_muon(
         coefficients = group["ns_coefficients"]
         steps = group["ns_steps"]
         eps = group["eps"]
-        if backend == "auto":
-            ortho = newton_schulz(full, coefficients, steps, eps, backend="auto")
+        if backend == "auto" or reuse_ns_buffers:
+            ortho = newton_schulz(full, coefficients, steps, eps, backend=backend)
         elif full.ndim == 2:
             ortho = _zeropower_via_newtonschulz(full, coefficients, steps, eps)
         else:
@@ -124,15 +138,17 @@ def step_sharded_muon(
                     for item in full.unbind(0)
                 ]
             )
-        # Preserve the one-rank BF16 momentum state transition after packing.
-        if (
-            len(updates) > 1
-            and not nesterov
-            and full.dtype == torch.bfloat16
-            and packed.device_mesh.size() == 1
-        ):
-            for index, (_, _, buf) in enumerate(chunk):
-                buf.to_local().copy_(full[index])
+        # Gathering and packing break the non-Nesterov momentum alias. Restore
+        # the normalized full input to every original shard before the next step.
+        if not nesterov and full.dtype == torch.bfloat16:
+            normalized = distribute_tensor(
+                full, packed.device_mesh, packed.placements, src_data_rank=None
+            )
+            buffers = (
+                torch.unbind(normalized, dim=0) if len(updates) > 1 else (normalized,)
+            )
+            for (_, _, buf), normalized_buf in zip(chunk, buffers):
+                buf.copy_(normalized_buf)
         sharded = distribute_tensor(
             ortho, packed.device_mesh, packed.placements, src_data_rank=None
         )
@@ -185,6 +201,9 @@ class ShardedMuon(optim.Muon):
                 (sharded if isinstance(param, DTensor) else plain).append(
                     (param, grad, buf)
                 )
+            for param, _, _ in sharded:
+                _validate_sharded_matrix(param)
+
             if plain:
                 pp, gg, bb = (list(t) for t in zip(*plain))
                 if (
@@ -228,5 +247,10 @@ class ShardedMuon(optim.Muon):
                 chunks = _batched_sharded_matrices(
                     sharded, self.ns_batch_size if self.batch_ns_updates else 1
                 )
-                step_sharded_muon(chunks, group, self.ns_backend)
+                step_sharded_muon(
+                    chunks,
+                    group,
+                    self.ns_backend,
+                    reuse_ns_buffers=self.reuse_ns_buffers,
+                )
         return loss

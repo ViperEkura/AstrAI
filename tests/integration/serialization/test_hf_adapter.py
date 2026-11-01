@@ -19,14 +19,17 @@ from astrai.serialization import (
     adapt_config,
     convert_hf_config,
     convert_hf_weights,
+    load_model_weights,
     looks_like_hf_state_dict,
     save_model,
+    save_model_weights,
 )
 from astrai.serialization.hf_adapter import _half_to_interleaved
 from astrai.trainer.callbacks.checkpoint import CheckpointCallback
 from astrai.trainer.context import TrainContextBuilder
 from tests.support.checkpoint import assert_state_dicts_equal
 from tests.support.models import make_tiny_config
+from tests.support.trainer import make_resume_metadata
 
 LLAMA_RAW = {
     "architectures": ["LlamaForCausalLM"],
@@ -806,27 +809,34 @@ def test_missing_policy_weights_fail_before_optimizer(
         AutoModel.from_pretrained(tmp_path)
 
 
-def test_partial_warm_start_is_explicit_and_never_relaxes_resume(
-    tmp_path, monkeypatch, caplog
+def test_partial_loading_uses_generic_strict_and_never_relaxes_training(
+    tmp_path, monkeypatch
 ):
     cfg = make_tiny_config()
     state = dict(AutoRegressiveLM(cfg).state_dict())
+    complete_path = tmp_path / "complete"
+    save_model(cfg.to_dict(), state, str(complete_path))
+    context = _load_training_policy(complete_path, cfg, monkeypatch)
     del state["lm_head.weight"]
     save_model(cfg.to_dict(), state, str(tmp_path))
-    context = _load_training_policy(
-        tmp_path, cfg, monkeypatch, allow_partial_pretrained=True
-    )
-    assert "lm_head.weight" in caplog.text
-    assert context.pretrained_metadata["partial_warm_start"]
-    with pytest.raises(RuntimeError, match="lm_head.weight"):
-        _load_training_policy(
-            tmp_path,
-            cfg,
-            monkeypatch,
-            allow_partial_pretrained=True,
-            resume=True,
-            load_state_dict={"optimizer": False, "scheduler": False},
-        )
+    loaded = AutoModel.from_pretrained(tmp_path, strict=False)
+    for name, value in state.items():
+        torch.testing.assert_close(loaded.state_dict()[name], value, rtol=0, atol=0)
+    resume_path = tmp_path / "resume"
+    Checkpoint(
+        state_dict=state,
+        config=cfg.to_dict(),
+        meta=make_resume_metadata(context.config, 2),
+    ).save(str(resume_path))
+    for path, resume in ((tmp_path, False), (resume_path, True)):
+        with pytest.raises(RuntimeError, match="lm_head.weight"):
+            _load_training_policy(
+                path,
+                cfg,
+                monkeypatch,
+                resume=resume,
+                load_state_dict={"optimizer": False, "scheduler": False},
+            )
 
 
 def test_new_lora_adapters_are_allowed_but_backbone_and_resume_are_complete(
@@ -842,9 +852,15 @@ def test_new_lora_adapters_are_allowed_but_backbone_and_resume_are_complete(
         reference.state_dict(),
     )
     assert len(context.pretrained_metadata["allowed_new_parameters"]) == 4
+    resume_path = tmp_path / "resume"
+    Checkpoint(
+        state_dict=reference.state_dict(),
+        config=cfg.to_dict(),
+        meta=make_resume_metadata(context.config, 2),
+    ).save(str(resume_path))
     with pytest.raises(RuntimeError, match="lora_A"):
         _load_training_policy(
-            tmp_path,
+            resume_path,
             cfg,
             monkeypatch,
             lora=lora,
@@ -923,3 +939,159 @@ def test_load_mapping_rejects_invalid_weight_options(tmp_path, weights):
     _write_mapping(tmp_path, {**TEST_MAPPING, "weights": weights})
     with pytest.raises(ValueError):
         adapt_config(LLAMA_RAW, str(tmp_path))
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_qwen3_explicit_head_and_qk_norm_match_hf_masked_logits(
+    tmp_path, tied, monkeypatch
+):
+    monkeypatch.setenv("LOCAL_DEVICE", "cpu")
+    hf = pytest.importorskip("transformers", minversion="4.51.3")
+    torch.manual_seed(615)
+    config = hf.Qwen3Config(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=256,
+        rope_theta=10000,
+        tie_word_embeddings=tied,
+        attention_bias=False,
+        attention_dropout=0.0,
+    )
+    config._attn_implementation = "eager"
+    reference = hf.Qwen3ForCausalLM(config).eval()
+    # Learned, nonuniform Q/K RMSNorm scales expose permutation errors that
+    # the all-ones initialization would conceal.
+    with torch.no_grad():
+        for layer in reference.model.layers:
+            layer.self_attn.q_norm.weight.uniform_(0.5, 1.5)
+            layer.self_attn.k_norm.weight.uniform_(0.5, 1.5)
+    reference.save_pretrained(tmp_path)
+    mapping = {
+        "version": 1,
+        "required": ["vocab_size", "hidden_size", "num_hidden_layers", "head_dim"],
+        "fields": {
+            key: key
+            for key in (
+                "vocab_size",
+                "hidden_size",
+                "num_hidden_layers",
+                "intermediate_size",
+                "rms_norm_eps",
+                "tie_word_embeddings",
+                "max_position_embeddings",
+                "rope_theta",
+            )
+        },
+        "constants": {
+            "attention.default_type": "gqa",
+            "attention.qk_norm": True,
+            "ffn_type": "mlp",
+        },
+        "weights": {"norm_weight_offset": 0, "skip_prefixes": []},
+    }
+    mapping["fields"].update(
+        {
+            "attention.num_heads": "num_attention_heads",
+            "attention.num_kv_heads": "num_key_value_heads",
+            "attention.gqa.head_dim": "head_dim",
+        }
+    )
+    (tmp_path / "hf_mapping.json").write_text(json.dumps(mapping))
+    native = AutoModel.from_pretrained(tmp_path, strict=True).eval()
+    assert native.config.head_dim == 16
+    cfg = TrainConfig(
+        model=ComponentSpec(
+            type="autoregressive_lm", params={"config": native.config.to_dict()}
+        ),
+        dataset=ComponentSpec(
+            type="tests.support.rollout:RandomTokenDataset",
+            params={"length": 2, "max_length": 4, "vocab_size": 128},
+        ),
+        optimizer=ComponentSpec(type="torch.optim:SGD", params={"lr": 0.0}),
+        scheduler=ComponentSpec(
+            type="torch.optim.lr_scheduler:StepLR",
+            params={"step_size": 1, "gamma": 1.0},
+        ),
+        strategy="seq",
+        device_type="cpu",
+        dp_mode="none",
+        num_workers=0,
+        pin_memory=False,
+        batch_per_device=1,
+        grad_accum_steps=1,
+        ckpt_dir=str(tmp_path / "unused-checkpoints"),
+    )
+    context = TrainContextBuilder(cfg).with_param_path(str(tmp_path)).build()
+    context.model.eval()
+    ids = torch.tensor([[1, 2, 3, 4, 5], [0, 0, 9, 7, 12]])
+    mask = torch.tensor([[True] * 5, [False, False, True, True, True]])
+    positions = (mask.long().cumsum(-1) - 1).clamp_min(0)
+    with torch.no_grad():
+        expected = reference(
+            ids, attention_mask=mask, position_ids=positions, use_cache=False
+        ).logits[mask]
+        actual = native(ids, input_mask=mask, position_ids=positions)["logits"][mask]
+        train = context.model(ids, input_mask=mask, position_ids=positions)["logits"][
+            mask
+        ]
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(train, expected, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_loading_shape_mismatch_fails_even_when_partial_is_allowed(tmp_path, strict):
+    cfg = make_tiny_config()
+    state = dict(AutoRegressiveLM(cfg).state_dict())
+    state["lm_head.weight"] = state["lm_head.weight"][:-1]
+    save_model(cfg.to_dict(), state, str(tmp_path))
+    with pytest.raises(RuntimeError, match="lm_head.weight"):
+        AutoModel.from_pretrained(tmp_path, strict=strict)
+
+
+def test_weight_io_roundtrip_preserves_dtypes_without_config(tmp_path):
+    weights = {
+        "weight": torch.randn(3, 4, dtype=torch.bfloat16),
+        "count": torch.tensor(7, dtype=torch.int64),
+    }
+    save_model_weights(weights, tmp_path / "weights")
+    assert not (tmp_path / "weights/config.json").exists()
+    assert_state_dicts_equal(load_model_weights(tmp_path / "weights"), weights)
+
+
+def test_weight_io_loads_indexed_shards(tmp_path):
+    first = {"a": torch.arange(4)}
+    second = {"b": torch.ones(2, dtype=torch.bfloat16)}
+    st.save_file(first, tmp_path / "part-1.safetensors")
+    st.save_file(second, tmp_path / "part-2.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"a": "part-1.safetensors", "b": "part-2.safetensors"}}
+        )
+    )
+    assert_state_dicts_equal(load_model_weights(tmp_path), {**first, **second})
+
+
+def test_strict_model_loading_requires_weights(tmp_path):
+    cfg = make_tiny_config()
+    (tmp_path / "config.json").write_text(json.dumps(cfg.to_dict()))
+    with pytest.raises(FileNotFoundError, match="No model weights"):
+        AutoModel.from_pretrained(tmp_path)
+
+
+def test_model_validation_rejects_bad_keys_before_mutation():
+    from astrai.model.automodel import validate_model_state_dict
+
+    model = AutoRegressiveLM(make_tiny_config())
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+    supplied = {name: torch.zeros_like(value) for name, value in before.items()}
+    supplied["unknown.weight"] = torch.ones(1)
+    with pytest.raises(RuntimeError, match="unknown.weight"):
+        validate_model_state_dict(model, supplied)
+    assert_state_dicts_equal(model.state_dict(), before)
+    missing, unexpected = validate_model_state_dict(model, supplied, strict=False)
+    assert missing == [] and unexpected == ["unknown.weight"]

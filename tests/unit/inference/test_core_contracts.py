@@ -147,7 +147,7 @@ def test_zero_output_admission_terminates_without_forward(scheduler, limit, prom
         execute.assert_not_called()
     assert len(events) == 1
     assert events[0] == RequestFinished(rid, "length", prompt_len, 0)
-    assert not sched.scheduler._requests.has_requests()
+    assert not sched.scheduler.has_requests()
     assert sched.scheduler.kv_manager.request_count == 0
 
 
@@ -374,7 +374,7 @@ def test_bad_batch_is_atomic_and_does_not_orphan_registry(scheduler, kwargs):
     with pytest.raises(ValueError):
         sched.add_requests(["a", "b"], **options)
     assert sched.scheduler._states == {}
-    assert not sched.scheduler._requests.has_requests()
+    assert not sched.scheduler.has_requests()
     assert sched.stop()
     assert sched.update_weights(1) == 1
 
@@ -387,5 +387,5 @@ def test_duplicate_existing_batch_id_does_not_enqueue_valid_prefix(scheduler):
             ["a", "b"], request_ids=["new", "live"], prompts_ids=[[10], [11]]
         )
     assert set(sched.scheduler._states) == {rid}
-    assert [r.request_id for r in sched.scheduler._requests.waiting] == [rid]
+    assert [r.request_id for r in sched.scheduler.waiting] == [rid]
     assert sched.cancel_request(rid)

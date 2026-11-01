@@ -65,10 +65,10 @@ class StrategyFactory(BaseFactory[BaseStrategy]):
         return allowed
 
     @classmethod
-    def create_checked(cls, name: str, *args, **kwargs) -> BaseStrategy:
+    def create(cls, name: str, *args, **kwargs) -> BaseStrategy:
         unknown = sorted(set(kwargs) - cls.option_names(name))
         if unknown:
             raise TypeError(
                 f"{name} strategy got unknown arguments: {', '.join(unknown)}"
             )
-        return super().create_checked(name, *args, **kwargs)
+        return super().create(name, *args, **kwargs)

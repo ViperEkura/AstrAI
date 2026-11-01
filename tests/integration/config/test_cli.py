@@ -100,6 +100,10 @@ def test_type_inference_from_config_fields():
     assert params["pin_memory"].default is False  # config default, no override
     assert params["metrics"].multiple
     assert params["metrics"].default == ("loss", "lr", "grad_norm")
+    train_metrics = next(
+        p for p in train_module.train_command.params if p.name == "metrics"
+    )
+    assert train_metrics.default == params["metrics"].default
 
 
 def test_spec_overrides_beat_config_defaults():
@@ -303,7 +307,21 @@ def test_cli_rejects_unknown_yaml_parameters(tmp_path):
     assert "Unknown config keys: learner_device" in result.output
 
 
-def test_seq_cli_defers_dataset_construction(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "optimizer, flags, expected",
+    [
+        ("muon_adamw", ["--muon_ns_steps", "7"], {"ns_steps": 7}),
+        ("nora_nadamw", ["--nora_lr", "0.02"], {"nora_lr": 0.02}),
+        (
+            "mano_adamw",
+            ["--mano_momentum", "0.8", "--no-mano_nesterov"],
+            {"momentum": 0.8, "nesterov": False},
+        ),
+    ],
+)
+def test_seq_cli_defers_dataset_construction(
+    tmp_path, monkeypatch, optimizer, flags, expected
+):
     make_rollout_config(max_position_embeddings=8).to_file(tmp_path / "config.json")
     data_dir = tmp_path / "packed"
     save_bin(str(data_dir), {"sequence": [torch.arange(33)]})
@@ -327,13 +345,22 @@ def test_seq_cli_defers_dataset_construction(tmp_path, monkeypatch):
 
     monkeypatch.setattr(train_module, "Trainer", Trainer)
     monkeypatch.setattr(DatasetFactory, "load", reject_parent_load)
-    result = CliRunner().invoke(train_module.train_command, ["--config", str(yaml)])
+    result = CliRunner().invoke(
+        train_module.train_command,
+        ["--config", str(yaml), "--optimizer", optimizer, "--max_lr", "0.003", *flags],
+    )
     assert result.exit_code == 0, (result.output, result.exception)
     assert len(captured) == 1
     assert captured[0].dataset.type == "packed"
     assert captured[0].dataset.params["path"] == str(data_dir)
     assert isinstance(captured[0].dataset, ComponentSpec)
     assert captured[0].scheduler.type == "cosine"
+    config = captured[0]
+    assert config.optimizer.type == optimizer
+    assert config.optimizer.params["lr"] == 0.003
+    for key, value in expected.items():
+        assert config.optimizer.params[key] == value
+    assert config.to_dict()["optimizer_hyperparameters"] == config.optimizer.params
 
 
 def test_cli_accepts_declarative_components(tmp_path, monkeypatch):
@@ -342,7 +369,7 @@ def test_cli_accepts_declarative_components(tmp_path, monkeypatch):
     save_bin(str(data_dir), {"sequence": [torch.arange(33)]})
     config_path = tmp_path / "components.yaml"
     config_path.write_text(
-        "model:\n  type: torch.nn:Linear\n  dtype: float32\n"
+        "precision:\n  compute_dtype: float32\nmodel:\n  type: torch.nn:Linear\n"
         "  params: {in_features: 2, out_features: 2}\n"
         "optimizer:\n  type: torch.optim:SGD\n  params: {lr: 0.01}\n"
         "scheduler:\n  type: torch.optim.lr_scheduler:StepLR\n"
@@ -371,7 +398,7 @@ def test_cli_accepts_declarative_components(tmp_path, monkeypatch):
         "torch.optim:SGD",
         "torch.optim.lr_scheduler:StepLR",
     )
-    assert config.model_dtype == "float32"
+    assert config.precision.compute_dtype == "float32"
     assert config.dataset.params["path"] == str(data_dir)
     dataset, _ = build_dataset_component(config.dataset, None, config.random_seed)
     assert len(dataset) > 0
@@ -534,7 +561,50 @@ def test_cli_options_instantiate_selected_strategy(tmp_path, monkeypatch, strate
     if capabilities.critic:
         options["critic"] = model
         options["critic_optimizer"] = torch.optim.SGD(model.parameters(), lr=0.1)
-    instance = train_module.StrategyFactory.create_checked(
+    instance = train_module.StrategyFactory.create(
         strategy, model=model, device="cpu", **options
     )
     assert instance.model is model
+
+
+def test_cli_precision_flags_override_individual_yaml_fields(tmp_path, monkeypatch):
+    make_rollout_config(max_position_embeddings=8).to_file(tmp_path / "config.json")
+    config_path = tmp_path / "precision.yaml"
+    config_path.write_text(
+        "precision:\n  compute_dtype: float32\n  gradient_dtype: float32\n"
+        "  master_dtype: float32\n  optimizer_state_dtype: bfloat16\n"
+        "  export_dtype: float16\n"
+        f"training:\n  train_type: seq\n  param_path: {tmp_path}\n"
+        f"  data_root_path: {tmp_path}\n"
+    )
+    captured = []
+
+    class Trainer:
+        def __init__(self, config):
+            captured.append(config)
+
+        def train(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(train_module, "Trainer", Trainer)
+    result = CliRunner().invoke(
+        train_module.train_command,
+        [
+            "--config",
+            str(config_path),
+            "--compute_dtype",
+            "bfloat16",
+            "--gradient_dtype",
+            "model",
+            "--master_dtype",
+            "bfloat16",
+            "--export_dtype",
+            "float32",
+        ],
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    policy = captured[0].precision
+    assert policy.compute_dtype == policy.master_dtype == "bfloat16"
+    assert policy.gradient_dtype == "model"
+    assert policy.optimizer_state_dtype == "bfloat16"
+    assert policy.export_dtype == "float32"

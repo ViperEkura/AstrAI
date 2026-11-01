@@ -14,7 +14,7 @@ from astrai.serialization import Checkpoint
 from astrai.trainer.rollout import BaseRewardModel
 from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
-from astrai.trainer.rollout.types import SamplingParams
+from astrai.trainer.rollout.types import ResolvedAsyncRolloutConfig, SamplingParams
 from astrai.trainer.trainer import Trainer
 from tests.support.tokenizers import CHAT_TEMPLATE
 from tests.support.trainer import (
@@ -145,7 +145,7 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:InstructionDataset",
             params={
@@ -195,7 +195,7 @@ def test_async_round_ddp_two_learners_two_workers(base_test_env):
             type="autoregressive_lm",
             params={"config": base_test_env["transformer_config"].to_dict()},
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:InstructionDataset",
             params={
@@ -223,7 +223,7 @@ def test_async_round_ddp_two_learners_two_workers(base_test_env):
         reward_model_fn=LengthRewardModel,
     )
     Trainer(config).train(param_path=test_dir)
-    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_1"))
+    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_1"))
     assert checkpoint.meta["policy_version"] == 1
     assert checkpoint.consumed_samples == 4
 
@@ -259,7 +259,7 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:_instruction_subset",
             params={
@@ -289,7 +289,7 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
     )
     Trainer(config).train(param_path=test_dir)
 
-    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_3"))
+    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_3"))
     assert checkpoint.meta["policy_version"] == 3
     assert checkpoint.consumed_samples == 10
     assert seen == [0, 0, 1]
@@ -307,9 +307,9 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
 
     resume_config = replace(config, n_epoch=2)
     Trainer(resume_config).train(
-        param_path=os.path.join(test_dir, "ckpt", "epoch_0_step_3"), resume=True
+        param_path=os.path.join(test_dir, "ckpt", "epoch_1_step_3"), resume=True
     )
-    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_6"))
+    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_2_step_6"))
     assert resumed.meta["policy_version"] == 6
     assert resumed.consumed_samples == 20
 
@@ -329,7 +329,7 @@ def test_async_round_version_commit_failure_checkpoint_resumes_once(
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.gpu.trainer.test_online_e2e:_instruction_subset",
             params={
@@ -375,7 +375,7 @@ def test_async_round_version_commit_failure_checkpoint_resumes_once(
 
     monkeypatch.setattr(NCCLWeightChannel, "mark_committed", original_publication)
     Trainer(config).train(param_path=checkpoint_path, resume=True)
-    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_2"))
+    resumed = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_2"))
     assert resumed.meta["policy_version"] == 2
     assert resumed.meta["optimizer_step"] == 2
     assert resumed.consumed_samples == 8
@@ -405,21 +405,27 @@ def test_async_seeds_match_after_worker_repartition_and_resume(base_test_env):
     ):
         per_worker = 8 // len(devices)
         pool = AsyncRoundCoordinator(
+            config=ResolvedAsyncRolloutConfig(
+                learner_device="cuda:0",
+                devices=tuple(devices),
+                params=SamplingParams(
+                    group_size=2, max_tokens=6, temperature=0.7, top_k=0, top_p=1.0
+                ),
+                max_seq_len=64,
+                max_prompts_per_worker=per_worker,
+                startup_timeout_s=300.0,
+                generation_timeout_s=600.0,
+                weight_timeout_s=600.0,
+                max_policy_lag=1,
+                random_seed=42,
+                sample_cursor=10,
+            ),
             source=source,
             model_fn=model_fn,
             param_path=base_test_env["test_dir"],
-            devices=devices,
-            params=SamplingParams(
-                group_size=2, max_tokens=6, temperature=0.7, top_k=0, top_p=1.0
-            ),
             reward_model=LengthRewardModel(),
             policy_version=0,
-            max_batch_size=per_worker * 2,
-            max_seq_len=64,
             model_dtype=torch.bfloat16,
-            max_prompts_per_worker=per_worker,
-            random_seed=42,
-            sample_cursor=10,
         )
         try:
             results.append(pool.collect_round(pool.submit_round(batch)))

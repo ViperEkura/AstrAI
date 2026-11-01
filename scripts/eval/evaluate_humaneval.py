@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -18,25 +19,15 @@ import tqdm
 from datasets import load_dataset
 
 from astrai.bench import (
-    generate_batch,
+    execute_one,
     load_jsonl,
     report,
     save_json,
     score_results,
-    test_all,
 )
 from astrai.inference import InferenceEngine, build_engine
 
 HUMANEVAL_HF_DATASET = "openai/openai_humaneval"
-
-STOP_SEQUENCES = [
-    "\nclass ",
-    "\ndef ",
-    "\n# ",
-    "\nif __name__",
-    "\nprint(",
-    "\n\n\n",
-]
 
 
 @dataclass
@@ -59,6 +50,7 @@ class EvalConfig:
     test_workers: int = 8
     k_values: Tuple[int, ...] = (1, 10, 100)
     problem_indices: Optional[List[int]] = None
+    prompt_format: str = "completion"
 
 
 def download(path: str):
@@ -73,91 +65,94 @@ def download(path: str):
     print(f"  saved {len(ds)} problems to {path}")
 
 
-def trim_stop(text: str) -> str:
-    for stop in STOP_SEQUENCES:
-        idx = text.find(stop)
-        if idx != -1:
-            text = text[:idx]
-    return text
-
-
-def extract_body(code: str, entry_point: str) -> Optional[str]:
-    pattern = rf"def\s+{re.escape(entry_point)}\b[^:]*:"
-    match = re.search(pattern, code)
-    if not match:
-        return code
-
-    lines = code[match.end() :].split("\n")
-    body_lines = []
-    started = False
-
-    for line in lines:
-        stripped = line.rstrip()
-        if not stripped and not started:
-            continue
-        if not stripped and started:
-            body_lines.append("")
-            continue
-        if not started:
-            started = True
-        if stripped.lstrip() == stripped and started:
-            break
-        body_lines.append(stripped)
-
-    body = "\n".join(body_lines)
-    return body if body.strip() else None
-
-
 def extract_completions(
     raw: Sequence[str],
     entry_point: str,
 ) -> List[str]:
     bodies = []
     for r in raw:
-        t = trim_stop(r)
-        body = extract_body(t, entry_point)
-        if body:
-            bodies.append(body)
+        blocks = re.findall(r"```(?:python|Python|py)?\s*\n(.*?)```", r, re.S)
+        code = next(
+            (b for b in blocks if re.search(rf"def\s+{re.escape(entry_point)}\b", b)),
+            blocks[0] if blocks else r,
+        )
+        # Preserve every sample, including failed extractions, in the denominator.
+        bodies.append(code)
     return bodies
 
 
 def generate_all(
-    engine: InferenceEngine,
-    problems: Sequence[Dict],
-    cfg: EvalConfig,
+    engine: InferenceEngine, problems: Sequence[Dict], cfg: EvalConfig
 ) -> List[Dict]:
-    results = []
-    for problem in tqdm.tqdm(problems, desc="Generating", unit="problem"):
-        raw = generate_batch(
-            engine,
-            problem["prompt"],
-            cfg.num_samples,
-            cfg.batch_size,
-            cfg.max_tokens,
-            cfg.temperature,
-            cfg.top_p,
-            cfg.top_k,
-        )
-        bodies = extract_completions(raw, problem["entry_point"])
+    results, requests = [], []
+    for index, problem in enumerate(problems):
+        prompt = problem["prompt"]
+        if cfg.prompt_format == "chat":
+            prompt = engine.tokenizer.apply_chat_template(
+                [
+                    {
+                        "role": "user",
+                        "content": "Complete the following Python function. Return the complete function and any necessary imports as Python code only.\n\n"
+                        + prompt,
+                    }
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         results.append(
             dict(
-                request_id=problem["request_id"],
+                request_id=problem.get("task_id", problem.get("request_id")),
                 entry_point=problem["entry_point"],
                 prompt=problem["prompt"],
                 test=problem["test"],
-                completions=bodies,
+                raw_completions=[],
             )
+        )
+        requests.extend([(index, prompt)] * cfg.num_samples)
+    for start in tqdm.tqdm(
+        range(0, len(requests), cfg.batch_size), desc="Generating batches"
+    ):
+        batch = requests[start : start + cfg.batch_size]
+        outputs = engine.generate(
+            [prompt for _, prompt in batch],
+            stream=False,
+            max_tokens=cfg.max_tokens,
+            temperature=cfg.temperature,
+            top_p=cfg.top_p,
+            top_k=cfg.top_k,
+            frequency_penalty=0.0,
+        )
+        for (index, _), output in zip(batch, outputs):
+            results[index]["raw_completions"].append(output)
+    for result in results:
+        result["completions"] = extract_completions(
+            result["raw_completions"], result["entry_point"]
         )
     return results
 
 
-def he_codes(item: Dict, test_timeout: float):
-    """(request_id, [(full_code, timeout), ...]) — prompt + completion + test block."""
-    codes = [
-        (item["prompt"] + c + "\n" + item["test"], test_timeout)
-        for c in item["completions"]
-    ]
-    return item["request_id"], codes
+def evaluate_completions(generated: Sequence[Dict], cfg: EvalConfig):
+    results = []
+    with ThreadPoolExecutor(max_workers=cfg.test_workers) as pool:
+        for item in tqdm.tqdm(generated, desc="Testing"):
+            codes = []
+            for completion in item["completions"]:
+                full_function = re.search(
+                    rf"^def\s+{re.escape(item['entry_point'])}\b",
+                    completion,
+                    re.MULTILINE,
+                )
+                code = (
+                    item["prompt"]
+                    + ("    pass\n\n" if full_function else "")
+                    + completion
+                )
+                code += "\n" + item["test"] + f"\ncheck({item['entry_point']})\n"
+                codes.append((code, cfg.test_timeout))
+            flags = list(pool.map(execute_one, codes))
+            item["passed_samples"] = flags
+            results.append((item["request_id"], len(codes), sum(flags)))
+    return results
 
 
 def run_pipeline(cfg: EvalConfig) -> Dict:
@@ -177,6 +172,7 @@ def run_pipeline(cfg: EvalConfig) -> Dict:
             max_seq_len=cfg.max_seq_len,
         )
 
+        engine.model.eval()
         try:
             generated = generate_all(engine, problems, cfg)
         finally:
@@ -190,11 +186,9 @@ def run_pipeline(cfg: EvalConfig) -> Dict:
         if cfg.generate_only:
             return {}
 
-    results = test_all(
-        generated,
-        lambda it: he_codes(it, cfg.test_timeout),
-        cfg.test_workers,
-    )
+    results = evaluate_completions(generated, cfg)
+    if cfg.output:
+        save_json(cfg.output.replace(".json", "_tested.json"), generated)
     scored = score_results(results, cfg.k_values)
     return scored
 
@@ -223,6 +217,9 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
     p.add_argument("--test_workers", type=int, default=8)
     p.add_argument("--test_timeout", type=float, default=3.0)
     p.add_argument("--problems", type=int, nargs="+", default=None)
+    p.add_argument(
+        "--prompt_format", choices=["completion", "chat"], default="completion"
+    )
     args = p.parse_args(argv)
 
     return EvalConfig(
@@ -241,6 +238,7 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
         test_workers=args.test_workers,
         test_timeout=args.test_timeout,
         problem_indices=args.problems,
+        prompt_format=args.prompt_format,
     )
 
 

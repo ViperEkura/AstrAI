@@ -199,7 +199,8 @@ def test_shared_train_batch_commits_async_round_once():
         grad_accum_steps = 1
         sync_gradients = True
 
-        def accumulate(self, _model):
+        def accumulate_explicit(self, _model, sync):
+            assert sync
             return nullcontext()
 
         def backward(self, loss):
@@ -211,16 +212,16 @@ def test_shared_train_batch_commits_async_round_once():
     strategy._rollout_runner = coordinator
     optimizer = torch.optim.SGD(strategy.model.parameters(), lr=0.01)
     before = strategy.model.embed.weight.detach().clone()
-    context = SimpleNamespace(
+    context = TrainContext(
         model=strategy.model,
         strategy=strategy,
         executor=Executor(),
         config=SimpleNamespace(async_train_microbatch_prompts=1),
         async_rollout=coordinator,
-        dp_size=1,
         optimizer=optimizer,
         scheduler=None,
         consumed_samples=0,
+        epoch_sample_offset=0,
         optimizer_steps_completed=0,
         loss=0.0,
         metrics={},
@@ -280,6 +281,19 @@ def test_rollout_truncation_metric_reaches_grpo_metrics():
     (output,) = list(strategy.training_steps({"instruction": ["x"] * 4}))
     assert output["metrics"]["truncation_rate"] == pytest.approx(0.5)
     assert output["metrics"]["stop_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("minibatch", [None, 2])
+def test_replay_accepts_scalar_metadata_before_prompt_tensors(minibatch):
+    strategy = _grpo_strategy(_rollout_result(), rl_minibatch_prompts=minibatch)
+    prepare = strategy.prepare_from_rollout
+    strategy.prepare_from_rollout = lambda result: {
+        "temperature": torch.tensor(1.0),
+        **prepare(result),
+    }
+    outputs = list(strategy.training_steps({"instruction": ["x"] * 4}))
+    assert len(outputs) == (1 if minibatch is None else 2)
+    assert all(torch.isfinite(output["loss"]) for output in outputs)
 
 
 def test_ppo_advantages_pinned_once_across_minibatches_and_epochs():
@@ -517,7 +531,7 @@ def _online_config(base_test_env, **overrides):
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.integration.trainer.test_rl_scheduling:InstructionDataset",
             params={

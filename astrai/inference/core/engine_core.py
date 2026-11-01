@@ -269,7 +269,7 @@ class EngineCore:
             return False
         if any(
             not r.prefill_complete
-            or r.frequency_penalty
+            or r.sampling.frequency_penalty
             or r.next_pos >= self.scheduler.max_seq_len
             or (r.max_tokens is not None and r.output_tokens + 1 >= r.max_tokens)
             for r in active

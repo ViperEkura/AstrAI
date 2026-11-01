@@ -5,19 +5,21 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
 
 from astrai.serialization import Checkpoint
-from astrai.trainer.callbacks.base import CallbackFactory, TrainCallback
+from astrai.trainer.callbacks.base import TrainCallback
 from astrai.trainer.optional_extras import (
+    component_optimizers,
     snapshot_component_extras,
     snapshot_extras,
 )
 
 if TYPE_CHECKING:
-    from astrai.trainer.callbacks.metrics import MetricCallback
     from astrai.trainer.context import TrainContext
+    from astrai.trainer.context.metric import MetricSnapshot
 
 
 _TOKENIZER_FILES = (
@@ -48,7 +50,15 @@ def _copy_tokenizer_files(param_path: Optional[str], save_path: str):
         shutil.copy2(src, dst)
 
 
-@CallbackFactory.register("checkpoint")
+def _write_metric_snapshot(snapshot: MetricSnapshot, destination: Path) -> None:
+    with destination.open("wb") as output:
+        if snapshot.source_path is not None:
+            with snapshot.source_path.open("rb") as source:
+                shutil.copyfileobj(source, output)
+        for record in snapshot.records:
+            output.write(record.encode("utf-8"))
+
+
 class CheckpointCallback(TrainCallback):
     """
     Checkpoint callback for trainer.
@@ -59,12 +69,10 @@ class CheckpointCallback(TrainCallback):
         save_dir: str,
         interval: int,
         save_extra_fn: Optional[Callable[["TrainContext"], Dict]] = None,
-        metric_callback: Optional["MetricCallback"] = None,
     ):
         self.save_dir = save_dir
         self.interval = interval
         self.save_extra_fn = save_extra_fn or CheckpointCallback.save_extra
-        self.metric_callback = metric_callback
         self.last_ckpt_step = None
         self.last_ckpt_cursor = None
         self._saved = False
@@ -76,13 +84,19 @@ class CheckpointCallback(TrainCallback):
     def _save_checkpoint(self, context: TrainContext):
         if not context.checkpoint_safe:
             return
-        with context.executor.checkpoint_context(context.model) as state_dict:
+        with context.executor.checkpoint_context(
+            context.model,
+            optimizer=context.optimizer,
+            export_dtype=context.config.precision.export_dtype,
+            extra_optimizers=component_optimizers(context.strategy),
+        ) as (state_dict, weight_extras):
             if state_dict is not None:
                 save_path = os.path.join(
                     self.save_dir,
                     f"epoch_{context.epoch}_step_{context.optimizer_step}",
                 )
                 extra = self.save_extra_fn(context)
+                extra.update(weight_extras)
                 context.checkpoint = Checkpoint(
                     state_dict=state_dict,
                     epoch=context.epoch,
@@ -94,18 +108,21 @@ class CheckpointCallback(TrainCallback):
                     meta=self._meta(context),
                 )
 
+                snapshot = context.metric_history.snapshot()
+
                 def prepare_staging(staging_path: Path) -> None:
                     _copy_tokenizer_files(context.param_path, str(staging_path))
-                    if self.metric_callback is not None:
-                        self.metric_callback.write_snapshot(
-                            staging_path / "metric.jsonl"
-                        )
+                    _write_metric_snapshot(snapshot, staging_path / "metric.jsonl")
 
                 published = context.checkpoint.save(
                     save_path, prepare_staging=prepare_staging
                 )
-                if self.metric_callback is not None:
-                    self.metric_callback.checkpoint_saved(Path(save_path), published)
+                if published:
+                    context.metric_history.mark_saved(Path(save_path))
+                elif snapshot.records:
+                    raise RuntimeError(
+                        f"Checkpoint {save_path} already exists but has unsaved metrics"
+                    )
         self.last_ckpt_step = context.optimizer_step
         self.last_ckpt_cursor = context.consumed_samples
         self._saved = True
@@ -115,6 +132,7 @@ class CheckpointCallback(TrainCallback):
         """Run state plus what a report reads; not a copy of the CLI config."""
         cfg = context.config
         meta = {
+            "precision": asdict(cfg.precision),
             "optimizer_step": context.optimizer_step,
             "strategy": cfg.strategy,
             "dp_size": context.dp_size,
@@ -126,18 +144,17 @@ class CheckpointCallback(TrainCallback):
             "optimizer": {"type": cfg.optimizer.type},
             "scheduler": {"type": cfg.scheduler.type},
         }
-        if context.global_cursor:
-            meta.update(
-                resume_contract_version=1,
-                dataset_len=context.dataset_len,
-                epoch_sample_offset=context.epoch_sample_offset,
-                random_seed=cfg.random_seed,
-                tp_size=cfg.tp_size,
-                dp_mode=cfg.dp_mode,
-                rollout_mode=cfg.rollout_mode,
-                rl_update_epochs=cfg.rl_update_epochs,
-                rl_minibatch_prompts=cfg.rl_minibatch_prompts,
-            )
+        meta.update(
+            resume_contract_version=1,
+            dataset_len=context.dataset_len,
+            epoch_sample_offset=context.epoch_sample_offset,
+            random_seed=cfg.random_seed,
+            tp_size=cfg.tp_size,
+            dp_mode=cfg.dp_mode,
+            rollout_mode=cfg.rollout_mode,
+            rl_update_epochs=cfg.rl_update_epochs,
+            rl_minibatch_prompts=cfg.rl_minibatch_prompts,
+        )
         if context.pretrained_metadata:
             meta["pretrained"] = context.pretrained_metadata
         policy_version = context.strategy.policy_version

@@ -45,6 +45,7 @@ class AutoTokenizer:
         self._tokenizer = Tokenizer.from_file(str(tokenizer_file))
         self._stop_token_ids = None
 
+        config = {}
         if config_file.exists():
             with open(config_file, "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -66,38 +67,30 @@ class AutoTokenizer:
                     if eos and token_id is None:
                         raise ValueError("declared EOS token is absent from tokenizer")
                     self._stop_token_ids = [] if token_id is None else [token_id]
-                    generation_path = path / "generation_config.json"
-                    if generation_path.is_file():
-                        generation = json.loads(generation_path.read_text())
-                        ids = generation.get("eos_token_id")
-                        if ids is not None:
-                            if type(ids) is int:
-                                ids = [ids]
-                            if not isinstance(ids, list) or any(
-                                type(i) is not int
-                                or not 0 <= i < 2**32
-                                or self._tokenizer.id_to_token(i) is None
-                                for i in ids
-                            ):
-                                raise ValueError("invalid declared generation EOS ids")
-                            self._stop_token_ids = list(
-                                dict.fromkeys(self._stop_token_ids + ids)
-                            )
-
-            if "stop_token_ids" in config:
-                ids = config["stop_token_ids"]
-                if not isinstance(ids, list) or any(
-                    type(i) is not int
-                    or not 0 <= i < 2**32
-                    or self._tokenizer.id_to_token(i) is None
-                    for i in ids
-                ):
-                    raise ValueError("invalid declared stop_token_ids")
-                self._stop_token_ids = list(dict.fromkeys(ids))
-
             # Load chat template from config
             if "chat_template" in config:
                 self.set_chat_template(config["chat_template"])
+
+        generation_path = path / "generation_config.json"
+        generation = (
+            json.loads(generation_path.read_text()) if generation_path.is_file() else {}
+        )
+        ids = generation.get("eos_token_id")
+        label = "generation EOS ids"
+        if "stop_token_ids" in config:
+            ids = config["stop_token_ids"]
+            label = "stop_token_ids"
+        elif type(ids) is int:
+            ids = [ids]
+        if ids is not None:
+            if not isinstance(ids, list) or any(
+                type(i) is not int
+                or not 0 <= i < 2**32
+                or self._tokenizer.id_to_token(i) is None
+                for i in ids
+            ):
+                raise ValueError(f"invalid declared {label}")
+            self._stop_token_ids = list(dict.fromkeys(ids))
 
     @classmethod
     def from_pretrained(cls, path: Union[str, Path]) -> "AutoTokenizer":

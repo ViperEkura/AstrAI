@@ -13,9 +13,6 @@ from astrai.inference.contracts import (
     SchedulerOutput,
 )
 
-# Kept as a name for callers that inspect a pending batch's immutable identity.
-BatchSnapshot = SchedulerOutput
-
 
 @dataclass
 class PendingExecution:

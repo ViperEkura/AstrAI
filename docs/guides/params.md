@@ -108,7 +108,9 @@ with `--optimizer=muon_adamw`.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--metrics` | Repeatable metric option (for example, `--metrics loss --metrics lr --metrics val_loss`) | `loss`, `lr`, `grad_norm`, `grad_snr` |
+| `--metrics` | Repeatable metric option (for example, `--metrics loss --metrics lr --metrics val_loss`) | `loss`, `lr`, `grad_norm` |
+
+`grad_snr` is opt-in. To enable it, include `--metrics grad_snr` alongside the other desired metrics. Its persistent gradient EMA uses one model-sized tensor set per GPU, approximately 7.44 GiB for 2B FP32 gradients.
 
 ### Gradient Checkpointing
 

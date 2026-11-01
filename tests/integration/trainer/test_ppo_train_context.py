@@ -14,6 +14,7 @@ from astrai.optimization.scheduler import SchedulerFactory
 from astrai.serialization import Checkpoint
 from astrai.trainer.backend import ColocatedBackend, P2PCopyPublisher, ReplicaBackend
 from astrai.trainer.callbacks import CheckpointCallback
+from astrai.trainer.components import build_optimizer_component
 from astrai.trainer.context import TrainContext, TrainContextBuilder
 from astrai.trainer.rollout import BaseRewardModel, RolloutEvaluator
 from astrai.trainer.strategy import GRPOStrategy, PPOStrategy
@@ -21,6 +22,7 @@ from astrai.trainer.trainer import Trainer
 from tests.support.models import make_frozen, make_model, make_rollout_config
 from tests.support.rollout import FakeExecutor
 from tests.support.tokenizers import build_test_tokenizer
+from tests.support.trainer import make_resume_metadata
 
 
 class _StubRewardModel(BaseRewardModel):
@@ -115,7 +117,9 @@ def test_create_critic_restores_checkpoint_extras(device, monkeypatch):
     saved_critic = ValueModel(config).to(device)
     with torch.no_grad():
         saved_critic.value_head.weight.fill_(1.0)
-    saved_optimizer = torch.optim.SGD(saved_critic.parameters(), lr=0.1)
+    saved_optimizer = build_optimizer_component(
+        ComponentSpec(type="torch.optim:SGD", params={"lr": 0.1}), saved_critic
+    )
     checkpoint = Checkpoint(
         state_dict=model.state_dict(),
         config=config.to_dict(),
@@ -135,8 +139,8 @@ def test_create_critic_restores_checkpoint_extras(device, monkeypatch):
         saved_critic.state_dict()["value_head.weight"],
     )
     assert (
-        critic_optimizer.state_dict()["param_groups"]
-        == saved_optimizer.state_dict()["param_groups"]
+        critic_optimizer.state_dict()["optimizer"]["param_groups"]
+        == saved_optimizer.state_dict()["optimizer"]["param_groups"]
     )
 
 
@@ -164,8 +168,12 @@ def test_builder_resumes_critic_from_checkpoint(device, temp_dir, monkeypatch):
     saved_critic = ValueModel(config).to(device)
     with torch.no_grad():
         saved_critic.value_head.weight.fill_(2.0)
-    saved_optimizer = torch.optim.SGD(saved_critic.parameters(), lr=0.1)
-    policy_optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    saved_optimizer = build_optimizer_component(
+        ComponentSpec(type="torch.optim:SGD", params={"lr": 0.1}), saved_critic
+    )
+    policy_optimizer = build_optimizer_component(
+        ComponentSpec(type="torch.optim:SGD", params={"lr": 0.0}), model
+    )
     policy_scheduler = SchedulerFactory.create(
         "cosine", policy_optimizer, warmup_steps=1, lr_decay_steps=4, min_rate=0.05
     )
@@ -185,7 +193,7 @@ def test_builder_resumes_critic_from_checkpoint(device, temp_dir, monkeypatch):
                 key: value.clone() for key, value in model.state_dict().items()
             },
         },
-        meta={"policy_version": 3},
+        meta={**make_resume_metadata(_ppo_config(device), 2), "policy_version": 3},
     )
     checkpoint.save(temp_dir)
     build_test_tokenizer(vocab_size=200).save_pretrained(temp_dir)

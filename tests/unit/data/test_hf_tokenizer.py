@@ -83,3 +83,26 @@ def test_hf_missing_declared_eos_fails_instead_of_length_only_generation(tmp_pat
     _write_tokenizer(tmp_path, eos="<not-in-vocabulary>")
     with pytest.raises(ValueError, match="EOS token is absent"):
         AutoTokenizer.from_pretrained(tmp_path)
+
+
+@pytest.mark.parametrize("generation", [{"eos_token_id": 4}, {"eos_token_id": [4]}])
+def test_generation_eos_overrides_tokenizer_eos(tmp_path, generation):
+    _write_tokenizer(tmp_path, generation=generation)
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path)
+    assert tokenizer.eos_token_id == 3
+    assert tokenizer.stop_ids == [4]
+
+
+def test_generation_eos_without_named_tokenizer_fields(tmp_path):
+    _write_tokenizer(tmp_path, generation={"eos_token_id": [4]})
+    (tmp_path / "tokenizer_config.json").write_text("{}")
+    assert AutoTokenizer.from_pretrained(tmp_path).stop_ids == [4]
+
+
+def test_native_stop_ids_override_copied_generation_config(tmp_path):
+    _write_tokenizer(tmp_path, generation={"eos_token_id": [3]})
+    path = tmp_path / "tokenizer_config.json"
+    config = json.loads(path.read_text())
+    config["stop_token_ids"] = [4]
+    path.write_text(json.dumps(config))
+    assert AutoTokenizer.from_pretrained(tmp_path).stop_ids == [4]

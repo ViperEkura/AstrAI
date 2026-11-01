@@ -8,14 +8,13 @@ from typing import IO, TYPE_CHECKING, Optional
 from tqdm import tqdm
 
 from astrai.parallel import only_on_rank
-from astrai.trainer.callbacks.base import CallbackFactory, TrainCallback
-from astrai.trainer.step_plan import global_epoch_steps, legacy_epoch_steps
+from astrai.trainer.callbacks.base import TrainCallback
+from astrai.trainer.step_plan import global_epoch_steps
 
 if TYPE_CHECKING:
     from astrai.trainer.context import TrainContext
 
 
-@CallbackFactory.register("progress_bar")
 class ProgressBarCallback(TrainCallback):
     """
     Progress bar callback for trainer.
@@ -31,7 +30,7 @@ class ProgressBarCallback(TrainCallback):
 
     @only_on_rank(0)
     def on_epoch_begin(self, context: TrainContext):
-        if context.global_cursor:
+        if context.async_rollout is None:
             config = context.config
             total_steps = global_epoch_steps(
                 context.dataset_len,
@@ -41,13 +40,6 @@ class ProgressBarCallback(TrainCallback):
                 online=context.strategy.policy_version is not None,
                 rl_update_epochs=config.rl_update_epochs,
                 rl_minibatch_prompts=config.rl_minibatch_prompts,
-            )
-        elif context.async_rollout is None and context.strategy.policy_version is None:
-            total_steps = legacy_epoch_steps(
-                len(context.dataloader.sampler),
-                context.config.batch_per_device,
-                context.executor.grad_accum_steps,
-                context.config.epoch_tail_policy,
             )
         else:
             total_steps = (

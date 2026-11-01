@@ -8,14 +8,14 @@ modes, both driven declaratively through ``input.sections`` or
 from dataclasses import field
 from typing import Dict, List, Optional
 
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 from pydantic.dataclasses import dataclass
 
 from astrai.config.base import BaseConfig
 
-_PACKING_STRATEGIES = frozenset({"simple", "bfd", "bfd_split"})
+_PACKING_MODES = frozenset({"bfd", "none"})
+_OVERFLOW_MODES = frozenset({"truncate", "split"})
 _TRUNCATION_MODES = frozenset({"keep_start", "keep_end"})
-_STORAGE_FORMATS = frozenset({"bin", "jsonl"})
 _POSITION_IDS_MODES = frozenset({"none", "doc_reset", "continuous"})
 
 
@@ -43,7 +43,7 @@ class InputConfig(BaseConfig):
     sources: Optional[Dict[str, Dict]] = None
 
 
-@dataclass
+@dataclass(config=ConfigDict(extra="forbid"))
 class ProcessingConfig(BaseConfig):
     """Processing configuration for tokenization and packing.
 
@@ -53,7 +53,8 @@ class ProcessingConfig(BaseConfig):
         max_chars (int): Maximum number of characters to keep. Defaults to 2_000_000.
         max_items (Optional[int]): Maximum number of items to process, None=unlimited. Defaults to None.
         batch_size (int): Number of records tokenized together. Defaults to 256.
-        packing_strategy (str): How to pack sequences: 'simple', 'bfd', or 'bfd_split'. Defaults to "simple".
+        overflow (str): Handle long single-output samples: "truncate" or "split".
+        packing (str): Merge single-output samples with "bfd", or keep "none".
         max_packed_len (int): Maximum length of a packed bin. Defaults to 8192.
         truncation_mode (str): How to truncate over-length sequences: 'keep_start' or 'keep_end'. Defaults to "keep_start".
     """
@@ -63,15 +64,24 @@ class ProcessingConfig(BaseConfig):
     max_chars: int = 2_000_000
     max_items: Optional[int] = None
     batch_size: int = 256
-    packing_strategy: str = "simple"
+    overflow: str = "truncate"
+    packing: str = "bfd"
     max_packed_len: int = 8192
     truncation_mode: str = "keep_start"
 
-    @field_validator("packing_strategy")
-    def _validate_packing_strategy(cls, v: str) -> str:
-        if v not in _PACKING_STRATEGIES:
+    @field_validator("packing")
+    def _validate_packing(cls, v: str) -> str:
+        if v not in _PACKING_MODES:
             raise ValueError(
-                f"packing_strategy must be one of {sorted(_PACKING_STRATEGIES)}, got {v!r}"
+                f"packing must be one of {sorted(_PACKING_MODES)}, got {v!r}"
+            )
+        return v
+
+    @field_validator("overflow")
+    def _validate_overflow(cls, v: str) -> str:
+        if v not in _OVERFLOW_MODES:
+            raise ValueError(
+                f"overflow must be one of {sorted(_OVERFLOW_MODES)}, got {v!r}"
             )
         return v
 
@@ -102,10 +112,11 @@ class OutputConfig(BaseConfig):
 
     Args:
         domain_key (Optional[str]): Domain key for the output store. Defaults to None.
-        storage_format (str): Storage format: 'bin' or 'jsonl'. Defaults to "bin".
+        storage_format (str): Pipeline output format: 'bin'. Defaults to "bin".
         max_tokens_per_shard (int): Maximum tokens per shard before splitting. Defaults to 100_000_000.
         dtype (Dict[str, str]): Per-key dtype overrides, e.g. {"input_ids": "int32"}. Defaults to {}.
         position_ids_mode (str): Position ids mode: 'none', 'doc_reset', or 'continuous'. Defaults to "doc_reset".
+        record_keys (List[str]): Fields stored with per-record offsets. Defaults to an empty list.
     """
 
     domain_key: Optional[str] = None
@@ -113,13 +124,18 @@ class OutputConfig(BaseConfig):
     max_tokens_per_shard: int = 100_000_000
     dtype: Dict[str, str] = field(default_factory=dict)
     position_ids_mode: str = "doc_reset"
+    record_keys: List[str] = field(default_factory=list)
+
+    @field_validator("record_keys")
+    def _validate_record_keys(cls, value: List[str]) -> List[str]:
+        if any(not key.strip() for key in value) or len(set(value)) != len(value):
+            raise ValueError("record_keys must contain unique, non-empty field names")
+        return value
 
     @field_validator("storage_format")
     def _validate_storage_format(cls, v: str) -> str:
-        if v not in _STORAGE_FORMATS:
-            raise ValueError(
-                f"storage_format must be one of {sorted(_STORAGE_FORMATS)}, got {v!r}"
-            )
+        if v != "bin":
+            raise ValueError("Pipeline output storage_format only supports 'bin'")
         return v
 
     @field_validator("position_ids_mode")

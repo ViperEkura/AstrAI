@@ -63,8 +63,12 @@ metadata. It does not contain a storage-format or total-token field:
 }
 ```
 
-Record-aware binary data may also include `"offsets": [0, ...]` inside a key's
-metadata, but the preprocessing `BinWriter` currently does not write offsets.
+Record-aware binary data includes `"offsets": [0, ...]` inside each record key's
+metadata. `Pipeline` forwards `output.record_keys` to `BinWriter`, which writes
+offsets only for explicitly selected fields. DPO configs list all four standard
+fields, preserving each pair independently within each shard. The default empty
+list preserves the original stream-only writer behavior, including custom
+outputs whose field names happen to resemble DPO fields.
 
 ### Format Detection
 
@@ -104,7 +108,21 @@ Only DPO gets an automatic lazy route from `DatasetFactory`: raw JSONL plus
 `tokenizer_path` installs `dpo_processor` and tokenizes each record in
 `fetch_record`. GRPO does not currently have an automatic lazy processor.
 
-Eager-loaded stores normalize tensors into `Store._data[Dict[str, List[Tensor]]]` + `Store._cum[Dict[str, List[int]]]` (cumulative lengths for stream indexing) + `Store._offsets[Dict[str, List[int]]]` (per-record offsets for record indexing). Nested JSONL keys such as GRPO `responses`/`masks` are kept as record values and excluded from stream bookkeeping. Lazy DPO instead retains raw records and processes them in `fetch_record`.
+Eager-loaded stores normalize tensors into `Store._data[Dict[str, List[Tensor]]]`
+and `Store._cum[Dict[str, List[int]]]` (cumulative lengths for stream indexing).
+Binary record indexing uses `Store._offsets[Dict[str, List[List[int]]]]`, with
+one offset array per shard and key, plus `_record_cum` (cumulative shard record
+counts). A binary search maps each global record index to a shard before slicing
+its mmap tensor. `MmapStore` retains shard discovery order rather than sorting
+paths. It builds and validates the binary record index lazily when records or
+their count are requested; `DPODataset` requests validation during construction.
+Token-stream access does not require a valid record index. Record fields must
+have offsets and equal record counts in every shard. In record mode, `store[i]`
+requests all fields and fails explicitly if any lack offsets, while
+`fetch_record(i, key)` can select an indexed field from a mixed store.
+Nested JSONL keys such as GRPO `responses`/`masks` remain record
+values and are excluded from stream bookkeeping. Lazy DPO instead retains raw
+records and processes them in `fetch_record`.
 
 ## Data Keys by Training Type
 
@@ -115,11 +133,11 @@ Eager-loaded stores normalize tensors into `Store._data[Dict[str, List[Tensor]]]
 | `dpo` | `chosen`, `rejected`, `chosen_mask`, `rejected_mask` | record (`fetch_record`) |
 | `grpo` | `prompts`, `responses`, `masks`, `rewards` | record (`fetch_record`) |
 
-Offline `.bin` output from DPO/GRPO preprocessing is not currently loadable for
-training. DPO shards are written without record offsets, while GRPO response
-groups are flattened without preserving record/group boundaries. Supported raw
-routes are eager JSONL for SEQ/SFT and automatic lazy JSONL for DPO. GRPO
-requires a caller-built, already-loaded record store.
+Offline DPO `.bin` output supports single and multiple shards with per-record
+offsets. Legacy DPO binary output without offsets requires reprocessing. GRPO
+binary response groups are still flattened without preserving record/group
+boundaries. Supported raw routes are eager JSONL for SEQ/SFT and automatic lazy
+JSONL for DPO. GRPO requires a caller-built, already-loaded record store.
 
 ## Dataset Architecture
 

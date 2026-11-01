@@ -8,15 +8,21 @@ import torch
 
 from astrai.config import TrainConfig
 from astrai.dataset import GlobalBatchSampler
+from astrai.parallel.executor.gradients import parameter_gradient
 from astrai.parallel.setup import agree_stop, get_rank, spawn_parallel_fn
 from astrai.trainer.callbacks import (
-    CallbackFactory,
+    CheckpointCallback,
+    GradientCheckpointingCallback,
+    GradientClippingCallback,
+    MetricCallback,
+    ProgressBarCallback,
     TrainCallback,
 )
 from astrai.trainer.components import stop_loader_workers
 from astrai.trainer.context import TrainContext, TrainContextBuilder
 from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.session import TrainSession
+from astrai.trainer.step_plan import learner_update_slices
 
 logger = logging.getLogger(__name__)
 
@@ -43,41 +49,23 @@ class Trainer:
 
     def _get_default_callbacks(self) -> List[TrainCallback]:
         cfg = self.train_config
-        metric_callback = CallbackFactory.create_checked(
-            "metric",
-            metrics=cfg.metrics,
-            val_step=cfg.val_step,
-            grad_snr_interval=cfg.grad_snr_interval,
-        )
-        callbacks = [
-            CallbackFactory.create_checked(
-                "gradient_checkpointing",
-                modules=cfg.gradient_checkpointing_modules,
+        return [
+            GradientCheckpointingCallback(modules=cfg.gradient_checkpointing_modules),
+            MetricCallback(
+                metrics=cfg.metrics,
+                val_step=cfg.val_step,
+                grad_snr_interval=cfg.grad_snr_interval,
             ),
-            metric_callback,
-            CallbackFactory.create_checked(
-                "checkpoint",
-                cfg.ckpt_dir,
-                cfg.ckpt_interval,
-                metric_callback=metric_callback,
-            ),
-            CallbackFactory.create_checked("progress_bar", cfg.n_epoch),
-            CallbackFactory.create_checked("gradient_clipping", cfg.max_grad_norm),
+            CheckpointCallback(cfg.ckpt_dir, cfg.ckpt_interval),
+            ProgressBarCallback(cfg.n_epoch),
+            GradientClippingCallback(cfg.max_grad_norm),
         ]
-        return callbacks
 
     def _call_callbacks(self, method_name: str, context: TrainContext):
         for callback in self.callbacks:
             method = getattr(callback, method_name, None)
             if method:
                 method(context)
-
-    def _commit_update(self, context: TrainContext, batch, new_data: bool = True):
-        if context.async_rollout is not None:
-            self._commit_online_update(context, batch, new_data)
-        else:
-            self._commit_offline_update(context, new_data)
-        self._after_commit(context, agree_stop=context.async_rollout is None)
 
     def _after_commit(self, context: TrainContext, *, agree_stop: bool) -> None:
         self._call_callbacks("after_optimizer_step", context)
@@ -91,6 +79,7 @@ class Trainer:
         validate record the step they belong to; advancing it after would
         label every logged step with the previous one.
         """
+        context.metric_history.discard_pending()
         committed_samples = context.pending_samples if new_data else 0
         context.optimizer_steps_completed += 1
         if new_data:
@@ -103,19 +92,22 @@ class Trainer:
                 context.scheduler.step()
             context.pending_samples = 0
         except BaseException:
+            context.metric_history.discard_pending()
             context.optimizer_steps_completed -= 1
             if new_data:
                 context.consumed_samples -= committed_samples
             raise
+        context.metric_history.commit(context.optimizer_step, context.consumed_samples)
 
     def _commit_online_update(
         self, context: TrainContext, batch, new_data: bool
     ) -> None:
         """Publish one policy version; the cursor follows the version, not the call."""
-        self._call_callbacks("before_optimizer_step", context)
+        context.metric_history.discard_pending()
         coordinator = context.async_rollout
         version_before = coordinator.policy_version
         try:
+            self._call_callbacks("before_optimizer_step", context)
             context.strategy.optimizer_step(context.optimizer)
         finally:
             # A version advance marks a committed step, even if later
@@ -126,42 +118,29 @@ class Trainer:
                     context.scheduler.step()
                 context.optimizer_steps_completed += 1
                 if new_data:
-                    context.consumed_samples += batch.prompts.shape[0] * context.dp_size
+                    count = batch.prompts.shape[0] * context.dp_size
+                    context.consumed_samples += count
+                    context.epoch_sample_offset += count
+                context.metric_history.commit(
+                    context.optimizer_step, context.consumed_samples
+                )
+                context.checkpoint_safe = True
+            else:
+                context.metric_history.discard_pending()
 
-    def _train_batch(
-        self,
-        context: TrainContext,
-        batch,
-        force_sync: bool = False,
-        batch_samples: Optional[int] = None,
-    ) -> None:
+    def _train_batch(self, context: TrainContext, batch) -> None:
+        context.checkpoint_safe = False
         executor = context.executor
-        accumulation = (
-            executor.accumulate(context.model, force_sync=True)
-            if force_sync
-            else executor.accumulate(context.model)
-        )
-        with accumulation:
-            if context.async_rollout is None:
-                if batch_samples is None:
-                    batch_samples = context.config.batch_per_device * context.dp_size
-                context.pending_samples += batch_samples
+        with executor.accumulate_explicit(context.model, sync=True):
             self._call_callbacks("on_batch_begin", context)
-            microbatch_prompts = (
-                context.config.async_train_microbatch_prompts
-                if context.async_rollout is not None
-                else None
-            )
-            # A batch can produce several updates (replayed rollout rounds) or
-            # none (mid-window). Steps follow every commit; the data cursor
-            # moves once per batch, because a replayed batch is one position.
-            committed = False
-            for update in context.strategy.training_updates(batch, microbatch_prompts):
+            for update in context.strategy.training_updates(
+                batch, context.config.async_train_microbatch_prompts
+            ):
                 update_loss = None
                 update_metrics = {}
                 for output in update:
                     loss = output["loss"]
-                    executor.backward(loss / executor.grad_accum_steps)
+                    executor.backward(loss)
                     detached = loss.detach()
                     update_loss = (
                         detached if update_loss is None else update_loss + detached
@@ -174,17 +153,8 @@ class Trainer:
                     raise RuntimeError("training update has no valid loss")
                 context.loss = float(update_loss.item())
                 context.metrics = update_metrics
-                if executor.sync_gradients:
-                    if (
-                        context.async_rollout is None
-                        and executor.window_steps < executor.grad_accum_steps
-                    ):
-                        executor.scale_gradients(
-                            context.model,
-                            executor.grad_accum_steps / executor.window_steps,
-                        )
-                    self._commit_update(context, batch, new_data=not committed)
-                    committed = True
+                self._commit_online_update(context, batch, new_data=True)
+                self._after_commit(context, agree_stop=False)
             self._call_callbacks("on_batch_end", context)
 
     def _should_stop(self, context: TrainContext) -> bool:
@@ -285,9 +255,10 @@ class Trainer:
         critic = getattr(context.strategy, "critic", None)
         if critic is not None:
             for parameter in critic.parameters():
-                if parameter.grad is not None:
-                    context.topology.reduce_sum(parameter.grad)
-                    parameter.grad.mul_(1.0 / denominator)
+                gradient = parameter_gradient(parameter)
+                if gradient is not None:
+                    context.topology.reduce_sum(gradient)
+                    gradient.mul_(1.0 / denominator)
         context.loss = float(totals[1].item()) / denominator
         context.metrics = {
             name: float(totals[index + 2].item()) / denominator
@@ -328,64 +299,53 @@ class Trainer:
             if online:
                 prepared = []
                 for batch, _real_count in batches:
-                    result, is_fresh = context.strategy._rollout_runner(batch)
-                    if is_fresh:
-                        context.strategy._on_rollout_refresh()
                     prepared.append(
                         {
                             key: value.detach().cpu()
                             if isinstance(value, torch.Tensor)
                             else value
-                            for key, value in context.strategy.prepare_from_rollout(
-                                result
+                            for key, value in context.strategy.prepare_rollout_batch(
+                                batch
                             ).items()
                         }
                     )
-                group_size = context.config.rl_minibatch_prompts or window_samples
-                groups = (window_samples + group_size - 1) // group_size
-                total_updates = context.config.rl_update_epochs * groups
             else:
                 prepared = []
-                group_size = window_samples
-                groups = 1
-                total_updates = 1
 
-            update_index = 0
-            for _pass in range(context.config.rl_update_epochs if online else 1):
-                for group in range(groups):
-                    chunks = []
-                    for slot, (batch, real_count) in enumerate(batches):
-                        if online:
-                            local_first = (
-                                slot * context.dp_size * context.config.batch_per_device
-                                + context.topology.dp_rank
-                                * context.config.batch_per_device
-                            )
-                            indices = [
-                                index
-                                for index in range(real_count)
-                                if group * group_size
-                                <= local_first + index
-                                < min((group + 1) * group_size, window_samples)
-                            ]
-                            source = prepared[slot]
-                            total = next(
-                                value.shape[0]
-                                for value in source.values()
-                                if isinstance(value, torch.Tensor)
-                            )
-                            chunk = slice_batch(source, indices or [0], total)
-                            chunks.append((chunk, len(indices)))
-                        else:
-                            chunks.append((batch, real_count))
-                    update_index += 1
-                    self._run_global_update(
-                        context,
-                        chunks,
-                        window_samples,
-                        window_start + window_samples,
-                        final_update=update_index == total_updates,
-                    )
+            for selection, final_update in learner_update_slices(
+                window_samples,
+                context.config.rl_update_epochs if online else 1,
+                context.config.rl_minibatch_prompts if online else None,
+            ):
+                chunks = []
+                for slot, (batch, real_count) in enumerate(batches):
+                    if online:
+                        local_first = (
+                            slot * context.dp_size * context.config.batch_per_device
+                            + context.topology.dp_rank * context.config.batch_per_device
+                        )
+                        indices = [
+                            index
+                            for index in range(real_count)
+                            if selection.start <= local_first + index < selection.stop
+                        ]
+                        source = prepared[slot]
+                        total = next(
+                            value.shape[0]
+                            for value in source.values()
+                            if isinstance(value, torch.Tensor)
+                        )
+                        chunk = slice_batch(source, indices or [0], total)
+                        chunks.append((chunk, len(indices)))
+                    else:
+                        chunks.append((batch, real_count))
+                self._run_global_update(
+                    context,
+                    chunks,
+                    window_samples,
+                    window_start + window_samples,
+                    final_update=final_update,
+                )
 
         if not context.stop_agreed:
             stop_loader_workers(iterator)
@@ -400,89 +360,33 @@ class Trainer:
             context.epoch = epoch + 1
 
     def _train_epoch(self, context: TrainContext, epoch: int) -> None:
-        if context.global_cursor and context.async_rollout is None:
+        if context.async_rollout is None:
             self._train_global_epoch(context, epoch)
             return
         context.epoch = epoch
+        context.dataloader.sampler.set_epoch(epoch)
+        context.dataloader.sampler.iter = context.epoch_sample_offset // context.dp_size
         self._call_callbacks("on_epoch_begin", context)
-        batches = context.dataloader
-        if context.async_rollout is not None:
-            batches = context.async_rollout.iter_rounds(
-                batches, lambda: context.stop_requested
-            )
-        # A stop waits for the next commit. The epoch tail follows the
-        # configured policy only when the epoch ends naturally.
-        if not context.stop_agreed:
-            self._agree_stop(context)
-        if context.async_rollout is None:
-            # Capture this before creating the iterator: worker prefetch can
-            # advance the sampler well beyond the batches the loop consumed.
-            remaining_samples = len(context.dataloader.sampler)
-            total_batches = len(context.dataloader)
-            if context.config.epoch_tail_policy == "drop":
-                full_batches = remaining_samples // context.config.batch_per_device
-                trainable_batches = (
-                    full_batches // context.executor.grad_accum_steps
-                ) * context.executor.grad_accum_steps
-            else:
-                trainable_batches = total_batches
+        loader_iterator = iter(context.dataloader)
+        batches = context.async_rollout.iter_rounds(
+            loader_iterator, lambda: context.stop_requested
+        )
         iterator = iter(batches)
         context.train_iterator = iterator
-        # The session runs this before any checkpoint is written: a worker
-        # killed by the stop signal would otherwise raise mid-save.
-        context.on_shutdown("train_loader", partial(stop_loader_workers, iterator))
-        batch_index = 0
-        while not self._should_stop(context) and (
-            context.async_rollout is not None or batch_index < trainable_batches
-        ):
+        context.on_shutdown(
+            "train_loader", partial(stop_loader_workers, loader_iterator)
+        )
+        exhausted = False
+        while not self._should_stop(context):
             try:
                 batch = next(iterator)
             except StopIteration:
+                exhausted = True
                 break
-            if context.async_rollout is None:
-                batch_samples = (
-                    min(
-                        context.config.batch_per_device,
-                        remaining_samples
-                        - batch_index * context.config.batch_per_device,
-                    )
-                    * context.dp_size
-                )
-                self._train_batch(
-                    context,
-                    batch,
-                    force_sync=(
-                        context.config.epoch_tail_policy == "flush"
-                        and batch_index + 1 == trainable_batches
-                    ),
-                    batch_samples=batch_samples,
-                )
-            else:
-                self._train_batch(context, batch)
-            batch_index += 1
-        dropped_samples = 0
-        if (
-            context.async_rollout is None
-            and batch_index == trainable_batches
-            and (batch_index > 0 or not context.stop_agreed)
-        ):
-            # Close prefetched workers before advancing the sampler. Under
-            # "drop", no remaining tail batch is passed through the model.
-            stop_loader_workers(iterator)
-            context.dataloader.sampler.set_epoch(epoch + 1)
-            dropped_samples = (
-                max(
-                    0,
-                    remaining_samples
-                    - trainable_batches * context.config.batch_per_device,
-                )
-                * context.dp_size
-            )
-            context.consumed_samples += dropped_samples
+            self._train_batch(context, batch)
         self._call_callbacks("on_epoch_end", context)
-        if dropped_samples:
-            # Keep the same optimizer step, but publish a distinct checkpoint
-            # for the advanced data cursor if shutdown happens at this boundary.
+        if exhausted:
+            context.epoch_sample_offset = 0
             context.epoch = epoch + 1
 
     def _trainer_loop(self, param_path: Optional[str] = None, resume: bool = False):

@@ -2,7 +2,7 @@
  * Attention dispatch: select a kernel type, build a launch plan, then execute.
  * The typed visitor binds planning and launch to the same specialization.
  * Pure CUDA, no torch: native harnesses use the production dispatch path.
- * Kernel bodies live in kernel/attention/split_{q,kv}.cuh.
+ * Kernel bodies live in kernel/attention/mainloop.cuh.
  */
 
 #pragma once
@@ -15,8 +15,8 @@
 #include <type_traits>
 
 #include <api/native/attention.h>
-#include <kernel/attention/split_kv.cuh>
-#include <kernel/attention/split_q.cuh>
+#include <kernel/attention/epilogue.cuh>
+#include <kernel/attention/mainloop.cuh>
 #include <memory/layout_policies.cuh>
 #include <utils/launch.cuh>
 
@@ -144,7 +144,8 @@ struct PrefillKernel {
     }
 
     static void launch(const AttentionParams& p, dim3 grid, cudaStream_t stream) {
-        attn_prefill_split_q_mma_kernel<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape>
+        using Mainloop = PrefillMainloop<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape>;
+        attention_kernel<Mainloop, OutputEpilogue<Traits, QSchedule, true>>
             <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
@@ -164,7 +165,8 @@ struct DecodeKernel {
                 HEAD_DIM,
                 (kv_len + Traits::BC - 1) / Traits::BC,
                 decode_wave_capacity<
-                    attn_decode_split_kv_mma_kernel<Traits, KV, HasMask, false, SkipEmptySplits>,
+                    attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits>,
+                                     SplitEpilogue<Traits>>,
                     Traits::NUM_THREADS>()};
     }
 
@@ -174,16 +176,16 @@ struct DecodeKernel {
         p.num_splits = static_cast<int>(plan.grid.z);
         if constexpr (HEAD_DIM <= 128) {
             if (plan.direct_output) {
-                attn_decode_split_kv_mma_kernel<Traits, KV, HasMask, true>
+                attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits, KV>>
                     <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
                 ASTRAI_LAUNCH_CHECK();
                 return;
             }
         }
-        attn_decode_split_kv_mma_kernel<Traits, KV, HasMask, false, SkipEmptySplits>
-            <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
+        attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits>,
+                         SplitEpilogue<Traits>><<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
-        attn_decode_combine_kernel<KV, Traits::BC, SkipEmptySplits>
+        split_kv_combine<KV, Traits::BC, SkipEmptySplits>
             <<<p.batch * p.q_head, HEAD_DIM, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
@@ -260,28 +262,15 @@ inline auto with_decode_kernel(const AttentionParams& p, Fn&& fn) {
     });
 }
 
-template <typename QSchedule, typename KV> struct PrefillDispatch {
-    static void run(AttentionParams& p, cudaStream_t stream) {
-        with_prefill_kernel<QSchedule, KV>(p, [&](auto kernel) {
-            const auto plan = kernel.plan(p);
-            kernel.launch(p, plan, stream);
-        });
-    }
-};
+template <typename QSchedule, typename KV>
+inline void launch_prefill(AttentionParams& p, cudaStream_t stream) {
+    with_prefill_kernel<QSchedule, KV>(
+        p, [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); });
+}
 
-template <typename KV> struct DecodeDispatch {
-    static void run(AttentionParams& p, cudaStream_t stream) {
-        with_decode_kernel<KV>(p, [&](auto kernel) {
-            const auto plan = kernel.plan(p);
-            kernel.launch(p, plan, stream);
-        });
-    }
-};
-
-template <typename T> using AttnDispatchPrefill = PrefillDispatch<DenseQSchedule, ContigKV<T>>;
-template <typename T> using AttnDispatchPagedPrefill = PrefillDispatch<PackedQSchedule, PagedKV<T>>;
-template <typename T> using AttnDispatchDecode = DecodeDispatch<ContigKV<T>>;
-template <typename T> using AttnDispatchPagedDecode = DecodeDispatch<PagedKV<T>>;
+template <typename KV> inline void launch_decode(AttentionParams& p, cudaStream_t stream) {
+    with_decode_kernel<KV>(p, [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); });
+}
 
 } // namespace attention
 } // namespace astrai

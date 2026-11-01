@@ -4,11 +4,15 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
+import astrai.trainer.context.builder as builder_module
+import astrai.trainer.session as session_module
 from astrai.config import ComponentSpec, TrainConfig
 from astrai.factory import BaseFactory
 from astrai.trainer import components as dataset_component
 from astrai.trainer.components import build_scheduler_component
 from astrai.trainer.context import TrainContext, TrainContextBuilder
+from astrai.trainer.context.metric import MetricHistory
+from astrai.trainer.rollout import worker as worker_module
 from astrai.trainer.session import TrainSession
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 from astrai.trainer.trainer import Trainer
@@ -100,7 +104,7 @@ def test_component_specs_resolve_without_trainer_branches():
     assert TrainContext(config=config).dataset is None
 
 
-def test_legacy_scheduler_counts_padded_rank_windows():
+def test_scheduler_counts_only_unpadded_global_windows():
     config = _config(
         dp_size=2,
         batch_per_device=2,
@@ -112,11 +116,8 @@ def test_legacy_scheduler_counts_padded_rank_windows():
         type="torch.optim.lr_scheduler:StepLR",
         params={"step_size": "$total_steps", "gamma": 0.5},
     )
-    # The old sampler pads 7 samples to 4 per rank: one complete update.
-    legacy = build_scheduler_component(spec, optimizer, 7, config, global_cursor=False)
-    global_cursor = build_scheduler_component(spec, optimizer, 7, config)
-    assert legacy.step_size == 1
-    assert global_cursor.step_size == 0
+    scheduler = build_scheduler_component(spec, optimizer, 7, config)
+    assert scheduler.step_size == 0
 
 
 def test_builder_creates_and_splits_context_dataset():
@@ -163,8 +164,6 @@ def test_builder_resolves_custom_dataset():
 
 
 def test_scheduler_uses_dataset_owned_by_context(monkeypatch):
-    import astrai.trainer.context.builder as builder_module
-
     seen = []
     config = _config()
     context = TrainContext(dataset=NoCopyDataset(), config=config)
@@ -173,9 +172,7 @@ def test_scheduler_uses_dataset_owned_by_context(monkeypatch):
     monkeypatch.setattr(
         builder,
         "_instantiate_scheduler",
-        lambda optimizer, length, *, global_cursor: seen.append(
-            (length, global_cursor)
-        ),
+        lambda optimizer, length: seen.append(length),
     )
 
     class Executor:
@@ -183,7 +180,7 @@ def test_scheduler_uses_dataset_owned_by_context(monkeypatch):
             return None, None, scheduler_fn(object())
 
     builder._prepare_model(context, Executor(), SimpleNamespace(state_dict=None))
-    assert seen == [(context.dataset_len, context.global_cursor)]
+    assert seen == [context.dataset_len]
 
 
 def test_global_window_uses_offline_strategy_update_hook():
@@ -238,17 +235,17 @@ def test_registered_custom_strategy_and_unknown_options():
     config = _config(strategy="custom_refactor_test")
     assert config.strategy == "custom_refactor_test"
     model = torch.nn.Linear(1, 1)
-    strategy = StrategyFactory.create_checked(
+    strategy = StrategyFactory.create(
         "custom_refactor_test", model=model, device="cpu", custom_scale=2.0
     )
     assert strategy.custom_scale == 2.0
     with pytest.raises(TypeError, match="unknown arguments"):
-        StrategyFactory.create_checked(
+        StrategyFactory.create(
             "custom_refactor_test", model=model, device="cpu", custm_scale=2.0
         )
 
 
-def test_legacy_factory_warns_for_dropped_kwargs_and_checked_path_raises():
+def test_factory_preserves_arguments_and_rejects_unknown_options():
     class Component:
         def __init__(self, value):
             self.value = value
@@ -257,15 +254,18 @@ def test_legacy_factory_warns_for_dropped_kwargs_and_checked_path_raises():
         pass
 
     Factory.register("component")(Component)
-    with pytest.warns(DeprecationWarning, match="ignored arguments"):
-        assert Factory.create("component", value=1, typo=2).value == 1
+    assert Factory.create("component", value=1).value == 1
     with pytest.raises(TypeError):
-        Factory.create_checked("component", value=1, typo=2)
+        Factory.create("component", value=1, typo=2)
+    config = {"value": 1, "other_component_option": 2}
+    assert Factory.create_from_config("component", config).value == 1
+    assert Factory.create_from_config("component", config, value=3).value == 3
+    with pytest.raises(TypeError):
+        Factory.create_from_config("component", config, typo=2)
+    assert config == {"value": 1, "other_component_option": 2}
 
 
 def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):
-    import astrai.trainer.session as session_module
-
     events = []
     monkeypatch.setattr(
         session_module, "register_signal_handlers", lambda _: events.append("register")
@@ -281,12 +281,17 @@ def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):
         executor=SimpleNamespace(use_distributed=False),
         stop_requested=False,
         run_shutdown=lambda: events.append("shutdown_hooks"),
+        metric_history=MetricHistory(),
     )
 
     def callback(name, _):
         events.append(name)
         if name == "on_train_begin":
+            context.metric_history.stage({"type": "step"})
             raise RuntimeError("startup failed")
+        if name == "on_shutdown":
+            context.metric_history.commit(1, 2)
+            assert not context.metric_history.snapshot().records
 
     with pytest.raises(RuntimeError, match="startup failed"):
         with TrainSession(lambda: context, callback):
@@ -303,8 +308,6 @@ def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):
 
 
 def test_builder_closes_rollout_after_configuration_failure(monkeypatch):
-    import astrai.trainer.context.builder as builder_module
-
     closed = []
     rollout = SimpleNamespace(close=lambda: closed.append(True))
     context = SimpleNamespace(async_rollout=None, dataset=[], val_dataset=None)
@@ -337,7 +340,6 @@ def test_builder_closes_rollout_after_configuration_failure(monkeypatch):
 
 def test_rollout_worker_follows_its_parent_first(monkeypatch):
     """A replica sets its parent-death signal before touching any state."""
-    from astrai.trainer.rollout import worker as worker_module
 
     class ParentDied(RuntimeError):
         pass

@@ -99,7 +99,7 @@ def adapt_config(
 def convert_hf_weights(
     state_dict: Mapping[str, Any],
     config: BaseConfig,
-    mapping: Mapping[str, Any] | None = None,
+    mapping: Optional[Mapping[str, Any]] = None,
     *,
     strict: bool = False,
 ) -> Dict[str, torch.Tensor]:

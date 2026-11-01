@@ -8,20 +8,23 @@ from typing import Any, Callable, Dict, Optional
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
+from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from astrai.config.model_config import ConfigFactory
-from astrai.config.train_config import ComponentSpec, TrainConfig
+from astrai.config.train_config import ComponentSpec, PrecisionConfig, TrainConfig
 from astrai.dataset import (
     DatasetFactory,
     GlobalBatchSampler,
     RDSampler,
     dpo_collate_fn,
     grpo_collate_fn,
+    sft_collate_fn,
 )
 from astrai.model.automodel import ModelFactory
 from astrai.optimization.optimizer import OptimizerFactory
-from astrai.optimization.protocols import OptimizerProtocol
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.optimization.scheduler import SchedulerFactory
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -30,7 +33,7 @@ from astrai.parallel.executor import (
 )
 from astrai.parallel.setup import follow_parent
 from astrai.parallel.topology import ParallelTopology
-from astrai.trainer.step_plan import ceil_div, global_epoch_steps, legacy_epoch_steps
+from astrai.trainer.step_plan import ceil_div, global_epoch_steps
 from astrai.trainer.strategy import StrategyFactory
 
 logger = logging.getLogger(__name__)
@@ -47,7 +50,7 @@ def resolve_component(path: str) -> Any:
 
 
 def build_model_component(
-    spec: ComponentSpec, model_dtype: Optional[str], model_config: Dict
+    spec: ComponentSpec, compute_dtype: Optional[str], model_config: Dict
 ) -> nn.Module:
     """Build one model from serializable settings inside the current rank."""
     params = dict(spec.params)
@@ -55,7 +58,7 @@ def build_model_component(
     if ModelFactory.is_registered(spec.type):
         if not model_config:
             raise ValueError("Registered model requires model config")
-        model = ModelFactory.create_checked(
+        model = ModelFactory.create(
             spec.type, ConfigFactory.load(model_config), **params
         )
     else:
@@ -69,25 +72,56 @@ def build_model_component(
         model = target(**params)
     if not isinstance(model, nn.Module):
         raise TypeError(f"Model target {spec.type!r} must return nn.Module")
-    if model_dtype is not None:
-        model = model.to(dtype=getattr(torch, model_dtype))
+    if compute_dtype is not None:
+        model = model.to(dtype=getattr(torch, compute_dtype))
     return model
 
 
-def build_optimizer_component(spec: ComponentSpec, model: nn.Module):
+def build_optimizer_component(
+    spec: ComponentSpec,
+    model: nn.Module,
+    precision: Optional[PrecisionConfig] = None,
+    *,
+    process_group=None,
+):
+    params = dict(spec.params)
+    cpu_offload = params.pop("cpu_offload", False)
+    shard_state = params.pop("shard_state", False)
     if OptimizerFactory.is_registered(spec.type):
-        return OptimizerFactory.create_checked(spec.type, model, **spec.params)
-    target = resolve_component(spec.type)
-    parameters = list(inspect.signature(target).parameters.values())
-    first_arg = (
-        model.parameters()
-        if parameters and parameters[0].name in ("params", "parameters")
-        else model
-    )
-    return target(first_arg, **spec.params)
+        optimizer = OptimizerFactory.create(spec.type, model, **params)
+    else:
+        target = resolve_component(spec.type)
+        parameters = list(inspect.signature(target).parameters.values())
+        first_arg = (
+            model.parameters()
+            if parameters and parameters[0].name in ("params", "parameters")
+            else model
+        )
+        optimizer = target(first_arg, **params)
+    policy = precision or PrecisionConfig()
+    master_dtype = getattr(torch, policy.master_dtype)
+    state_dtype = getattr(torch, policy.optimizer_state_dtype)
+    parameters = [p for group in optimizer.param_groups for p in group["params"]]
+    if (
+        not any(isinstance(p, DTensor) for p in parameters)
+        or cpu_offload
+        or shard_state
+        or master_dtype != torch.float32
+        or state_dtype != torch.float32
+        or any(p.dtype != master_dtype or hasattr(p, "main_grad") for p in parameters)
+    ):
+        optimizer = PrecisionOptimizer(
+            optimizer,
+            cpu_offload=cpu_offload,
+            master_dtype=master_dtype,
+            state_dtype=state_dtype,
+            shard_state=shard_state,
+            process_group=process_group,
+        )
+    return optimizer
 
 
-def load_optimizer_state_dict(optimizer: OptimizerProtocol, state_dict: Dict) -> None:
+def load_optimizer_state_dict(optimizer: Optimizer, state_dict: Dict) -> None:
     """Load optimizer state_dict while retaining configured parameter-group options."""
     options = [
         deepcopy({key: value for key, value in group.items() if key != "params"})
@@ -111,8 +145,6 @@ def build_scheduler_component(
     optimizer,
     dataset_len: int,
     cfg: TrainConfig,
-    *,
-    global_cursor: bool = True,
 ):
     params = dict(spec.params)
     warmup_ratio = params.pop("warmup_ratio", 0.0)
@@ -122,13 +154,6 @@ def build_scheduler_component(
         samples_per_replica = ceil_div(dataset_len, cfg.dp_size)
         batches_per_replica = ceil_div(samples_per_replica, cfg.batch_per_device)
         steps_per_epoch = ceil_div(batches_per_replica, cfg.grad_accum_steps)
-    elif not global_cursor and not online:
-        steps_per_epoch = legacy_epoch_steps(
-            ceil_div(dataset_len, cfg.dp_size),
-            cfg.batch_per_device,
-            cfg.grad_accum_steps,
-            cfg.epoch_tail_policy,
-        )
     else:
         global_batch = cfg.dp_size * cfg.batch_per_device * cfg.grad_accum_steps
         steps_per_epoch = global_epoch_steps(
@@ -170,7 +195,7 @@ def build_scheduler_component(
             stable_steps = max(1, int(remaining * 0.8))
             params.setdefault("stable_steps", stable_steps)
             params.setdefault("decay_steps", max(1, remaining - stable_steps))
-        return SchedulerFactory.create_checked(spec.type, optimizer, **params)
+        return SchedulerFactory.create(spec.type, optimizer, **params)
     return resolve_component(spec.type)(optimizer, **params)
 
 
@@ -259,6 +284,8 @@ def resolve_collate(spec: ComponentSpec):
         return resolve_component(collate)
     if spec.type == "packed":
         train_type = spec.params.get("train_type")
+        if train_type == "sft":
+            return sft_collate_fn
         if train_type == "dpo":
             return dpo_collate_fn
         if train_type == "grpo":
@@ -292,7 +319,7 @@ def build_dataloader(
     epoch: int,
     start_iter: int,
     shuffle: bool = True,
-    global_cursor: bool = False,
+    training: bool = False,
 ) -> DataLoader:
     kwargs = dict(
         dataset=dataset,
@@ -300,7 +327,7 @@ def build_dataloader(
         pin_memory=config.pin_memory,
         collate_fn=resolve_collate(spec),
     )
-    if global_cursor:
+    if training and config.rollout_mode != "async_round":
         kwargs["batch_sampler"] = GlobalBatchSampler(
             dataset,
             dp_size=topology.dp_size,

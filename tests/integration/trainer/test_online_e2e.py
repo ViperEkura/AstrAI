@@ -128,7 +128,7 @@ def test_online_rollout_end_to_end(
         model=ComponentSpec(
             type="autoregressive_lm", params={"config": model_config.to_dict()}
         ),
-        model_dtype="float32",
+        precision={"compute_dtype": "float32"},
         dataset=ComponentSpec(
             type="tests.integration.trainer.test_online_e2e:InstructionDataset",
             params={

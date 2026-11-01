@@ -2,16 +2,18 @@
 
 import logging
 from functools import partial
+from pathlib import Path
 from typing import Dict, Optional, Self, Tuple
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.optim import Optimizer
 
 from astrai.config.train_config import TrainConfig, _TrainRuntimeDependencies
 from astrai.inference.core.engine_core import EngineCore
+from astrai.model.automodel import validate_model_state_dict
 from astrai.model.components.lora import LoRALinear, inject_lora
-from astrai.optimization.protocols import OptimizerProtocol
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -19,10 +21,10 @@ from astrai.parallel.executor import (
     broadcast_state_dict,
     strip_compile_prefix,
 )
+from astrai.parallel.executor.gradients import MainGradientAccumulator
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.parallel.topology import ParallelTopology, build_topology
 from astrai.parallel.tp import TPState
-from astrai.serialization.pretrained import load_pretrained_state_dict
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.components import (
     build_dataloader,
@@ -33,6 +35,7 @@ from astrai.trainer.components import (
     create_ref_model,
     stop_loader_workers,
 )
+from astrai.trainer.context.metric import MetricHistory
 from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.context.state import TrainContext
 from astrai.trainer.optional_extras import (
@@ -60,21 +63,26 @@ class TrainContextBuilder:
 
     def _instantiate_model(self, model_config: Dict) -> nn.Module:
         return build_model_component(
-            self.config.model, self.config.model_dtype, model_config
+            self.config.model, self.config.precision.compute_dtype, model_config
         )
 
     def _instantiate_optimizer(self, model: nn.Module):
-        return build_optimizer_component(self.config.optimizer, model)
+        return build_optimizer_component(
+            self.config.optimizer,
+            model,
+            self.config.precision,
+            process_group=self.config.executor_kwargs.get(
+                "process_group",
+                self._topology.dp_group if self._topology is not None else None,
+            ),
+        )
 
-    def _instantiate_scheduler(
-        self, optimizer, dataset_len: int, *, global_cursor: bool = True
-    ):
+    def _instantiate_scheduler(self, optimizer, dataset_len: int):
         return build_scheduler_component(
             self.config.scheduler,
             optimizer,
             dataset_len,
             self.config,
-            global_cursor=global_cursor,
         )
 
     def with_param_path(self, param_path: Optional[str], resume: bool = False) -> Self:
@@ -94,6 +102,12 @@ class TrainContextBuilder:
             tp_size=self.config.tp_size,
             device_type=self.config.device_type,
         )
+        if self.config.optimizer.params.get("shard_state", False) and (
+            not self._topology.is_trivial or self.config.dp_mode == "fsdp"
+        ):
+            raise NotImplementedError(
+                "Optimizer state ownership requires replicated none/DDP parameters"
+            )
         if self._topology.tp_size > 1:
             self._validate_tp()
 
@@ -112,17 +126,9 @@ class TrainContextBuilder:
         executor = self._create_executor()
         self._validate_rollout_configuration(executor)
         context = self._create_context(preloaded_state, executor)
-        if self.config.rollout_mode == "async_round" or (
-            not self._resume and self.config.start_samples > 0
-        ):
-            context.global_cursor = False
         try:
             self._create_datasets(context)
-            if (
-                self._resume
-                and context.global_cursor
-                and context.checkpoint is not None
-            ):
+            if self._resume and context.checkpoint is not None:
                 saved_len = context.checkpoint.meta["dataset_len"]
                 if context.dataset_len != saved_len:
                     raise ValueError(
@@ -150,6 +156,10 @@ class TrainContextBuilder:
     def _create_executor(self) -> BaseExecutor:
         cfg = self.config
         kwargs = dict(cfg.executor_kwargs)
+        if cfg.dp_mode in ("none", "ddp"):
+            kwargs["grad_accum_dtype"] = cfg.precision.gradient_dtype
+        elif cfg.precision.gradient_dtype not in ("float32", "model"):
+            raise NotImplementedError("Configurable gradient storage requires none/DDP")
         if self._topology is not None and self._topology.tp_size > 1:
             # Gradient sync must span the dp dimension only: tp peers hold
             # different weight shards, and a world-group default would
@@ -158,7 +168,7 @@ class TrainContextBuilder:
                 kwargs.setdefault("process_group", self._topology.dp_group)
             elif cfg.dp_mode == "fsdp":
                 kwargs.setdefault("mesh", self._topology.mesh["dp"])
-        return ExecutorFactory.create_checked(
+        return ExecutorFactory.create(
             cfg.dp_mode,
             grad_accum_steps=cfg.grad_accum_steps,
             **kwargs,
@@ -177,6 +187,9 @@ class TrainContextBuilder:
     def _create_context(
         self, state: PreloadedState, executor: BaseExecutor
     ) -> TrainContext:
+        resume_path = None
+        if state.checkpoint is not None and self._param_path is not None:
+            resume_path = Path(self._param_path)
         return TrainContext(
             world_size=get_world_size(),
             rank=get_rank(),
@@ -188,9 +201,9 @@ class TrainContextBuilder:
             epoch=state.epoch,
             consumed_samples=state.consumed_samples,
             epoch_sample_offset=state.epoch_sample_offset,
-            global_cursor=state.global_cursor,
             optimizer_steps_completed=state.optimizer_steps_completed,
             checkpoint=state.checkpoint,
+            metric_history=MetricHistory(resume_path),
             param_path=self._param_path,
         )
 
@@ -216,28 +229,22 @@ class TrainContextBuilder:
                     if isinstance(module, LoRALinear) and not self._resume
                     for parameter in ("lora_A", "lora_B")
                 }
-                result = load_pretrained_state_dict(
-                    model,
-                    state.state_dict,
-                    strict=self._resume or not cfg.allow_partial_pretrained,
-                    allowed_missing_keys=allowed_missing,
+                validate_model_state_dict(
+                    model, state.state_dict, allowed_missing_keys=allowed_missing
+                )
+                result = model.load_state_dict(
+                    state.state_dict, strict=not allowed_missing
                 )
                 missing = sorted(set(result.missing_keys) - allowed_missing)
+                if missing or result.unexpected_keys:
+                    raise RuntimeError(
+                        "Model state dict mismatch: "
+                        f"missing={missing}, unexpected={result.unexpected_keys}"
+                    )
                 context.pretrained_metadata.update(
                     loaded_tensor_count=len(state.state_dict),
                     allowed_new_parameters=sorted(allowed_missing),
-                    partial_warm_start=cfg.allow_partial_pretrained
-                    and not self._resume,
                 )
-                if missing or result.unexpected_keys:
-                    logger.warning(
-                        "preloaded state dict mismatch: %d missing, %d unexpected "
-                        "(first missing: %s, first unexpected: %s)",
-                        len(missing),
-                        len(result.unexpected_keys),
-                        missing[:3],
-                        result.unexpected_keys[:3],
-                    )
             if self._topology.tp_size > 1:
                 # Shard after the full weights are in and before the
                 # executor wraps/optimize: the shards are the parameters the
@@ -254,9 +261,7 @@ class TrainContextBuilder:
             return model
 
         def scheduler_for_context(optimizer):
-            return self._instantiate_scheduler(
-                optimizer, context.dataset_len, global_cursor=context.global_cursor
-            )
+            return self._instantiate_scheduler(optimizer, context.dataset_len)
 
         context.model, context.optimizer, context.scheduler = executor.prepare(
             lambda: self._instantiate_model(context.model_config),
@@ -274,15 +279,14 @@ class TrainContextBuilder:
     def _create_dataloaders(
         self, context: TrainContext, train_dataset, val_dataset
     ) -> None:
-        sampler_offset = (
-            context.epoch_sample_offset
-            if context.global_cursor
-            else context.consumed_samples // context.dp_size
-        )
-        if not context.global_cursor and self._resume and sampler_offset > 0:
-            samples_per_replica = self._topology.samples_per_replica(len(train_dataset))
-            if samples_per_replica > 0:
-                context.epoch = sampler_offset // samples_per_replica
+        sampler_offset = context.epoch_sample_offset
+        if self.config.rollout_mode == "async_round":
+            sampler_offset //= context.dp_size
+            extent = self._topology.samples_per_replica(len(train_dataset))
+            if sampler_offset == extent:
+                context.epoch += 1
+                context.epoch_sample_offset = 0
+                sampler_offset = 0
         context.dataloader = build_dataloader(
             train_dataset,
             self.config.dataset,
@@ -290,7 +294,7 @@ class TrainContextBuilder:
             self._topology,
             context.epoch,
             sampler_offset,
-            global_cursor=context.global_cursor,
+            training=True,
         )
         if val_dataset is not None:
             context.val_dataloader = build_dataloader(
@@ -355,7 +359,7 @@ class TrainContextBuilder:
             kwargs["critic"] = critic
             kwargs["critic_optimizer"] = critic_optimizer
             kwargs.setdefault("max_grad_norm", cfg.max_grad_norm)
-        context.strategy = StrategyFactory.create_checked(
+        context.strategy = StrategyFactory.create(
             cfg.strategy,
             model=context.model,
             device=get_current_device(),
@@ -436,7 +440,7 @@ class TrainContextBuilder:
 
     def _create_critic(
         self, context: TrainContext, executor: BaseExecutor
-    ) -> Tuple[nn.Module, OptimizerProtocol]:
+    ) -> Tuple[nn.Module, Optimizer]:
         """Build the PPO critic and its optimizer, restoring persisted state.
 
         The critic backbone warm-starts from the policy weights (standard
@@ -482,6 +486,18 @@ class TrainContextBuilder:
         if checkpoint is not None:
             load_component_extra(checkpoint.extra, "value_model", critic, cfg)
         critic = critic.to(device)
+        if cfg.precision.compute_dtype is not None:
+            critic = critic.to(dtype=getattr(torch, cfg.precision.compute_dtype))
+        if cfg.precision.gradient_dtype != "model":
+            gradient_dtype = getattr(torch, cfg.precision.gradient_dtype)
+            if any(
+                p.requires_grad and p.dtype != gradient_dtype
+                for p in critic.parameters()
+            ):
+                accumulator = MainGradientAccumulator(
+                    critic, lambda: False, dtype=gradient_dtype
+                )
+                context.on_shutdown("critic_gradients", accumulator.close)
         if context.dp_size > 1 and dist.is_initialized():
             # The value head is freshly initialized on each rank. Start every
             # replica from rank zero's head before reducing its gradients.
@@ -497,6 +513,10 @@ class TrainContextBuilder:
             self.runtime.critic_optimizer_fn or self._instantiate_optimizer
         )
         critic_optimizer = optimizer_factory(critic)
+        if any(hasattr(p, "main_grad") for p in critic.parameters()) and not getattr(
+            critic_optimizer, "supports_main_grad", False
+        ):
+            raise TypeError("Critic optimizer must support main_grad")
         if checkpoint is not None:
             load_component_extra(
                 checkpoint.extra, "value_optimizer", critic_optimizer, cfg

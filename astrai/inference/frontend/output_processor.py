@@ -83,7 +83,6 @@ class ProcessedOutput:
     """User-visible output state for one request."""
 
     request_id: str
-    text: str = ""
     token_ids: List[int] = field(default_factory=list)
     prompt_tokens: int = 0
     finish_reason: Optional[str] = None
@@ -109,7 +108,6 @@ class OutputProcessor:
         request_id: str,
         tokenizer: AutoTokenizer,
         stop_sequences: Optional[List[str]] = None,
-        keep_token_ids: bool = False,
         *,
         prompt_tokens: int = 0,
     ):
@@ -137,7 +135,6 @@ class OutputProcessor:
                 raw = str(event.token_id)
             self.state.token_ids.append(event.token_id)
             text, stopped = self._stop.push(raw)
-            self.state.text += text
             if stopped:
                 self._finish(FINISH_STOP_TOKEN)
             return text, stopped
@@ -149,7 +146,6 @@ class OutputProcessor:
             # A sampled EOS is not a matched text stop: its ambiguous tail
             # still belongs to the response, just as on length/cancellation.
             tail = self._stop.flush()
-            self.state.text += tail
             return tail, False
         return "", False
 

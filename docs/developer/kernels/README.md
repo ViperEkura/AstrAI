@@ -26,8 +26,8 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Variant | File | Optimization |
 |---------|------|--------------|
-| Split-KV MMA decode | `attention/decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
-| Split-Q MMA prefill | `attention/prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
+| Split-KV MMA decode | `kernel/attention/mainloop.cuh` | Split KV across warps + MMA (sm_80+) |
+| Split-Q MMA prefill | `kernel/attention/mainloop.cuh` | Split Q across warps + MMA (sm_80+) |
 
 ## Kernel index
 
@@ -335,9 +335,9 @@ csrc/
 │   ├── kernel/                       # device kernels and launch helpers, grouped by operator
 │   │   ├── attention/
 │   │   │   ├── mma.cuh               # attention fragments and softmax helpers
-│   │   │   ├── split_kv.cuh          # decode and split-combine kernels
-│   │   │   ├── split_q.cuh           # prefill kernel
-│   │   │   └── launch.cuh            # attention launch and dispatch
+│   │   │   ├── mainloop.cuh          # prefill and decode mainloops
+│   │   │   ├── epilogue.cuh          # output stores and split-KV combine
+│   │   │   └── kernel.cuh            # mainloop/epilogue composition
 │   │   ├── gemm/
 │   │   │   ├── sm80.cuh              # staged mma.sync mainloop
 │   │   │   └── kernel.cuh            # cp.async and TMA entry kernels

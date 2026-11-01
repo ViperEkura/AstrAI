@@ -29,7 +29,7 @@ def _make_engine_mocks(decode=None):
 def _drive_events(engine, events_by_id):
     """Push output events through the engine's installed sink (mock schedulers
     emit nothing on their own; tests drive the event protocol directly)."""
-    sink = engine._tracker.sink
+    sink = engine._tracker
     flat = []
     for rid, events in events_by_id.items():
         flat.extend(events)
@@ -62,11 +62,12 @@ def event_engine(monkeypatch):
     monkeypatch.setattr(
         "astrai.inference.frontend.output_processor.StreamDecoder", _CharacterDecoder
     )
-    with patch("astrai.inference.frontend.engine.EngineCore"):
+    with patch("astrai.inference.frontend.engine.EngineCore") as core_cls:
+        core_cls.return_value.max_seq_len = 32
         engine = InferenceEngine(MagicMock(), FakeTokenizer(), max_seq_len=32)
     engine._core = MagicMock()
-    engine._core.abort_request.side_effect = lambda rid: (
-        engine._tracker.sink([RequestFinished(rid, FINISH_CANCELLED)]) or True
+    engine._core.cancel_request.side_effect = lambda rid: (
+        engine._tracker([RequestFinished(rid, FINISH_CANCELLED)]) or True
     )
     _emit_on_submission(engine)
     return engine
@@ -79,28 +80,25 @@ def _emit_on_submission(engine, text="", reason=None, error=False):
             events.append(RequestError(rid, "test", "failed"))
         elif reason is not None:
             events.append(RequestFinished(rid, reason, len(prompt_ids), len(text)))
-        engine._tracker.sink(events)
+        engine._tracker(events)
 
-    def send_request(**kwargs):
+    def add_request(**kwargs):
         rid = kwargs["request_id"]
         emit(rid, kwargs["prompt_ids"])
         return rid
 
-    def send_requests(**kwargs):
+    def add_requests(**kwargs):
         for rid, ids in zip(kwargs["request_ids"], kwargs["prompts_ids"]):
             emit(rid, ids)
         return kwargs["request_ids"]
 
-    engine._core.send_request.side_effect = send_request
-    engine._core.send_requests.side_effect = send_requests
+    engine._core.add_request.side_effect = add_request
+    engine._core.add_requests.side_effect = add_requests
 
 
 def _assert_frontend_released(engine):
     tracker = engine._tracker
-    assert not tracker._finished
-    assert not tracker.sink._queues
-    assert not tracker.sink._async_subscribers
-    assert not tracker.sink._terminal
+    assert not tracker._requests
 
 
 def _collect_async(stream):

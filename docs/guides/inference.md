@@ -131,18 +131,12 @@ the scheduler rejects updates while requests are queued and invalidates reusable
 prefix KV pages before exposing the new version. Synchronous `run_batch()` and
 weight updates are serialized so a generation cannot straddle two versions.
 
-## Sampling (Strategy Pattern)
+## Sampling
 
-```
-BaseSamplingStrategy (ABC)
-  ├── TemperatureStrategy
-  ├── TopKStrategy
-  ├── TopPStrategy
-  └── SamplingPipeline
-```
-
-`SamplingPipeline` composes them: Temperature → Top-K → Top-P → softmax → multinomial.  
-`sample()` is a convenience shortcut for one-shot usage.
+`sample()` applies frequency penalties, temperature, top-k and top-p in order,
+then samples token IDs. `SamplingMeta` caches batch facts on the host to avoid
+GPU synchronization during decode. Optional returned log probabilities use
+the raw model distribution, before penalties and filtering.
 
 ## Protocol Handlers (Strategy Pattern)
 
@@ -177,9 +171,12 @@ InferenceEngine (frontend layer)
 `generate_events` is the structured entry for protocol adapters: each chunk
 carries the incremental `text`, `delta_token_ids`, and — on the final chunk —
 exact `usage` and a mapped `finish_reason` (no re-tokenizing text to count
-tokens). Internally the engine mints request ids up front (`InputProcessor`),
+tokens). Token deltas include IDs buffered while decoding or stop matching
+produced no text. Consumers needing the complete history should accumulate
+`delta_token_ids`; chunks no longer carry `current_token_ids` snapshots.
+Internally the engine mints request ids up front (`InputProcessor`),
 folds scheduler events through `OutputProcessor` (detokenize, stop matching,
-usage), and reaches the core only via `EngineCoreClient`. Blocking `generate` folds
+usage), and calls the public operations of `EngineCore` directly. Blocking `generate` folds
 the request's events on the caller's thread once the terminal event lands;
 there is no intermediate accumulator object.
 
@@ -391,3 +388,16 @@ async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[s
 ```
 
 > Document Update Time: 2026-08-22
+
+## Core injection API migration
+
+Pass an `EngineCore` (or a test double implementing the same operations) as
+`InferenceEngine(model, tokenizer, core=core)`. The frontend installs its event
+sink, starts the supplied core and stops it on shutdown, as it does for a core
+it constructs itself. A supplied core should belong to this frontend lifecycle.
+
+`core_client=`, `EngineCoreClient`, `InprocClient` and the deprecated
+`InferenceEngine.scheduler` property have been removed. Migrate custom clients
+to the core methods: `add_requests`, `cancel_request`, `get_stats`, `stop`,
+`set_event_sink`, `start`, and `score_ids`; retain `max_batch_size`,
+`op_selection`, and `cuda_graph_enabled`. Generation and HTTP APIs are unchanged.

@@ -233,8 +233,6 @@ class TestQuantGemmPositiveGeometry:
     @pytest.mark.parametrize("shape", [(0, 64, 32), (8, 0, 32), (8, 64, 0)])
     @pytest.mark.parametrize("batched", [False, True])
     def test_zero_dimension_rejected(self, mode, shape, batched):
-        from astrai.extension import plan
-
         m, n, k = shape
         prefix = (3,) if batched else ()
         a = torch.empty((*prefix, m, k), device="cuda", dtype=torch.bfloat16)

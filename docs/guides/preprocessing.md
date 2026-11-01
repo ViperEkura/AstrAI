@@ -1,6 +1,6 @@
 # Preprocessing Pipeline
 
-Declarative JSON-driven data preprocessing. `MaskBuilderFactory` supports three registered builders: `"single"` (single-output via `input.sections`), `"multi"` (multi-output via `input.sources`), and `"sectioned"` (façade dispatching to `single` or `multi` based on config).
+Declarative JSON-driven data preprocessing. The built-in pipeline directly constructs `SectionedMaskBuilder`, which selects `SingleOutputMaskBuilder` for `input.sections` or `MultiOutputMaskBuilder` for `input.sources`. All three builders remain available for direct construction and custom renderer injection.
 
 ## Contents
 
@@ -43,7 +43,7 @@ A single config file captures the entire pipeline, reusable and version-controll
 | `field` | str | -- | JSONL key to read |
 | `action` | str | -- | `"train"` / `"mask"` / `"$role"` / `"value"`; `"value"` copies raw values without tokenization |
 | `template` | bool | `false` | Apply `chat_template` per message |
-| `add_special_tokens` | bool | `true` for first non-template section | Add special tokens during encode |
+| `add_special_tokens` | bool | `true` when the first retained section is non-template; `false` for list elements | Add special tokens during encode; template sections always encode without additional special tokens |
 
 ### Source Fields (multi-output mode)
 
@@ -52,6 +52,25 @@ A single config file captures the entire pipeline, reusable and version-controll
 | `sections` | list[dict] | -- | Same as single-output section list |
 | `list_field` | bool | `false` | JSONL field holds a list; tokenise each element |
 | `mask_key` | str | `"{key}_mask"` | Explicit output key for loss mask |
+
+Scalar and batch rendering use the same filtering, masking and truncation rules.
+An empty or filtered section does not consume the first-section special-token
+default. Top-level template sequences retain the existing masked BOS prefix;
+individual template messages and list elements do not add another prefix.
+
+For `list_field`, every element defaults to `add_special_tokens: false`; an
+explicit `true` or `false` is honored for non-template elements. This fixes an
+earlier scalar/batch discrepancy: batch encoding used to add special tokens by
+default, while scalar encoding ignored an explicit `true`. Template elements
+continue to use the tokens supplied by `chat_template`, without extra encoder
+special tokens.
+
+Custom `SectionRenderer` implementations can override `process_sections` and
+`process_sections_batch`, or the corresponding `process_list_field` methods.
+Builders keep these scalar and batch entry points separate: scalar rendering
+uses `encode(str)` and supports scalar-only tokenizers; batch rendering uses
+`encode(list)` grouped by special-token policy. A batch renderer/tokenizer must
+return one result per input record/text in the same order.
 
 ---
 
@@ -175,16 +194,24 @@ Config:
     "user": "mask",
     "assistant": "train"
   },
-  "mask_default": "mask"
+  "mask_default": "mask",
+  "output": {
+    "record_keys": ["chosen", "rejected", "chosen_mask", "rejected_mask"]
+  }
 }
 ```
 
 Output keys: `chosen`, `chosen_mask`, `rejected`, `rejected_mask`
 
-The offline `Pipeline` can construct these keys, but its `.bin` output is not
-currently loadable for DPO training because the writer does not preserve
-per-record offsets. Train DPO directly from raw JSONL instead; see
-[Training Compatibility](#training-compatibility).
+The offline `Pipeline` preserves each preference pair in `.bin` output by
+writing per-record offsets for the four keys explicitly listed in
+`output.record_keys`. Single and multiple shards are supported. When both a
+source and its mask are listed, omitted all-ones masks are materialized using
+that source's own length; explicit masks are preserved and checked for matching
+lengths. Custom preprocessing may use another `mask_key`, but `DPODataset`
+expects the four standard names shown above. Pairs are not packed together.
+Binary DPO data produced without offsets must be preprocessed again.
+See [Training Compatibility](#training-compatibility).
 
 ### GRPO
 
@@ -230,7 +257,7 @@ Config:
 Output keys: `prompts`, `prompts_mask`, `responses`, `masks`, `rewards` (float32)
 
 - `action: "value"` — extract raw values from JSONL without tokenisation
-- `list_field: true` — tokenise each list element independently, then concatenate
+- `list_field: true` — tokenise each list element independently; builders retain one token and mask list per element
 - `mask_key: "masks"` — rename the auto-generated mask key (default: `responses_mask`)
 - `prompts_mask` is auto-generated (all masked) and unused by GRPOStrategy
 
@@ -263,12 +290,13 @@ When `sources` is set, `sections` is ignored.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_seq_len` | int | `2048` | Truncate sequences to this length |
+| `max_seq_len` | int | `2048` | Maximum single segment length; overflow runs after full tokenization |
 | `min_chars` | int | `50` | Skip text-mode items shorter than this |
 | `max_chars` | int | `2000000` | Skip text-mode items longer than this |
 | `max_items` | int or null | `null` | Stop after N documents |
 | `batch_size` | int | `256` | Records per tokenization batch |
-| `packing_strategy` | str | `"simple"` | Packing is supported for single-output data with a `sequence` key: `"simple"`, `"bfd"`, or `"bfd_split"`. Multi-output DPO/GRPO data is not record-preserving packed output. |
+| `overflow` | str | `"truncate"` | Long single-output samples: `"truncate"` or `"split"` |
+| `packing` | str | `"bfd"` | `"bfd"` merges segments by best fit; `"none"` keeps each segment separate |
 | `max_packed_len` | int | `8192` | Maximum length of a packed bin |
 | `truncation_mode` | str | `"keep_start"` | How to truncate sequences: `"keep_start"` or `"keep_end"` |
 
@@ -293,10 +321,11 @@ launching the job; they do not reconfigure already-running workers.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `domain_key` | str or null | `null` | JSONL key for domain grouping |
-| `storage_format` | str | `"bin"` | Pipeline output format. Only `"bin"` has a registered writer; `"jsonl"` is accepted by config validation but cannot be emitted by `Pipeline`. |
+| `storage_format` | str | `"bin"` | Pipeline output format. Only `"bin"` is supported; other formats are rejected before preprocessing starts. JSONL input is still supported. |
 | `max_tokens_per_shard` | int | `100000000` | Flush threshold counted from each record's primary flat sequence: `sequence` for single-output data, otherwise the first flat source output |
 | `dtype` | dict[str, str] | `{}` | Per-key tensor dtype override (e.g. `{"loss_mask": "bool"}`) |
 | `position_ids_mode` | str | `"doc_reset"` | How to compute position_ids: `"none"`, `"doc_reset"`, `"continuous"` |
+| `record_keys` | list[str] | `[]` | Explicit flat record fields to write with offsets. Names must be unique and non-empty; selected fields must exist and have equal record counts. No fields are inferred from DPO-like names. |
 
 ---
 
@@ -370,9 +399,19 @@ Each shard's metadata is a top-level object keyed by tensor name:
 }
 ```
 
-An optional `offsets` array may appear for record-oriented binary data written
-through `save_bin(..., record_keys=...)`; the preprocessing `BinWriter` does not
-currently request those offsets.
+An optional `offsets` array appears for record-oriented binary data written
+through `save_bin(..., record_keys=...)`. `Pipeline` forwards the explicitly
+configured `output.record_keys` to `BinWriter`; the default empty list preserves
+stream-only output. Offsets start at zero in each shard, end at the field's token
+count, and have one more entry than the number of records.
+`MmapStore` preserves the existing filesystem discovery order (not guaranteed to
+be sorted) and locates records using cumulative shard record counts. Record
+index validation is deferred until record access or record-count queries;
+invalid offsets do not block token-stream access to otherwise valid tensors.
+DPO validates offsets and token/mask boundaries when the dataset is constructed.
+In record mode, `store[i]` requests all fields and raises if any lack offsets;
+use `fetch_record(i, key)` to select an indexed field from a mixed record/stream
+store. Field names are not silently dropped from `store[i]`.
 
 ---
 
@@ -382,13 +421,12 @@ currently request those offsets.
 |---------------|-----------------------|
 | `seq` | Offline preprocessed `.bin`, or raw `.jsonl` eagerly transformed by `JsonlStore` using `dataset_config.json` or the built-in `messages` config |
 | `sft` | Offline preprocessed `.bin`, or raw `.jsonl` through the same eager transform routes |
-| `dpo` | Raw `.jsonl` through the automatic lazy DPO processor selected by `DatasetFactory` when `tokenizer_path` is supplied, or a caller-provided record store |
+| `dpo` | Offline preprocessed `.bin` with record offsets (single or multiple shards), raw `.jsonl` through the automatic lazy DPO processor when `tokenizer_path` is supplied, or a caller-provided record store |
 | `grpo` | A caller-provided, already-loaded `Store` with record-shaped `prompts`, `responses`, `masks`, and `rewards`; no automatic raw-JSONL processor is currently wired |
 
-Offline DPO and GRPO preprocessing configs describe the intended token fields,
-but their `.bin` output is not currently loadable for training. DPO binary
-shards lack per-record offsets. GRPO response groups are flattened before the
-binary writer and their record/group boundaries are not preserved.
+Offline GRPO `.bin` output is not currently loadable for training. GRPO response
+groups are flattened before the binary writer and their record/group boundaries
+are not preserved.
 
 ---
 
@@ -428,3 +466,65 @@ Pipeline(
 ```
 
 > Document Update Time: 2026-07-09
+
+## Python API migration
+
+Construct `SectionedMaskBuilder()`, `SingleOutputMaskBuilder()` or
+`MultiOutputMaskBuilder()` directly instead of using `MaskBuilderFactory`.
+Their `build` / `build_batch` methods and renderer injection remain available.
+
+Position generation is now the pure function
+`generate_position_ids(sequences, mode)` from `astrai.preprocessing`.
+It returns `[]` for `none`, resets numbering for each document in `doc_reset`,
+and returns one continuous range for `continuous`. Empty sequences produce no
+positions; an unsupported mode raises `ValueError`. The position strategy
+classes and their factory have been removed. Online transforms omit the
+`position_ids` key when there are no positions. Offline packing still attaches
+per-document resets before packing and continuous positions after packing.
+Configuration names and stored data formats are unchanged.
+
+
+### Writer construction
+
+The pipeline constructs `BinWriter()` directly. `StoreWriter` and
+`StoreWriterFactory` have been removed; direct callers can import `BinWriter`
+from `astrai.preprocessing`. Record validation and partial-shard cleanup remain
+part of the writer. `output.storage_format` accepts only `"bin"`, including
+when loading a configuration file. This restriction concerns output;
+`JsonlStore` and JSONL input tokenization remain available.
+
+### SFT packs with explicit boundaries
+
+Use the independent defaults `overflow: truncate` and `packing: bfd`.
+Set both `max_seq_len` and `max_packed_len` to the training context length
+(for example, 2048). Overflow uses the smaller limit; BFD uses the packed
+limit as bin capacity. `split` preserves token chunks but does not copy
+previous context or repair incomplete conversation turns. `none` still
+applies the selected overflow policy.
+
+For SFT, set `output.record_keys` to
+`["sequence", "loss_mask", "seq_lengths"]` and keep
+`output.position_ids_mode: doc_reset`. Each bin is one binary record;
+`seq_lengths` holds the lengths of its independent segments. No padding
+or per-token position IDs are stored. SFTDataset reads every record,
+including the final partial pack. The trainer selects `sft_collate_fn`
+automatically for packed SFT datasets; custom DataLoaders must select it too.
+
+The collator pads to the longest pack in the batch, resets positions for
+each segment, and shifts labels within segments. Segment-ending targets
+and padding are ignored by the loss. Token ID zero is a valid masked
+filler, not an assumed tokenizer padding symbol. Existing SFT attention
+constructs a same-segment causal mask from the position resets. Resets
+and EOS tokens alone do not isolate attention. This path uses the
+existing dense attention mask and requires a compatible model/backend;
+packed context parallelism remains unsupported.
+
+The old `packing_strategy` option and strategy classes have been removed.
+Migrate `simple` to `packing: none`, `bfd` to `packing: bfd`, and
+`bfd_split` to `overflow: split, packing: bfd`. Replace the temporary
+`bfd_pad_sft` option with the record format above and regenerate data.
+Old stream datasets remain readable, but cannot recover discarded pack
+boundaries. Single-output builders now return full tokenized samples;
+use `prepare_sequences` to apply length and packing policies.
+DPO/GRPO outputs retain independent per-output truncation and are not
+split or merged by these single-output policies.

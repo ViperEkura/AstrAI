@@ -122,7 +122,7 @@ class TrainContextBuilder:
                 "the per-token aux loss assume full-feature router inputs"
             )
         if (
-            self.config.rl_microbatch_prompts is not None
+            getattr(self.config, "rl_microbatch_prompts", None) is not None
             and self.config.moe_aux_loss_coef != 0
             and str(preloaded_state.model_config.get("ffn_type", "mlp")) == "moe"
         ):

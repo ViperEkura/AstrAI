@@ -226,7 +226,7 @@ class Trainer:
         once after the last one. Ranks pad to the same per-chunk schedule
         with zero-weight rows, so every collective forward/backward matches.
         """
-        size = context.config.rl_microbatch_prompts
+        size = getattr(context.config, "rl_microbatch_prompts", None)
         if size is None:
             return [[chunk] for chunk in chunks]
         plan = []

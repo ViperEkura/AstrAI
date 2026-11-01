@@ -100,6 +100,10 @@ def test_type_inference_from_config_fields():
     assert params["pin_memory"].default is False  # config default, no override
     assert params["metrics"].multiple
     assert params["metrics"].default == ("loss", "lr", "grad_norm")
+    train_metrics = next(
+        p for p in train_module.train_command.params if p.name == "metrics"
+    )
+    assert train_metrics.default == params["metrics"].default
 
 
 def test_spec_overrides_beat_config_defaults():

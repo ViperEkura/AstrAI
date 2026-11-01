@@ -430,8 +430,7 @@ _SPECS = [
     OptSpec(
         "metrics",
         "Validation",
-        default=("loss", "lr", "grad_norm", "grad_snr"),
-        help="Metrics to log (repeatable).",
+        help="Metrics to log (repeatable). grad_snr is opt-in and keeps model-sized state.",
     ),
     OptSpec("ckpt_interval", "Checkpoint", help="Steps between checkpoints."),
     OptSpec(

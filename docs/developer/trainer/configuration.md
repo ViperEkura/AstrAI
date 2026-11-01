@@ -83,8 +83,7 @@ GPU-local NUMA node when measuring or launching a CPU-offloaded run.
 
 CPU state storage is disabled by default and supports AdamW, SGD and
 MuonAdamW/ShardedMuon with unsharded parameters. Other optimizers are rejected
-because repeated per-parameter steps may change their semantics. Each DDP rank
-retains its own CPU state; GPU state sharding is separate work. Staging limits
+because repeated per-parameter steps may change their semantics. Without state sharding, each DDP rank retains its own CPU state. Staging limits
 cross-parameter batching and does not overlap optimizer mutation with
 forward/backward. GPU space must still fit the largest parameter, gradient,
 state and compute scratch.
@@ -131,4 +130,38 @@ Optimizer zero_grad clears main-gradient presence (or zeros existing gradients
 for set_to_none=False), while retaining reusable bucket storage. Checkpoints
 remain update-boundary snapshots: save masters and optimizer state, not partial
 gradient accumulation. FP32 master checkpoint and legacy-reset rules above
-still apply. Complete optimizer-state GPU sharding remains separate work.
+still apply.
+
+### Distributed optimizer state
+
+Set optimizer.params.shard_state to true with cpu_offload false to keep FP32
+masters and moments on their owning GPUs. Assignment is deterministic and
+balances estimated state bytes; each Muon matrix stays intact. Every rank
+still accumulates and reduces full FP32 gradients. Only the owner updates a
+parameter, then broadcasts its compute-format weights to all ranks. This
+avoids replicated updates and repeated CPU state transfers.
+
+```yaml
+optimizer:
+  type: muon_adamw
+  params:
+    lr: 8.0e-5
+    use_ns_kernels: true
+    ns_batch_size: 4
+    shard_state: true
+    cpu_offload: false
+```
+
+Ownership is opt-in and supports replicated parameters with SGD, AdamW and
+Muon. It does not add DTensor/FSDP/TP support or change the precision policy.
+CPU offload can also be combined with ownership. All ranks must participate
+in step and load_state_dict, with the same already-reduced gradients.
+
+The executor enters optimizer.checkpoint_context collectively. The optimizer
+gathers masters and moments to rank zero as CPU tensors, streaming tensor
+payloads without staging the complete checkpoint on one GPU. The writer then
+uses the existing full optimizer checkpoint format. Temporary consolidated
+state is released on context exit. Direct distributed optimizer callers must
+enter that context on every rank before calling state_dict or exporting named
+masters on rank zero. An unsharded optimizer can load the resulting checkpoint;
+a sharded optimizer selects the state for its current owners when loading.

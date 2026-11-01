@@ -14,6 +14,7 @@ from astrai.trainer.context import TrainContextBuilder
 from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.trainer import Trainer
 from tests.integration.trainer.test_unified_resume import _config, _StopAfterOne
+from tests.support.precision import assert_precision_state
 
 
 @pytest.mark.parametrize("compute", ["float32", "bfloat16"])
@@ -169,3 +170,63 @@ def test_export_handles_tied_names_unmanaged_weights_and_buffers(
     actual = executor.model_state_dict(model)
     for name, value in expected.items():
         torch.testing.assert_close(actual[name], value, atol=0, rtol=0)
+
+
+def _sharded_config(path, policy):
+    config = _config(
+        path,
+        precision=policy,
+        dp_mode="ddp",
+        dp_size=2,
+        batch_per_device=1,
+        backend="gloo",
+    )
+    return replace(
+        config,
+        optimizer=replace(
+            config.optimizer, params={**config.optimizer.params, "shard_state": True}
+        ),
+    )
+
+
+def test_sharded_trainer_export_resume_matches_continuous_training(tmp_path):
+    policy = PrecisionConfig(compute_dtype="bfloat16", export_dtype="float16")
+    baseline_dir, source_dir, resumed_dir = [
+        tmp_path / name for name in ("baseline", "source", "resumed")
+    ]
+    Trainer(_sharded_config(baseline_dir, policy)).train()
+    Trainer(_sharded_config(source_dir, policy), callbacks=[_StopAfterOne()]).train()
+    source = source_dir / "epoch_0_step_1"
+    saved = Checkpoint.load(str(source))
+    assert all(
+        value.dtype == torch.float16
+        for value in saved.state_dict.values()
+        if value.is_floating_point()
+    )
+    assert all(
+        value.dtype == torch.bfloat16
+        for value in saved.extra["training_model"].values()
+        if value.is_floating_point()
+    )
+    warm = PreloadedState()
+    loader = ResumeLoader(
+        _sharded_config(tmp_path / "warm", policy),
+        str(source),
+        False,
+        None,
+        lambda _: None,
+    )
+    loader._load_from_param_path(warm)
+    torch.testing.assert_close(warm.state_dict, saved.state_dict, rtol=0, atol=0)
+    Trainer(
+        _sharded_config(resumed_dir, replace(policy, export_dtype="float32"))
+    ).train(param_path=str(source), resume=True)
+    baseline = Checkpoint.load(str(baseline_dir / "epoch_0_step_4"))
+    resumed = Checkpoint.load(str(resumed_dir / "epoch_0_step_4"))
+    torch.testing.assert_close(
+        baseline.extra["training_model"],
+        resumed.extra["training_model"],
+        rtol=0,
+        atol=0,
+    )
+    assert_precision_state(baseline.extra["optimizer"], resumed.extra["optimizer"])

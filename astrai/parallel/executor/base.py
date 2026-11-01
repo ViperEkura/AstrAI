@@ -228,34 +228,40 @@ class BaseExecutor:
         """Gather export weights and original training weights at one step boundary."""
         if self.use_distributed:
             dist.barrier()
-        # Compile wraps the parallel module; gather its original public keys.
-        model = getattr(model, "_orig_mod", model)
-        state_dict = self._gather_state_dict(model)
-        weight_extras = {}
-        if state_dict is not None and export_dtype is not None:
-            masters = {}
-            master_state_dict = getattr(optimizer, "master_state_dict", None)
-            if master_state_dict is not None:
-                module = self.model_for_inference(model)
-                named_parameters = strip_compile_prefix(
-                    dict(module.named_parameters(remove_duplicate=False))
-                )
-                masters = master_state_dict(named_parameters.items())
-            weight_extras["training_model"] = {
-                name: value.detach().to(device="cpu", copy=True)
-                for name, value in state_dict.items()
-            }
-            target = getattr(torch, export_dtype)
-            exported = {}
-            for name, value in state_dict.items():
-                source = masters.get(name, value)
-                exported[name] = source.to(
-                    device="cpu",
-                    dtype=target if source.is_floating_point() else source.dtype,
-                    copy=True,
-                )
-            state_dict = exported
-        yield state_dict, weight_extras
+        optimizer_context = getattr(optimizer, "checkpoint_context", None)
+        with (
+            optimizer_context()
+            if optimizer_context is not None
+            else contextlib.nullcontext()
+        ):
+            # Compile wraps the parallel module; gather its original public keys.
+            model = getattr(model, "_orig_mod", model)
+            state_dict = self._gather_state_dict(model)
+            weight_extras = {}
+            if state_dict is not None and export_dtype is not None:
+                masters = {}
+                master_state_dict = getattr(optimizer, "master_state_dict", None)
+                if master_state_dict is not None:
+                    module = self.model_for_inference(model)
+                    named_parameters = strip_compile_prefix(
+                        dict(module.named_parameters(remove_duplicate=False))
+                    )
+                    masters = master_state_dict(named_parameters.items())
+                weight_extras["training_model"] = {
+                    name: value.detach().to(device="cpu", copy=True)
+                    for name, value in state_dict.items()
+                }
+                target = getattr(torch, export_dtype)
+                exported = {}
+                for name, value in state_dict.items():
+                    source = masters.get(name, value)
+                    exported[name] = source.to(
+                        device="cpu",
+                        dtype=target if source.is_floating_point() else source.dtype,
+                        copy=True,
+                    )
+                state_dict = exported
+            yield state_dict, weight_extras
         if self.use_distributed:
             dist.barrier()
 

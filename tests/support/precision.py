@@ -108,3 +108,18 @@ def check_precision_storage(
                 state_dtype=stored_dtype,
             )
             optimizer.load_state_dict(saved)
+
+
+def assert_precision_state(actual, expected, *, rtol=0, atol=0):
+    if isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for name in actual:
+            assert_precision_state(actual[name], expected[name], rtol=rtol, atol=atol)
+    elif isinstance(actual, (list, tuple)):
+        assert type(actual) is type(expected) and len(actual) == len(expected)
+        for left, right in zip(actual, expected):
+            assert_precision_state(left, right, rtol=rtol, atol=atol)
+    elif isinstance(actual, torch.Tensor):
+        torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=rtol, atol=atol)
+    else:
+        assert actual == expected

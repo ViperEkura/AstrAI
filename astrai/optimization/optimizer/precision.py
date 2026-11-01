@@ -1,11 +1,14 @@
 """Composable update precision and configurable persistent optimizer storage."""
 
+from contextlib import contextmanager
 from typing import Dict, Iterable, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.optim import SGD, AdamW, Optimizer
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.muon.sharded_update import ShardedMuon
@@ -17,6 +20,90 @@ from astrai.optimization.optimizer.offload import (
 from astrai.parallel.executor.gradients import parameter_gradient
 
 
+def _parameter_owners(optimizers, world_size):
+    costs = {}
+    for child in optimizers:
+        factor = 3 if isinstance(child, AdamW) else 2
+        for group in child.param_groups:
+            for parameter in group["params"]:
+                costs[parameter] = parameter.numel() * 4 * factor
+    loads = [0] * world_size
+    owners = {}
+    for parameter in sorted(costs, key=costs.__getitem__, reverse=True):
+        owner = min(range(world_size), key=loads.__getitem__)
+        owners[parameter] = owner
+        loads[owner] += costs[parameter]
+    return owners
+
+
+def _gather_tensor_tree(value, source, device):
+    """Collect CPU snapshots on rank zero without a full GPU staging buffer."""
+    rank = dist.get_rank()
+    if rank == source:
+        leaves, spec = tree_flatten(value)
+        descriptions = [
+            (True, tuple(leaf.shape), leaf.dtype)
+            if isinstance(leaf, torch.Tensor)
+            else (False, leaf)
+            for leaf in leaves
+        ]
+        metadata = [spec, descriptions]
+    else:
+        leaves = None
+        metadata = [None, None]
+    dist.broadcast_object_list(metadata, src=source)
+    spec, descriptions = metadata
+    result = []
+    for index, description in enumerate(descriptions):
+        if not description[0]:
+            if rank == 0:
+                result.append(description[1])
+            continue
+        if source == 0:
+            if rank == 0:
+                result.append(leaves[index].detach().to(device="cpu", copy=True))
+        elif rank == source:
+            dist.send(leaves[index].detach().to(device=device).contiguous(), dst=0)
+        elif rank == 0:
+            received = torch.empty(description[1], dtype=description[2], device=device)
+            dist.recv(received, src=source)
+            result.append(received.to(device="cpu", copy=True))
+            del received
+    return tree_unflatten(result, spec) if rank == 0 else None
+
+
+def _merge_optimizer_state(destination, source):
+    if "state" in destination and "param_groups" in destination:
+        destination["state"].update(source["state"])
+    else:
+        for name in destination:
+            _merge_optimizer_state(destination[name], source[name])
+
+
+def _local_optimizer_state(saved, model_groups, owners, rank):
+    groups = []
+    selected = set()
+    if len(saved["param_groups"]) != len(model_groups):
+        raise ValueError("Checkpoint optimizer groups do not match the model")
+    for group, models in zip(saved["param_groups"], model_groups):
+        if len(group["params"]) != len(models):
+            raise ValueError("Checkpoint optimizer groups do not match the model")
+        indices = [
+            index
+            for index, parameter in zip(group["params"], models)
+            if owners[parameter] == rank
+        ]
+        selected.update(indices)
+        groups.append({**group, "params": indices})
+    return {
+        **saved,
+        "state": {
+            index: state for index, state in saved["state"].items() if index in selected
+        },
+        "param_groups": groups,
+    }
+
+
 class PrecisionOptimizer(Optimizer):
     """Compute updates in FP32 and persist the configured storage formats.
 
@@ -25,7 +112,8 @@ class PrecisionOptimizer(Optimizer):
     CPU offload stores masters and optimizer state in host memory between
     steps. Pinned host state uses a bounded upload/compute/return pipeline.
     Each step completes host copies before returning; forward/backward do
-    not overlap with optimizer mutation.
+    not overlap with optimizer mutation. Optional state sharding assigns
+    complete parameters to ranks and broadcasts updated compute weights.
     """
 
     supports_main_grad = True
@@ -36,7 +124,10 @@ class PrecisionOptimizer(Optimizer):
         cpu_offload: bool = False,
         master_dtype: torch.dtype = torch.float32,
         state_dtype: torch.dtype = torch.float32,
+        shard_state: bool = False,
     ):
+        if not isinstance(shard_state, bool):
+            raise ValueError("shard_state must be a boolean")
         if master_dtype not in (torch.float32, torch.bfloat16) or state_dtype not in (
             torch.float32,
             torch.bfloat16,
@@ -73,6 +164,32 @@ class PrecisionOptimizer(Optimizer):
             raise NotImplementedError(
                 "CPU state offload supports AdamW, SGD and Muon optimizers"
             )
+        self._all_model_params = parameters
+        self._model_groups = [
+            [list(group["params"]) for group in child.param_groups]
+            for child in self._optimizers
+        ]
+        self._owners = None
+        self._checkpoint_state = None
+        if shard_state and dist.is_initialized() and dist.get_world_size() > 1:
+            if any(
+                not isinstance(child, (AdamW, SGD, ShardedMuon))
+                for child in self._optimizers
+            ):
+                raise NotImplementedError("State sharding supports AdamW, SGD and Muon")
+            if len({parameter.device for parameter in parameters}) != 1:
+                raise ValueError("Sharded optimizer parameters must share one device")
+            self._owners = _parameter_owners(self._optimizers, dist.get_world_size())
+            rank = dist.get_rank()
+            parameters = [
+                parameter for parameter in parameters if self._owners[parameter] == rank
+            ]
+            for group in groups:
+                group["params"] = [
+                    parameter
+                    for parameter in group["params"]
+                    if self._owners[parameter] == rank
+                ]
         super().__init__(groups, optimizer.defaults)
         self.optimizer = optimizer
         self._model_params = parameters
@@ -111,12 +228,29 @@ class PrecisionOptimizer(Optimizer):
         self._convert_state = (
             state_dtype != torch.float32 or master_dtype != torch.float32
         )
+        if (
+            self._owners is not None
+            and master_dtype == torch.bfloat16
+            and any(
+                parameter.dtype == torch.float32 for parameter in self._all_model_params
+            )
+        ):
+            self._publish_models()
 
     def master_state_dict(
         self, named_parameters: Iterable[Tuple[str, nn.Parameter]]
     ) -> Dict[str, torch.Tensor]:
         """Expose managed master views under the caller's canonical parameter names."""
-        masters = dict(zip(self._model_params, self._master_params))
+        if self._owners is not None:
+            if self._checkpoint_state is None:
+                raise RuntimeError(
+                    "Enter optimizer.checkpoint_context() on every rank before exporting sharded masters"
+                )
+            masters = dict(
+                zip(self._all_model_params, self._checkpoint_state["master_params"])
+            )
+        else:
+            masters = dict(zip(self._model_params, self._master_params))
         return {
             name: masters[parameter].detach()
             for name, parameter in named_parameters
@@ -129,9 +263,11 @@ class PrecisionOptimizer(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        self._checkpoint_state = None
         result = (
             self._offload.step() if self._offload is not None else self._step_resident()
         )
+        self._publish_models()
         return loss if closure is not None else result
 
     @torch.no_grad()
@@ -177,7 +313,7 @@ class PrecisionOptimizer(Optimizer):
 
     def zero_grad(self, set_to_none: bool = True):
         self.optimizer.zero_grad(set_to_none=set_to_none)
-        for parameter in self._model_params:
+        for parameter in self._all_model_params:
             if getattr(parameter, "main_grad", None) is not None:
                 if set_to_none:
                     parameter.main_grad = None
@@ -193,7 +329,77 @@ class PrecisionOptimizer(Optimizer):
                         parameter.grad.requires_grad_(False)
                     parameter.grad.zero_()
 
+    def _publish_models(self):
+        if self._owners is None:
+            return
+        pending = [
+            dist.broadcast(
+                parameter.detach(), src=self._owners[parameter], async_op=True
+            )
+            for parameter in self._all_model_params
+        ]
+        for work in pending:
+            work.wait()
+
+    @contextmanager
+    def checkpoint_context(self):
+        """All ranks assemble the existing full checkpoint format on rank zero."""
+        if self._owners is None:
+            yield
+            return
+        masters = dict(zip(self._model_params, self._master_params))
+        stored_groups = []
+        try:
+            for child, model_groups in zip(self._optimizers, self._model_groups):
+                for group, models in zip(child.param_groups, model_groups):
+                    stored_groups.append((group, group["params"]))
+                    group["params"] = [
+                        masters.get(parameter, parameter) for parameter in models
+                    ]
+            local = {
+                "optimizer": self.optimizer.state_dict(),
+                "master_params": {
+                    index: masters[parameter].detach()
+                    for index, parameter in enumerate(self._all_model_params)
+                    if parameter in masters
+                },
+                "precision": {
+                    "master_dtype": str(self.master_dtype).removeprefix("torch."),
+                    "optimizer_state_dtype": str(self.state_dtype).removeprefix(
+                        "torch."
+                    ),
+                },
+            }
+        finally:
+            for group, parameters in stored_groups:
+                group["params"] = parameters
+        full = None
+        for source in range(dist.get_world_size()):
+            part = _gather_tensor_tree(local, source, self._all_model_params[0].device)
+            if dist.get_rank() == 0:
+                if full is None:
+                    full = part
+                else:
+                    full["master_params"].update(part["master_params"])
+                    _merge_optimizer_state(full["optimizer"], part["optimizer"])
+        if full is not None:
+            full["master_params"] = [
+                full["master_params"][index]
+                for index in range(len(self._all_model_params))
+            ]
+        self._checkpoint_state = full
+        try:
+            yield
+        finally:
+            self._checkpoint_state = None
+
     def state_dict(self) -> Dict:
+        if self._owners is not None:
+            if self._checkpoint_state is None:
+                raise RuntimeError(
+                    "Enter optimizer.checkpoint_context() on every rank before saving sharded state"
+                )
+            return self._checkpoint_state
         return {
             "optimizer": self.optimizer.state_dict(),
             "master_params": [p.detach() for p in self._master_params],
@@ -220,18 +426,38 @@ class PrecisionOptimizer(Optimizer):
         saved_dtype = state_dict["precision"]["master_dtype"]
         if saved_dtype not in ("float32", "bfloat16"):
             raise ValueError("Checkpoint master precision is unsupported")
-        if len(saved) != len(self._master_params) or any(
-            value.dtype != getattr(torch, saved_dtype) or value.shape != master.shape
-            for value, master in zip(saved, self._master_params)
+        if len(saved) != len(self._all_model_params) or any(
+            value.dtype != getattr(torch, saved_dtype) or value.shape != model.shape
+            for value, model in zip(saved, self._all_model_params)
         ):
             raise ValueError("Checkpoint master weights do not match the model")
+        optimizer_state = state_dict["optimizer"]
+        if self._owners is not None:
+            rank = dist.get_rank()
+            if isinstance(self.optimizer, MuonAdamW):
+                optimizer_state = {
+                    name: _local_optimizer_state(
+                        optimizer_state[name], groups, self._owners, rank
+                    )
+                    for name, groups in zip(("muon", "adamw"), self._model_groups)
+                }
+            else:
+                optimizer_state = _local_optimizer_state(
+                    optimizer_state, self._model_groups[0], self._owners, rank
+                )
+            saved = [
+                value
+                for model, value in zip(self._all_model_params, saved)
+                if self._owners[model] == rank
+            ]
+        self._checkpoint_state = None
         # Native loaders cast moments to parameter dtype. Present FP32 update
         # parameters while loading to avoid rounding FP32 state via BF16 masters.
         stored = [master.data for master in self._master_params]
         try:
             for master, value in zip(self._master_params, stored):
                 master.data = value.float()
-            self.optimizer.load_state_dict(state_dict["optimizer"])
+            self.optimizer.load_state_dict(optimizer_state)
         finally:
             for master, value in zip(self._master_params, stored):
                 master.data = value
@@ -243,3 +469,4 @@ class PrecisionOptimizer(Optimizer):
         for model, master, value in zip(self._model_params, self._master_params, saved):
             master.copy_(value)
             model.copy_(master)
+        self._publish_models()

@@ -60,7 +60,8 @@ def _store(value: torch.Tensor, destination: Optional[torch.Tensor] = None, dtyp
             value, dtype=dtype or value.dtype, device="cpu", pin_memory=True
         )
     destination.copy_(value, non_blocking=True)
-    value.record_stream(torch.cuda.current_stream(value.device))
+    if value.is_cuda:
+        value.record_stream(torch.cuda.current_stream(value.device))
     return destination
 
 

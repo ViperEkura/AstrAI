@@ -9,10 +9,12 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
 
+from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.parallel.executor import DDPExecutor, NoneExecutor
 from astrai.parallel.executor.gradients import parameter_gradient
 from astrai.trainer.callbacks.metric_util import GradSNRTracker, grad_norm
+from tests.support.precision import assert_precision_state
 
 
 def _distributed_check(
@@ -350,6 +352,186 @@ def test_fp32_compute_bf16_main_gradients_reduce_across_ranks(tmp_path):
             torch.float32,
             "bfloat16",
         ),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _owner_optimizer(
+    model, kind, shard_state, cpu_offload, state_dtype, master_dtype=torch.float32
+):
+    if kind == "muon":
+        native = MuonAdamW(model, lr=2e-5, use_ns_kernels=True, ns_batch_size=4)
+    elif kind == "adamw":
+        native = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    else:
+        native = torch.optim.SGD(
+            model.parameters(), lr=2e-5, momentum=0.9, weight_decay=0.1
+        )
+    return PrecisionOptimizer(
+        native,
+        shard_state=shard_state,
+        cpu_offload=cpu_offload,
+        state_dtype=state_dtype,
+        master_dtype=master_dtype,
+    )
+
+
+def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
+    torch.set_num_threads(1)
+    device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
+    if backend == "nccl":
+        torch.cuda.set_device(device)
+    dist.init_process_group(backend, rank=rank, world_size=2, init_method=rendezvous)
+    try:
+        cases = [
+            (kind, state_dtype, master_dtype)
+            for kind in ("sgd", "adamw", "muon")
+            for state_dtype in (torch.float32, torch.bfloat16)
+            for master_dtype in (torch.float32, torch.bfloat16)
+        ]
+        cases.append(("single", torch.float32, torch.float32))
+        for case, (kind, state_dtype, master_dtype) in enumerate(cases):
+            compute_dtype = (
+                torch.bfloat16 if master_dtype == torch.float32 else torch.float32
+            )
+            torch.manual_seed(73)
+            model = nn.Module()
+            if kind == "single":
+                model.norm = nn.Parameter(
+                    torch.ones(8, device=device, dtype=compute_dtype)
+                )
+            else:
+                model.matrix = nn.ParameterList(
+                    [
+                        nn.Parameter(
+                            torch.randn(16, 32, device=device, dtype=compute_dtype)
+                        )
+                        for _ in range(4)
+                    ]
+                )
+                model.embed = nn.Embedding(32, 16, device=device, dtype=compute_dtype)
+                model.lm_head = nn.Linear(
+                    16, 32, bias=False, device=device, dtype=compute_dtype
+                )
+                model.lm_head.weight = model.embed.weight
+                model.norm = nn.Parameter(
+                    torch.ones(16, device=device, dtype=compute_dtype)
+                )
+            model.register_buffer("counter", torch.tensor(7, device=device))
+            reference = copy.deepcopy(model)
+            actual = _owner_optimizer(
+                model, kind, True, cpu_offload, state_dtype, master_dtype
+            )
+            expected = _owner_optimizer(
+                reference, kind, False, False, state_dtype, master_dtype
+            )
+            counts = torch.tensor(len(actual._model_params), device=device)
+            dist.all_reduce(counts)
+            assert counts.item() == len(list(model.parameters()))
+            for step in range(6):
+                torch.manual_seed(130 + step)
+                for index, (param, target) in enumerate(
+                    zip(model.parameters(), reference.parameters())
+                ):
+                    gradient = torch.randn_like(param, dtype=torch.float32) * 0.1
+                    if index == 0 and step % 3 == 0:
+                        gradient = None
+                    param.main_grad = gradient
+                    target.main_grad = None if gradient is None else gradient.clone()
+                actual.step()
+                expected.step()
+                for param, target in zip(model.parameters(), reference.parameters()):
+                    torch.testing.assert_close(param, target, rtol=0, atol=0)
+                actual.zero_grad(set_to_none=step % 2 == 0)
+                expected.zero_grad(set_to_none=step % 2 == 0)
+                assert all(
+                    parameter_gradient(param) is None
+                    or torch.count_nonzero(parameter_gradient(param)) == 0
+                    for param in model.parameters()
+                )
+                if step == 2:
+                    filename = Path(directory) / f"owner-{case}.pt"
+                    with actual.checkpoint_context():
+                        if rank == 0:
+                            saved = copy.deepcopy(actual.state_dict())
+                            torch.save(saved, filename)
+                            assert_precision_state(
+                                saved, expected.state_dict(), rtol=1e-6, atol=1e-7
+                            )
+                    with pytest.raises(RuntimeError, match="checkpoint_context"):
+                        actual.state_dict()
+                    dist.barrier()
+                    saved = torch.load(filename, map_location="cpu", weights_only=True)
+                    model = copy.deepcopy(model)
+                    actual = _owner_optimizer(
+                        model, kind, True, cpu_offload, state_dtype, master_dtype
+                    )
+                    actual.load_state_dict(saved)
+            executor = DDPExecutor(grad_accum_dtype="float32")
+            for export_dtype in (None, "float16", "float32"):
+                with executor.checkpoint_context(
+                    model, optimizer=actual, export_dtype=export_dtype
+                ) as (exported, extra):
+                    if rank != 0:
+                        assert exported is None and extra == {}
+                        continue
+                    assert exported["counter"].dtype == torch.int64
+                    masters = expected.master_state_dict(
+                        reference.named_parameters(remove_duplicate=False)
+                    )
+                    for name, master in masters.items():
+                        wanted = (
+                            reference.state_dict()[name]
+                            if export_dtype is None
+                            else master.to(getattr(torch, export_dtype))
+                        )
+                        torch.testing.assert_close(
+                            exported[name].cpu(), wanted.cpu(), rtol=0, atol=0
+                        )
+                    if export_dtype is not None:
+                        for name, value in model.state_dict().items():
+                            torch.testing.assert_close(
+                                extra["training_model"][name],
+                                value.cpu(),
+                                rtol=0,
+                                atol=0,
+                            )
+                    replica = copy.deepcopy(model)
+                    unsharded = _owner_optimizer(
+                        replica, kind, False, False, state_dtype, master_dtype
+                    )
+                    unsharded.load_state_dict(actual.state_dict())
+                    for param, target in zip(replica.parameters(), model.parameters()):
+                        torch.testing.assert_close(param, target, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "backend,cpu_offload",
+    [
+        ("gloo", False),
+        pytest.param(
+            "nccl",
+            False,
+            marks=pytest.mark.skipif(
+                torch.cuda.device_count() < 2, reason="Two GPUs required"
+            ),
+        ),
+        pytest.param(
+            "nccl",
+            True,
+            marks=pytest.mark.skipif(
+                torch.cuda.device_count() < 2, reason="Two GPUs required"
+            ),
+        ),
+    ],
+)
+def test_complete_parameter_ownership_export_and_resume(tmp_path, backend, cpu_offload):
+    mp.spawn(
+        _owner_state_check,
+        args=(Path(tmp_path / "owners").as_uri(), str(tmp_path), backend, cpu_offload),
         nprocs=2,
         join=True,
     )

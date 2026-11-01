@@ -81,6 +81,7 @@ def build_optimizer_component(
 ):
     params = dict(spec.params)
     cpu_offload = params.pop("cpu_offload", False)
+    shard_state = params.pop("shard_state", False)
     if OptimizerFactory.is_registered(spec.type):
         optimizer = OptimizerFactory.create(spec.type, model, **params)
     else:
@@ -98,6 +99,7 @@ def build_optimizer_component(
     parameters = [p for group in optimizer.param_groups for p in group["params"]]
     if (
         cpu_offload
+        or shard_state
         or master_dtype != torch.float32
         or state_dtype != torch.float32
         or any(p.dtype != master_dtype or hasattr(p, "main_grad") for p in parameters)
@@ -107,6 +109,7 @@ def build_optimizer_component(
             cpu_offload=cpu_offload,
             master_dtype=master_dtype,
             state_dtype=state_dtype,
+            shard_state=shard_state,
         )
     return optimizer
 

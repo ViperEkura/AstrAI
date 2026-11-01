@@ -252,7 +252,7 @@ def test_global_trainer_microbatches_match_one_full_objective(
     monkeypatch.setattr(strategy, "compute_loss_output", counted)
     context = TrainContext(
         model=model,
-        optimizer=torch.optim.AdamW(model.parameters(), lr=0.001),
+        optimizer=torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9),
         executor=executor,
         strategy=strategy,
         config=_config(tmp_path, grad_accum_steps=2, rl_microbatch_prompts=microbatch),
@@ -260,7 +260,12 @@ def test_global_trainer_microbatches_match_one_full_objective(
     trainer = Trainer(context.config)
     probe = _BatchProbe()
     trainer.callbacks = [probe]
-    expected_optimizer = torch.optim.AdamW(oracle_model.parameters(), lr=0.001)
+    # SGD+momentum, not AdamW: Adam's first step is ~lr * sign(g) for |g| << eps,
+    # so fp32 reduction-order noise on near-zero gradients (~1e-9) would
+    # dominate the comparison instead of the objective under test.
+    expected_optimizer = torch.optim.SGD(
+        oracle_model.parameters(), lr=0.01, momentum=0.9
+    )
     batch = _batch(oracle_model, 3, 4)
     chunks = [(_rows(batch, 0, 1), 1), (_rows(batch, 1, 3), 2)]
     for step in range(3):

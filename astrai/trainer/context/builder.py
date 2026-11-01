@@ -12,7 +12,8 @@ from torch.optim import Optimizer
 
 from astrai.config.train_config import TrainConfig, _TrainRuntimeDependencies
 from astrai.inference.core.engine_core import EngineCore
-from astrai.model.components.lora import inject_lora
+from astrai.model.automodel import validate_model_state_dict
+from astrai.model.components.lora import LoRALinear, inject_lora
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
 from astrai.parallel.executor import (
     BaseExecutor,
@@ -195,6 +196,7 @@ class TrainContextBuilder:
             topology=self._topology,
             config=self.config,
             model_config=state.model_config,
+            pretrained_metadata=state.pretrained_metadata,
             executor=executor,
             epoch=state.epoch,
             consumed_samples=state.consumed_samples,
@@ -221,16 +223,28 @@ class TrainContextBuilder:
                     target_modules=set(cfg.lora.target_modules),
                 )
             if state.state_dict is not None:
-                result = model.load_state_dict(state.state_dict, strict=False)
-                if result.missing_keys or result.unexpected_keys:
-                    logger.warning(
-                        "preloaded state dict mismatch: %d missing, %d unexpected "
-                        "(first missing: %s, first unexpected: %s)",
-                        len(result.missing_keys),
-                        len(result.unexpected_keys),
-                        result.missing_keys[:3],
-                        result.unexpected_keys[:3],
+                allowed_missing = {
+                    f"{name}.{parameter}" if name else parameter
+                    for name, module in model.named_modules()
+                    if isinstance(module, LoRALinear) and not self._resume
+                    for parameter in ("lora_A", "lora_B")
+                }
+                validate_model_state_dict(
+                    model, state.state_dict, allowed_missing_keys=allowed_missing
+                )
+                result = model.load_state_dict(
+                    state.state_dict, strict=not allowed_missing
+                )
+                missing = sorted(set(result.missing_keys) - allowed_missing)
+                if missing or result.unexpected_keys:
+                    raise RuntimeError(
+                        "Model state dict mismatch: "
+                        f"missing={missing}, unexpected={result.unexpected_keys}"
                     )
+                context.pretrained_metadata.update(
+                    loaded_tensor_count=len(state.state_dict),
+                    allowed_new_parameters=sorted(allowed_missing),
+                )
             if self._topology.tp_size > 1:
                 # Shard after the full weights are in and before the
                 # executor wraps/optimize: the shards are the parameters the

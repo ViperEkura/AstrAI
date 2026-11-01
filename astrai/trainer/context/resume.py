@@ -5,6 +5,7 @@ assembler: what a stored run *means* (cursor, step count, component states,
 the refusal rules) is decided in one module.
 """
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,9 +18,11 @@ from astrai.config.train_config import TrainConfig
 from astrai.parallel.executor import strip_compile_prefix
 from astrai.parallel.topology import ParallelTopology
 from astrai.serialization import (
+    HF_MAPPING_FILENAME,
     Checkpoint,
     adapt_config,
     convert_hf_weights,
+    load_hf_mapping,
     load_json,
     looks_like_hf_state_dict,
 )
@@ -38,6 +41,7 @@ class PreloadedState:
     """What the checkpoint contributes to a context that is about to be built."""
 
     model_config: Dict = field(default_factory=dict)
+    pretrained_metadata: Dict = field(default_factory=dict)
     state_dict: Optional[Dict] = None
     epoch: int = 0
     consumed_samples: int = 0
@@ -90,7 +94,20 @@ class ResumeLoader:
         cfg = self.config
         config_path = Path(self.param_path) / "config.json"
         if config_path.exists():
-            state.model_config = adapt_config(load_json(config_path), self.param_path)
+            raw_config = load_json(config_path)
+            state.model_config = adapt_config(raw_config, self.param_path)
+            state.pretrained_metadata = {
+                "source_path": str(Path(self.param_path).resolve()),
+                "model_source": raw_config.get("_name_or_path"),
+                "model_revision": raw_config.get("_commit_hash"),
+            }
+        mapping = load_hf_mapping(self.param_path)
+        if mapping is not None:
+            mapping_path = Path(self.param_path) / HF_MAPPING_FILENAME
+            state.pretrained_metadata.update(
+                mapping_sha256=hashlib.sha256(mapping_path.read_bytes()).hexdigest(),
+                excluded_prefixes=mapping.get("weights", {}).get("skip_prefixes", []),
+            )
 
         options = cfg.state_dict_load_options(self.resume)
         # The optional extras carry no resumable state, so a warm start
@@ -110,15 +127,16 @@ class ResumeLoader:
             self.param_path, extra_keys=extra_keys, load_weights=options["model"]
         )
         if checkpoint is None:
+            if self.resume or (mapping is not None and options["model"]):
+                raise FileNotFoundError(
+                    f"No pretrained policy weights found in {self.param_path}"
+                )
+            # A native factory may use param_path only for its tokenizer.
+            state.pretrained_metadata = {}
             return
 
         if checkpoint.config:
             checkpoint.config = adapt_config(checkpoint.config, self.param_path)
-        if checkpoint.state_dict and looks_like_hf_state_dict(checkpoint.state_dict):
-            checkpoint.state_dict = convert_hf_weights(
-                checkpoint.state_dict,
-                ConfigFactory.load(checkpoint.config or state.model_config),
-            )
         saved_precision = checkpoint.meta.get("precision", {})
         if (
             self.resume
@@ -131,10 +149,20 @@ class ResumeLoader:
                 )
             checkpoint.state_dict = checkpoint.extra["training_model"]
         checkpoint.state_dict = strip_compile_prefix(checkpoint.state_dict)
+        if checkpoint.state_dict and looks_like_hf_state_dict(checkpoint.state_dict):
+            checkpoint.state_dict = convert_hf_weights(
+                checkpoint.state_dict,
+                ConfigFactory.load(checkpoint.config or state.model_config),
+                mapping=mapping,
+                strict=True,
+            )
         state.state_dict = checkpoint.state_dict if options["model"] else None
         state.model_config = checkpoint.config or state.model_config
 
         if self.resume:
+            state.pretrained_metadata = dict(
+                checkpoint.meta.get("pretrained", state.pretrained_metadata)
+            )
             self._take_cursor(state, checkpoint, options)
         for entry in EXTRAS:
             name = entry.key

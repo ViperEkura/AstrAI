@@ -94,7 +94,7 @@ def test_builder_loads_selected_state_dicts(tmp_path, monkeypatch, flags, resume
     loaded_extras = []
     loaded_weights = []
     original_load = checkpoint_module.load_torch
-    original_weights = checkpoint_module.load_state_dict
+    original_weights = checkpoint_module.load_model_weights
 
     def record_load(path, **kwargs):
         loaded_extras.append(Path(path).name)
@@ -105,7 +105,7 @@ def test_builder_loads_selected_state_dicts(tmp_path, monkeypatch, flags, resume
         return original_weights(path, **kwargs)
 
     monkeypatch.setattr(checkpoint_module, "load_torch", record_load)
-    monkeypatch.setattr(checkpoint_module, "load_state_dict", record_weights)
+    monkeypatch.setattr(checkpoint_module, "load_model_weights", record_weights)
     kwargs = {} if flags is None else {"load_state_dict": flags}
     config = _config(**kwargs)
     options = config.state_dict_load_options(resume)

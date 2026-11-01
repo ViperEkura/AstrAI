@@ -48,6 +48,7 @@ class TrainContext:
     checkpoint: Checkpoint = field(default=None)
     config: TrainConfig = field(default=None)
     model_config: Dict = field(default_factory=dict)
+    pretrained_metadata: Dict = field(default_factory=dict)
     executor: BaseExecutor = field(default=None)
     epoch: int = field(default=0)
     consumed_samples: int = field(default=0)

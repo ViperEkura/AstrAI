@@ -26,6 +26,7 @@ _TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
+    "generation_config.json",
 )
 
 
@@ -154,6 +155,8 @@ class CheckpointCallback(TrainCallback):
             rl_update_epochs=cfg.rl_update_epochs,
             rl_minibatch_prompts=cfg.rl_minibatch_prompts,
         )
+        if context.pretrained_metadata:
+            meta["pretrained"] = context.pretrained_metadata
         policy_version = context.strategy.policy_version
         if policy_version is not None:
             meta["policy_version"] = policy_version

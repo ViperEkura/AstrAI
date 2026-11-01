@@ -36,10 +36,6 @@ class AutoRegressiveLM(AutoModel):
             # same tensor for embed and lm_head
             if embed_key in state_dict:
                 state_dict[lm_head_key] = state_dict[embed_key]
-        else:
-            if lm_head_key not in state_dict and embed_key in state_dict:
-                # clone to avoid sharing gradients
-                state_dict[lm_head_key] = torch.clone(state_dict[embed_key])
 
         return super().load_state_dict(state_dict, strict, assign)
 

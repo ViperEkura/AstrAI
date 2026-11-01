@@ -41,7 +41,7 @@ def test_missing_and_partial_weights_initialize_missing_parameters(tmp_path):
     torch.manual_seed(91)
     expected = AutoRegressiveLM(config)
     torch.manual_seed(91)
-    without_weights = AutoModel.from_pretrained(tmp_path)
+    without_weights = AutoModel.from_pretrained(tmp_path, strict=False)
     for key, value in expected.state_dict().items():
         torch.testing.assert_close(
             without_weights.state_dict()[key], value, rtol=0, atol=0

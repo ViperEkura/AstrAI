@@ -492,6 +492,33 @@ context = TrainContextBuilder(config).with_param_path(param_path, resume=True).b
 - Creates `RDSampler` for shuffle+resume
 - Builds strategy via `StrategyFactory.create(train_type, model, device, **kwargs)`
 
+Pretrained policy loading uses the same model-owned `hf_mapping.json` weight
+conversion as `AutoModel.from_pretrained`, including norm offsets and declared
+vision/MTP exclusions. Missing required tensors or unsupported HF weight keys
+fail before the optimizer is created. An untied output head must be present in
+the checkpoint; a tied embedding/head uses the model's canonical embedding key.
+New LoRA adapter parameters may be initialized when loading a base policy, while
+resume requires the saved adapters as well as the backbone. Critic head
+initialization remains separate from policy loading.
+
+The generic model-loading API defaults to strict loading:
+`AutoModel.from_pretrained(path, strict=True)`. Deliberate partial loading uses
+`strict=False`; missing parameters keep their initialized values, unexpected
+keys are ignored, and shape mismatches still fail. To train that deliberately
+initialized model, save it as a complete model directory first. Training and
+full resume always require complete policy weights, except newly created LoRA
+adapter parameters during a warm start.
+
+`load_model_weights(directory)` and `save_model_weights(state_dict, directory)`
+read and write weight dictionaries only. They do not construct a model, convert
+HF layouts, or decide resume semantics. Checkpoint metadata records the available
+source revision, mapping SHA-256, explicit exclusions and adapter initialization.
+An unavailable source revision is recorded as `null`.
+
+For factory-initialized native training, `param_path` may supply only the native
+config/tokenizer directory. A directory declaring an HF mapping must contain
+policy weights, and resume always requires checkpoint weights.
+
 ## Training CLI
 
 ```bash

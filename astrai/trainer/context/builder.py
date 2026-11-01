@@ -20,6 +20,7 @@ from astrai.parallel.executor import (
     broadcast_state_dict,
     strip_compile_prefix,
 )
+from astrai.parallel.executor.gradients import MainGradientAccumulator
 from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.parallel.topology import ParallelTopology, build_topology
 from astrai.parallel.tp import TPState
@@ -61,11 +62,19 @@ class TrainContextBuilder:
 
     def _instantiate_model(self, model_config: Dict) -> nn.Module:
         return build_model_component(
-            self.config.model, self.config.model_dtype, model_config
+            self.config.model, self.config.precision.compute_dtype, model_config
         )
 
     def _instantiate_optimizer(self, model: nn.Module):
-        return build_optimizer_component(self.config.optimizer, model)
+        return build_optimizer_component(
+            self.config.optimizer,
+            model,
+            self.config.precision,
+            process_group=self.config.executor_kwargs.get(
+                "process_group",
+                self._topology.dp_group if self._topology is not None else None,
+            ),
+        )
 
     def _instantiate_scheduler(self, optimizer, dataset_len: int):
         return build_scheduler_component(
@@ -92,6 +101,12 @@ class TrainContextBuilder:
             tp_size=self.config.tp_size,
             device_type=self.config.device_type,
         )
+        if self.config.optimizer.params.get("shard_state", False) and (
+            not self._topology.is_trivial or self.config.dp_mode == "fsdp"
+        ):
+            raise NotImplementedError(
+                "Optimizer state ownership requires replicated none/DDP parameters"
+            )
         if self._topology.tp_size > 1:
             self._validate_tp()
 
@@ -140,6 +155,10 @@ class TrainContextBuilder:
     def _create_executor(self) -> BaseExecutor:
         cfg = self.config
         kwargs = dict(cfg.executor_kwargs)
+        if cfg.dp_mode in ("none", "ddp"):
+            kwargs["grad_accum_dtype"] = cfg.precision.gradient_dtype
+        elif cfg.precision.gradient_dtype not in ("float32", "model"):
+            raise NotImplementedError("Configurable gradient storage requires none/DDP")
         if self._topology is not None and self._topology.tp_size > 1:
             # Gradient sync must span the dp dimension only: tp peers hold
             # different weight shards, and a world-group default would
@@ -453,6 +472,18 @@ class TrainContextBuilder:
         if checkpoint is not None:
             load_component_extra(checkpoint.extra, "value_model", critic, cfg)
         critic = critic.to(device)
+        if cfg.precision.compute_dtype is not None:
+            critic = critic.to(dtype=getattr(torch, cfg.precision.compute_dtype))
+        if cfg.precision.gradient_dtype != "model":
+            gradient_dtype = getattr(torch, cfg.precision.gradient_dtype)
+            if any(
+                p.requires_grad and p.dtype != gradient_dtype
+                for p in critic.parameters()
+            ):
+                accumulator = MainGradientAccumulator(
+                    critic, lambda: False, dtype=gradient_dtype
+                )
+                context.on_shutdown("critic_gradients", accumulator.close)
         if context.dp_size > 1 and dist.is_initialized():
             # The value head is freshly initialized on each rank. Start every
             # replica from rank zero's head before reducing its gradients.
@@ -468,6 +499,10 @@ class TrainContextBuilder:
             self.runtime.critic_optimizer_fn or self._instantiate_optimizer
         )
         critic_optimizer = optimizer_factory(critic)
+        if any(hasattr(p, "main_grad") for p in critic.parameters()) and not getattr(
+            critic_optimizer, "supports_main_grad", False
+        ):
+            raise TypeError("Critic optimizer must support main_grad")
         if checkpoint is not None:
             load_component_extra(
                 checkpoint.extra, "value_optimizer", critic_optimizer, cfg

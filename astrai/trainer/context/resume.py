@@ -119,6 +119,17 @@ class ResumeLoader:
                 checkpoint.state_dict,
                 ConfigFactory.load(checkpoint.config or state.model_config),
             )
+        saved_precision = checkpoint.meta.get("precision", {})
+        if (
+            self.resume
+            and options["model"]
+            and saved_precision.get("export_dtype") is not None
+        ):
+            if "training_model" not in checkpoint.extra:
+                raise ValueError(
+                    "Cannot resume: missing original training_model weights"
+                )
+            checkpoint.state_dict = checkpoint.extra["training_model"]
         checkpoint.state_dict = strip_compile_prefix(checkpoint.state_dict)
         state.state_dict = checkpoint.state_dict if options["model"] else None
         state.model_config = checkpoint.config or state.model_config
@@ -137,6 +148,16 @@ class ResumeLoader:
         self, state: PreloadedState, checkpoint: Checkpoint, options: Dict
     ) -> None:
         """Adopt the checkpoint's epoch and data cursor, refusing stale layouts."""
+        saved_precision = checkpoint.meta.get("precision")
+        if saved_precision is not None:
+            for name in (
+                "compute_dtype",
+                "gradient_dtype",
+                "master_dtype",
+                "optimizer_state_dtype",
+            ):
+                if saved_precision[name] != getattr(self.config.precision, name):
+                    raise ValueError(f"Cannot resume: precision.{name} changed")
         saved_tail_policy = checkpoint.meta.get("epoch_tail_policy", "drop")
         if saved_tail_policy != self.config.epoch_tail_policy:
             raise ValueError(

@@ -13,7 +13,12 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from astrai.factory import BaseFactory
-from astrai.parallel.setup import get_rank, get_world_size
+from astrai.parallel.executor.gradients import (
+    MainGradientAccumulator,
+    clip_model_gradients,
+    parameter_gradient,
+)
+from astrai.parallel.setup import get_world_size
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +123,13 @@ def broadcast_state_dict(
 
 
 class BaseExecutor:
-    def __init__(self, grad_accum_steps: int = 1):
+    def __init__(self, grad_accum_steps: int = 1, grad_accum_dtype: str = "float32"):
         self.grad_accum_steps = max(grad_accum_steps, 1)
         self._sync_gradients = True
+        if grad_accum_dtype not in ("float32", "bfloat16", "model"):
+            raise ValueError("grad_accum_dtype must be float32, bfloat16 or model")
+        self.grad_accum_dtype = grad_accum_dtype
+        self._grad_accumulator = None
 
     def prepare(
         self,
@@ -140,12 +149,37 @@ class BaseExecutor:
         scheduler = None
         if optimizer_fn is not None:
             optimizer = optimizer_fn(model)
+            if self._grad_accumulator is not None and not getattr(
+                optimizer, "supports_main_grad", False
+            ):
+                self._grad_accumulator.close()
+                self._grad_accumulator = None
+                raise TypeError(
+                    "Main-gradient accumulation requires an optimizer supporting main_grad; "
+                    "use PrecisionOptimizer or grad_accum_dtype='model'"
+                )
             if scheduler_fn is not None:
                 scheduler = scheduler_fn(optimizer)
         return model, optimizer, scheduler
 
     def _prepare_model(self, model: nn.Module) -> nn.Module:
+        self._prepare_gradients(model)
         return model
+
+    def _uses_main_gradients(self, model: nn.Module) -> bool:
+        return self.grad_accum_dtype != "model" and any(
+            p.requires_grad and p.dtype != getattr(torch, self.grad_accum_dtype)
+            for p in model.parameters()
+        )
+
+    def _prepare_gradients(self, model: nn.Module, bucket_cap_mb: float = 25) -> None:
+        if self._uses_main_gradients(model):
+            self._grad_accumulator = MainGradientAccumulator(
+                model,
+                lambda: self.sync_gradients,
+                bucket_cap_mb,
+                dtype=getattr(torch, self.grad_accum_dtype),
+            )
 
     def rollout_capabilities(self) -> RolloutCapabilities:
         """Describe whether an in-process rollout may share this model."""
@@ -174,25 +208,68 @@ class BaseExecutor:
                 yield
 
     def backward(self, loss: torch.Tensor):
+        if self._grad_accumulator is not None:
+            self._grad_accumulator.begin_backward()
         loss.backward()
+        if self._grad_accumulator is not None:
+            self._grad_accumulator.finish_backward()
 
     def model_state_dict(self, model: nn.Module):
         """The checkpoint payload of *model*, without the compile prefix."""
         return strip_compile_prefix(model.state_dict())
 
     @property
+    def checkpoint_group(self):
+        """Communication domain whose leader publishes this model's checkpoint."""
+        return None
+
+    @property
     def writes_checkpoints(self) -> bool:
         """Whether this rank owns the published checkpoint payload."""
-        return not self.use_distributed or get_rank() == 0
+        return not self.use_distributed or dist.get_rank(self.checkpoint_group) == 0
 
     @contextmanager
-    def checkpoint_context(self, model: nn.Module):
+    def checkpoint_context(
+        self, model: nn.Module, *, optimizer, export_dtype, extra_optimizers=()
+    ):
+        """Gather export weights and original training weights at one step boundary."""
         if self.use_distributed:
-            dist.barrier()
-        state_dict = self._gather_state_dict(model)
-        yield state_dict
+            dist.barrier(group=self.checkpoint_group)
+        with contextlib.ExitStack() as stack:
+            for component in dict.fromkeys((optimizer, *extra_optimizers)):
+                optimizer_context = getattr(component, "checkpoint_context", None)
+                if optimizer_context is not None:
+                    stack.enter_context(optimizer_context())
+            # Compile wraps the parallel module; gather its original public keys.
+            model = getattr(model, "_orig_mod", model)
+            state_dict = self._gather_state_dict(model)
+            weight_extras = {}
+            if state_dict is not None and export_dtype is not None:
+                masters = {}
+                master_state_dict = getattr(optimizer, "master_state_dict", None)
+                if master_state_dict is not None:
+                    module = self.model_for_inference(model)
+                    named_parameters = strip_compile_prefix(
+                        dict(module.named_parameters(remove_duplicate=False))
+                    )
+                    masters = master_state_dict(named_parameters.items())
+                weight_extras["training_model"] = {
+                    name: value.detach().to(device="cpu", copy=True)
+                    for name, value in state_dict.items()
+                }
+                target = getattr(torch, export_dtype)
+                exported = {}
+                for name, value in state_dict.items():
+                    source = masters.get(name, value)
+                    exported[name] = source.to(
+                        device="cpu",
+                        dtype=target if source.is_floating_point() else source.dtype,
+                        copy=True,
+                    )
+                state_dict = exported
+            yield state_dict, weight_extras
         if self.use_distributed:
-            dist.barrier()
+            dist.barrier(group=self.checkpoint_group)
 
     def _gather_state_dict(self, model: nn.Module):
         state_dict = self.model_state_dict(model)
@@ -210,15 +287,21 @@ class BaseExecutor:
         return self._sync_gradients
 
     def scale_gradients(self, model: nn.Module, factor: float) -> None:
-        for parameter in model.parameters():
-            if parameter.grad is not None:
-                parameter.grad.mul_(factor)
+        if self._grad_accumulator is None:
+            for parameter in model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(factor)
+            return
+        gradients = [
+            gradient
+            for parameter in model.parameters()
+            if (gradient := parameter_gradient(parameter)) is not None
+        ]
+        if gradients:
+            torch._foreach_mul_(gradients, factor)
 
     def clip_grad_norm(self, model: nn.Module, max_norm: float) -> float:
-        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        if isinstance(total_norm, torch.Tensor):
-            return total_norm.item()
-        return total_norm
+        return float(clip_model_gradients(model, max_norm))
 
 
 class ExecutorFactory(BaseFactory[BaseExecutor]):

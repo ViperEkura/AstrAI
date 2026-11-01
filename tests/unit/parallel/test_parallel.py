@@ -62,6 +62,8 @@ def test_setup_parallel_applies_process_group_timeout(monkeypatch):
             pass
 
     monkeypatch.setattr(parallel_setup, "dist", FakeDist())
+    # setup_parallel writes launcher variables directly; isolate this fake run.
+    monkeypatch.setattr(parallel_setup.os, "environ", parallel_setup.os.environ.copy())
     with parallel_setup.setup_parallel(
         rank=0,
         world_size=2,

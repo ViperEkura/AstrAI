@@ -2,6 +2,7 @@ import importlib
 import json
 import os
 from collections.abc import Callable
+from dataclasses import asdict
 from functools import partial
 from typing import Dict, List
 
@@ -13,6 +14,7 @@ from click.core import ParameterSource
 from astrai.config import (
     AutoRegressiveLMConfig,
     ComponentSpec,
+    PrecisionConfig,
     TrainConfig,
 )
 from astrai.config.cli import (
@@ -552,6 +554,27 @@ _SPECS = [
 ]
 
 
+_PRECISION_FIELDS = (
+    "compute_dtype",
+    "gradient_dtype",
+    "master_dtype",
+    "optimizer_state_dtype",
+    "export_dtype",
+)
+_SPECS.extend(
+    OptSpec(
+        name,
+        "Precision",
+        default=None,
+        choices=["float32", "bfloat16"]
+        + (["float16"] if name == "export_dtype" else [])
+        + (["model"] if name == "gradient_dtype" else []),
+        help=f"Set precision.{name}.",
+    )
+    for name in _PRECISION_FIELDS
+)
+
+
 @click.command(
     name="train",
     cls=GroupedCommand,
@@ -563,12 +586,17 @@ _SPECS = [
 def train_command(ctx, config_path, dry_run, metrics, **kwargs):
     """Start model training (pretrain / SFT / DPO / GRPO)."""
     kwargs["metrics"] = metrics
+    kwargs["precision"] = None
     component_blocks = {}
     if config_path:
         with open(config_path) as stream:
             raw_config = yaml.safe_load(stream) or {}
         if not isinstance(raw_config, dict):
             raise click.UsageError("Training config must be a mapping")
+        if "precision" in raw_config:
+            if not isinstance(raw_config["precision"], dict):
+                raise click.UsageError("precision must be a mapping")
+            kwargs["precision"] = raw_config["precision"]
         for name in ("model", "optimizer", "scheduler", "dataset"):
             block = raw_config.get(name)
             if block is None:
@@ -576,14 +604,12 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
             if (
                 name == "model"
                 and isinstance(block, dict)
-                and not ({"type", "params", "dtype"} & block.keys())
+                and not ({"type", "params"} & block.keys())
             ):
                 continue  # Legacy flat model section.
             if not isinstance(block, dict) or "type" not in block:
                 raise click.UsageError(f"{name} component requires a type")
-            allowed = (
-                {"type", "params", "dtype"} if name == "model" else {"type", "params"}
-            )
+            allowed = {"type", "params"}
             unknown = set(block) - allowed
             if unknown:
                 raise click.UsageError(
@@ -611,6 +637,17 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
         )
     for name, block in component_blocks.items():
         kwargs[f"{name}_spec"] = block
+
+    settings = dict(kwargs.get("precision") or {})
+    settings.setdefault("compute_dtype", "bfloat16")
+    for name in _PRECISION_FIELDS:
+        value = kwargs.pop(name, None)
+        if value is not None:
+            settings[name] = value
+    try:
+        kwargs["precision"] = asdict(PrecisionConfig(**settings))
+    except (TypeError, ValueError) as error:
+        raise click.UsageError(str(error)) from error
 
     required = ["train_type", "param_path"]
     if "dataset" not in component_blocks:
@@ -668,6 +705,7 @@ def _print_dry_run(kwargs: Dict) -> None:
             .get("path", kwargs.get("data_root_path")),
         ),
         ("Data type", (kwargs.get("dataset_spec") or {}).get("type", "packed")),
+        ("Precision", json.dumps(kwargs.get("precision"), sort_keys=True)),
         ("DP mode", kwargs.get("dp_mode", "none")),
         ("DP replicas", str(dp_size)),
         ("CP size", str(cp_size)),
@@ -708,8 +746,13 @@ def load_reward_factory(reference: str) -> Callable:
     return factory
 
 
-def create_value_model(config):
-    return ValueModel(config).to(dtype=torch.bfloat16)
+def create_value_model(config, compute_dtype):
+    model = ValueModel(config)
+    return (
+        model
+        if compute_dtype is None
+        else model.to(dtype=getattr(torch, compute_dtype))
+    )
 
 
 def train(
@@ -839,11 +882,17 @@ def train(
         raise ValueError(
             "online training requires --reward_model module:qualified_name"
         )
+    precision_raw = kwargs.pop("precision", {"compute_dtype": "bfloat16"})
+    precision = (
+        precision_raw
+        if isinstance(precision_raw, PrecisionConfig)
+        else PrecisionConfig(**precision_raw)
+    )
     critic_model_fn = None
     if train_type == "online_ppo":
         # The optimizer defaults to the policy's; critic_optimizer_fn can
         # override it in the TrainConfig.
-        critic_model_fn = partial(create_value_model, config)
+        critic_model_fn = partial(create_value_model, config, precision.compute_dtype)
 
     executor_kwargs = {}
     if dp_mode == "ddp":
@@ -855,10 +904,6 @@ def train(
     model_raw = kwargs.pop("model_spec", None)
     optimizer_raw = kwargs.pop("optimizer_spec", None)
     scheduler_raw = kwargs.pop("scheduler_spec", None)
-    model_dtype = "bfloat16"
-    if model_raw is not None:
-        model_raw = dict(model_raw)
-        model_dtype = model_raw.pop("dtype", model_dtype)
     model_spec = (
         ComponentSpec(**model_raw)
         if model_raw
@@ -972,7 +1017,7 @@ def train(
         strategy=train_type,
         dataset=dataset_spec,
         model=model_spec,
-        model_dtype=model_dtype,
+        precision=precision,
         optimizer=optimizer_spec,
         scheduler=scheduler_spec,
         load_state_dict=load_state_dict,

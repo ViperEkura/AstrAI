@@ -97,6 +97,7 @@ def _init_single_rank_process_group(tmp_path, backend):
 
 def _rollout_config(*, compile_mode=None):
     return SimpleNamespace(
+        optimizer=ComponentSpec(type="torch.optim:SGD"),
         strategy="online_grpo",
         rollout_mode="sync",
         compile_mode=compile_mode,

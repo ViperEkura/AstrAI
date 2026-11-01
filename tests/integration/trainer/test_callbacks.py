@@ -204,7 +204,7 @@ def test_checkpoint_captures_completed_optimizer_step(
         not torch.equal(checkpoint.state_dict[name].cpu(), initial_tensor)
         for name, initial_tensor in initial_state.items()
     )
-    assert checkpoint.extra["optimizer"]["state"]
+    assert checkpoint.extra["optimizer"]["optimizer"]["state"]
     assert checkpoint.extra["scheduler"]["last_epoch"] == 1
     assert checkpoint.meta["optimizer_step"] == 1
     log_path = Path(base_test_env["test_dir"]) / "epoch_0_step_1" / "metric.jsonl"

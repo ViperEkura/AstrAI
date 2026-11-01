@@ -20,6 +20,34 @@ from astrai.config.rollout import resolve_rollout_devices
 from astrai.model.components.lora import LoRAConfig
 
 
+@plain_dataclass(frozen=True)
+class PrecisionConfig:
+    """Explicit compute, accumulation, persistent-state and export formats."""
+
+    compute_dtype: Optional[str] = None
+    gradient_dtype: str = "float32"
+    master_dtype: str = "float32"
+    optimizer_state_dtype: str = "float32"
+    export_dtype: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        supported = {"float32", "bfloat16"}
+        for name in ("compute_dtype", "master_dtype", "optimizer_state_dtype"):
+            value = getattr(self, name)
+            if (
+                name != "compute_dtype" or value is not None
+            ) and value not in supported:
+                raise ValueError(f"precision.{name} must be float32 or bfloat16")
+        if self.gradient_dtype not in supported | {"model"}:
+            raise ValueError(
+                "precision.gradient_dtype must be float32, bfloat16 or model"
+            )
+        if self.export_dtype not in supported | {"float16", None}:
+            raise ValueError(
+                "precision.export_dtype must be float32, bfloat16, float16 or None"
+            )
+
+
 @plain_dataclass(frozen=True, kw_only=True)
 class ComponentSpec:
     """Serializable component target and constructor parameters."""
@@ -158,7 +186,7 @@ class TrainConfig(BaseConfig):
     model: ComponentSpec
     optimizer: ComponentSpec
     scheduler: ComponentSpec
-    model_dtype: Optional[str] = None
+    precision: PrecisionConfig = field(default_factory=PrecisionConfig)
 
     reward_model_fn: Optional[Callable] = None
     critic_model_fn: Optional[Callable] = None
@@ -531,9 +559,10 @@ class TrainConfig(BaseConfig):
 
     @model_validator(mode="after")
     def _validate_online_strategy(self) -> "TrainConfig":
-        if self.model_dtype not in (None, "float32", "float16", "bfloat16"):
-            raise ValueError("model_dtype must be float32, float16, or bfloat16")
-
+        if "grad_accum_dtype" in self.executor_kwargs:
+            raise ValueError(
+                "Set precision.gradient_dtype instead of executor_kwargs.grad_accum_dtype"
+            )
         capabilities = _STRATEGY_CAPABILITIES[self.strategy]
         if self.strategy_kwargs.get("group_size", 4) < capabilities.min_group_size:
             raise ValueError(

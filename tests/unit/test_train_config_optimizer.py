@@ -1,8 +1,9 @@
-from dataclasses import fields, replace
+import json
+from dataclasses import asdict, fields, replace
 
 import pytest
 
-from astrai.config import ComponentSpec, TrainConfig
+from astrai.config import ComponentSpec, PrecisionConfig, TrainConfig
 
 
 def _settings():
@@ -91,3 +92,57 @@ def test_positional_optimizer_spec_wins_over_legacy_metadata():
     assert config.optimizer == spec
     assert config.optimizer_name == spec.type
     assert config.optimizer_hyperparameters == spec.params
+
+
+def _config(**kwargs):
+    return TrainConfig(
+        strategy="sft",
+        model=ComponentSpec(
+            type="torch.nn:Linear", params={"in_features": 1, "out_features": 1}
+        ),
+        dataset=ComponentSpec(type="packed"),
+        optimizer=ComponentSpec(type="sgd", params={"lr": 0.01}),
+        scheduler=ComponentSpec(type="constant"),
+        **kwargs,
+    )
+
+
+def test_precision_roundtrip():
+    policy = PrecisionConfig(
+        compute_dtype="bfloat16",
+        gradient_dtype="bfloat16",
+        master_dtype="bfloat16",
+        optimizer_state_dtype="float32",
+        export_dtype="float16",
+    )
+    config = _config(precision=asdict(policy))
+    payload = json.loads(json.dumps(config.to_dict()))
+    assert payload["precision"] == asdict(policy)
+    assert "model_dtype" not in payload
+    assert TrainConfig(**payload).precision == policy
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"model_dtype": "float32"},
+        {"executor_kwargs": {"grad_accum_dtype": "float32"}},
+    ],
+)
+def test_reject_old_precision_configuration(kwargs):
+    with pytest.raises(ValueError):
+        _config(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"compute_dtype": "float64"},
+        {"master_dtype": None},
+        {"optimizer_state_dtype": "int8"},
+        {"gradient_dtype": "auto"},
+    ],
+)
+def test_reject_invalid_precision(settings):
+    with pytest.raises(ValueError):
+        PrecisionConfig(**settings)

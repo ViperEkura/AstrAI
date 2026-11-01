@@ -8,6 +8,7 @@ import torch
 
 from astrai.config import TrainConfig
 from astrai.dataset import GlobalBatchSampler
+from astrai.parallel.executor.gradients import parameter_gradient
 from astrai.parallel.setup import agree_stop, get_rank, spawn_parallel_fn
 from astrai.trainer.callbacks import (
     CheckpointCallback,
@@ -254,9 +255,10 @@ class Trainer:
         critic = getattr(context.strategy, "critic", None)
         if critic is not None:
             for parameter in critic.parameters():
-                if parameter.grad is not None:
-                    context.topology.reduce_sum(parameter.grad)
-                    parameter.grad.mul_(1.0 / denominator)
+                gradient = parameter_gradient(parameter)
+                if gradient is not None:
+                    context.topology.reduce_sum(gradient)
+                    gradient.mul_(1.0 / denominator)
         context.loss = float(totals[1].item()) / denominator
         context.metrics = {
             name: float(totals[index + 2].item()) / denominator

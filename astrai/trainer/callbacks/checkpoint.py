@@ -27,6 +27,7 @@ _TOKENIZER_FILES = (
     "tokenizer_config.json",
     "special_tokens_map.json",
     "generation_config.json",
+    "chat_template.jinja",
 )
 
 

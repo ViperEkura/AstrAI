@@ -17,6 +17,30 @@ Messages = List[Message]
 """Single conversation — a list of messages."""
 
 
+def _resolve_stop_ids(tokenizer, special_tokens, generation) -> List[int]:
+    """Resolve generation EOS IDs, falling back to the named tokenizer EOS."""
+    if "eos_token_id" in generation:
+        ids = generation["eos_token_id"]
+        if ids is None:
+            return []
+        if type(ids) is int:
+            ids = [ids]
+    else:
+        eos = special_tokens.get("eos_token")
+        if eos is None:
+            return []
+        token_id = tokenizer.token_to_id(eos)
+        if token_id is None:
+            raise ValueError("declared EOS token is absent from tokenizer")
+        ids = [token_id]
+    if not isinstance(ids, list) or any(
+        type(i) is not int or not 0 <= i < 2**32 or tokenizer.id_to_token(i) is None
+        for i in ids
+    ):
+        raise ValueError("invalid declared EOS ids")
+    return list(dict.fromkeys(ids))
+
+
 class AutoTokenizer:
     """Base tokenizer class with automatic loading support"""
 
@@ -26,71 +50,72 @@ class AutoTokenizer:
         special_token_map: Optional[Dict[str, str]] = None,
         chat_template: Optional[str] = None,
     ):
-        self._tokenizer: Tokenizer = None
+        self._tokenizer: Optional[Tokenizer] = None
         self._chat_template: Optional[ChatTemplate] = None
-        self._special_token_map: Optional[Dict] = special_token_map or {}
-        self._stop_token_ids: Optional[List[int]] = None
-
-        if chat_template:
+        self._special_token_map = dict(special_token_map or {})
+        self._stop_token_ids: List[int] = []
+        self._tokenizer_config: Dict = {}
+        self._generation_config: Dict = {}
+        if path:
+            self.load(
+                path, special_token_map=special_token_map, chat_template=chat_template
+            )
+        elif chat_template:
             self.set_chat_template(chat_template)
 
-        if path:
-            self.load(path)
-
-    def load(self, path: Union[str, Path]):
-        """Load tokenizer from directory."""
+    def load(
+        self,
+        path: Union[str, Path],
+        *,
+        special_token_map: Optional[Dict[str, str]] = None,
+        chat_template: Optional[str] = None,
+    ):
+        """Replace state after parsing succeeds; file fields override explicit defaults."""
         path = Path(path)
-        tokenizer_file = path / "tokenizer.json"
-        config_file = path / "tokenizer_config.json"
-        self._tokenizer = Tokenizer.from_file(str(tokenizer_file))
-        self._stop_token_ids = None
-
-        config = {}
-        if config_file.exists():
-            with open(config_file, "r", encoding="utf-8") as f:
-                config = json.load(f)
-
-            if "special_tokens" in config:
-                self._special_token_map.update(config["special_tokens"])
+        tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
+        configs = {}
+        for name in ("special_tokens_map", "tokenizer_config", "generation_config"):
+            file = path / f"{name}.json"
+            configs[name] = (
+                json.loads(file.read_text(encoding="utf-8")) if file.is_file() else {}
+            )
+        config = {**configs["special_tokens_map"], **configs["tokenizer_config"]}
+        if "special_tokens" in config or "stop_token_ids" in config:
+            raise ValueError("Legacy tokenizer fields require migration to HF format")
+        special_tokens = dict(special_token_map or {})
+        for name in (
+            "bos_token",
+            "eos_token",
+            "pad_token",
+            "unk_token",
+            "sep_token",
+            "cls_token",
+            "mask_token",
+        ):
+            value = config.get(name, special_tokens.get(name))
+            if isinstance(value, dict):
+                value = value.get("content")
+            if isinstance(value, str):
+                special_tokens[name] = value
             else:
-                # HF stores named tokens at the top level, sometimes as
-                # AddedToken dictionaries rather than plain strings.
-                for name in ("bos_token", "eos_token", "pad_token", "unk_token"):
-                    value = config.get(name)
-                    if isinstance(value, dict):
-                        value = value.get("content")
-                    if isinstance(value, str):
-                        self._special_token_map[name] = value
-                if any(name in config for name in ("eos_token", "pad_token")):
-                    eos = self._special_token_map.get("eos_token")
-                    token_id = self._tokenizer.token_to_id(eos) if eos else None
-                    if eos and token_id is None:
-                        raise ValueError("declared EOS token is absent from tokenizer")
-                    self._stop_token_ids = [] if token_id is None else [token_id]
-            # Load chat template from config
-            if "chat_template" in config:
-                self.set_chat_template(config["chat_template"])
-
-        generation_path = path / "generation_config.json"
-        generation = (
-            json.loads(generation_path.read_text()) if generation_path.is_file() else {}
+                special_tokens.pop(name, None)
+        generation = configs["generation_config"]
+        stop_ids = _resolve_stop_ids(tokenizer, special_tokens, generation)
+        template = config.get("chat_template", chat_template)
+        template_file = path / "chat_template.jinja"
+        if template_file.is_file():
+            template = template_file.read_text(encoding="utf-8")
+        template = (
+            ChatTemplate.from_string(template, special_tokens=special_tokens)
+            if template is not None
+            else None
         )
-        ids = generation.get("eos_token_id")
-        label = "generation EOS ids"
-        if "stop_token_ids" in config:
-            ids = config["stop_token_ids"]
-            label = "stop_token_ids"
-        elif type(ids) is int:
-            ids = [ids]
-        if ids is not None:
-            if not isinstance(ids, list) or any(
-                type(i) is not int
-                or not 0 <= i < 2**32
-                or self._tokenizer.id_to_token(i) is None
-                for i in ids
-            ):
-                raise ValueError(f"invalid declared {label}")
-            self._stop_token_ids = list(dict.fromkeys(ids))
+        self._tokenizer = tokenizer
+        self._special_token_map = special_tokens
+        self._stop_token_ids = stop_ids
+        self._chat_template = template
+        self._tokenizer_config = config
+        self._generation_config = generation
 
     @classmethod
     def from_pretrained(cls, path: Union[str, Path]) -> "AutoTokenizer":
@@ -98,7 +123,6 @@ class AutoTokenizer:
 
         Raises:
             FileNotFoundError: If tokenizer.json is missing.
-            RuntimeError: If tokenizer failed to initialize.
         """
         path = Path(path)
         tokenizer_file = path / "tokenizer.json"
@@ -107,22 +131,10 @@ class AutoTokenizer:
                 f"Tokenizer file not found: {tokenizer_file}. "
                 "A valid tokenizer.json is required."
             )
-        instance = cls(path)
-        if instance._tokenizer is None:
-            raise RuntimeError(
-                f"Failed to load tokenizer from {path}. "
-                "The tokenizer.json may be corrupted or incompatible."
-            )
-        return instance
+        return cls(path)
 
     def save_pretrained(self, save_path: str):
-        """
-        Save tokenizer to pretrained directory.
-
-        Args:
-            save_path: Path to save the tokenizer
-        """
-
+        """Save tokenization, named tokens, resolved stop IDs and the chat template."""
         if self._tokenizer is None:
             raise RuntimeError(
                 "Tokenizer not initialized. Load or create a tokenizer first."
@@ -135,16 +147,28 @@ class AutoTokenizer:
         self._tokenizer.save(str(save_path / "tokenizer.json"))
 
         # Save tokenizer config
-        config = {}
-        if self._special_token_map is not None:
-            config["special_tokens"] = self._special_token_map
-        if self._stop_token_ids is not None:
-            config["stop_token_ids"] = self._stop_token_ids
+        config = {**self._special_token_map, **self._tokenizer_config}
+        config.setdefault("tokenizer_class", "PreTrainedTokenizerFast")
         if self._chat_template is not None:
             config["chat_template"] = self._chat_template.template_str
 
-        with open(save_path / "tokenizer_config.json", "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
+        generation = {**self._generation_config, "eos_token_id": self._stop_token_ids}
+        for name, value in (
+            ("tokenizer_config.json", config),
+            ("special_tokens_map.json", self._special_token_map),
+            ("generation_config.json", generation),
+        ):
+            (save_path / name).write_text(
+                json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        template_file = save_path / "chat_template.jinja"
+        if template_file.exists():
+            if self._chat_template is None:
+                template_file.unlink()
+            else:
+                template_file.write_text(
+                    self._chat_template.template_str, encoding="utf-8"
+                )
 
     def encode(
         self,
@@ -199,35 +223,9 @@ class AutoTokenizer:
         return self._tokenizer.get_vocab_size()
 
     def __getattr__(self, key: str):
-        """
-        Dynamically intercept special token attribute access.
-        Supports three forms:
-          - tokenizer.bos_token   → returns string
-          - tokenizer.bos_token_id → returns corresponding integer ID
-          - tokenizer.stop_ids → returns list of corresponding integer IDs for all special tokens
-
-        Internal/private attrs are not intercepted: during unpickle
-        ``__dict__`` is empty, so probing ``self._special_token_map``
-        would recurse infinitely.
-        """
+        """Expose named token strings and IDs; reject private probes during unpickle."""
         if key.startswith("_"):
             raise AttributeError(key)
-
-        # Handle stop_ids - return IDs for all special tokens
-        if key == "stop_ids":
-            if self._stop_token_ids is not None:
-                return list(self._stop_token_ids)
-            stop_ids = []
-
-            if self._tokenizer is None:
-                return stop_ids
-
-            for val in self._special_token_map.values():
-                token_id = self._tokenizer.token_to_id(val)
-                if token_id is not None:
-                    stop_ids.append(token_id)
-
-            return stop_ids
 
         # Handle _id suffix (e.g., bos_token_id -> bos_token)
         if key.endswith("_id"):
@@ -247,20 +245,16 @@ class AutoTokenizer:
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
 
     @property
+    def stop_ids(self) -> List[int]:
+        """Declared generation terminal IDs; other special tokens never imply stopping."""
+        return list(self._stop_token_ids)
+
+    @property
     def vocab_size(self) -> int:
         return len(self)
 
     def set_chat_template(self, template: Union[str, ChatTemplate]):
-        """
-        Set the chat template for the tokenizer.
-
-        Args:
-            template: Either a template name (str) registered in the global registry,
-                      or a ChatTemplate instance, or a Jinja2 template string.
-
-        Raises:
-            KeyError: If template name is not registered.
-        """
+        """Set a Jinja template string or an existing ChatTemplate."""
         if isinstance(template, str):
             self._chat_template = ChatTemplate.from_string(
                 template, special_tokens=self._special_token_map

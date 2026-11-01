@@ -515,6 +515,16 @@ HF layouts, or decide resume semantics. Checkpoint metadata records the availabl
 source revision, mapping SHA-256, explicit exclusions and adapter initialization.
 An unavailable source revision is recorded as `null`.
 
+Tokenizer directories use Hugging Face fields: named tokens and the chat template
+in `tokenizer_config.json`, and terminal IDs in `generation_config.json`'s
+`eos_token_id` (an integer or list). Generation EOS takes precedence over the
+named tokenizer EOS; an explicit `null` or empty list disables token-based
+stopping. BOS, PAD and other special tokens do not imply stopping. Saved
+directories retain generation metadata and can be reloaded by Transformers.
+AstrAI currently consumes only generation EOS, not the stored sampling defaults.
+Legacy `special_tokens`/`stop_token_ids` fields require separate migration.
+Loading another directory replaces prior state only after parsing succeeds.
+
 For factory-initialized native training, `param_path` may supply only the native
 config/tokenizer directory. A directory declaring an HF mapping must contain
 policy weights, and resume always requires checkpoint weights.

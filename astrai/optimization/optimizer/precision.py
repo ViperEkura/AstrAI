@@ -1,6 +1,6 @@
 """Composable update precision and configurable persistent optimizer storage."""
 
-from typing import Dict
+from typing import Dict, Iterable, Tuple
 
 import torch
 from torch import nn
@@ -112,10 +112,16 @@ class PrecisionOptimizer(Optimizer):
             state_dtype != torch.float32 or master_dtype != torch.float32
         )
 
-    @property
-    def master_parameters(self):
-        """Compute/source pairs for serialization without exposing storage logic."""
-        return tuple(zip(self._model_params, self._master_params))
+    def master_state_dict(
+        self, named_parameters: Iterable[Tuple[str, nn.Parameter]]
+    ) -> Dict[str, torch.Tensor]:
+        """Expose managed master views under the caller's canonical parameter names."""
+        masters = dict(zip(self._model_params, self._master_params))
+        return {
+            name: masters[parameter].detach()
+            for name, parameter in named_parameters
+            if parameter in masters
+        }
 
     @torch.no_grad()
     def step(self, closure=None):

@@ -9,8 +9,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
 
-import torch
-
 from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks.base import TrainCallback
 from astrai.trainer.optional_extras import (
@@ -59,28 +57,6 @@ def _write_metric_snapshot(snapshot: MetricSnapshot, destination: Path) -> None:
             output.write(record.encode("utf-8"))
 
 
-def _tensor_identity(tensor):
-    return tensor.device, tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride())
-
-
-def export_model_state(state_dict, dtype, master_parameters=()):
-    if dtype is None:
-        return state_dict
-    target = getattr(torch, dtype)
-    sources = {
-        _tensor_identity(model): master.detach() for model, master in master_parameters
-    }
-    result = {}
-    for name, value in state_dict.items():
-        source = sources.get(_tensor_identity(value), value)
-        result[name] = source.to(
-            device="cpu",
-            dtype=target if source.is_floating_point() else source.dtype,
-            copy=True,
-        )
-    return result
-
-
 class CheckpointCallback(TrainCallback):
     """
     Checkpoint callback for trainer.
@@ -106,24 +82,18 @@ class CheckpointCallback(TrainCallback):
     def _save_checkpoint(self, context: TrainContext):
         if not context.checkpoint_safe:
             return
-        with context.executor.checkpoint_context(context.model) as state_dict:
+        with context.executor.checkpoint_context(
+            context.model,
+            optimizer=context.optimizer,
+            export_dtype=context.config.precision.export_dtype,
+        ) as (state_dict, weight_extras):
             if state_dict is not None:
-                training_state = state_dict
-                state_dict = export_model_state(
-                    training_state,
-                    context.config.precision.export_dtype,
-                    getattr(context.optimizer, "master_parameters", ()),
-                )
                 save_path = os.path.join(
                     self.save_dir,
                     f"epoch_{context.epoch}_step_{context.optimizer_step}",
                 )
                 extra = self.save_extra_fn(context)
-                if context.config.precision.export_dtype is not None:
-                    extra["training_model"] = {
-                        name: value.detach().to(device="cpu", copy=True)
-                        for name, value in training_state.items()
-                    }
+                extra.update(weight_extras)
                 context.checkpoint = Checkpoint(
                     state_dict=state_dict,
                     epoch=context.epoch,

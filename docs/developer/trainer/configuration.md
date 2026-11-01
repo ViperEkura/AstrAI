@@ -29,14 +29,14 @@ rank, rendezvous and tensor-layout data remain in `RolloutWorkerSpec`.
 
 Use one precision policy independently of optimizer placement:
 
-~~~yaml
+```yaml
 precision:
   compute_dtype: bfloat16
   gradient_dtype: float32
   master_dtype: float32
   optimizer_state_dtype: float32
   export_dtype: bfloat16
-~~~
+```
 
 Compute, main gradients, persistent master weights and optimizer moments support
 float32 or bfloat16. Gradient dtype model uses native parameter gradients.
@@ -50,6 +50,11 @@ dtype (None); the CLI defaults compute to bfloat16. Other defaults are float32.
 CLI flags such as --master_dtype and --export_dtype override individual YAML
 precision fields. Old FP32 class aliases and model_dtype/executor gradient
 configuration bridges have been removed.
+
+The optimizer exposes named master views through master_state_dict; the executor
+prepares export and training snapshots in checkpoint_context. Parameter-object
+matching preserves tied names without inspecting storage addresses. The
+checkpoint callback consumes those snapshots and owns persistence only.
 
 An explicit export_dtype controls model.safetensors only. Float32 exports use
 actual master weights when present. Checkpoints also save original compute
@@ -127,6 +132,3 @@ for set_to_none=False), while retaining reusable bucket storage. Checkpoints
 remain update-boundary snapshots: save masters and optimizer state, not partial
 gradient accumulation. FP32 master checkpoint and legacy-reset rules above
 still apply. Complete optimizer-state GPU sharding remains separate work.
-
-The design follows Megatron-LM's separation of compute parameters and main_grad
-buffers: https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/distributed/distributed_data_parallel.py

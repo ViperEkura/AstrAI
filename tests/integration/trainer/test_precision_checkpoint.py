@@ -4,10 +4,14 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch import nn
 
 from astrai.config import PrecisionConfig
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
+from astrai.parallel.executor import NoneExecutor
 from astrai.serialization import Checkpoint
 from astrai.trainer.context import TrainContextBuilder
+from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.trainer import Trainer
 from tests.integration.trainer.test_unified_resume import _config, _StopAfterOne
 
@@ -32,6 +36,17 @@ def test_export_roundtrip_preserves_training_state(tmp_path, compute):
         for t in saved.extra["training_model"].values()
         if t.is_floating_point()
     )
+    warm = PreloadedState()
+    loader = ResumeLoader(
+        _config(tmp_path / "warm", precision=policy),
+        str(source),
+        False,
+        None,
+        lambda _: None,
+    )
+    loader._load_from_param_path(warm)
+    for name, value in saved.state_dict.items():
+        torch.testing.assert_close(warm.state_dict[name], value, atol=0, rtol=0)
     # Changing only export format must preserve the full resume trajectory.
     Trainer(
         _config(resumed_dir, precision=replace(policy, export_dtype="float32"))
@@ -62,3 +77,95 @@ def test_resume_rejects_training_precision_change(tmp_path, name):
         TrainContextBuilder(
             _config(tmp_path / "resumed", precision=changed)
         ).with_param_path(str(source_dir / "epoch_0_step_1"), resume=True).build()
+
+
+def test_export_uses_master_without_mutating_training_state():
+    model = nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.weight.fill_(1)
+    optimizer = PrecisionOptimizer(torch.optim.SGD(model.parameters(), lr=1e-5))
+    for _ in range(20):
+        model.weight.main_grad = torch.ones_like(model.weight, dtype=torch.float32)
+        optimizer.step()
+        optimizer.zero_grad()
+    master = optimizer.master_state_dict(model.named_parameters())["weight"]
+    assert model.weight.item() == 1
+    assert master.item() < 1
+    executor = NoneExecutor()
+    with executor.checkpoint_context(
+        model, optimizer=optimizer, export_dtype="float32"
+    ) as (fp32, extra):
+        torch.testing.assert_close(fp32["weight"], master, atol=0, rtol=0)
+        torch.testing.assert_close(
+            extra["training_model"]["weight"], model.weight, atol=0, rtol=0
+        )
+    with executor.checkpoint_context(
+        model, optimizer=optimizer, export_dtype="bfloat16"
+    ) as (bf16, _):
+        assert bf16["weight"].item() == 1
+    with executor.checkpoint_context(model, optimizer=optimizer, export_dtype=None) as (
+        native,
+        extra,
+    ):
+        assert native["weight"].dtype == torch.bfloat16
+        assert native["weight"].item() == 1
+        assert extra == {}
+    assert master.dtype == torch.float32 and model.weight.dtype == torch.bfloat16
+    assert executor.model_state_dict(model)["weight"].item() == 1
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("use_masters", [False, True])
+def test_export_handles_tied_names_unmanaged_weights_and_buffers(
+    compiled, use_masters, tmp_path
+):
+    model = nn.Sequential(
+        nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False)
+    ).bfloat16()
+    model[1].weight = model[0].weight
+    model.register_parameter(
+        "unmanaged", nn.Parameter(torch.full((2,), 0.375, dtype=torch.bfloat16))
+    )
+    model.register_buffer("count", torch.tensor(7, dtype=torch.int64))
+    model.register_buffer("average", torch.tensor(0.625, dtype=torch.bfloat16))
+    optimizer = torch.optim.SGD([model[0].weight], lr=1e-5)
+    if use_masters:
+        optimizer = PrecisionOptimizer(optimizer)
+        master = optimizer.master_state_dict(model.named_parameters())["0.weight"]
+        with torch.no_grad():
+            master.fill_(0.9998)
+    expected = {name: value.clone() for name, value in model.state_dict().items()}
+    if compiled:
+        model = torch.compile(model, backend="eager")
+    executor = NoneExecutor()
+    with executor.checkpoint_context(
+        model, optimizer=optimizer, export_dtype="float32"
+    ) as (exported, extra):
+        assert set(exported) == set(expected)
+        assert exported["count"].dtype == torch.int64
+        assert exported["average"].dtype == torch.float32
+        assert exported["count"].item() == 7
+        assert exported["average"].item() == 0.625
+        torch.testing.assert_close(
+            exported["unmanaged"], expected["unmanaged"].float(), atol=0, rtol=0
+        )
+        for name in ("0.weight", "1.weight"):
+            torch.testing.assert_close(
+                exported[name],
+                master if use_masters else expected[name].float(),
+                atol=0,
+                rtol=0,
+            )
+        # Both tied names must be independently serializable.
+        saved_path = tmp_path / "export"
+        Checkpoint(state_dict=exported).save(str(saved_path))
+        saved = Checkpoint.load(str(saved_path))
+        torch.testing.assert_close(
+            saved.state_dict["0.weight"], saved.state_dict["1.weight"], atol=0, rtol=0
+        )
+        exported["0.weight"].zero_()
+        assert torch.count_nonzero(exported["1.weight"]) > 0
+        extra["training_model"]["unmanaged"].zero_()
+    actual = executor.model_state_dict(model)
+    for name, value in expected.items():
+        torch.testing.assert_close(actual[name], value, atol=0, rtol=0)

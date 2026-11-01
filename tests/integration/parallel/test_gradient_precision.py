@@ -80,6 +80,52 @@ def _distributed_check(
                 peer = p.detach().clone()
                 dist.broadcast(peer, src=0)
                 torch.testing.assert_close(p, peer, atol=0, rtol=0)
+        for compiled in (False, True):
+            snapshot_model = (
+                torch.compile(model, backend="eager") if compiled else model
+            )
+            with executor.checkpoint_context(
+                snapshot_model, optimizer=optimizer, export_dtype="float32"
+            ) as (exported, extra):
+                if rank == 0:
+                    masters = optimizer.master_state_dict(
+                        model.module.named_parameters()
+                    )
+                    assert set(exported) == set(masters)
+                    for name, master in masters.items():
+                        torch.testing.assert_close(
+                            exported[name], master.cpu(), atol=0, rtol=0
+                        )
+                    native = executor.model_state_dict(model)
+                    for name, value in native.items():
+                        torch.testing.assert_close(
+                            extra["training_model"][name], value.cpu(), atol=0, rtol=0
+                        )
+                else:
+                    assert exported is None and extra == {}
+        native_executor = DDPExecutor(grad_accum_dtype="model")
+        native_model, native_optimizer, _ = native_executor.prepare(
+            lambda: nn.Linear(2, 2).to(device),
+            lambda module: torch.optim.SGD(module.parameters(), lr=0.01),
+        )
+        with native_executor.checkpoint_context(
+            torch.compile(native_model, backend="eager"),
+            optimizer=native_optimizer,
+            export_dtype="bfloat16",
+        ) as (exported, extra):
+            if rank == 0:
+                assert set(exported) == {"weight", "bias"}
+                for name, value in native_executor.model_state_dict(
+                    native_model
+                ).items():
+                    torch.testing.assert_close(
+                        exported[name], value.cpu().bfloat16(), atol=0, rtol=0
+                    )
+                    torch.testing.assert_close(
+                        extra["training_model"][name], value.cpu(), atol=0, rtol=0
+                    )
+            else:
+                assert exported is None and extra == {}
     finally:
         dist.destroy_process_group()
 

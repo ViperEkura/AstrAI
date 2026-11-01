@@ -39,7 +39,9 @@ def check_precision_storage(
         master_dtype=master_dtype,
         state_dtype=stored_dtype,
     )
-    for parameter, master in optimizer.master_parameters:
+    initial_masters = optimizer.master_state_dict(model.named_parameters())
+    for name, parameter in model.named_parameters():
+        master = initial_masters[name]
         torch.testing.assert_close(
             parameter, master.to(device=device, dtype=compute_dtype), atol=0, rtol=0
         )
@@ -73,14 +75,15 @@ def check_precision_storage(
                                 and name != "step"
                             ):
                                 value.copy_(value.bfloat16().float())
-        names = {p: name for name, p in model.named_parameters()}
         for p, q in zip(model.parameters(), reference.parameters()):
             torch.testing.assert_close(p, q.to(compute_dtype), atol=0, rtol=0)
-        for p, master in optimizer.master_parameters:
+        for name, master in optimizer.master_state_dict(
+            model.named_parameters()
+        ).items():
             assert master.dtype == master_dtype
             torch.testing.assert_close(
                 master.cpu(),
-                reference_by_name[names[p]].detach().to(master_dtype).cpu(),
+                reference_by_name[name].detach().to(master_dtype).cpu(),
                 atol=0,
                 rtol=0,
             )

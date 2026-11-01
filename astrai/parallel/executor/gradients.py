@@ -68,8 +68,8 @@ class GradientBucket:
 class MainGradientAccumulator:
     """Keep compute weights separate from persistent main-gradient storage.
 
-    Following Megatron's main_grad design, each parameter has a view into one
-    contiguous communication bucket. The same storage accumulates backward
+    Each parameter has a view into one contiguous communication bucket.
+    The same storage accumulates backward
     contributions and participates in same-dtype all-reduce. No BF16 reducer buckets
     or per-update gradient packing are retained. This preserves precision
     across backward calls, not inside individual BF16 backward operators.

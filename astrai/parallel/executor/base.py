@@ -224,11 +224,38 @@ class BaseExecutor:
         return not self.use_distributed or get_rank() == 0
 
     @contextmanager
-    def checkpoint_context(self, model: nn.Module):
+    def checkpoint_context(self, model: nn.Module, *, optimizer, export_dtype):
+        """Gather export weights and original training weights at one step boundary."""
         if self.use_distributed:
             dist.barrier()
+        # Compile wraps the parallel module; gather its original public keys.
+        model = getattr(model, "_orig_mod", model)
         state_dict = self._gather_state_dict(model)
-        yield state_dict
+        weight_extras = {}
+        if state_dict is not None and export_dtype is not None:
+            masters = {}
+            master_state_dict = getattr(optimizer, "master_state_dict", None)
+            if master_state_dict is not None:
+                module = self.model_for_inference(model)
+                named_parameters = strip_compile_prefix(
+                    dict(module.named_parameters(remove_duplicate=False))
+                )
+                masters = master_state_dict(named_parameters.items())
+            weight_extras["training_model"] = {
+                name: value.detach().to(device="cpu", copy=True)
+                for name, value in state_dict.items()
+            }
+            target = getattr(torch, export_dtype)
+            exported = {}
+            for name, value in state_dict.items():
+                source = masters.get(name, value)
+                exported[name] = source.to(
+                    device="cpu",
+                    dtype=target if source.is_floating_point() else source.dtype,
+                    copy=True,
+                )
+            state_dict = exported
+        yield state_dict, weight_extras
         if self.use_distributed:
             dist.barrier()
 

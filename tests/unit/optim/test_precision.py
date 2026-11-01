@@ -10,7 +10,6 @@ from torch import nn
 from astrai.config.train_config import ComponentSpec
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.precision import PrecisionOptimizer
-from astrai.trainer.callbacks.checkpoint import export_model_state
 from astrai.trainer.components import (
     build_optimizer_component,
     load_optimizer_state_dict,
@@ -201,22 +200,18 @@ def test_resident_storage_precision_and_restart(
     )
 
 
-def test_export_uses_master_without_mutating_training_state():
-    model = nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+def test_master_state_dict_preserves_aliases_and_filters_unmanaged_parameters():
+    model = nn.Linear(2, 2, bias=False).bfloat16()
+    model.register_parameter("tied", model.weight)
+    # Same storage is insufficient: this distinct Parameter is not managed.
+    model.register_parameter("unmanaged", nn.Parameter(model.weight.detach()))
+    optimizer = PrecisionOptimizer(torch.optim.SGD([model.weight], lr=1e-3))
+    state = optimizer.master_state_dict(model.named_parameters(remove_duplicate=False))
+    assert set(state) == {"weight", "tied"}
+    assert all(not value.requires_grad for value in state.values())
     with torch.no_grad():
-        model.weight.fill_(1)
-    optimizer = PrecisionOptimizer(torch.optim.SGD(model.parameters(), lr=1e-5))
-    for _ in range(20):
-        model.weight.main_grad = torch.ones_like(model.weight, dtype=torch.float32)
-        optimizer.step()
-        optimizer.zero_grad()
-    master = optimizer.master_parameters[0][1]
-    assert model.weight.item() == 1
-    assert master.item() < 1
-    state = model.state_dict()
-    fp32 = export_model_state(state, "float32", optimizer.master_parameters)
-    bf16 = export_model_state(state, "bfloat16", optimizer.master_parameters)
-    torch.testing.assert_close(fp32["weight"], master, atol=0, rtol=0)
-    assert bf16["weight"].item() == 1
-    assert master.dtype == torch.float32 and model.weight.dtype == torch.bfloat16
-    assert export_model_state(state, None, optimizer.master_parameters) is state
+        state["weight"].fill_(0.75)
+    torch.testing.assert_close(state["tied"], state["weight"], atol=0, rtol=0)
+    torch.testing.assert_close(
+        optimizer.state_dict()["master_params"][0], state["weight"], atol=0, rtol=0
+    )

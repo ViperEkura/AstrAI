@@ -146,7 +146,9 @@ class CheckpointCallback(TrainCallback):
         )
         if context.pretrained_metadata:
             meta["pretrained"] = context.pretrained_metadata
-        policy_version = context.strategy.policy_version
+        policy_version = (
+            context.rollout.policy_version if context.rollout is not None else None
+        )
         if policy_version is not None:
             meta["policy_version"] = policy_version
         return meta

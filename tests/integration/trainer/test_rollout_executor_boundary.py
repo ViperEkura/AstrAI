@@ -38,14 +38,8 @@ class _ConfigModel(nn.Module):
 
 
 class _OnlineStrategy:
-    def __init__(self):
-        self.runner = None
-
     def supports_online(self):
         return True
-
-    def set_rollout_runner(self, runner):
-        self.runner = runner
 
 
 class _ConfigDataset(Dataset):
@@ -168,10 +162,7 @@ def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatc
         assert captured["model"].generation_config == {"eos_token_id": [1, 2]}
         assert captured["max_seq_len"] == 32
         assert captured["max_batch_size"] == 2
-        assert (
-            context.strategy.runner.generator.backend.engine_core.__class__
-            is _EngineCore
-        )
+        assert context.rollout.generator.backend.engine_core.__class__ is _EngineCore
     finally:
         dist.destroy_process_group()
 
@@ -399,9 +390,7 @@ def test_effective_grpo_defaults_and_all_worker_parameters(monkeypatch):
     context = SimpleNamespace(
         model=model,
         executor=SimpleNamespace(model_for_inference=lambda m: m),
-        strategy=SimpleNamespace(
-            group_size=4, supports_online=lambda: True, set_rollout_runner=Mock()
-        ),
+        strategy=SimpleNamespace(group_size=4, supports_online=lambda: True),
         consumed_samples=10,
         checkpoint=None,
         optimizer_step=2,
@@ -430,10 +419,7 @@ def test_effective_grpo_defaults_and_all_worker_parameters(monkeypatch):
     assert values["model_dtype"] == torch.bfloat16
     assert resolved.devices == ("cuda:1", "cuda:2")
     assert resolved.learner_rank is None
-    assert (
-        context.async_rollout is context.strategy.set_rollout_runner.call_args.args[0]
-    )
-    assert context.async_rollout.coordinator is coordinator.return_value
+    assert context.rollout.coordinator is coordinator.return_value
 
 
 @pytest.mark.parametrize("devices", [["cuda:0"], ["cuda:3"]])

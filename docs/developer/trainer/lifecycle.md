@@ -29,13 +29,14 @@ classDiagram
     TrainContextBuilder --> TrainContext : assembles
     TrainContext --> BaseExecutor
     TrainContext --> BaseStrategy
-    TrainContext --> AsyncRoundCoordinator
+    TrainContext --> RolloutRunner
+    RolloutRunner --> AsyncRoundCoordinator
     TrainSession --> TrainContext : callbacks and teardown
 ```
 
 The builder resolves topology and persisted state, creates the executor and
 context, then prepares the model, optimizer, datasets, strategy and rollout.
-After a context exists, a failed build closes its assigned async rollout and
+After a context exists, a failed build closes its context-owned rollout and
 re-raises the original error. AsyncRoundCoordinator also closes workers and
 its weight channel if its own constructor fails before assignment.
 
@@ -47,7 +48,7 @@ The shutdown order is the same for normal completion, a stop request and errors:
 
 1. Run registered cleanup hooks, including stopping DataLoader workers.
 2. Discard pending metric records and dispatch `on_shutdown`.
-3. Close asynchronous rollout, then dispatch `on_train_end`.
+3. Close context-owned rollout, then dispatch `on_train_end`.
 4. On a successful run, attempt the distributed barrier.
 5. Restore the prior signal handlers.
 

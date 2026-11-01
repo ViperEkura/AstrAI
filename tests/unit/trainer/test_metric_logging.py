@@ -17,7 +17,7 @@ def _callback(val_step=0):
     return MetricCallback(metrics=["loss"], val_step=val_step)
 
 
-def _context(step=0, samples=0, checkpoint=None, param_path=None, async_rollout=None):
+def _context(step=0, samples=0, checkpoint=None, param_path=None, rollout=None):
     return TrainContext(
         checkpoint=checkpoint,
         param_path=param_path,
@@ -28,7 +28,8 @@ def _context(step=0, samples=0, checkpoint=None, param_path=None, async_rollout=
         loss=1.0,
         val_dataloader=None,
         grad_snr_tracker=None,
-        async_rollout=async_rollout,
+        rollout=rollout,
+        config=SimpleNamespace(rollout_mode="async_round" if rollout else "sync"),
     )
 
 
@@ -103,17 +104,18 @@ def test_metric_commit_follows_optimizer_commit_on_failure(tmp_path, mode):
     context.checkpoint_safe = False
     context.pending_samples = 2
     context.optimizer = SimpleNamespace(zero_grad=lambda: None)
-    context.async_rollout = SimpleNamespace(policy_version=0)
+    context.rollout = SimpleNamespace(policy_version=0)
 
-    def fail_update(_optimizer):
+    def fail_update(_context):
         if mode == "online_committed":
-            context.async_rollout.policy_version += 1
+            context.rollout.policy_version += 1
         raise RuntimeError("update failed")
 
-    context.strategy = SimpleNamespace(optimizer_step=fail_update)
+    context.strategy = SimpleNamespace(after_update=lambda: None)
+    trainer._step_policy = fail_update
     with pytest.raises(RuntimeError, match="update failed"):
         if mode == "offline":
-            trainer._commit_offline_update(context, new_data=True)
+            trainer._commit_global_update(context, new_data=True)
         else:
             batch = SimpleNamespace(prompts=SimpleNamespace(shape=(2,)))
             trainer._commit_online_update(context, batch, new_data=True)
@@ -141,8 +143,6 @@ def test_validation_cadence_uses_global_step_after_resume():
 @pytest.mark.parametrize(("step", "expected"), [(0, 0), (1, 10), (11, 20)])
 def test_async_validation_cadence_uses_pre_update_step(step, expected):
     callback = _callback(val_step=10)
-    callback.on_train_begin(
-        _context(step=step, checkpoint=object(), async_rollout=object())
-    )
+    callback.on_train_begin(_context(step=step, checkpoint=object(), rollout=object()))
 
     assert callback._next_val_step == expected

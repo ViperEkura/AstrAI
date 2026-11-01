@@ -1,10 +1,4 @@
-"""Unit tests for online rollout integration in :class:`BaseStrategy`.
-
-Covers the shared rollout-trigger logic in ``BaseStrategy.__call__``
-(runner injection, cache-driven refresh hook, ``step()`` callback) and
-the per-strategy ``prepare_from_rollout`` mappings for both
-:class:`GRPOStrategy` and :class:`DPOStrategy`.
-"""
+"""Rollout-to-batch mappings and policy/reference gradient boundaries."""
 
 import pytest
 import torch
@@ -30,65 +24,6 @@ def _make_rollout_result(B=2, G=4, P=6, R=8, device="cpu"):
         rewards=torch.randn(B, G, device=device),
         logprobs_old=torch.zeros(B, G, R, device=device),
     )
-
-
-class _RecordingRunner:
-    """Fake RolloutRunner returning a fixed result with freshness tracking.
-
-    Freshness is ``True`` on the first call after construction or after
-    :meth:`swap_result`; ``False`` on subsequent cached calls -- mirroring
-    the real ``RolloutRunner`` contract without invoking generation.
-    """
-
-    def __init__(self, result):
-        self.result = result
-        self.calls = 0
-        self.step_calls = 0
-        self._fresh = True
-        self.policy_version = result.policy_version
-        self.weight_updates = []
-        self.eval_calls = 0
-
-    def __call__(self, batch):
-        self.calls += 1
-        fresh = self._fresh
-        self._fresh = False
-        return self.result, fresh
-
-    def evaluate(self, batch):
-        # Mirrors RolloutRunner.evaluate: one-off scoring that never
-        # touches the replay cache or freshness state.
-        self.eval_calls += 1
-        return self.result
-
-    def step(self):
-        self.step_calls += 1
-
-    def update_weights(self, policy_version):
-        self.policy_version = policy_version
-        self.weight_updates.append(policy_version)
-        return policy_version
-
-    def apply_weight_update(self, policy_version, update):
-        if policy_version is None:
-            # Mirror the scheduler: None derives live+1 under the lock.
-            policy_version = self.policy_version + 1
-        result = update(policy_version)
-        self.update_weights(policy_version)
-        return result
-
-    def swap_result(self, result):
-        self.result = result
-        self._fresh = True
-
-
-class _NoOpOptimizer:
-    def step(self):
-        return None
-
-
-def _step(strat):
-    strat.optimizer_step(_NoOpOptimizer())
 
 
 def _make_grpo(device, executor=None):
@@ -232,184 +167,35 @@ def test_call_without_runner_accepts_behavior_logprobs_grpo(device):
     assert torch.isfinite(loss).item()
 
 
-def test_call_with_runner_returns_finite_loss_grpo(device):
+def test_prepared_rollout_returns_finite_loss_grpo(device):
     strat = _make_grpo(device)
-    strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
+    batch = strat.prepare_from_rollout(_make_rollout_result(device=device))
+    loss = strat(batch)["loss"]
     assert torch.isfinite(loss).item()
 
 
-def test_call_with_runner_returns_finite_loss_dpo(device):
+def test_prepared_rollout_returns_finite_loss_dpo(device):
     strat = _make_dpo(device)
-    strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
+    batch = strat.prepare_from_rollout(_make_rollout_result(device=device))
+    loss = strat(batch)["loss"]
     assert torch.isfinite(loss).item()
-
-
-def test_call_invokes_runner_each_time(device):
-    strat = _make_grpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    assert runner.calls == 2
 
 
 def test_grpo_reuses_rollout_logprobs_without_old_model(device):
     strat = _make_grpo(device)
     result = _make_rollout_result(device=device)
     result.logprobs_old.normal_().requires_grad_()
-    runner = _RecordingRunner(result)
-    strat.set_rollout_runner(runner)
+    batch = strat.prepare_from_rollout(result)
     assert strat.old_model is None
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
+    loss = strat(batch)["loss"]
     loss.backward()
     assert result.logprobs_old.grad is None
 
 
-def test_grpo_reuses_same_cached_result(device):
-    strat = _make_grpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    _step(strat)
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    _step(strat)
-    assert runner.calls == 2
-    assert runner.step_calls == 2
-
-
-def test_grpo_accepts_new_rollout_result(device):
-    strat = _make_grpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    _step(strat)
-    runner.swap_result(_make_rollout_result(device=device))
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    _step(strat)
-    assert runner.calls == 2
-    assert runner.step_calls == 2
-
-
-def test_dpo_no_sync_hook_when_new_rollout_result(device):
-    """DPO has no old_model, so ``_on_rollout_refresh`` must be a no-op.
-
-    We verify by ensuring no AttributeError is raised (DPO has no
-    old_model) and that step is still called.
-    """
-    strat = _make_dpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    _step(strat)
-    runner.swap_result(_make_rollout_result(device=device))
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    _step(strat)
-    assert runner.step_calls == 2
-
-
-def test_step_not_called_when_sync_gradients_false(device):
-    executor = FakeExecutor(sync_gradients=False)
-    strat = _make_grpo(device, executor=executor)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    assert runner.step_calls == 0
-
-
-def test_step_called_when_sync_gradients_true(device):
-    executor = FakeExecutor(sync_gradients=True)
-    strat = _make_grpo(device, executor=executor)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})
-    _step(strat)
-    assert runner.step_calls == 1
-    assert runner.weight_updates == [1]
-    assert strat.policy_version == 1
-
-
-def test_post_hoc_online_optimizer_step_is_rejected(device):
-    strat = _make_grpo(device)
-    strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-
-    with pytest.raises(RuntimeError, match="strategy.optimizer_step"):
-        strat.on_optimizer_step()
-
-
-def test_optimizer_step_publishes_version_with_weight_update(device):
-    strat = _make_grpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    parameter = next(strat.model.parameters())
-    parameter.grad = torch.ones_like(parameter)
-    optimizer = torch.optim.SGD(strat.model.parameters(), lr=0.1)
-    before = parameter.detach().clone()
-
-    strat.optimizer_step(optimizer)
-
-    assert not torch.equal(parameter, before)
-    assert runner.weight_updates == [1]
-    assert runner.step_calls == 1
-
-
-class _RecordingPublisher:
-    """WeightPublisher double: records (version, source model) per publish."""
-
-    def __init__(self, error=None):
-        self.calls = []
-        self.error = error
-
-    def publish(self, policy_version, source):
-        self.calls.append((policy_version, source))
-        if self.error is not None:
-            raise self.error
-
-
-def test_optimizer_step_publishes_to_weight_publishers(device):
-    strat = _make_grpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    publisher = _RecordingPublisher()
-    strat.set_weight_publishers([publisher])
-    parameter = next(strat.model.parameters())
-    parameter.grad = torch.ones_like(parameter)
-    optimizer = torch.optim.SGD(strat.model.parameters(), lr=0.1)
-    before = parameter.detach().clone()
-
-    strat.optimizer_step(optimizer)
-
-    # Publish runs after the optimizer step (fresh weights visible) and
-    # receives the derived target version plus the strategy's model.
-    assert not torch.equal(parameter, before)
-    assert publisher.calls == [(1, strat.model)]
-    assert runner.weight_updates == [1]
-
-
-def test_weight_publisher_failure_prevents_version_commit(device):
-    strat = _make_grpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-    publisher = _RecordingPublisher(error=RuntimeError("publish failed"))
-    strat.set_weight_publishers([publisher])
-    parameter = next(strat.model.parameters())
-    parameter.grad = torch.ones_like(parameter)
-    optimizer = torch.optim.SGD(strat.model.parameters(), lr=0.1)
-
-    with pytest.raises(RuntimeError, match="publish failed"):
-        strat.optimizer_step(optimizer)
-
-    # The update callable raised inside the lock, so no version was
-    # published and the replay-cadence counter never advanced.
-    assert runner.weight_updates == []
-    assert runner.step_calls == 0
-
-
 def test_loss_is_differentiable_dpo(device):
     strat = _make_dpo(device)
-    strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
+    batch = strat.prepare_from_rollout(_make_rollout_result(device=device))
+    loss = strat(batch)["loss"]
     loss.backward()
     has_grad = any(
         p.grad is not None and p.grad.abs().sum() > 0 for p in strat.model.parameters()
@@ -417,30 +203,10 @@ def test_loss_is_differentiable_dpo(device):
     assert has_grad
 
 
-def test_validate_online_returns_none_without_runner(device):
-    strat = _make_grpo(device)
-    batch = {"input_ids": torch.randint(3, 200, (2, 4), device=device)}
-    assert strat.validate_online(batch) is None
-
-
-def test_validate_online_uses_one_off_rollout_not_replay_cache(device):
-    strat = _make_grpo(device)
-    runner = _RecordingRunner(_make_rollout_result(device=device))
-    strat.set_rollout_runner(runner)
-
-    out = strat.validate_online(
-        {"input_ids": torch.randint(3, 200, (2, 4), device=device)}
-    )
-
-    assert torch.isfinite(out["loss"]).item()
-    assert runner.eval_calls == 1
-    assert runner.calls == 0  # replay cache path untouched
-
-
 def test_ref_model_not_updated_by_backward_dpo(device):
     strat = _make_dpo(device)
-    strat.set_rollout_runner(_RecordingRunner(_make_rollout_result(device=device)))
-    loss = strat({"input_ids": torch.randint(3, 200, (2, 4), device=device)})["loss"]
+    batch = strat.prepare_from_rollout(_make_rollout_result(device=device))
+    loss = strat(batch)["loss"]
     loss.backward()
     for p in strat.ref_model.parameters():
         assert p.grad is None

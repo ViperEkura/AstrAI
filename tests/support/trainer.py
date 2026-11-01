@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import torch
 
 from astrai.config import ComponentSpec, TrainConfig
@@ -87,7 +85,6 @@ def make_resume_metadata(config, dataset_len, offset=0, step=0):
         config=config,
         dataset=range(dataset_len),
         world_size=config.nprocs,
-        strategy=SimpleNamespace(policy_version=None),
         epoch_sample_offset=offset,
         optimizer_steps_completed=step,
     )

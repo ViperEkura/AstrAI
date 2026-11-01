@@ -213,7 +213,7 @@ def test_builder_resumes_critic_from_checkpoint(device, temp_dir, monkeypatch):
         context.strategy.critic.state_dict()["value_head.weight"],
         saved_critic.state_dict()["value_head.weight"],
     )
-    assert context.strategy.policy_version == 3
+    assert context.rollout.policy_version == 3
 
 
 def test_builder_wires_val_evaluator_with_inherited_params(
@@ -242,7 +242,7 @@ def test_builder_wires_val_evaluator_with_inherited_params(
     assert context.val_evaluator.params.top_p == cfg.rollout_top_p
 
     # Training-side defaults are untouched by the val overrides.
-    runner = context.strategy._rollout_runner
+    runner = context.rollout
     assert runner.generator.params.group_size == 2  # from strategy_kwargs
     assert runner.generator.params.temperature == cfg.rollout_temperature
     # The evaluator shares the training generator (same scheduler) until
@@ -266,12 +266,12 @@ def test_builder_wires_val_replica_and_publisher(device, temp_dir, monkeypatch):
     )
     context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
 
-    train_generator = context.strategy._rollout_runner.generator
+    train_generator = context.rollout.generator
     assert isinstance(train_generator.backend, ColocatedBackend)
     assert isinstance(context.val_evaluator.generator.backend, ReplicaBackend)
     assert context.val_evaluator.generator is not train_generator
 
-    publishers = context.strategy._weight_publishers
+    publishers = context.rollout._publishers
     assert len(publishers) == 1
     assert isinstance(publishers[0], P2PCopyPublisher)
     # The val replica started at the trainer's live policy version.
@@ -296,7 +296,7 @@ def test_builder_right_sizes_rollout_pool(device, temp_dir, monkeypatch):
         rollout_pool_seq_len=32,
     )
     context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
-    scheduler = context.strategy._rollout_runner.generator.backend.engine_core
+    scheduler = context.rollout.generator.backend.engine_core
     assert scheduler.max_seq_len == 32
 
     cfg = _ppo_config(
@@ -307,7 +307,7 @@ def test_builder_right_sizes_rollout_pool(device, temp_dir, monkeypatch):
         ckpt_dir=os.path.join(temp_dir, "ckpt2"),
     )
     context = TrainContextBuilder(cfg).with_param_path(temp_dir).build()
-    scheduler = context.strategy._rollout_runner.generator.backend.engine_core
+    scheduler = context.rollout.generator.backend.engine_core
     assert scheduler.max_seq_len == make_rollout_config().max_position_embeddings
 
 

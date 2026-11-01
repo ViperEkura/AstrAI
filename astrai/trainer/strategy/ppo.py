@@ -85,20 +85,13 @@ class PPOStrategy(BaseStrategy):
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
 
-    def optimizer_step(self, optimizer: Optimizer):
-        """Step the policy under the version lock, then the critic.
-
-        The critic step runs after the policy's atomic version publication:
-        a concurrent rollout may already observe the new policy version,
-        but only the (unused-for-generation) critic lags by one step.
-        """
-        result = super().optimizer_step(optimizer)
+    def after_update(self) -> None:
+        """Update the critic outside the actor's policy-version lock."""
         if self.critic_optimizer is not None:
             if self.max_grad_norm is not None:
                 clip_model_gradients(self.critic, self.max_grad_norm)
             self.critic_optimizer.step()
             self.critic_optimizer.zero_grad()
-        return result
 
     @torch.no_grad()
     def _compute_advantages(

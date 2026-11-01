@@ -8,11 +8,14 @@ import astrai.trainer.context.builder as builder_module
 import astrai.trainer.session as session_module
 from astrai.config import ComponentSpec, TrainConfig
 from astrai.factory import BaseFactory
+from astrai.inference.core.versioning import PolicyVersionGuard
 from astrai.trainer import components as dataset_component
 from astrai.trainer.components import build_scheduler_component
 from astrai.trainer.context import TrainContext, TrainContextBuilder
 from astrai.trainer.context.metric import MetricHistory
+from astrai.trainer.rollout import RolloutRunner
 from astrai.trainer.rollout import worker as worker_module
+from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 from astrai.trainer.session import TrainSession
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 from astrai.trainer.trainer import Trainer
@@ -183,46 +186,29 @@ def test_scheduler_uses_dataset_owned_by_context(monkeypatch):
     assert seen == [context.dataset_len]
 
 
-def test_global_window_uses_offline_strategy_update_hook():
-    class CustomStrategy:
-        policy_version = None
-
-        def training_updates(self, batch):
-            assert batch == "batch"
-            yield iter(
-                (
-                    {
-                        "loss": torch.tensor(2.0),
-                        "metrics": {"task": 2.0},
-                        "normalizer": 4,
-                    },
-                    {
-                        "loss": torch.tensor(3.0),
-                        "metrics": {"task": 3.0},
-                        "normalizer": 4,
-                    },
-                )
-            )
-
-        def compute_loss_output(self, batch):
-            raise AssertionError("training_updates must be called")
-
-    output = Trainer._window_loss_output(CustomStrategy(), "batch", 4)
+def test_global_window_combines_losses_with_shared_normalizer():
+    strategy = SimpleNamespace(
+        loss_outputs=lambda batch: iter(
+            {"loss": torch.tensor(loss), "metrics": {"task": loss}, "normalizer": 4}
+            for loss in (2.0, 3.0)
+        )
+    )
+    output = Trainer._window_loss_output(strategy, "batch", 4)
     assert output["loss"].item() == 5.0
     assert output["metrics"] == {"task": 5.0}
     assert output["normalizer"] == 4.0
 
 
-def test_global_window_rejects_unplanned_strategy_commits():
-    class CustomStrategy:
-        policy_version = None
-
-        def training_updates(self, batch):
-            for _ in range(2):
-                yield iter(({"loss": torch.tensor(1.0), "metrics": {}},))
-
-    with pytest.raises(RuntimeError, match="one update per microbatch"):
-        Trainer._window_loss_output(CustomStrategy(), "batch", 2)
+@pytest.mark.parametrize("counts", [[], [2, 3]])
+def test_global_window_rejects_empty_or_inconsistent_losses(counts):
+    strategy = SimpleNamespace(
+        loss_outputs=lambda batch: iter(
+            {"loss": torch.tensor(1.0), "metrics": {}, "normalizer": count}
+            for count in counts
+        )
+    )
+    with pytest.raises(RuntimeError, match="has no loss|share a normalizer"):
+        Trainer._window_loss_output(strategy, "batch", 2)
 
 
 def test_registered_custom_strategy_and_unknown_options():
@@ -277,7 +263,7 @@ def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):
     )
     rollout = SimpleNamespace(close=lambda: events.append("close"))
     context = SimpleNamespace(
-        async_rollout=rollout,
+        rollout=rollout,
         executor=SimpleNamespace(use_distributed=False),
         stop_requested=False,
         run_shutdown=lambda: events.append("shutdown_hooks"),
@@ -310,7 +296,7 @@ def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):
 def test_builder_closes_rollout_after_configuration_failure(monkeypatch):
     closed = []
     rollout = SimpleNamespace(close=lambda: closed.append(True))
-    context = SimpleNamespace(async_rollout=None, dataset=[], val_dataset=None)
+    context = SimpleNamespace(rollout=None, dataset=[], val_dataset=None)
     builder = TrainContextBuilder(_config())
     monkeypatch.setattr(builder_module, "get_world_size", lambda: 1)
     monkeypatch.setattr(
@@ -329,7 +315,7 @@ def test_builder_closes_rollout_after_configuration_failure(monkeypatch):
     monkeypatch.setattr(builder, "_create_strategy", lambda *_: {})
 
     def fail_configure(ctx, _):
-        ctx.async_rollout = rollout
+        ctx.rollout = rollout
         raise RuntimeError("rollout setup failed")
 
     monkeypatch.setattr(builder, "_configure_rollout", fail_configure)
@@ -349,3 +335,113 @@ def test_rollout_worker_follows_its_parent_first(monkeypatch):
     )
     with pytest.raises(ParentDied):
         worker_module.run_rollout_worker(None, None)
+
+
+@pytest.mark.parametrize(
+    ("mode", "failure"),
+    [
+        (mode, failure)
+        for mode in ("offline", "sync", "async_round")
+        for failure in (None, "optimizer", "publisher", "critic", "scheduler")
+        if mode != "offline" or failure != "publisher"
+    ],
+)
+def test_update_failure_keeps_partial_weights_unpublishable(mode, failure):
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.weight.data.fill_(1)
+    model.weight.grad = torch.ones_like(model.weight)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    events = []
+    guard = PolicyVersionGuard(0, lambda: None, lambda: events.append("version"))
+
+    def fail_at(phase):
+        events.append(phase)
+        if failure == phase:
+            raise RuntimeError(phase)
+
+    actor_step = optimizer.step
+
+    def update():
+        actor_step()
+        fail_at("optimizer")
+
+    optimizer.step = update
+
+    class Publisher:
+        def publish(self, version, source):
+            assert source is model and version == 1
+            assert model.weight.item() == pytest.approx(0.9)
+            if mode == "sync":
+                assert guard.lock._is_owned()
+                assert guard.policy_version == 0
+            fail_at("publisher")
+
+    if mode == "async_round":
+        coordinator = AsyncRoundCoordinator.__new__(AsyncRoundCoordinator)
+        coordinator._policy_version = 0
+        coordinator.weights = SimpleNamespace(
+            mark_committed=lambda version: events.append("version")
+        )
+        rollout = RolloutRunner(coordinator=coordinator, publishers=[Publisher()])
+    elif mode == "sync":
+        rollout = RolloutRunner(
+            generator=guard, reward_model=object(), publishers=[Publisher()]
+        )
+    else:
+        rollout = None
+
+    def after_update():
+        assert not guard.lock._is_owned()
+        if rollout is not None:
+            assert rollout.policy_version == 1
+        fail_at("critic")
+
+    context = TrainContext(
+        model=model,
+        optimizer=optimizer,
+        rollout=rollout,
+        pending_samples=2,
+        strategy=SimpleNamespace(after_update=after_update),
+        scheduler=SimpleNamespace(step=lambda: fail_at("scheduler")),
+    )
+    trainer = Trainer.__new__(Trainer)
+    trainer.callbacks = [
+        SimpleNamespace(
+            before_optimizer_step=lambda ctx: ctx.metric_history.stage({"type": "step"})
+        )
+    ]
+    batch = SimpleNamespace(prompts=torch.ones(2, 1))
+
+    def commit():
+        if mode == "async_round":
+            trainer._commit_online_update(context, batch, new_data=True)
+        else:
+            trainer._commit_global_update(context, new_data=True)
+
+    if failure:
+        with pytest.raises(RuntimeError, match=failure):
+            commit()
+    else:
+        commit()
+        assert events == (
+            ["optimizer", "critic", "scheduler"]
+            if mode == "offline"
+            else ["optimizer", "publisher", "version", "critic", "scheduler"]
+        )
+
+    # Mutation is real even when the optimizer or publisher raises. Never
+    # mistake a rolled-back cursor for rolled-back weights.
+    assert model.weight.item() == pytest.approx(0.9)
+    advanced = failure not in ("optimizer", "publisher")
+    if rollout is not None:
+        assert rollout.policy_version == int(advanced)
+    committed = failure is None or (mode == "async_round" and advanced)
+    assert context.optimizer_step == int(committed)
+    assert context.consumed_samples == 2 * int(committed)
+    assert context.epoch_sample_offset == (
+        2 * int(committed) if mode == "async_round" else 0
+    )
+    assert context.checkpoint_safe == (mode == "async_round" and failure is None)
+    assert len(context.metric_history.snapshot().records) == int(failure is None)
+    context.metric_history.commit(99, 99)
+    assert len(context.metric_history.snapshot().records) == int(failure is None)

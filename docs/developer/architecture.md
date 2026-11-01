@@ -63,7 +63,11 @@ classDiagram
     }
     namespace Strategy {
         class BaseStrategy
+    }
+    namespace Rollout {
         class RolloutRunner
+        class RolloutEvaluator
+        class WeightPublisher
     }
     namespace Parallel {
         class BaseExecutor
@@ -86,10 +90,13 @@ classDiagram
     TrainSession --> TrainContextBuilder : construct
     TrainContextBuilder --> TrainContext : assemble and restore
     Trainer --> TrainContext : update state
-    Trainer --> BaseStrategy : objective and update hook
+    Trainer --> BaseStrategy : prepare, loss and after_update
     Trainer --> BaseExecutor : backward and synchronization
-    BaseStrategy --> RolloutRunner : optional scored responses
-    BaseStrategy --> Optimizer : update
+    TrainContext *-- RolloutRunner : sync or async generation
+    TrainContext *-- RolloutEvaluator : online validation
+    Trainer --> RolloutRunner : collect and publish
+    RolloutRunner --> WeightPublisher : copy replicas inside version lock
+    Trainer --> Optimizer : actor update
     Trainer --> LRScheduler : advance after update
     Trainer --> MetricCallback : pre-update hook
     Trainer --> GradientClippingCallback : pre-update hook
@@ -121,18 +128,30 @@ See [lifecycle](trainer/lifecycle.md), [strategies](trainer/strategy.md),
 sequenceDiagram
     participant T as Trainer
     participant S as Strategy
+    participant R as RolloutRunner
     participant E as Executor
     participant B as Callbacks
     participant O as Optimizer / Scheduler
     participant H as MetricHistory
     participant C as CheckpointCallback
-    T->>S: Compute microbatch objective
+    opt Online training
+        T->>R: Collect scored rollout
+        R-->>T: Versioned result
+        T->>S: Prepare rollout batch
+    end
+    Note over T,S: Trainer selects replay and minibatches
+    T->>S: Iterate losses for one update
     T->>E: Backward and synchronize selected boundary
     T->>E: Normalize accumulated gradients
     T->>B: Dispatch pre-update hooks
     B->>H: MetricCallback stages measurements
     B->>E: GradientClippingCallback clips gradients
-    T->>O: Update weights and advance schedule
+    T->>O: Update actor (inside rollout lock when online)
+    opt Online training
+        T->>R: Publish replicas, advance version and update count
+    end
+    T->>S: after_update (critic or old policy)
+    T->>O: Clear actor gradients and advance schedule
     T->>H: Commit records and counters after success
     Note over T,C: Publish only at a checkpoint-safe boundary
     T->>C: Dispatch post-update hooks

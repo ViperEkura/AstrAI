@@ -202,7 +202,8 @@ def test_async_epoch_cursor_ignores_prefetch_and_resets_at_epoch_end():
         dataloader=torch.utils.data.DataLoader(
             dataset, batch_size=2, sampler=RDSampler(dataset, seed=seed)
         ),
-        async_rollout=SimpleNamespace(iter_rounds=prefetch_rounds),
+        config=SimpleNamespace(rollout_mode="async_round"),
+        rollout=SimpleNamespace(iter_rounds=prefetch_rounds),
     )
     trainer = Trainer.__new__(Trainer)
     trainer.callbacks = []

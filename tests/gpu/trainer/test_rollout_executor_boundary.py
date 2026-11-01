@@ -32,14 +32,8 @@ class _ConfigModel(nn.Module):
 
 
 class _OnlineStrategy:
-    def __init__(self):
-        self.runner = None
-
     def supports_online(self):
         return True
-
-    def set_rollout_runner(self, runner):
-        self.runner = runner
 
 
 class _ConfigDataset(Dataset):

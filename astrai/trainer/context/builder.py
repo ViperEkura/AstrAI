@@ -144,9 +144,9 @@ class TrainContextBuilder:
             self._configure_rollout(context, strategy_kwargs)
             return context
         except BaseException:
-            if context.async_rollout is not None:
+            if context.rollout is not None:
                 try:
-                    context.async_rollout.close()
+                    context.rollout.close()
                 except BaseException:
                     logger.exception(
                         "Failed to close rollout after training build error"
@@ -332,8 +332,6 @@ class TrainContextBuilder:
             cp_state = CPState(self._topology)
         kwargs = cfg._validate_strategy_kwargs(dict(cfg.strategy_kwargs))
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
-        kwargs.setdefault("rl_update_epochs", cfg.rl_update_epochs)
-        kwargs.setdefault("rl_minibatch_prompts", cfg.rl_minibatch_prompts)
         kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
         capabilities = StrategyFactory.capabilities(cfg.strategy)
         if capabilities.reference_model:

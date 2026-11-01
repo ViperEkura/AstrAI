@@ -90,7 +90,7 @@ def test_cp_normalizer_reuses_loss_collective(monkeypatch):
         def token_loss_output(self, scaled, mean, forward):
             return {"loss": scaled, "metrics": {"task_loss": mean.item()}}
 
-    output = CPStrategy(Inner(), FakeCP()).compute_loss_output({})
+    (output,) = CPStrategy(Inner(), FakeCP()).loss_outputs({})
     assert len(calls) == 1
     assert output["normalizer"] == 8.0
     assert output["metrics"]["task_loss"] == 0.75

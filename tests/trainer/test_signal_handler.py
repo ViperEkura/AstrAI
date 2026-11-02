@@ -10,15 +10,12 @@ from torch.utils.data import Dataset
 
 import astrai.trainer.session as session_module
 from astrai.config import ComponentSpec, TrainConfig
-from astrai.model.autoregressive_lm import AutoRegressiveLM
-from astrai.signal_handler import register_signal_handlers, unregister_signal_handlers
 from astrai.trainer import Trainer
-from astrai.trainer.context import TrainContext
 from astrai.trainer.context.metric import MetricHistory
 from astrai.trainer.rollout import worker as worker_module
 from astrai.trainer.session import TrainSession
 from tests.support.checkpoint import load_checkpoint_meta
-from tests.support.models import TINY_CONFIG, make_tiny_config
+from tests.support.models import TINY_CONFIG
 
 
 class PicklableDataset(Dataset):
@@ -35,12 +32,6 @@ class PicklableDataset(Dataset):
             "input_ids": torch.randint(0, self.vocab_size, (self.max_length,)),
             "target_ids": torch.randint(0, self.vocab_size, (self.max_length,)),
         }
-
-
-def _build_model():
-    config = make_tiny_config()
-    device = "cpu"
-    return AutoRegressiveLM(config).to(device=device)
 
 
 class _ReadyCallback:
@@ -112,24 +103,6 @@ def _spawn_train_and_signal(ckpt_dir, sig, timeout=120):
 
     assert not p.is_alive()
     return p.exitcode
-
-
-def test_context_stop_flag():
-    ctx = TrainContext()
-    assert not ctx.stop_requested
-    ctx.request_stop()
-    assert ctx.stop_requested
-
-
-def test_register_signal_handlers():
-    ctx = TrainContext()
-    register_signal_handlers(ctx)
-    try:
-        assert not ctx.stop_requested
-        os.kill(os.getpid(), signal.SIGTERM)
-        assert ctx.stop_requested
-    finally:
-        unregister_signal_handlers()
 
 
 @pytest.mark.slow

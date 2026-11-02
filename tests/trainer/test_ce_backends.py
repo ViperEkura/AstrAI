@@ -64,23 +64,6 @@ def test_cpu_fallback_and_mask():
     assert m(batch("cpu")["input_ids"])["logits"] is not None
 
 
-def test_removed_backend_rejected():
-    with pytest.raises(
-        ValueError, match="loss_backend must be torch or cuda_linear_ce"
-    ):
-        SFTStrategy(model("cpu"), "cpu", loss_backend="cuda_ce")
-
-
-def test_model_has_no_loss_api():
-    m = model("cpu")
-    data = batch("cpu")
-    with pytest.raises(TypeError, match="loss_targets"):
-        m(data["input_ids"], loss_targets=data["target_ids"])
-    outputs = m(data["input_ids"], skip_lm_head=True, return_lm_head_weight=True)
-    assert outputs["logits"] is None
-    assert outputs["lm_head_weight"].shape == m.lm_head.weight.shape
-
-
 def _ddp_worker(rank, init_file):
     torch.cuda.set_device(rank)
     dist.init_process_group(

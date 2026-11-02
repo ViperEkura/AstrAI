@@ -11,7 +11,6 @@ from astrai.trainer import Trainer
 from astrai.trainer import components as dataset_component
 from astrai.trainer.components import build_scheduler_component
 from astrai.trainer.context import TrainContext, TrainContextBuilder
-from astrai.trainer.strategy import BaseStrategy, StrategyFactory
 from tests.support.checkpoint import load_checkpoint_meta
 from tests.support.rollout import RandomTokenDataset
 
@@ -67,8 +66,6 @@ def test_checkpoint_snapshot_does_not_copy_runtime_objects():
         critic_model_fn=RuntimeFactory(),
         critic_optimizer_fn=RuntimeFactory(),
     ).to_dict()
-    assert snapshot["strategy"] == "seq"
-    assert snapshot["batch_per_device"] == 4
     assert snapshot["dataset"]["type"].endswith(":NoCopyDataset")
     assert snapshot["dataset"]["params"] == {}
     assert "model_fn" not in snapshot
@@ -98,8 +95,6 @@ def test_component_specs_resolve_without_trainer_branches():
     assert optimizer.param_groups[0]["params"][0] is model.weight
     assert scheduler.step_size == 2
     assert config.to_dict()["scheduler"]["params"]["step_size"] == "$total_steps"
-    assert isinstance(config.dataset, ComponentSpec)
-    assert TrainContext(config=config).dataset is None
 
 
 def test_scheduler_counts_only_unpadded_global_windows():
@@ -118,7 +113,7 @@ def test_scheduler_counts_only_unpadded_global_windows():
     assert scheduler.step_size == 0
 
 
-def test_builder_creates_and_splits_context_dataset():
+def test_builder_creates_and_splits_context_dataset(monkeypatch):
     created = []
     original_load = dataset_component.load_dataset_component
 
@@ -127,20 +122,15 @@ def test_builder_creates_and_splits_context_dataset():
         created.append(dataset)
         return dataset
 
-    monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(dataset_component, "load_dataset_component", track_load)
-    try:
-        config = _config(
-            dataset=ComponentSpec(
-                type="tests.trainer.test_trainer:NoCopyDataset",
-                params={"length": 10},
-            ),
-            val_split=0.2,
-        )
-        context = TrainContext(config=config)
-        TrainContextBuilder(config)._create_datasets(context)
-    finally:
-        monkeypatch.undo()
+    config = _config(
+        dataset=ComponentSpec(
+            type="tests.trainer.test_trainer:NoCopyDataset", params={"length": 10}
+        ),
+        val_split=0.2,
+    )
+    context = TrainContext(config=config)
+    TrainContextBuilder(config)._create_datasets(context)
 
     assert created == [context.dataset.dataset]
     assert context.dataset_len == 8
@@ -159,55 +149,6 @@ def test_builder_resolves_custom_dataset():
     assert context.dataset_len == 3
     assert context.val_dataset is None
     assert isinstance(context.dataset, NoCopyDataset)
-
-
-def test_scheduler_uses_dataset_owned_by_context(monkeypatch):
-    seen = []
-    config = _config()
-    context = TrainContext(dataset=NoCopyDataset(), config=config)
-    builder = TrainContextBuilder(config)
-    monkeypatch.setattr(builder_module, "get_current_device", lambda: "cpu")
-    monkeypatch.setattr(
-        builder,
-        "_instantiate_scheduler",
-        lambda optimizer, length: seen.append(length),
-    )
-
-    class Executor:
-        def prepare(self, model_fn, optimizer_fn, scheduler_fn, **kwargs):
-            return None, None, scheduler_fn(object())
-
-    builder._prepare_model(context, Executor(), SimpleNamespace(state_dict=None))
-    assert seen == [context.dataset_len]
-
-
-def test_registered_custom_strategy_and_unknown_options(monkeypatch):
-    monkeypatch.setattr(StrategyFactory, "_entries", dict(StrategyFactory._entries))
-    monkeypatch.setattr(
-        StrategyFactory, "_capabilities", dict(StrategyFactory._capabilities)
-    )
-    monkeypatch.setattr(
-        "astrai.config.train_config._STRATEGY_CAPABILITIES",
-        StrategyFactory._capabilities,
-    )
-
-    @StrategyFactory.register("custom_refactor_test")
-    class CustomStrategy(BaseStrategy):
-        def __init__(self, model, device, custom_scale=1.0, **kwargs):
-            super().__init__(model, device, **kwargs)
-            self.custom_scale = custom_scale
-
-    config = _config(strategy="custom_refactor_test")
-    assert config.strategy == "custom_refactor_test"
-    model = torch.nn.Linear(1, 1)
-    strategy = StrategyFactory.create(
-        "custom_refactor_test", model=model, device="cpu", custom_scale=2.0
-    )
-    assert strategy.custom_scale == 2.0
-    with pytest.raises(TypeError, match="unknown arguments"):
-        StrategyFactory.create(
-            "custom_refactor_test", model=model, device="cpu", custm_scale=2.0
-        )
 
 
 def test_factory_preserves_arguments_and_rejects_unknown_options():

@@ -1,5 +1,3 @@
-"""Unit tests for the online rollout module."""
-
 import threading
 
 import torch
@@ -21,17 +19,6 @@ def make_instruction_batch(n=2):
     instructions = [f"Tell me about topic {i}" for i in range(n)]
     inputs = [f"context {i}" for i in range(n)]
     return {"instruction": instructions, "input": inputs}
-
-
-def blocking_hook(original, started, release):
-    """Wrap a hook so it signals ``started`` then blocks until ``release``."""
-
-    def hook(*args, **kwargs):
-        started.set()
-        assert release.wait(timeout=5)
-        return original(*args, **kwargs)
-
-    return hook
 
 
 def assert_interleaved(first, second, *, started, release, finished):
@@ -83,16 +70,6 @@ def make_generator(
     )
 
 
-def make_replica_pair():
-    """A training model on cuda:0 and a diverged replica on cuda:1."""
-    train_model, _ = make_model("cuda:0", max_position_embeddings=128)
-    replica_model, _ = make_model("cuda:1", max_position_embeddings=128)
-    with torch.no_grad():
-        for p in replica_model.parameters():
-            p.add_(1.0)
-    return train_model, replica_model
-
-
 def make_runner(device, *, rollout_interval=2, max_policy_lag=None, **generation):
     generator, model = make_generator(device, **generation)
     return (
@@ -104,19 +81,6 @@ def make_runner(device, *, rollout_interval=2, max_policy_lag=None, **generation
         ),
         model,
     )
-
-
-def interleave_before_snapshot(runner, callback):
-    """Wrap ``with_policy_snapshot`` so ``callback`` runs just before a
-    named snapshot callback enters the generator/scheduler locks."""
-    original_snapshot = runner.generator.with_policy_snapshot
-
-    def wrapper(inspect):
-        if inspect.__name__ == "reuse":
-            callback()
-        return original_snapshot(inspect)
-
-    runner.generator.with_policy_snapshot = wrapper
 
 
 class ConstantRewardModel(BaseRewardModel):

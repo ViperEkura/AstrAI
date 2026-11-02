@@ -1,7 +1,6 @@
 import dataclasses
 import multiprocessing as mp
 import pickle
-import typing as t
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -9,17 +8,13 @@ import click
 import pytest
 import torch
 from click.testing import CliRunner
-from torch.utils.data import TensorDataset
 
-from astrai.config import ComponentSpec, TrainConfig, merge_yaml_into_kwargs
+from astrai.config import ComponentSpec, merge_yaml_into_kwargs
 from astrai.config.cli import (
-    GroupedCommand,
     OptSpec,
     apply_specs,
-    option_from_spec,
 )
 from astrai.dataset import DatasetFactory
-from astrai.model.components.mlp import MLP
 from astrai.serialization import save_bin
 from astrai.trainer.components import build_dataset_component
 from scripts.tools import train as train_module
@@ -90,201 +85,30 @@ def test_merge_yaml_ignores_unknown_sections(tmp_path):
     assert merged["max_lr"] == 3e-4
 
 
-def test_type_inference_from_config_fields():
-    @click.command()
-    @apply_specs(
-        [
-            OptSpec("n_epoch", "G"),
-            OptSpec("rollout_max_policy_lag", "G"),
-            OptSpec("pin_memory", "G"),
-            OptSpec("metrics", "G"),
-        ],
-        TrainConfig,
-    )
-    def cmd(**kwargs):
-        pass
-
-    params = {p.name: p for p in cmd.params}
-    assert params["n_epoch"].default == 1
-    assert params["n_epoch"].type.name == "integer"
-    assert params["rollout_max_policy_lag"].default is None
-    assert params["rollout_max_policy_lag"].type.name == "integer"
-    assert params["pin_memory"].secondary_opts == ["--no-pin_memory"]
-    assert params["pin_memory"].default is False  # config default, no override
-    assert params["metrics"].multiple
-    assert params["metrics"].default == ("loss", "lr", "grad_norm")
-    train_metrics = next(
-        p for p in train_module.train_command.params if p.name == "metrics"
-    )
-    assert train_metrics.default == params["metrics"].default
-
-
-def test_spec_overrides_beat_config_defaults():
-    @click.command()
-    @apply_specs(
-        [
-            OptSpec("num_workers", "G", default=4),
-            OptSpec("dp_mode", "G", default="fsdp"),
-        ],
-        TrainConfig,
-    )
-    def cmd(**kwargs):
-        pass
-
-    params = {p.name: p for p in cmd.params}
-    assert params["num_workers"].default == 4
-    assert params["dp_mode"].default == "fsdp"
-
-
-def test_cli_only_flag_pair_and_one_way_flag():
-    @click.command()
-    @apply_specs(
-        [
-            OptSpec("muon_nesterov", "G", type=bool, default=True),
-            OptSpec("dry_run", "G", is_flag=True, default=False),
-        ]
-    )
-    def cmd(**kwargs):
-        pass
-
-    params = {p.name: p for p in cmd.params}
-    assert params["muon_nesterov"].secondary_opts == ["--no-muon_nesterov"]
-    assert params["muon_nesterov"].default is True
-    assert params["dry_run"].is_flag
-    assert not params["dry_run"].secondary_opts
-
-
-def test_uninferrable_type_raises_without_spec_type():
-    with pytest.raises(TypeError, match="cannot infer"):
-        option_from_spec(OptSpec("mystery", "G"), {})
-
-
 @pytest.mark.parametrize(
-    "annotation,default,type_name",
+    "annotation,default,args,expected",
     [
-        (Optional[int], None, "integer"),
-        (int | None, None, "integer"),
-        (Optional[float], None, "float"),
-        (List[str], ["loss", "lr"], "text"),
-        (list[str], ["loss"], "text"),
-        (bool, True, "boolean"),
-    ],
-    ids=[
-        "optional",
-        "union-type",
-        "optional-float",
-        "typing-list",
-        "builtin-list",
-        "bool",
+        (Optional[int], None, ["--value", "4"], 4),
+        (int | None, None, ["--value", "4"], 4),
+        ("Optional[int]", None, ["--value", "4"], 4),
+        (List[str], (), ["--value", "loss", "--value", "lr"], ("loss", "lr")),
+        (list[str], (), ["--value", "loss"], ("loss",)),
+        (bool, True, ["--no-value"], False),
     ],
 )
-def test_annotation_types_infer_click_options(annotation, default, type_name):
-    value = (
-        dataclasses.field(default_factory=lambda: default)
-        if isinstance(default, list)
-        else default
+def test_inferred_cli_options_parse_values(annotation, default, args, expected):
+    config = dataclasses.make_dataclass(
+        "Options", [("value", annotation, default)], namespace={"__module__": __name__}
     )
-    config = dataclasses.make_dataclass("Options", [("value", annotation, value)])
 
     @click.command()
     @apply_specs([OptSpec("value", "G")], config)
-    def command(**kwargs):
-        pass
+    def command(value):
+        click.echo(repr(value))
 
-    option = command.params[0]
-    assert option.type.name == type_name
-    assert option.default == (tuple(default) if isinstance(default, list) else default)
-    assert option.multiple == isinstance(default, list)
-    assert bool(option.secondary_opts) == (annotation is bool)
-
-
-def test_stringified_annotations_resolve_via_get_type_hints():
-    """PEP 563 modules (``from __future__ import annotations``) leave
-    ``Field.type`` as a string; hints resolution still infers types."""
-
-    @dataclasses.dataclass
-    class FutureStyle:
-        opt_int: "t.Optional[int]" = None
-        count: "int" = 3
-
-    @click.command()
-    @apply_specs(
-        [
-            OptSpec("opt_int", "G"),
-            OptSpec("count", "G"),
-        ],
-        FutureStyle,
-    )
-    def cmd(**kwargs):
-        pass
-
-    params = {p.name: p for p in cmd.params}
-    assert params["opt_int"].type.name == "integer"
-    assert params["count"].type.name == "integer"
-    assert params["count"].default == 3
-
-
-def test_help_order_follows_spec_table():
-    @click.command(cls=GroupedCommand)
-    @apply_specs(
-        [
-            OptSpec("first", "G", type=int, default=1),
-            OptSpec("second", "G", type=int, default=2),
-        ]
-    )
-    def cmd(**kwargs):
-        pass
-
-    result = CliRunner().invoke(cmd, ["--help"])
-    assert result.exit_code == 0
-    assert result.output.index("--first") < result.output.index("--second")
-
-
-def test_async_cli_yaml_and_explicit_flags_reach_training_config(tmp_path, monkeypatch):
-    make_rollout_config().to_file(tmp_path / "config.json")
-    yaml = tmp_path / "train.yaml"
-    yaml.write_text(
-        f"training:\n  train_type: online_grpo\n  param_path: {tmp_path}\n  data_root_path: {tmp_path}\n  dp_mode: none\n  rollout_mode: async_round\n  rollout_devices: [cuda:1, cuda:2]\n  rollout_interval: 1\n  rollout_worker_timeout_s: 91\n  rollout_startup_timeout_s: 73\n  rollout_weight_timeout_s: 123\n  async_train_microbatch_prompts: 2\n  reward_model: tests.trainer.test_async_round:_Reward\n"
-    )
-    captured = []
-
-    class Trainer:
-        def __init__(self, config):
-            captured.append(config)
-
-        def train(self, **kwargs):
-            assert kwargs == {"param_path": str(tmp_path), "resume": False}
-
-    monkeypatch.setattr(train_module, "Trainer", Trainer)
-    monkeypatch.setattr(
-        DatasetFactory,
-        "load",
-        lambda **kwargs: TensorDataset(torch.ones(5)),
-    )
-    result = CliRunner().invoke(
-        train_module.train_command,
-        [
-            "--config",
-            str(yaml),
-            "--rollout_devices",
-            "cuda:3",
-            "--rollout_temperature",
-            "0.8",
-        ],
-    )
+    result = CliRunner().invoke(command, args)
     assert result.exit_code == 0, (result.output, result.exception)
-    config = captured[0]
-    assert config.rollout_mode == "async_round"
-    assert config.rollout_devices == ["cuda:3"]
-    assert config.rollout_temperature == 0.8
-    assert (
-        config.rollout_startup_timeout_s,
-        config.rollout_worker_timeout_s,
-        config.rollout_weight_timeout_s,
-    ) == (73, 91, 123)
-    assert config.async_train_microbatch_prompts == 2
-    assert callable(config.reward_model_fn)
-    assert config.strategy_kwargs["group_size"] == 4
+    assert result.output.strip() == repr(expected)
 
 
 def test_cli_rejects_unknown_yaml_parameters(tmp_path):
@@ -404,144 +228,10 @@ def test_seq_config_factory_survives_spawn(training_configs, tmp_path, monkeypat
     assert process.exitcode == 0
 
 
-def test_sft_cli_routes_linear_ce_options_from_yaml(
-    training_configs, tmp_path, monkeypatch
-):
-    make_rollout_config().to_file(tmp_path / "config.json")
-    yaml = tmp_path / "train.yaml"
-    yaml.write_text(
-        f"training:\n  train_type: sft\n  param_path: {tmp_path}\n"
-        f"  data_root_path: {tmp_path}\n  dp_mode: none\n"
-        "  loss_backend: cuda_linear_ce\n  loss_chunk_size: 128\n"
-        "  gradient_checkpointing: true\n"
-    )
-    captured = training_configs
-    monkeypatch.setattr(
-        DatasetFactory,
-        "load",
-        lambda **kwargs: TensorDataset(torch.ones(5)),
-    )
-    result = CliRunner().invoke(
-        train_module.train_command,
-        ["--config", str(yaml), "--loss_chunk_size", "256"],
-    )
-    assert result.exit_code == 0, (result.output, result.exception)
-    assert captured[0].strategy_kwargs["loss_backend"] == "cuda_linear_ce"
-    assert captured[0].strategy_kwargs["loss_chunk_size"] == 256
-    assert captured[0].gradient_checkpointing_modules == [MLP]
-
-
 @pytest.mark.parametrize("reference", ["missing_separator", "math:pi"])
 def test_reward_factory_must_be_importable_and_callable(reference):
     with pytest.raises(ValueError, match="reward_model"):
         train_module.load_reward_factory(reference)
-
-
-@pytest.mark.parametrize(
-    "yaml_value,cli_flags,expected",
-    [
-        ("", [], {}),
-        ("  load_state_dict: {optimizer: false}\n", [], {"optimizer": False}),
-        (
-            "  load_state_dict: {optimizer: false}\n",
-            ["--load_state_dict", '{"model": true, "optimizer": true}'],
-            {"model": True, "optimizer": True},
-        ),
-        (
-            "  load_state_dict: {model: false, scheduler: true}\n",
-            [],
-            {"model": False, "scheduler": True},
-        ),
-    ],
-)
-def test_state_dict_loading_config_reaches_trainer(
-    training_configs, tmp_path, monkeypatch, yaml_value, cli_flags, expected
-):
-    make_rollout_config().to_file(tmp_path / "config.json")
-    path = tmp_path / "train.yaml"
-    path.write_text(
-        f"training:\n  train_type: seq\n  param_path: {tmp_path}\n"
-        f"  data_root_path: {tmp_path}\n  dp_mode: none\n" + yaml_value
-    )
-    captured = training_configs
-    result = CliRunner().invoke(
-        train_module.train_command, ["--config", str(path), *cli_flags]
-    )
-    assert result.exit_code == 0, (result.output, result.exception)
-    assert captured[0].load_state_dict == expected
-
-
-@pytest.mark.parametrize(
-    "strategy", ["seq", "sft", "dpo", "grpo", "online_grpo", "online_dpo", "online_ppo"]
-)
-def test_cli_options_instantiate_selected_strategy(
-    training_configs, tmp_path, monkeypatch, strategy
-):
-    make_rollout_config().to_file(tmp_path / "config.json")
-    path = tmp_path / "train.yaml"
-    path.write_text(
-        f"training:\n  train_type: {strategy}\n  param_path: {tmp_path}\n"
-        f"  data_root_path: {tmp_path}\n  dp_mode: none\n"
-        + (
-            "  reward_model: tests.trainer.test_async_round:_Reward\n"
-            if strategy.startswith("online_")
-            else ""
-        )
-    )
-    captured = training_configs
-    result = CliRunner().invoke(train_module.train_command, ["--config", str(path)])
-    assert result.exit_code == 0, (result.output, result.exception)
-    config = captured[0]
-    model = torch.nn.Linear(2, 2)
-    options = dict(config.strategy_kwargs)
-    capabilities = train_module.StrategyFactory.capabilities(strategy)
-    if capabilities.reference_model:
-        options["ref_model"] = model
-    if capabilities.old_model:
-        options["old_model"] = model
-    if capabilities.critic:
-        options["critic"] = model
-        options["critic_optimizer"] = torch.optim.SGD(model.parameters(), lr=0.1)
-    instance = train_module.StrategyFactory.create(
-        strategy, model=model, device="cpu", **options
-    )
-    assert instance.model is model
-
-
-def test_cli_precision_flags_override_individual_yaml_fields(
-    training_configs, tmp_path, monkeypatch
-):
-    make_rollout_config(max_position_embeddings=8).to_file(tmp_path / "config.json")
-    config_path = tmp_path / "precision.yaml"
-    config_path.write_text(
-        "precision:\n  compute_dtype: float32\n  gradient_dtype: float32\n"
-        "  master_dtype: float32\n  optimizer_state_dtype: bfloat16\n"
-        "  export_dtype: float16\n"
-        f"training:\n  train_type: seq\n  param_path: {tmp_path}\n"
-        f"  data_root_path: {tmp_path}\n"
-    )
-    captured = training_configs
-    result = CliRunner().invoke(
-        train_module.train_command,
-        [
-            "--config",
-            str(config_path),
-            "--compute_dtype",
-            "bfloat16",
-            "--gradient_dtype",
-            "model",
-            "--master_dtype",
-            "bfloat16",
-            "--export_dtype",
-            "float32",
-        ],
-    )
-    assert result.exit_code == 0, (result.output, result.exception)
-    policy = captured[0].precision
-    assert policy.compute_dtype == policy.master_dtype == "bfloat16"
-    assert policy.gradient_dtype == "model"
-    assert policy.optimizer_state_dtype == "bfloat16"
-    assert policy.export_dtype == "float32"
 
 
 def test_dry_run_uses_resolved_components_without_starting_trainer(

@@ -1,7 +1,5 @@
-from tests.support.rollout import instruction_collate_fn
-
-"""End-to-end integration tests for online GRPO/DPO rollout."""
-
+import copy
+import json
 import os
 from dataclasses import replace
 from functools import partial
@@ -10,64 +8,75 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.utils.data import Dataset, Subset
 
 from astrai.config import ComponentSpec, TrainConfig
+from astrai.model.autoregressive_lm import AutoRegressiveLM
+from astrai.parallel.setup import find_free_port
 from astrai.serialization import Checkpoint
-from astrai.trainer.context import builder as train_context_builder
-from astrai.trainer.rollout import BaseRewardModel
+from astrai.trainer.callbacks import TrainCallback
 from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
 from astrai.trainer.rollout.setup import configure_rollout
 from astrai.trainer.rollout.types import ResolvedAsyncRolloutConfig, SamplingParams
 from astrai.trainer.trainer import Trainer
+from tests.support.rollout import (
+    InstructionDataset,
+    LengthRewardModel,
+    instruction_collate_fn,
+)
 from tests.support.tokenizers import CHAT_TEMPLATE
 from tests.support.trainer import (
-    make_online_model,
-    make_online_optimizer,
     make_online_value_model,
 )
 
 
-class InstructionDataset(Dataset):
-    """Toy instruction/input dataset for online RL rollout.
+@pytest.fixture
+def online_env(base_test_env):
+    env = dict(base_test_env)
+    env["tokenizer"] = copy.deepcopy(env["tokenizer"])
+    env["tokenizer"].set_chat_template(CHAT_TEMPLATE)
+    env["tokenizer"].save_pretrained(env["test_dir"])
+    return env
 
-    Each sample has an ``instruction`` and an optional ``input``; the
-    RolloutGenerator renders both through the tokenizer's chat template
-    so the prompt matches the SFT-trained format.
-    """
 
-    _SAMPLES = (
-        {"instruction": "Hello", "input": ""},
-        {"instruction": "Tell me a story", "input": "about dragons"},
-        {"instruction": "Summarize", "input": "the article"},
-        {"instruction": "Translate", "input": "to French: hi"},
+def _online_config(env, *, dataset_length=4, **overrides):
+    defaults = dict(
+        strategy="online_grpo",
+        model=ComponentSpec(
+            type="autoregressive_lm",
+            params={"config": env["transformer_config"].to_dict()},
+        ),
+        precision={"compute_dtype": "float32"},
+        dataset=ComponentSpec(
+            type="tests.support.rollout:InstructionDataset",
+            params={
+                "length": dataset_length,
+                "collate": "tests.support.rollout:instruction_collate_fn",
+            },
+        ),
+        optimizer=ComponentSpec(type="torch.optim:AdamW", params={"lr": 1e-4}),
+        scheduler=ComponentSpec(
+            type="cosine",
+            params={"warmup_steps": 1, "lr_decay_steps": 4, "min_rate": 0.05},
+        ),
+        ckpt_dir=os.path.join(env["test_dir"], "ckpt"),
+        n_epoch=1,
+        batch_per_device=2,
+        ckpt_interval=100,
+        grad_accum_steps=1,
+        random_seed=42,
+        device_type=env["device"],
+        dp_mode="none",
+        strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
+        rollout_interval=1,
+        rollout_temperature=1.0,
+        rollout_top_k=0,
+        rollout_top_p=1.0,
+        rollout_max_tokens=4,
+        reward_model_fn=LengthRewardModel,
     )
-
-    def __init__(self, repeats=1):
-        self.repeats = repeats
-
-    def __len__(self):
-        return len(self._SAMPLES) * self.repeats
-
-    def __getitem__(self, idx):
-        return dict(self._SAMPLES[idx % len(self._SAMPLES)])
-
-
-class LengthRewardModel(BaseRewardModel):
-    """Rewards each response by its (non-pad) token count.
-
-    Gives the group-normalized advantage a non-degenerate signal.
-    """
-
-    def score(self, prompts, responses):
-        B = len(prompts)
-        G = len(responses[0]) if B else 0
-        rewards = torch.zeros(B, G)
-        for i in range(B):
-            for g in range(G):
-                rewards[i, g] = float(len(responses[i][g]))
-        return rewards
+    defaults.update(overrides)
+    return TrainConfig(**defaults)
 
 
 _ONLINE_STRATEGIES = [
@@ -99,67 +108,18 @@ _DDP_TEST_WORLD_SIZE = int(os.environ.get("ASTRAI_DDP_TEST_WORLD_SIZE", "2"))
 @pytest.mark.parametrize(
     ("strategy", "strategy_kwargs", "with_critic"), _ONLINE_STRATEGIES
 )
-def test_online_rollout_end_to_end(
-    base_test_env, strategy, strategy_kwargs, with_critic, monkeypatch
-):
+def test_online_rollout_end_to_end(online_env, strategy, strategy_kwargs, with_critic):
     """Run one epoch of online RL rollout with KV-cache-backed generation."""
-    created_reference_models = []
-    create_ref_model = train_context_builder.create_ref_model
+    test_dir = online_env["test_dir"]
+    model_config = online_env["transformer_config"]
 
-    def track_reference_model(*args, **kwargs):
-        created_reference_models.append(strategy)
-        return create_ref_model(*args, **kwargs)
-
-    monkeypatch.setattr(
-        train_context_builder, "create_ref_model", track_reference_model
-    )
-
-    test_dir = base_test_env["test_dir"]
-    device = base_test_env["device"]
-    tokenizer = base_test_env["tokenizer"]
-    model_config = base_test_env["transformer_config"]
-
-    tokenizer.set_chat_template(CHAT_TEMPLATE)
-    tokenizer.save_pretrained(test_dir)
-
-    config_kwargs = dict(
-        strategy=strategy,
-        model=ComponentSpec(
-            type="autoregressive_lm", params={"config": model_config.to_dict()}
-        ),
-        precision={"compute_dtype": "float32"},
-        dataset=ComponentSpec(
-            type="tests.trainer.test_online_e2e:InstructionDataset",
-            params={"collate": "tests.support.rollout:instruction_collate_fn"},
-        ),
-        optimizer=ComponentSpec(type="torch.optim:AdamW", params={"lr": 1e-4}),
-        scheduler=ComponentSpec(
-            type="cosine",
-            params={"warmup_steps": 1, "lr_decay_steps": 4, "min_rate": 0.05},
-        ),
-        ckpt_dir=os.path.join(test_dir, "ckpt"),
-        n_epoch=1,
-        batch_per_device=2,
-        ckpt_interval=100,
-        grad_accum_steps=1,
-        random_seed=42,
-        device_type=device,
-        dp_mode="none",
-        strategy_kwargs=strategy_kwargs,
-        rollout_interval=1,
-        rollout_max_policy_lag=0,
-        rollout_temperature=1.0,
-        rollout_top_k=0,
-        rollout_top_p=1.0,
-        rollout_max_tokens=4,
-        reward_model_fn=LengthRewardModel,
-    )
+    config_kwargs = {"strategy": strategy, "strategy_kwargs": strategy_kwargs}
     if with_critic:
         config_kwargs["critic_model_fn"] = partial(
             make_online_value_model, model_config
         )
         config_kwargs["critic_optimizer_fn"] = make_online_optimizer
-    train_config = TrainConfig(**config_kwargs)
+    train_config = _online_config(online_env, **config_kwargs)
 
     trainer = Trainer(train_config)
     trainer.train(param_path=test_dir)
@@ -168,7 +128,6 @@ def test_online_rollout_end_to_end(
     assert os.path.isdir(checkpoint_dir)
     checkpoint = Checkpoint.load(checkpoint_dir)
     assert checkpoint.meta["policy_version"] == 2
-    assert len(created_reference_models) == 1
     if with_critic:
         assert "value_model" in checkpoint.extra
         assert "value_optimizer" in checkpoint.extra
@@ -176,53 +135,32 @@ def test_online_rollout_end_to_end(
         assert "value_model" not in checkpoint.extra
 
 
-def _minimal_online_config(**overrides):
-    """A TrainConfig for online GRPO that only needs field overrides."""
-    defaults = dict(
-        strategy="online_grpo",
-        model=ComponentSpec(
-            type="torch.nn:Linear", params={"in_features": 2, "out_features": 2}
-        ),
-        dataset=ComponentSpec(
-            type="tests.trainer.test_online_e2e:InstructionDataset",
-            params={"collate": "tests.support.rollout:instruction_collate_fn"},
-        ),
-        optimizer=ComponentSpec(type="torch.optim:SGD", params={"lr": 0.0}),
-        scheduler=ComponentSpec(
-            type="cosine",
-            params={"warmup_steps": 1, "lr_decay_steps": 4, "min_rate": 0.05},
-        ),
-        reward_model_fn=LengthRewardModel,
-    )
-    defaults.update(overrides)
-    return TrainConfig(**defaults)
-
-
-def test_online_config_rejects_contradictory_policy_lag():
+def test_online_config_rejects_contradictory_policy_lag(online_env):
     """rollout_max_policy_lag below rollout_interval - 1 guarantees a fatal
     RolloutVersionError mid-training; it must fail at config time instead."""
     with pytest.raises(ValueError, match="rollout_max_policy_lag=0"):
-        _minimal_online_config(rollout_interval=3, rollout_max_policy_lag=0)
+        _online_config(online_env, rollout_interval=3, rollout_max_policy_lag=0)
 
     # lag == interval - 1 (including the derived default) stays valid.
-    config = _minimal_online_config(rollout_interval=3, rollout_max_policy_lag=2)
+    config = _online_config(online_env, rollout_interval=3, rollout_max_policy_lag=2)
     assert config.rollout_max_policy_lag == 2
-    config = _minimal_online_config(rollout_interval=3)
+    config = _online_config(online_env, rollout_interval=3)
     assert config.rollout_max_policy_lag is None
 
     # Offline strategies never consult the rollout window.
-    config = _minimal_online_config(
-        strategy="sft", rollout_interval=3, rollout_max_policy_lag=0
+    config = _online_config(
+        online_env, strategy="sft", rollout_interval=3, rollout_max_policy_lag=0
     )
     assert config.rollout_max_policy_lag == 0
 
 
-def test_rollout_val_overrides_drop_unset_fields():
+def test_rollout_val_overrides_drop_unset_fields(online_env):
     """Only explicitly set validation fields enter the replace() dict."""
-    config = _minimal_online_config(rollout_val_temperature=0.0)
+    config = _online_config(online_env, rollout_val_temperature=0.0)
     assert config.rollout_val_overrides() == {"temperature": 0.0}
 
-    config = _minimal_online_config(
+    config = _online_config(
+        online_env,
         rollout_val_temperature=0.0,
         rollout_val_top_p=0.95,
         rollout_val_top_k=0,
@@ -240,43 +178,14 @@ def test_rollout_val_overrides_drop_unset_fields():
     # Unset fields stay legal (inherit) while out-of-range values are
     # rejected at config time; temperature=0 (greedy) is val-only legal.
     with pytest.raises(ValueError, match="rollout_val_top_p"):
-        _minimal_online_config(rollout_val_top_p=0.0)
+        _online_config(online_env, rollout_val_top_p=0.0)
     with pytest.raises(ValueError, match="rollout_val_group_size"):
-        _minimal_online_config(rollout_val_group_size=0)
+        _online_config(online_env, rollout_val_group_size=0)
 
 
-@pytest.mark.parametrize("worker_count", [1, 2, 3, 4])
-def test_async_round_accepts_distinct_worker_counts(worker_count):
-    devices = [f"cuda:{index}" for index in range(1, worker_count + 1)]
-    config = _minimal_online_config(
-        rollout_mode="async_round",
-        rollout_devices=devices,
-        rollout_interval=1,
-        rollout_max_policy_lag=1,
-    )
-    assert config.rollout_devices == devices
-
-
-@pytest.mark.parametrize(
-    "devices, message",
-    [
-        ([], "at least one rollout device"),
-        (["cuda:1", "cuda:01"], "distinct rollout_devices"),
-        (["cpu"], "indexed CUDA devices"),
-    ],
-)
-def test_async_round_rejects_invalid_worker_devices(devices, message):
-    with pytest.raises(ValueError, match=message):
-        _minimal_online_config(
-            rollout_mode="async_round",
-            rollout_devices=devices,
-            rollout_interval=1,
-            rollout_max_policy_lag=1,
-        )
-
-
-def test_async_round_rejects_moe_before_starting_workers():
-    config = _minimal_online_config(
+def test_async_round_rejects_moe_before_starting_workers(online_env):
+    config = _online_config(
+        online_env,
         rollout_mode="async_round",
         rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
         rollout_interval=1,
@@ -310,60 +219,24 @@ def test_async_round_rejects_moe_before_starting_workers():
         )
 
 
-def instruction_subset(repeats, count):
-    return Subset(InstructionDataset(repeats=repeats), range(count))
-
-
 @pytest.mark.distributed
 @pytest.mark.cuda
 @pytest.mark.skipif(
     torch.cuda.device_count() < _DDP_TEST_WORLD_SIZE,
     reason=f"{_DDP_TEST_WORLD_SIZE} CUDA devices are required",
 )
-def test_ddp_online_grpo_end_to_end(base_test_env):
+def test_ddp_online_grpo_end_to_end(online_env):
     """Run real rollout and optimizer steps on the requested DDP replicas."""
-    test_dir = base_test_env["test_dir"]
-    tokenizer = base_test_env["tokenizer"]
-    model_config = base_test_env["transformer_config"]
+    test_dir = online_env["test_dir"]
 
-    tokenizer.set_chat_template(CHAT_TEMPLATE)
-    tokenizer.save_pretrained(test_dir)
-
-    dataset = InstructionDataset(repeats=10)
-    train_config = TrainConfig(
-        strategy="online_grpo",
-        model=ComponentSpec(
-            type="autoregressive_lm", params={"config": model_config.to_dict()}
-        ),
-        precision={"compute_dtype": "float32"},
-        dataset=ComponentSpec(
-            type="tests.trainer.test_online_e2e:InstructionDataset",
-            params={
-                "repeats": 10,
-                "collate": "tests.support.rollout:instruction_collate_fn",
-            },
-        ),
-        optimizer=ComponentSpec(type="torch.optim:AdamW", params={"lr": 1e-4}),
-        scheduler=ComponentSpec(
-            type="cosine",
-            params={"warmup_steps": 1, "lr_decay_steps": 4, "min_rate": 0.05},
-        ),
-        ckpt_dir=os.path.join(test_dir, "ckpt"),
-        n_epoch=1,
+    dataset = InstructionDataset(length=40)
+    train_config = _online_config(
+        online_env,
+        dataset_length=40,
         batch_per_device=1,
-        ckpt_interval=100,
-        grad_accum_steps=1,
-        random_seed=42,
         device_type="cuda",
         dp_size=_DDP_TEST_WORLD_SIZE,
         dp_mode="ddp",
-        strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
-        rollout_interval=1,
-        rollout_temperature=1.0,
-        rollout_top_k=0,
-        rollout_top_p=1.0,
-        rollout_max_tokens=4,
-        reward_model_fn=LengthRewardModel,
     )
 
     Trainer(train_config).train(param_path=test_dir)
@@ -375,43 +248,19 @@ def test_ddp_online_grpo_end_to_end(base_test_env):
 @pytest.mark.distributed
 @pytest.mark.cuda
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="four CUDA devices required")
-def test_async_round_ddp_two_learners_two_workers(base_test_env):
-    test_dir = base_test_env["test_dir"]
-    tokenizer = base_test_env["tokenizer"]
-    tokenizer.set_chat_template(CHAT_TEMPLATE)
-    tokenizer.save_pretrained(test_dir)
-    config = TrainConfig(
-        strategy="online_grpo",
-        model=ComponentSpec(
-            type="autoregressive_lm",
-            params={"config": base_test_env["transformer_config"].to_dict()},
-        ),
-        precision={"compute_dtype": "float32"},
-        dataset=ComponentSpec(
-            type="tests.trainer.test_online_e2e:InstructionDataset",
-            params={
-                "repeats": 1,
-                "collate": "tests.support.rollout:instruction_collate_fn",
-            },
-        ),
-        optimizer=ComponentSpec(type="torch.optim:AdamW", params={"lr": 1e-4}),
-        scheduler=ComponentSpec(
-            type="cosine",
-            params={"warmup_steps": 1, "lr_decay_steps": 4, "min_rate": 0.05},
-        ),
-        ckpt_dir=os.path.join(test_dir, "ckpt"),
-        n_epoch=1,
-        batch_per_device=2,
-        grad_accum_steps=1,
+def test_async_round_ddp_two_learners_two_workers(online_env):
+    test_dir = online_env["test_dir"]
+    config = _online_config(
+        online_env,
         device_type="cuda",
         dp_size=2,
         dp_mode="ddp",
-        strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
         rollout_mode="async_round",
         rollout_devices=["cuda:2", "cuda:3"],
-        rollout_interval=1,
-        rollout_max_tokens=4,
-        reward_model_fn=LengthRewardModel,
+        random_seed=3407,
+        rollout_temperature=0.7,
+        rollout_top_p=0.9,
+        ckpt_interval=5000,
     )
     Trainer(config).train(param_path=test_dir)
     checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_1"))
@@ -422,13 +271,9 @@ def test_async_round_ddp_two_learners_two_workers(base_test_env):
 @pytest.mark.distributed
 @pytest.mark.cuda
 @pytest.mark.skipif(torch.cuda.device_count() < 5, reason="five CUDA devices required")
-def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
+def test_async_round_online_grpo_five_gpus(online_env, monkeypatch):
     """Four simultaneous replicas feed one optimizer update per round."""
-    test_dir = base_test_env["test_dir"]
-    tokenizer = base_test_env["tokenizer"]
-    model_config = base_test_env["transformer_config"]
-    tokenizer.set_chat_template(CHAT_TEMPLATE)
-    tokenizer.save_pretrained(test_dir)
+    test_dir = online_env["test_dir"]
 
     seen = []
     pools = []
@@ -446,38 +291,18 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
 
     monkeypatch.setattr(AsyncRoundCoordinator, "__init__", tracked_init)
     monkeypatch.setattr(AsyncRoundCoordinator, "collect_round", tracked_collect)
-    config = TrainConfig(
-        strategy="online_grpo",
-        model=ComponentSpec(
-            type="autoregressive_lm", params={"config": model_config.to_dict()}
-        ),
-        precision={"compute_dtype": "float32"},
-        dataset=ComponentSpec(
-            type="tests.trainer.test_online_e2e:instruction_subset",
-            params={
-                "repeats": 3,
-                "count": 10,
-                "collate": "tests.support.rollout:instruction_collate_fn",
-            },
-        ),
-        optimizer=ComponentSpec(type="torch.optim:AdamW", params={"lr": 1e-4}),
-        scheduler=ComponentSpec(
-            type="cosine",
-            params={"warmup_steps": 1, "lr_decay_steps": 4, "min_rate": 0.05},
-        ),
-        ckpt_dir=os.path.join(test_dir, "ckpt"),
-        n_epoch=1,
+    config = _online_config(
+        online_env,
+        dataset_length=10,
         batch_per_device=4,
-        grad_accum_steps=1,
         device_type="cuda",
-        dp_mode="none",
-        strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
         rollout_mode="async_round",
         rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
-        rollout_interval=1,
         rollout_max_policy_lag=1,
-        rollout_max_tokens=4,
-        reward_model_fn=LengthRewardModel,
+        random_seed=3407,
+        rollout_temperature=0.7,
+        rollout_top_p=0.9,
+        ckpt_interval=5000,
     )
     Trainer(config).train(param_path=test_dir)
 
@@ -510,45 +335,21 @@ def test_async_round_online_grpo_five_gpus(base_test_env, monkeypatch):
 @pytest.mark.cuda
 @pytest.mark.skipif(torch.cuda.device_count() < 5, reason="five CUDA devices required")
 def test_async_round_version_commit_failure_checkpoint_resumes_once(
-    base_test_env, monkeypatch
+    online_env, monkeypatch
 ):
-    test_dir = base_test_env["test_dir"]
-    tokenizer = base_test_env["tokenizer"]
-    model_config = base_test_env["transformer_config"]
-    tokenizer.set_chat_template(CHAT_TEMPLATE)
-    tokenizer.save_pretrained(test_dir)
-    config = TrainConfig(
-        strategy="online_grpo",
-        model=ComponentSpec(
-            type="autoregressive_lm", params={"config": model_config.to_dict()}
-        ),
-        precision={"compute_dtype": "float32"},
-        dataset=ComponentSpec(
-            type="tests.trainer.test_online_e2e:instruction_subset",
-            params={
-                "repeats": 2,
-                "count": 8,
-                "collate": "tests.support.rollout:instruction_collate_fn",
-            },
-        ),
-        optimizer=ComponentSpec(type="torch.optim:AdamW", params={"lr": 1e-4}),
-        scheduler=ComponentSpec(
-            type="cosine",
-            params={"warmup_steps": 1, "lr_decay_steps": 4, "min_rate": 0.05},
-        ),
-        ckpt_dir=os.path.join(test_dir, "ckpt"),
-        n_epoch=1,
+    test_dir = online_env["test_dir"]
+    config = _online_config(
+        online_env,
+        dataset_length=8,
         batch_per_device=4,
-        grad_accum_steps=1,
         device_type="cuda",
-        dp_mode="none",
-        strategy_kwargs={"clip_eps": 0.2, "kl_coef": 0.01, "group_size": 2},
         rollout_mode="async_round",
         rollout_devices=["cuda:1", "cuda:2", "cuda:3", "cuda:4"],
-        rollout_interval=1,
         rollout_max_policy_lag=1,
-        rollout_max_tokens=4,
-        reward_model_fn=LengthRewardModel,
+        random_seed=3407,
+        rollout_temperature=0.7,
+        rollout_top_p=0.9,
+        ckpt_interval=5000,
     )
     original_publication = NCCLWeightChannel.mark_committed
 
@@ -574,19 +375,20 @@ def test_async_round_version_commit_failure_checkpoint_resumes_once(
     assert resumed.consumed_samples == 8
 
 
+def make_online_optimizer(model):
+    return torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+
 def make_graph_rollout_model(config):
-    return make_online_model(config).to(dtype=torch.bfloat16)
+    return AutoRegressiveLM(config).to(dtype=torch.bfloat16)
 
 
 @pytest.mark.distributed
 @pytest.mark.cuda
 @pytest.mark.skipif(torch.cuda.device_count() < 5, reason="five CUDA devices required")
-def test_async_seeds_match_after_worker_repartition_and_resume(base_test_env):
-    tokenizer = base_test_env["tokenizer"]
-    tokenizer.set_chat_template(CHAT_TEMPLATE)
-    tokenizer.save_pretrained(base_test_env["test_dir"])
+def test_async_seeds_match_after_worker_repartition_and_resume(online_env):
     config = replace(
-        base_test_env["transformer_config"], hidden_size=128, intermediate_size=256
+        online_env["transformer_config"], hidden_size=128, intermediate_size=256
     )
     model_fn = partial(make_graph_rollout_model, config)
     source = model_fn().to("cuda:0").eval()
@@ -616,7 +418,7 @@ def test_async_seeds_match_after_worker_repartition_and_resume(base_test_env):
             ),
             source=source,
             model_fn=model_fn,
-            param_path=base_test_env["test_dir"],
+            param_path=online_env["test_dir"],
             reward_model=LengthRewardModel(),
             policy_version=0,
             model_dtype=torch.bfloat16,
@@ -633,3 +435,137 @@ def test_async_seeds_match_after_worker_repartition_and_resume(base_test_env):
         torch.testing.assert_close(
             results[0].logprobs_old, other.logprobs_old, atol=1e-5, rtol=1e-5
         )
+
+
+class _StopAtFour(TrainCallback):
+    def after_optimizer_step(self, context):
+        if context.optimizer_step == 4:
+            context.request_stop()
+
+
+def test_online_replay_publishes_each_update_and_reference(online_env):
+    """Replay publishes each update; the cursor advances once per data window."""
+    test_dir = online_env["test_dir"]
+
+    config = _online_config(online_env, rl_update_epochs=2, rl_minibatch_prompts=1)
+    Trainer(config).train(param_path=test_dir)
+
+    checkpoint_dir = os.path.join(test_dir, "ckpt", "epoch_0_step_8")
+    checkpoint = Checkpoint.load(checkpoint_dir)
+    # 2 batches × (2 minibatches × 2 epochs) publications, one step each.
+    assert checkpoint.meta["policy_version"] == 8
+    assert checkpoint.meta["optimizer_step"] == 8
+    # The cursor counts data positions, not steps: a replayed batch is one
+    # position however many updates it produces.
+    assert checkpoint.meta["consumed_samples"] == 4
+    assert "reference_model" in checkpoint.extra
+    assert "rng_state" not in checkpoint.extra
+    ref_keys = set(checkpoint.extra["reference_model"])
+    assert ref_keys and ref_keys.issubset(checkpoint.state_dict.keys())
+
+
+def test_online_accumulation_commits_complete_rollout_windows(online_env):
+    """Replay updates publish separately; the data cursor moves once per window."""
+    test_dir = online_env["test_dir"]
+
+    config = _online_config(
+        online_env,
+        batch_per_device=1,
+        grad_accum_steps=2,
+        rl_update_epochs=2,
+        rl_minibatch_prompts=1,
+    )
+    Trainer(config).train(param_path=test_dir)
+    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_8"))
+    assert checkpoint.meta["policy_version"] == 8
+    assert checkpoint.meta["optimizer_step"] == 8
+    assert checkpoint.meta["consumed_samples"] == 4
+    assert checkpoint.meta["epoch_sample_offset"] == 4
+    with open(
+        os.path.join(test_dir, "ckpt", "epoch_0_step_8", "metric.jsonl"),
+        encoding="utf-8",
+    ) as file:
+        steps = [
+            record["step"]
+            for record in map(json.loads, file)
+            if record["type"] == "step"
+        ]
+    assert steps == list(range(1, 9))
+
+
+def test_online_ddp_accumulation_keeps_policy_versions_aligned(online_env):
+    """All ranks publish the same replay updates, including empty group slots."""
+    test_dir = online_env["test_dir"]
+
+    config = _online_config(
+        online_env,
+        dp_size=2,
+        dp_mode="ddp",
+        backend="gloo",
+        master_port=find_free_port(),
+        batch_per_device=1,
+        grad_accum_steps=2,
+        rl_update_epochs=2,
+        rl_minibatch_prompts=2,
+    )
+    Trainer(config).train(param_path=test_dir)
+    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_4"))
+    assert checkpoint.meta["policy_version"] == 4
+    assert checkpoint.meta["optimizer_step"] == 4
+    assert checkpoint.meta["consumed_samples"] == 4
+
+
+def test_online_rollout_window_resumes_after_dp_resize(online_env):
+    test_dir = online_env["test_dir"]
+    old = _online_config(
+        online_env,
+        dataset_length=8,
+        batch_per_device=2,
+        grad_accum_steps=2,
+        rl_update_epochs=2,
+        rl_minibatch_prompts=2,
+    )
+    Trainer(old, callbacks=[_StopAtFour()]).train(param_path=test_dir)
+    first = os.path.join(test_dir, "ckpt", "epoch_0_step_4")
+    saved = Checkpoint.load(first)
+    assert saved.consumed_samples == 4
+    assert saved.meta["policy_version"] == 4
+
+    new = _online_config(
+        online_env,
+        dataset_length=8,
+        dp_size=2,
+        dp_mode="ddp",
+        backend="gloo",
+        master_port=find_free_port(),
+        batch_per_device=1,
+        grad_accum_steps=2,
+        rl_update_epochs=2,
+        rl_minibatch_prompts=2,
+    )
+    Trainer(new).train(param_path=first, resume=True)
+    final = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_8"))
+    assert final.meta["policy_version"] == 8
+    assert final.meta["optimizer_step"] == 8
+    assert final.consumed_samples == 8
+
+
+def test_online_ddp_flushes_tail_with_empty_rank(online_env):
+    test_dir = online_env["test_dir"]
+    config = _online_config(
+        online_env,
+        dataset_length=5,
+        dp_size=2,
+        dp_mode="ddp",
+        backend="gloo",
+        master_port=find_free_port(),
+        batch_per_device=1,
+        grad_accum_steps=2,
+        epoch_tail_policy="flush",
+        rl_minibatch_prompts=2,
+    )
+    Trainer(config).train(param_path=test_dir)
+    checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_0_step_3"))
+    assert checkpoint.meta["policy_version"] == 3
+    assert checkpoint.consumed_samples == 5
+    assert checkpoint.meta["epoch_sample_offset"] == 5

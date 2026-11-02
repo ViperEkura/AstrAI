@@ -58,10 +58,5 @@ def random_dataset():
 
 
 @pytest.fixture
-def multi_turn_dataset():
-    return RandomTokenDataset(length=None, with_loss_mask=True)
-
-
-@pytest.fixture
 def early_stopping_dataset():
     return RandomTokenDataset(length=10, stop_after=5)

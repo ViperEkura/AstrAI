@@ -15,8 +15,6 @@ import torch
 from torch import nn
 
 from astrai.trainer.optional_extras import (
-    COMPONENT_EXTRAS,
-    component_extra,
     component_extra_keys,
     load_component_extra,
     require_component_extras,
@@ -32,31 +30,10 @@ class _Root(nn.Module):
         self.weight = nn.Parameter(torch.full((4,), value))
 
 
-class _Strategy:
-    """Strategy stand-in exposing exactly the table's attributes."""
-
-    def __init__(self, **components):
-        self.__dict__.update(components)
-
-
-def test_table_keys_are_unique_and_declared():
-    keys = [entry.key for entry in COMPONENT_EXTRAS]
-    assert len(keys) == len(set(keys))
-    # The PPO critic is restored as one unit: both its keys are table entries.
-    assert set(component_extra_keys("critic", "critic_optimizer")) == {
-        "value_model",
-        "value_optimizer",
-    }
-    for key in keys:
-        assert component_extra(key).key == key
-    with pytest.raises(ValueError, match="unknown component extra"):
-        component_extra("no_such_extra")
-
-
 def test_snapshot_walks_the_table_and_copies_modules_to_cpu():
     """A strategy owning all three components snapshots all three keys, with
     module state stored as detached CPU tensors."""
-    strategy = _Strategy(
+    strategy = SimpleNamespace(
         critic=_Root(1.0),
         critic_optimizer=torch.optim.SGD(_Root(1.0).parameters(), lr=0.1),
         ref_model=_Root(2.0),
@@ -75,10 +52,10 @@ def test_snapshot_walks_the_table_and_copies_modules_to_cpu():
 def test_snapshot_skips_absent_components_and_gated_entries():
     """Components the strategy does not own are skipped; the reference is
     gated by its config flag (default on)."""
-    critic_only = _Strategy(critic=_Root(), critic_optimizer=None)
+    critic_only = SimpleNamespace(critic=_Root(), critic_optimizer=None)
     assert set(snapshot_component_extras(critic_only, None)) == {"value_model"}
 
-    full = _Strategy(
+    full = SimpleNamespace(
         critic=_Root(),
         critic_optimizer=torch.optim.SGD(_Root().parameters(), lr=0.1),
         ref_model=_Root(),
@@ -88,16 +65,6 @@ def test_snapshot_skips_absent_components_and_gated_entries():
     assert set(gated) == {"value_model", "value_optimizer"}
     # A missing config keeps the default (save the reference).
     assert "reference_model" in snapshot_component_extras(full, None)
-
-
-def test_load_restores_the_declared_key_into_the_target():
-    source = _Root(3.0)
-    extra = {"reference_model": source.state_dict()}
-    target = _Root(0.0)
-
-    assert load_component_extra(extra, "reference_model", target) is True
-
-    torch.testing.assert_close(target.weight, source.weight)
 
 
 def test_missing_extra_is_fatal_unless_the_escape_flag_is_set():

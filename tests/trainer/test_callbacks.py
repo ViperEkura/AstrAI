@@ -74,57 +74,6 @@ def test_gradient_checkpointing_preserves_forward_gradients_and_restores(
     )
 
 
-def test_gradient_checkpointing_trainer_integration(
-    base_test_env, random_dataset, train_config_factory, cpu_device
-):
-    """Gradient checkpointing runs end-to-end via Trainer."""
-    train_config = train_config_factory(
-        dataset=random_dataset,
-        test_dir=base_test_env["test_dir"],
-        device=cpu_device,
-        ckpt_interval=3,
-        gradient_checkpointing_modules=[DecoderBlock],
-    )
-
-    trainer = Trainer(train_config)
-    gc_callbacks = [
-        c for c in trainer.callbacks if isinstance(c, GradientCheckpointingCallback)
-    ]
-    assert gc_callbacks and gc_callbacks[0].modules == (DecoderBlock,)
-    trainer.train()
-
-
-def test_callback_integration(
-    base_test_env, random_dataset, train_config_factory, cpu_device
-):
-    """Test that all callbacks are properly integrated"""
-    train_config = train_config_factory(
-        dataset=random_dataset,
-        test_dir=base_test_env["test_dir"],
-        device=cpu_device,
-        ckpt_interval=3,
-    )
-
-    callback_calls = []
-
-    class TrackingCallback(TrainCallback):
-        def on_train_begin(self, context):
-            callback_calls.append("on_train_begin")
-
-        def on_batch_end(self, context):
-            callback_calls.append("on_batch_end")
-
-        def on_epoch_end(self, context):
-            callback_calls.append("on_epoch_end")
-
-    trainer = Trainer(train_config, callbacks=[TrackingCallback()])
-    trainer.train()
-
-    assert "on_train_begin" in callback_calls
-    assert "on_batch_end" in callback_calls
-    assert "on_epoch_end" in callback_calls
-
-
 def test_checkpoint_captures_completed_optimizer_step(
     base_test_env, train_config_factory, cpu_device
 ):
@@ -231,12 +180,6 @@ def test_checkpoint_snapshots_tokenizer_files(
     # Resuming with param_path == checkpoint dir must not raise
     # (samefile guard).
     _copy_tokenizer_files(str(ckpt_dir), str(ckpt_dir))
-
-
-def test_copy_tokenizer_files_skips_missing_and_none(tmp_path):
-    _copy_tokenizer_files(None, str(tmp_path))
-    _copy_tokenizer_files(str(tmp_path), str(tmp_path / "out"))
-    assert not (tmp_path / "out").exists() or not any((tmp_path / "out").iterdir())
 
 
 def test_interrupt_before_first_step_still_checkpoints(

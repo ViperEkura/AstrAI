@@ -16,9 +16,9 @@ from astrai.trainer.context import TrainContextBuilder
 from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.trainer import Trainer
 from tests.support.precision import assert_precision_state
+from tests.support.rollout import LengthRewardModel
 from tests.support.tokenizers import CHAT_TEMPLATE
 from tests.support.trainer import make_online_value_model
-from tests.trainer.test_online_e2e import LengthRewardModel
 from tests.trainer.test_unified_resume import _StopAfterOne, make_resume_config
 
 
@@ -271,7 +271,7 @@ def test_sharded_ppo_critic_checkpoint_matches_continuous_training(base_test_env
         ),
         precision=PrecisionConfig(compute_dtype="float32", export_dtype="bfloat16"),
         dataset=ComponentSpec(
-            type="tests.trainer.test_online_e2e:InstructionDataset",
+            type="tests.support.rollout:InstructionDataset",
             params={"collate": "tests.support.rollout:instruction_collate_fn"},
         ),
         optimizer=ComponentSpec(

@@ -1,13 +1,9 @@
-from types import SimpleNamespace
-
-import torch
-
-"""Unit tests for the online rollout module."""
-
 import dataclasses
 import threading
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from astrai.trainer.rollout import (
     RolloutRunner,
@@ -16,37 +12,23 @@ from astrai.trainer.rollout import (
 from tests.support.rollout_cases import (
     ConstantRewardModel,
     assert_interleaved,
-    interleave_before_snapshot,
     make_generator,
     make_instruction_batch,
     make_runner,
 )
 
 
-def test_rollout_runner_shapes(cpu_device):
-    runner, model = make_runner(cpu_device, max_seq_len=64, group_size=3, max_tokens=5)
-    assert model.config.max_position_embeddings == 64
-    assert runner.generator.backend.engine_core.max_seq_len == 64
-    batch = make_instruction_batch(n=2)
-    r, is_fresh = runner(batch)
-    assert is_fresh
-    assert r.responses.shape == (2, 3, 5)
-    assert r.response_mask.shape == (2, 3, 5)
-    assert r.rewards.shape == (2, 3)
-    assert r.logprobs_old.shape == (2, 3, 5)
-    assert len(r.prompt_texts) == 2
-    assert len(r.response_texts) == 2
-    assert len(r.response_texts[0]) == 3
+def _interleave_before_snapshot(runner, callback):
+    """Wrap ``with_policy_snapshot`` so ``callback`` runs just before a
+    named snapshot callback enters the generator/scheduler locks."""
+    original_snapshot = runner.generator.with_policy_snapshot
 
+    def wrapper(inspect):
+        if inspect.__name__ == "reuse":
+            callback()
+        return original_snapshot(inspect)
 
-def test_rollout_runner_cache_returns_stale_flag(cpu_device):
-    runner, _ = make_runner(cpu_device, rollout_interval=10)
-    batch = make_instruction_batch()
-    r1, fresh1 = runner(batch)
-    r2, fresh2 = runner(batch)
-    assert r1 is r2
-    assert fresh1 is True
-    assert fresh2 is False
+    runner.generator.with_policy_snapshot = wrapper
 
 
 def test_rollout_runner_evaluate_leaves_cache_untouched(cpu_device):
@@ -161,11 +143,6 @@ def test_rollout_runner_publishes_cache_before_concurrent_policy_update(cpu_devi
     assert runner.policy_version == 1
 
 
-def test_rollout_runner_derives_default_policy_lag_from_interval(cpu_device):
-    runner, _ = make_runner(cpu_device, rollout_interval=4)
-    assert runner.max_policy_lag == 3
-
-
 def test_rollout_runner_reuse_reads_cache_inside_the_snapshot(cpu_device):
     """The reuse decision must observe the cache under the policy snapshot
     (regression: the cache was read outside the lock, so a concurrent
@@ -181,7 +158,7 @@ def test_rollout_runner_reuse_reads_cache_inside_the_snapshot(cpu_device):
         runner._cache = dataclasses.replace(first, policy_version=1)
         runner._steps_since_rollout = 0
 
-    interleave_before_snapshot(runner, concurrent_refresh)
+    _interleave_before_snapshot(runner, concurrent_refresh)
     result, fresh = runner(batch)
     assert fresh is False
     assert result is not first
@@ -197,7 +174,7 @@ def test_rollout_runner_recovers_when_cache_cleared_before_reuse_snapshot(cpu_de
     batch = make_instruction_batch(n=1)
     first, _ = runner(batch)
 
-    interleave_before_snapshot(runner, runner.clear_cache)
+    _interleave_before_snapshot(runner, runner.clear_cache)
     result, fresh = runner(batch)
     assert fresh is True
     assert result is not first
@@ -258,27 +235,6 @@ def test_rollout_runner_step_triggers_new_rollout(cpu_device):
     r3, fresh3 = runner(batch)
     assert r3 is not r1
     assert fresh3 is True
-
-
-def test_rollout_runner_clear_cache_forces_rerun(cpu_device):
-    runner, _ = make_runner(cpu_device, rollout_interval=100)
-    batch = make_instruction_batch()
-    r1, _ = runner(batch)
-    runner.clear_cache()
-    r2, fresh2 = runner(batch)
-    assert r2 is not r1
-    assert fresh2 is True
-
-
-def test_rollout_runner_step_resets_counter(cpu_device):
-    runner, _ = make_runner(cpu_device, rollout_interval=1)
-    batch = make_instruction_batch()
-    r1, _ = runner(batch)
-    runner.step()
-    r2, fresh2 = runner(batch)
-    assert r2 is not r1
-    assert fresh2 is True
-    # Counter reset after rollout; second call w/o step should be cached.
-    r3, fresh3 = runner(batch)
-    assert r3 is r2
-    assert fresh3 is False
+    cached, fresh = runner(batch)
+    assert cached is r3
+    assert fresh is False

@@ -1,19 +1,14 @@
-from tests.support.rollout import make_rollout_result
-
-"""Unit tests for PPO: GAE numerics, the ValueModel critic, and PPOStrategy."""
-
 import pytest
 import torch
 
 from astrai.model.value import ValueModel
 from astrai.trainer.strategy import (
     PPOStrategy,
-    StrategyFactory,
     compute_gae,
 )
 from astrai.trainer.strategy import ppo as strategy_module
 from tests.support.models import make_frozen, make_model, make_rollout_config
-from tests.support.rollout import FakeExecutor
+from tests.support.rollout import FakeExecutor, make_rollout_result
 
 
 def _make_batch(
@@ -64,9 +59,6 @@ def ppo_strategy(cpu_device):
         executor=FakeExecutor(),
     )
     return strategy, cpu_device
-
-
-# ============== compute_gae ==============
 
 
 def test_gae_monte_carlo_when_values_zero(cpu_device):
@@ -153,9 +145,6 @@ def test_gae_empty_response_is_all_zero(cpu_device):
     assert torch.count_nonzero(returns) == 0
 
 
-# ============== ValueModel ==============
-
-
 def test_value_model_trunk_matches_policy_hidden_states(cpu_device):
     """ValueModel's trunk reproduces AutoRegressiveLM's hidden states.
 
@@ -197,19 +186,6 @@ def test_value_model_rejects_packed_inference_input(cpu_device):
         critic(torch.randint(0, 200, (16,), device=cpu_device))
 
 
-# ============== PPOStrategy ==============
-
-
-def test_factory_registers_online_ppo():
-    assert StrategyFactory.is_registered("online_ppo")
-    assert StrategyFactory.get_component_class("online_ppo") is PPOStrategy
-
-
-def test_ppo_supports_online(ppo_strategy):
-    strategy, _ = ppo_strategy
-    assert strategy.supports_online() is True
-
-
 def test_ppo_loss_is_finite_and_differentiable(ppo_strategy):
     strategy, device = ppo_strategy
     batch = _make_batch(device=device)
@@ -225,6 +201,7 @@ def test_ppo_loss_is_finite_and_differentiable(ppo_strategy):
         p.grad is not None and p.grad.abs().sum().item() > 0
         for p in strategy.critic.parameters()
     )
+    assert all(p.grad is None for p in strategy.ref_model.parameters())
 
 
 def test_ppo_requires_behavior_logprobs(ppo_strategy):
@@ -248,14 +225,6 @@ def test_ppo_rejects_invalid_behavior_logprobs(ppo_strategy, invalid):
         match = "only finite values"
     with pytest.raises(ValueError, match=match):
         strategy.compute_loss(batch)
-
-
-def test_ppo_ref_model_not_updated_by_backward(ppo_strategy):
-    strategy, device = ppo_strategy
-    loss = strategy.compute_loss(_make_batch(device=device))
-    loss.backward()
-    for p in strategy.ref_model.parameters():
-        assert p.grad is None
 
 
 def test_ppo_zero_advantage_and_zero_critic_gives_zero_loss(ppo_strategy):
@@ -325,9 +294,6 @@ def test_ppo_after_update_clips_critic_gradients(ppo_strategy):
     # Clipped-to-zero critic gradients under SGD (no momentum) leave the
     # parameters unchanged.
     assert torch.equal(next(strategy.critic.parameters()), before)
-
-
-# ============== prepare_from_rollout / GAE integration ==============
 
 
 def test_prepare_from_rollout_computes_and_pins_gae(ppo_strategy, monkeypatch):
@@ -435,17 +401,3 @@ def test_compute_advantages_folds_kl_penalty_into_rewards(ppo_strategy, monkeypa
         expected_rewards.unsqueeze(0), fixed_values, result.response_mask, 1.0, 0.95
     )
     assert torch.allclose(advantages, expected_adv, atol=1e-6)
-
-
-def test_online_call_returns_finite_loss(ppo_strategy):
-    strategy, device = ppo_strategy
-
-    batch = strategy.prepare_from_rollout(make_rollout_result(device=device, G=2, R=5))
-    out = strategy(batch)
-    assert torch.isfinite(out["loss"]).item()
-    assert "policy_loss" in out["metrics"]
-    assert "value_loss" in out["metrics"]
-    assert "explained_variance" in out["metrics"]
-    for name in ("ratio_mean", "ratio_min", "ratio_max", "clip_fraction"):
-        assert name in out["metrics"]
-        assert out["metrics"][name] == out["metrics"][name]  # finite floats

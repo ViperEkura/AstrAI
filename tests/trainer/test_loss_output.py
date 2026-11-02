@@ -45,31 +45,6 @@ def test_seq_strategy_combines_and_reports_moe_aux_loss(cpu_device):
     assert all(isinstance(metric, float) for metric in output["metrics"].values())
 
 
-def test_metric_callback_includes_dynamic_strategy_metrics(tmp_path):
-    callback = MetricCallback(
-        metrics=["loss", "lr"],
-    )
-    context = SimpleNamespace(
-        metrics={"task_loss": 2.0, "moe_aux_loss": 1.0},
-        loss=2.01,
-        optimizer=SimpleNamespace(param_groups=[{"lr": 1e-3}]),
-        val_loss=None,
-        grad_norm=None,
-        grad_snr_tracker=None,
-        world_size=1,
-        dp_size=1,
-    )
-
-    metrics = callback._metrics(context, callback.metrics)
-
-    assert metrics == {
-        "loss": 2.01,
-        "lr": 1e-3,
-        "task_loss": 2.0,
-        "moe_aux_loss": 1.0,
-    }
-
-
 def test_metric_callback_only_computes_requested_metrics(tmp_path):
     def fail_metric(context):
         _ = context

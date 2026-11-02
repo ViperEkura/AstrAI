@@ -1,14 +1,4 @@
 import pytest
-
-from tests.support.rollout_cases import (
-    ConstantRewardModel,
-    make_instruction_batch,
-    make_replica_pair,
-)
-
-"""Unit tests for the online rollout module."""
-
-
 import torch
 
 from astrai.trainer.backend import P2PCopyPublisher, ReplicaBackend
@@ -20,7 +10,19 @@ from astrai.trainer.rollout import (
 )
 from astrai.trainer.trainer import Trainer
 from tests.support.capabilities import skip_no_multi_device
+from tests.support.models import make_model
+from tests.support.rollout_cases import ConstantRewardModel, make_instruction_batch
 from tests.support.tokenizers import FakeTokenizer
+
+
+def _make_replica_pair():
+    """A training model on cuda:0 and a diverged replica on cuda:1."""
+    train_model, _ = make_model("cuda:0", max_position_embeddings=128)
+    replica_model, _ = make_model("cuda:1", max_position_embeddings=128)
+    with torch.no_grad():
+        for p in replica_model.parameters():
+            p.add_(1.0)
+    return train_model, replica_model
 
 
 @pytest.mark.cuda
@@ -28,7 +30,7 @@ from tests.support.tokenizers import FakeTokenizer
 def test_replica_backend_generation_and_output_device():
     """A replica on cuda:1 generates under its own scheduler and the
     generator lands rollout tensors on the training device."""
-    train_model, replica_model = make_replica_pair()
+    train_model, replica_model = _make_replica_pair()
     replica_model.load_state_dict(train_model.state_dict())
     tokenizer = FakeTokenizer(with_chat_template=True)
     backend = ReplicaBackend(
@@ -57,7 +59,7 @@ def test_replica_backend_generation_and_output_device():
 @pytest.mark.cuda
 @skip_no_multi_device
 def test_p2p_publisher_copies_weights_and_advances_version():
-    train_model, replica_model = make_replica_pair()
+    train_model, replica_model = _make_replica_pair()
     tokenizer = FakeTokenizer(with_chat_template=True)
     backend = ReplicaBackend(
         model=replica_model,
@@ -89,7 +91,7 @@ def test_p2p_publisher_copies_weights_and_advances_version():
 def test_online_optimizer_step_syncs_replica_atomically():
     """Trainer advances the replica's weights and version
     inside one commit — the cross-GPU rollout contract."""
-    train_model, replica_model = make_replica_pair()
+    train_model, replica_model = _make_replica_pair()
     tokenizer = FakeTokenizer(with_chat_template=True)
     backend = ReplicaBackend(
         model=replica_model,

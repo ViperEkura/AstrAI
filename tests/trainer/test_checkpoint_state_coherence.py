@@ -15,7 +15,6 @@ from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks import TrainCallback
 from astrai.trainer.components import build_dataloader, build_scheduler_component
 from astrai.trainer.trainer import Trainer
-from tests.support.checkpoint import assert_state_dicts_equal
 from tests.support.rollout import RandomTokenDataset
 
 
@@ -172,7 +171,7 @@ def test_resume_reproduces_the_uninterrupted_run(
 
     baseline = _last_checkpoint(baseline_dir).state_dict
     resumed = _last_checkpoint(split_dir).state_dict
-    assert_state_dicts_equal(baseline, resumed)
+    torch.testing.assert_close(baseline, resumed, rtol=0, atol=0)
 
     def metric_coordinates(directory):
         path = _checkpoints(directory)[-1] / "metric.jsonl"
@@ -237,7 +236,7 @@ def test_epoch_tail_resume_matches_uninterrupted_run(
     resumed = _last_checkpoint(split_dir)
     assert baseline.meta["optimizer_step"] == resumed.meta["optimizer_step"] == 4
     assert baseline.consumed_samples == resumed.consumed_samples == 2 * length
-    assert_state_dicts_equal(baseline.state_dict, resumed.state_dict)
+    torch.testing.assert_close(baseline.state_dict, resumed.state_dict, rtol=0, atol=0)
     assert "rng_state" not in resumed.extra
 
 
@@ -358,7 +357,7 @@ def test_resume_from_checkpoint_before_discarded_tail(resume_config, tmp_path):
     resumed = _last_checkpoint(resumed_dir)
     assert baseline.meta["optimizer_step"] == resumed.meta["optimizer_step"] == 4
     assert baseline.consumed_samples == resumed.consumed_samples == 18
-    assert_state_dicts_equal(baseline.state_dict, resumed.state_dict)
+    torch.testing.assert_close(baseline.state_dict, resumed.state_dict, rtol=0, atol=0)
 
 
 def test_negative_cursor_is_refused(train_config_factory, tmp_path):

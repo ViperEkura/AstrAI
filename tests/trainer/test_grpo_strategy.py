@@ -50,21 +50,18 @@ def grpo_strategy(cpu_device):
     return strategy, cpu_device
 
 
-def test_grpo_loss_is_finite(grpo_strategy):
-    """compute_loss returns a finite scalar."""
-    strategy, device = grpo_strategy
-    batch = _make_batch(device=device)
-    loss = strategy.compute_loss(batch)
-    assert loss.dim() == 0
-    assert torch.isfinite(loss).item()
-
-
 def test_grpo_loss_backward(grpo_strategy):
     """Loss is differentiable w.r.t. policy model parameters."""
     strategy, device = grpo_strategy
     batch = _make_batch(device=device)
     loss = strategy.compute_loss(batch)
+    assert loss.ndim == 0 and torch.isfinite(loss)
     loss.backward()
+    assert all(
+        parameter.grad is None
+        for frozen in (strategy.ref_model, strategy.old_model)
+        for parameter in frozen.parameters()
+    )
     has_grad = any(
         p.grad is not None and p.grad.abs().sum().item() > 0
         for p in strategy.model.parameters()
@@ -108,14 +105,6 @@ def test_grpo_rejects_invalid_behavior_logprobs(grpo_strategy, invalid):
         match = "only finite values"
     with pytest.raises(ValueError, match=match):
         strategy.compute_loss(batch)
-
-
-def test_grpo_symmetric_clip_is_backward_compatible(grpo_strategy):
-    strategy, _device = grpo_strategy
-    assert strategy.clip_eps == pytest.approx(0.2)
-    assert strategy.clip_eps_low == pytest.approx(0.2)
-    assert strategy.clip_eps_high == pytest.approx(0.2)
-    assert strategy.loss_aggregation == "token"
 
 
 def test_grpo_dapo_clip_higher_changes_positive_advantage_bound(
@@ -263,17 +252,6 @@ def test_grpo_rejects_invalid_dapo_objective_options(grpo_strategy, kwargs, matc
         )
 
 
-@pytest.mark.parametrize("model_name", ["ref_model", "old_model"])
-def test_grpo_frozen_models_not_updated(grpo_strategy, model_name):
-    """Backward should not populate gradients on ref_model or old_model."""
-    strategy, device = grpo_strategy
-    batch = _make_batch(device=device)
-    loss = strategy.compute_loss(batch)
-    loss.backward()
-    for p in getattr(strategy, model_name).parameters():
-        assert p.grad is None
-
-
 def test_grpo_prompt_tokens_masked(grpo_strategy):
     """When only prompt-equivalent tokens are unmasked (response mask all 0),
     the policy loss should be zero (no valid tokens contribute)."""
@@ -294,58 +272,17 @@ def test_grpo_identical_rewards_zero_advantage(grpo_strategy):
     assert loss.item() == pytest.approx(0.0, abs=1e-5)
 
 
-def test_grpo_sync_old_model(grpo_strategy):
-    """sync_old_model copies current policy weights into old_model."""
-    strategy, device = grpo_strategy
+@pytest.mark.parametrize("with_old_model", [False, True], ids=["online", "offline"])
+def test_after_update_refreshes_the_old_policy(grpo_strategy, with_old_model):
+    strategy, _ = grpo_strategy
+    if not with_old_model:
+        strategy.old_model = None
     with torch.no_grad():
-        for p in strategy.model.parameters():
-            p.add_(0.05)
-    policy_sd = strategy.model.state_dict()
-    old_sd = strategy.old_model.state_dict()
-    differs_before = any(
-        not torch.allclose(policy_sd[k], old_sd[k]) for k in policy_sd if k in old_sd
-    )
-    assert differs_before
-
-    strategy.sync_old_model()
-
-    old_sd_after = strategy.old_model.state_dict()
-    matches = all(
-        torch.allclose(policy_sd[k], old_sd_after[k])
-        for k in policy_sd
-        if k in old_sd_after
-    )
-    assert matches
-
-
-def test_grpo_after_update_syncs_old_model(grpo_strategy):
-    """after_update must refresh old_model after each update."""
-    strategy, device = grpo_strategy
-
-    class _SteppedOptimizer:
-        def step(self):
-            with torch.no_grad():
-                for p in strategy.model.parameters():
-                    p.add_(0.05)
-
-    _SteppedOptimizer().step()
+        for parameter in strategy.model.parameters():
+            parameter.add_(0.05)
     strategy.after_update()
-
-    policy_sd = strategy.model.state_dict()
-    old_sd = strategy.old_model.state_dict()
-    assert all(
-        torch.allclose(policy_sd[k], old_sd[k]) for k in policy_sd if k in old_sd
-    )
-
-
-def test_online_grpo_after_update_skips_sync(grpo_strategy):
-    """old_model=None (online) must not attempt a sync."""
-    strategy, device = grpo_strategy
-    strategy.old_model = None
-
-    class _SteppedOptimizer:
-        def step(self):
-            return None
-
-    _SteppedOptimizer().step()
-    strategy.after_update()
+    if with_old_model:
+        for actual, expected in zip(
+            strategy.old_model.parameters(), strategy.model.parameters(), strict=True
+        ):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)

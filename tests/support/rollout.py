@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import Dataset
 
-from astrai.trainer.rollout import RolloutResult
+from astrai.trainer.rollout import BaseRewardModel, RolloutResult
 
 
 def make_rollout_result(B=2, G=4, P=6, R=8, device="cpu"):
@@ -89,3 +89,30 @@ class FakeExecutor:
 
     def model_state_dict(self, model):
         return model.state_dict()
+
+
+class InstructionDataset(Dataset):
+    """Small deterministic prompts shared by online training and resume tests."""
+
+    _SAMPLES = (
+        {"instruction": "Hello", "input": ""},
+        {"instruction": "Tell me a story", "input": "about dragons"},
+        {"instruction": "Summarize", "input": "the article"},
+        {"instruction": "Translate", "input": "to French: hi"},
+    )
+
+    def __init__(self, length=4):
+        self.length = length
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        return dict(self._SAMPLES[index % len(self._SAMPLES)])
+
+
+class LengthRewardModel(BaseRewardModel):
+    def score(self, prompts, responses):
+        return torch.tensor(
+            [[float(len(response)) for response in group] for group in responses]
+        ).reshape(len(prompts), len(responses[0]) if prompts else 0)

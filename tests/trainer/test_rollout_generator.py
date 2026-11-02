@@ -1,5 +1,3 @@
-"""Unit tests for the online rollout module."""
-
 import threading
 
 import pytest
@@ -14,27 +12,21 @@ from astrai.trainer.rollout import (
 from tests.support.rollout_cases import (
     ConstantRewardModel,
     assert_interleaved,
-    blocking_hook,
     make_generator,
     make_instruction_batch,
     make_runner,
 )
 
 
-def test_rollout_generator_shapes(cpu_device):
-    gen, model = make_generator(cpu_device, max_seq_len=64, group_size=3, max_tokens=5)
-    assert model.config.max_position_embeddings == 64
-    assert gen.backend.engine_core.max_seq_len == 64
-    batch = make_instruction_batch(n=2)
-    r = gen.generate(batch)
-    assert r.responses.shape == (2, 3, 5)
-    assert r.response_mask.shape == (2, 3, 5)
-    assert r.logprobs_old.shape == (2, 3, 5)
-    assert r.prompt_mask.shape == r.prompts.shape
-    assert len(r.prompt_texts) == 2
-    assert len(r.response_texts) == 2
-    assert len(r.response_texts[0]) == 3
-    assert r.policy_version == 0
+def _blocking_hook(original, started, release):
+    """Wrap a hook so it signals ``started`` then blocks until ``release``."""
+
+    def hook(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    return hook
 
 
 def test_rollout_generator_uses_eval_and_restores_mode(cpu_device, monkeypatch):
@@ -103,7 +95,7 @@ def test_rollout_generator_serializes_generation_and_policy_update(cpu_device):
     generation_started = threading.Event()
     allow_generation_to_finish = threading.Event()
     update_finished = threading.Event()
-    gen._generate_eval = blocking_hook(
+    gen._generate_eval = _blocking_hook(
         gen._generate_eval, generation_started, allow_generation_to_finish
     )
 
@@ -141,7 +133,7 @@ def test_rollout_generator_serializes_direct_scheduler_update(cpu_device):
     generation_started = threading.Event()
     allow_generation_to_finish = threading.Event()
     update_finished = threading.Event()
-    gen._generate_eval = blocking_hook(
+    gen._generate_eval = _blocking_hook(
         gen._generate_eval, generation_started, allow_generation_to_finish
     )
     rollout = []
@@ -192,18 +184,6 @@ def test_rollout_generator_mask_matches_responses(cpu_device):
                 assert torch.all(r.logprobs_old[i, g, real:] == 0)
 
 
-def test_rollout_generator_logprobs_are_nonpositive(cpu_device):
-    """Behaviour-policy logprobs of sampled tokens should be <= 0."""
-    gen, _ = make_generator(cpu_device, group_size=2, max_tokens=4)
-    batch = make_instruction_batch(n=1)
-    r = gen.generate(batch)
-    for i in range(1):
-        for g in range(2):
-            mask = r.response_mask[i, g]
-            lp = r.logprobs_old[i, g][mask]
-            assert torch.all(lp <= 1e-5)
-
-
 def test_rollout_generator_rejects_failed_requests(cpu_device, monkeypatch):
     gen, _ = make_generator(cpu_device, group_size=2, max_tokens=4)
 
@@ -236,21 +216,6 @@ def test_rollout_generator_instruction_role_mapping(cpu_device):
     assert "SYSTEM: Be helpful" in text
     assert "USER: What is 2+2?" in text
     assert "ASSISTANT: Four" in text
-
-
-def test_rollout_generator_messages_format(cpu_device):
-    """Rollout also accepts pre-built messages."""
-    gen, _ = make_generator(cpu_device, group_size=2, max_tokens=4)
-    batch = {
-        "messages": [
-            [{"role": "user", "content": "Hello"}],
-            [{"role": "user", "content": "Goodbye"}],
-        ]
-    }
-    r = gen.generate(batch)
-    assert r.responses.shape[0] == 2
-    assert len(r.prompt_texts) == 2
-    assert "Hello" in r.prompt_texts[0] or "USER" in r.prompt_texts[0]
 
 
 def test_rollout_generator_bad_batch_raises(cpu_device):

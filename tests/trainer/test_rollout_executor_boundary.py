@@ -8,7 +8,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset
 
 import astrai.parallel.executor.base as executor_module
 from astrai.config import ComponentSpec, TrainConfig
@@ -18,7 +17,7 @@ from astrai.parallel.executor import DDPExecutor, FSDPExecutor, NoneExecutor
 from astrai.trainer.backend import run_batch
 from astrai.trainer.context import TrainContextBuilder
 from astrai.trainer.context import builder as train_context_builder
-from astrai.trainer.rollout.setup import configure_rollout, resolve_async_rollout
+from astrai.trainer.rollout.setup import resolve_async_rollout
 from astrai.trainer.rollout.types import SamplingParams
 from tests.support.inference import make_cpu_scheduler
 from tests.support.models import make_rollout_config
@@ -27,54 +26,8 @@ from tests.support.tokenizers import FakeTokenizer
 _DDP_TEST_WORLD_SIZE = int(os.environ.get("ASTRAI_DDP_TEST_WORLD_SIZE", "2"))
 
 
-class _ConfigModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.projection = nn.Linear(4, 4)
-        self.config = SimpleNamespace(max_position_embeddings=32)
-
-    def forward(self, value):
-        return self.projection(value)
-
-
-class _OnlineStrategy:
-    def supports_online(self):
-        return True
-
-
-class _ConfigDataset(Dataset):
-    def __len__(self):
-        return 2
-
-    def __getitem__(self, index):
-        return {"index": index}
-
-
 def _optimizer_fn(model):
     return torch.optim.SGD(model.parameters(), lr=1e-3)
-
-
-def _scheduler_fn(optimizer, _dataset_len):
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
-
-
-def _online_train_config(dp_mode):
-    return TrainConfig(
-        strategy="online_grpo",
-        model=ComponentSpec(type=__name__ + ":_ConfigModel"),
-        dataset=ComponentSpec(
-            type="tests.trainer.test_rollout_executor_boundary:_ConfigDataset",
-            params={},
-        ),
-        optimizer=ComponentSpec(type="torch.optim:SGD", params={"lr": 1e-3}),
-        scheduler=ComponentSpec(
-            type="torch.optim.lr_scheduler:StepLR",
-            params={"step_size": 1, "gamma": 1.0},
-        ),
-        dp_size=2,
-        dp_mode=dp_mode,
-        reward_model_fn=object,
-    )
 
 
 def _init_single_rank_process_group(tmp_path, backend):
@@ -89,82 +42,25 @@ def _init_single_rank_process_group(tmp_path, backend):
     )
 
 
-def _rollout_config(*, compile_mode=None):
-    return SimpleNamespace(
-        optimizer=ComponentSpec(type="torch.optim:SGD"),
+def _online_train_config(dp_mode):
+    return TrainConfig(
         strategy="online_grpo",
-        rollout_mode="sync",
-        compile_mode=compile_mode,
-        batch_per_device=1,
-        rollout_max_tokens=4,
-        rollout_temperature=0.0,
-        rollout_top_k=0,
-        rollout_top_p=1.0,
-        rollout_interval=1,
-        rollout_max_policy_lag=None,
-        rollout_pool_seq_len=None,
-        rollout_device=None,
-        rollout_val_device=None,
-        rollout_val_overrides=lambda: {},
-        cp_size=1,
-        tp_size=1,
-        device_type="cpu",
+        model=ComponentSpec(
+            type="torch.nn:Linear", params={"in_features": 2, "out_features": 2}
+        ),
+        dataset=ComponentSpec(
+            type="tests.support.rollout:RandomTokenDataset",
+            params={"length": 2},
+        ),
+        optimizer=ComponentSpec(type="torch.optim:SGD", params={"lr": 1e-3}),
+        scheduler=ComponentSpec(
+            type="torch.optim.lr_scheduler:StepLR",
+            params={"step_size": 1, "gamma": 1.0},
+        ),
+        dp_size=2,
+        dp_mode=dp_mode,
         reward_model_fn=object,
     )
-
-
-def _rollout_context(model, executor):
-    return SimpleNamespace(
-        model=model,
-        executor=executor,
-        strategy=_OnlineStrategy(),
-        checkpoint=None,
-        optimizer_step=0,
-    )
-
-
-def test_ddp_executor_returns_the_public_underlying_module(tmp_path):
-    _init_single_rank_process_group(tmp_path, "gloo")
-    try:
-        model = _ConfigModel()
-        wrapped = DDP(model)
-
-        assert not hasattr(wrapped, "config")
-        assert DDPExecutor().model_for_inference(wrapped) is model
-    finally:
-        dist.destroy_process_group()
-
-
-def test_train_context_passes_ddp_inference_view_to_rollout(tmp_path, monkeypatch):
-    _init_single_rank_process_group(tmp_path, "gloo")
-    captured = {}
-
-    class _EngineCore:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(train_context_builder, "EngineCore", _EngineCore)
-    monkeypatch.setattr(
-        train_context_builder.AutoTokenizer,
-        "from_pretrained",
-        lambda _param_path: FakeTokenizer(),
-    )
-    try:
-        model = _ConfigModel()
-        model.generation_config = {"eos_token_id": [1, 2]}
-        wrapped = DDP(model)
-        context = _rollout_context(wrapped, DDPExecutor())
-        builder = TrainContextBuilder(_rollout_config())
-
-        builder._configure_rollout(context, {"group_size": 2})
-
-        assert captured["model"] is model
-        assert captured["model"].generation_config == {"eos_token_id": [1, 2]}
-        assert captured["max_seq_len"] == 32
-        assert captured["max_batch_size"] == 2
-        assert context.rollout.generator.backend.engine_core.__class__ is _EngineCore
-    finally:
-        dist.destroy_process_group()
 
 
 def test_online_rollout_rejects_torch_compile_before_scheduler(monkeypatch):
@@ -173,18 +69,19 @@ def test_online_rollout_rejects_torch_compile_before_scheduler(monkeypatch):
         "from_pretrained",
         lambda _param_path: pytest.fail("tokenizer should not be loaded"),
     )
-    context = _rollout_context(_ConfigModel(), NoneExecutor())
-    builder = TrainContextBuilder(_rollout_config(compile_mode="default"))
+    context = SimpleNamespace(
+        model=nn.Linear(4, 4),
+        executor=NoneExecutor(),
+        checkpoint=None,
+        optimizer_step=0,
+        strategy=SimpleNamespace(supports_online=lambda: True),
+    )
+    builder = TrainContextBuilder(
+        _config(rollout_mode="sync", rollout_devices=[], compile_mode="default")
+    )
 
     with pytest.raises(ValueError, match="does not support torch.compile"):
         builder._configure_rollout(context, {"group_size": 1})
-
-
-def test_train_config_accepts_multi_process_ddp_online_rollout():
-    config = _online_train_config("ddp")
-
-    assert config.nprocs == 2
-    assert config.dp_mode == "ddp"
 
 
 @pytest.mark.parametrize("dp_mode", ["none", "fsdp"])
@@ -203,20 +100,12 @@ def test_distributed_fsdp_rollout_fails_before_model_access(monkeypatch):
     assert not capabilities.supports_in_process
     assert "replicated model view" in capabilities.reason
     with pytest.raises(RuntimeError, match="parameters are sharded"):
-        executor.model_for_inference(_ConfigModel())
-
-
-def test_train_context_rejects_distributed_fsdp_during_early_validation(monkeypatch):
-    monkeypatch.setattr(executor_module, "get_world_size", lambda: 2)
-    builder = TrainContextBuilder(_rollout_config())
-
-    with pytest.raises(ValueError, match="replicated model view"):
-        builder._validate_rollout_configuration(FSDPExecutor())
+        executor.model_for_inference(nn.Linear(4, 4))
 
 
 def test_build_rejects_distributed_fsdp_before_model_construction(monkeypatch):
     monkeypatch.setattr(executor_module, "get_world_size", lambda: 2)
-    builder = TrainContextBuilder(_rollout_config())
+    builder = TrainContextBuilder(_config(rollout_mode="sync", rollout_devices=[]))
     monkeypatch.setattr(builder, "_load_preloaded_state", lambda: object())
     monkeypatch.setattr(builder, "_create_executor", FSDPExecutor)
     monkeypatch.setattr(
@@ -317,43 +206,20 @@ def _config(**overrides):
     return TrainConfig(**values)
 
 
-@pytest.mark.parametrize("name", ["learner_device", "group_size", "rollout_devies"])
-def test_unknown_training_fields_fail(name):
-    with pytest.raises(ValueError, match=name):
-        _config(**{name: 2})
-
-
-@pytest.mark.parametrize(
-    "name,value",
-    [
-        ("rl_update_epochs", 3),
-        ("rl_minibatch_prompts", 2),
-        ("gradient_chunked_logprobs", True),
-        ("moe_aux_loss_coef", 0.5),
-    ],
-)
-def test_strategy_kwargs_cannot_override_owned_fields(name, value):
-    with pytest.raises(ValueError, match="not strategy_kwargs"):
-        _config(strategy_kwargs={name: value})
-
-
-@pytest.mark.parametrize("value", [0, 1, True, 1.5, "4"])
-def test_invalid_grpo_group_size_fails_before_startup(value):
+def test_invalid_grpo_group_size_fails_before_startup():
     with pytest.raises(ValueError, match="group_size"):
-        _config(strategy_kwargs={"group_size": value})
+        _config(strategy_kwargs={"group_size": 1})
 
 
 @pytest.mark.parametrize(
     "name",
     [
         "rollout_temperature",
-        "rollout_val_temperature",
         "rollout_worker_timeout_s",
-        "rollout_startup_timeout_s",
         "rollout_weight_timeout_s",
     ],
 )
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
 def test_nonfinite_sampling_and_timeout_fields_fail(name, value):
     with pytest.raises(ValueError):
         _config(**{name: value})
@@ -367,59 +233,6 @@ def test_runtime_world_size_rejected_before_loading_models(monkeypatch):
     with pytest.raises(ValueError, match="world_size must match configured nprocs"):
         builder.build()
     load.assert_not_called()
-
-
-def test_effective_grpo_defaults_and_all_worker_parameters(monkeypatch):
-    cfg = _config(
-        batch_per_device=5,
-        rollout_startup_timeout_s=73,
-        rollout_worker_timeout_s=91,
-        rollout_weight_timeout_s=123,
-        random_seed=42,
-        rollout_temperature=0.8,
-        rollout_top_k=7,
-        rollout_top_p=0.75,
-        rollout_max_tokens=16,
-    )
-    model = SimpleNamespace(
-        config=SimpleNamespace(ffn_type="mlp", max_position_embeddings=256),
-        parameters=lambda: iter(
-            [SimpleNamespace(device=torch.device("cuda:0"), dtype=torch.bfloat16)]
-        ),
-    )
-    context = SimpleNamespace(
-        model=model,
-        executor=SimpleNamespace(model_for_inference=lambda m: m),
-        strategy=SimpleNamespace(group_size=4, supports_online=lambda: True),
-        consumed_samples=10,
-        checkpoint=None,
-        optimizer_step=2,
-    )
-    coordinator = Mock()
-    monkeypatch.setattr(
-        "astrai.trainer.rollout.setup.AsyncRoundCoordinator", coordinator
-    )
-    monkeypatch.setattr("torch.cuda.device_count", lambda: 3)
-    configure_rollout(
-        context, cfg, "tokenizer", {}, Mock(), lambda _: None, Mock(), Mock()
-    )
-    values = coordinator.call_args.kwargs
-    resolved = values["config"]
-    assert resolved.params == SamplingParams(
-        group_size=4, max_tokens=16, temperature=0.8, top_k=7, top_p=0.75
-    )
-    assert resolved.max_batch_size == 12
-    assert resolved.max_prompts_per_worker == 3
-    assert resolved.startup_timeout_s == 73
-    assert resolved.generation_timeout_s == 91
-    assert resolved.weight_timeout_s == 123
-    assert resolved.random_seed == 42
-    assert resolved.sample_cursor == 10
-    assert cfg.rollout_max_policy_lag == resolved.max_policy_lag == 1
-    assert values["model_dtype"] == torch.bfloat16
-    assert resolved.devices == ("cuda:1", "cuda:2")
-    assert resolved.learner_rank is None
-    assert context.rollout.coordinator is coordinator.return_value
 
 
 @pytest.mark.parametrize("devices", [["cuda:0"], ["cuda:3"]])

@@ -8,6 +8,14 @@ from astrai.model.components.mlp import MLP, DeepSeekMoE
 from astrai.trainer.callbacks import GradientCheckpointingCallback
 from tests.support.models import TINY_CONFIG
 
+MOE_CONFIG = {
+    **TINY_CONFIG,
+    "ffn_type": "moe",
+    "n_routed_experts": 4,
+    "n_shared_experts": 1,
+    "n_activated_experts": 2,
+}
+
 CONFIGS = [
     pytest.param(
         {**TINY_CONFIG, "attn_type": "gqa", "ffn_type": "mlp"},
@@ -37,25 +45,13 @@ CONFIGS = [
         id="gated_deltanet_mlp",
     ),
     pytest.param(
-        {
-            **TINY_CONFIG,
-            "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
-            "topk_method": "greedy",
-        },
+        {**MOE_CONFIG, "attn_type": "gqa", "topk_method": "greedy"},
         id="gqa_moe",
     ),
     pytest.param(
         {
-            **TINY_CONFIG,
+            **MOE_CONFIG,
             "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
             "topk_method": "greedy",
             "mlp_only_layers": [0],
         },
@@ -63,12 +59,8 @@ CONFIGS = [
     ),
     pytest.param(
         {
-            **TINY_CONFIG,
+            **MOE_CONFIG,
             "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
             "topk_method": "greedy",
             "decoder_sparse_step": 2,
         },
@@ -76,12 +68,8 @@ CONFIGS = [
     ),
     pytest.param(
         {
-            **TINY_CONFIG,
+            **MOE_CONFIG,
             "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
             "topk_method": "greedy",
             "norm_topk_prob": True,
         },
@@ -89,12 +77,8 @@ CONFIGS = [
     ),
     pytest.param(
         {
-            **TINY_CONFIG,
+            **MOE_CONFIG,
             "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
             "topk_method": "greedy",
             "moe_intermediate_size": 24,
             "shared_expert_intermediate_size": 20,
@@ -127,49 +111,23 @@ CONFIGS = [
 
 
 @pytest.mark.parametrize("config_kwargs", CONFIGS)
-def test_model_forward(config_kwargs, cpu_device):
+@pytest.mark.parametrize("padded", [False, True], ids=["dense", "padded"])
+def test_model_forward(config_kwargs, cpu_device, padded):
     config = AutoRegressiveLMConfig(**config_kwargs)
-    model = AutoRegressiveLM(config).to(device=cpu_device)
-    model.eval()
-
-    batch_size, seq_len = 2, 8
-    input_ids = torch.randint(
-        0, config.vocab_size, (batch_size, seq_len), device=cpu_device
-    )
-
-    with torch.no_grad():
-        output = model(input_ids)
-
-    assert "logits" in output
-    assert "hidden_states" in output
-    assert output["logits"].shape == (batch_size, seq_len, config.vocab_size)
-    assert output["hidden_states"].shape == (
-        batch_size,
-        seq_len,
-        config.hidden_size,
-    )
-    assert not torch.isnan(output["logits"]).any()
-    assert not torch.isnan(output["hidden_states"]).any()
-
-
-@pytest.mark.parametrize("config_kwargs", CONFIGS)
-def test_model_forward_with_padding(config_kwargs, cpu_device):
-    config = AutoRegressiveLMConfig(**config_kwargs)
-    model = AutoRegressiveLM(config).to(device=cpu_device)
-    model.eval()
-
-    batch_size, seq_len = 2, 8
-    input_ids = torch.randint(
-        0, config.vocab_size, (batch_size, seq_len), device=cpu_device
-    )
-    input_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=cpu_device)
-    input_mask[:, 4:] = False
-
+    model = AutoRegressiveLM(config).to(device=cpu_device).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 8), device=cpu_device)
+    input_mask = None
+    if padded:
+        input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        input_mask[:, 4:] = False
     with torch.no_grad():
         output = model(input_ids, input_mask=input_mask)
-
-    assert output["logits"].shape == (batch_size, seq_len, config.vocab_size)
-    assert not torch.isnan(output["logits"]).any()
+    for name, width in (
+        ("logits", config.vocab_size),
+        ("hidden_states", config.hidden_size),
+    ):
+        assert output[name].shape == (2, 8, width)
+        assert torch.isfinite(output[name]).all()
 
 
 def test_gated_deltanet_forward_backward_and_causal_prefix():
@@ -235,59 +193,20 @@ def test_gated_deltanet_rejects_invalid_configuration():
         AutoRegressiveLM(config)
 
 
-def test_moe_per_layer_ffn_resolution():
-    """Verify that mlp_only_layers and decoder_sparse_step resolve FFN types correctly."""
-
-    # mlp_only_layers: first layer dense, rest MoE
-    config = AutoRegressiveLMConfig(
-        **{
-            **TINY_CONFIG,
-            "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
-            "mlp_only_layers": [0],
-        }
-    )
-    model = AutoRegressiveLM(config)
-    assert isinstance(model.model.layers[0].mlp, MLP)
-    assert not isinstance(model.model.layers[0].mlp, DeepSeekMoE)
-    assert isinstance(model.model.layers[1].mlp, DeepSeekMoE)
-
-    # decoder_sparse_step=2: every other layer is MoE
-    config2 = AutoRegressiveLMConfig(
-        **{
-            **TINY_CONFIG,
-            "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
-            "decoder_sparse_step": 2,
-        }
-    )
-    model2 = AutoRegressiveLM(config2)
-    # layer 0 (id=0): (0+1)%2=1 != 0 -> MLP
-    assert isinstance(model2.model.layers[0].mlp, MLP)
-    assert not isinstance(model2.model.layers[0].mlp, DeepSeekMoE)
-    # layer 1 (id=1): (1+1)%2=0 -> MoE
-    assert isinstance(model2.model.layers[1].mlp, DeepSeekMoE)
-
-    # decoder_sparse_step=1 (default): all layers MoE
-    config3 = AutoRegressiveLMConfig(
-        **{
-            **TINY_CONFIG,
-            "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
-        }
-    )
-    model3 = AutoRegressiveLM(config3)
-    for layer in model3.model.layers:
-        assert isinstance(layer.mlp, DeepSeekMoE)
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"mlp_only_layers": [0]}, (MLP, DeepSeekMoE)),
+        ({"decoder_sparse_step": 2}, (MLP, DeepSeekMoE)),
+        ({}, (DeepSeekMoE, DeepSeekMoE)),
+    ],
+    ids=["dense-first", "sparse-step", "all-moe"],
+)
+def test_moe_per_layer_ffn_resolution(overrides, expected):
+    model = AutoRegressiveLM(AutoRegressiveLMConfig(**{**MOE_CONFIG, **overrides}))
+    for layer, kind in zip(model.model.layers, expected, strict=True):
+        assert isinstance(layer.mlp, kind)
+        assert isinstance(layer.mlp, DeepSeekMoE) == (kind is DeepSeekMoE)
 
 
 def test_moe_custom_intermediate_shape():
@@ -295,12 +214,8 @@ def test_moe_custom_intermediate_shape():
 
     config = AutoRegressiveLMConfig(
         **{
-            **TINY_CONFIG,
+            **MOE_CONFIG,
             "attn_type": "gqa",
-            "ffn_type": "moe",
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "n_activated_experts": 2,
             "moe_intermediate_size": 24,
             "shared_expert_intermediate_size": 20,
         }
@@ -321,88 +236,15 @@ def test_moe_custom_intermediate_shape():
 
 
 def test_moe_defaults_preserve_normalized_routing():
-    config = AutoRegressiveLMConfig(
-        **TINY_CONFIG,
-        ffn_type="moe",
-        n_routed_experts=4,
-        n_shared_experts=1,
-        n_activated_experts=2,
-        topk_method="greedy",
-    )
+    config = AutoRegressiveLMConfig(**MOE_CONFIG, topk_method="greedy")
     model = AutoRegressiveLM(config)
 
     assert config.norm_topk_prob is True
     assert model.model.layers[0].mlp.norm_topk_prob is True
 
 
-def test_moe_router_stats_in_output_during_training():
-    """Verify forward output carries per-layer router_stats in training mode."""
-
-    config = AutoRegressiveLMConfig(
-        **TINY_CONFIG,
-        ffn_type="moe",
-        n_routed_experts=4,
-        n_shared_experts=1,
-        n_activated_experts=2,
-        topk_method="greedy",
-    )
-    model = AutoRegressiveLM(config)
-    model.train()
-    input_ids = torch.randint(0, config.vocab_size, (2, 8))
-
-    with torch.enable_grad():
-        outputs = model(input_ids)
-
-    stats = outputs["router_stats"]
-    assert isinstance(stats, list)
-    assert len(stats) == config.num_hidden_layers
-    for s in stats:
-        assert s["probs"].shape == (2 * 8, 4)  # (N, n_routed_experts)
-        assert s["topk_indices"].shape == (2 * 8, 2)  # (N, n_activated_experts)
-
-
-def test_moe_router_stats_absent_in_eval():
-    """Verify no router_stats are emitted outside training."""
-
-    config = AutoRegressiveLMConfig(
-        **TINY_CONFIG,
-        ffn_type="moe",
-        n_routed_experts=4,
-        n_shared_experts=1,
-        n_activated_experts=2,
-    )
-    model = AutoRegressiveLM(config)
-    model.eval()
-
-    with torch.no_grad():
-        outputs = model(torch.randint(0, config.vocab_size, (2, 8)))
-
-    assert "router_stats" not in outputs
-
-
-def test_no_router_stats_for_mlp_model():
-    """Verify pure MLP models emit no router_stats and no aux_loss."""
-
-    config = AutoRegressiveLMConfig(**TINY_CONFIG, ffn_type="mlp")
-    model = AutoRegressiveLM(config)
-    model.train()
-
-    with torch.enable_grad():
-        outputs = model(torch.randint(0, config.vocab_size, (2, 8)))
-
-    assert "router_stats" not in outputs
-    assert "aux_loss" not in outputs
-
-
 def test_moe_aux_loss_only_emitted_during_training():
-    config = AutoRegressiveLMConfig(
-        **TINY_CONFIG,
-        ffn_type="moe",
-        n_routed_experts=4,
-        n_shared_experts=1,
-        n_activated_experts=2,
-        topk_method="greedy",
-    )
+    config = AutoRegressiveLMConfig(**MOE_CONFIG, topk_method="greedy")
     model = AutoRegressiveLM(config)
     input_ids = torch.randint(0, config.vocab_size, (2, 8))
 
@@ -550,60 +392,6 @@ def test_moe_routing_replays_across_forward_recompute_and_reload(tmp_path):
     torch.testing.assert_close(resumed_output, rollout_output, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"n_routed_experts": 0}, "n_routed_experts must be positive"),
-        ({"n_shared_experts": -1}, "n_shared_experts must be non-negative"),
-        ({"n_activated_experts": 0}, "n_activated_experts must be positive"),
-        (
-            {"n_routed_experts": 2, "n_activated_experts": 3},
-            "cannot exceed n_routed_experts",
-        ),
-        ({"topk_method": "group_limited_greedy"}, "unsupported topk_method"),
-    ],
-)
-def test_moe_rejects_inconsistent_expert_topology(overrides, message):
-    kwargs = {
-        **TINY_CONFIG,
-        "ffn_type": "moe",
-        "n_routed_experts": 4,
-        "n_shared_experts": 1,
-        "n_activated_experts": 2,
-        "topk_method": "greedy",
-        **overrides,
-    }
-    with pytest.raises(ValidationError, match=message):
-        AutoRegressiveLMConfig(**kwargs)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"n_routed_experts": 0}, "n_routed_experts must be positive"),
-        ({"n_shared_experts": -1}, "n_shared_experts must be non-negative"),
-        ({"n_activated_experts": 0}, "n_activated_experts must be positive"),
-        (
-            {"n_routed_experts": 2, "n_activated_experts": 3},
-            "cannot exceed n_routed_experts",
-        ),
-        ({"topk_method": "group_limited_greedy"}, "unsupported topk_method"),
-    ],
-)
-def test_moe_component_rejects_inconsistent_expert_topology(overrides, message):
-    kwargs = {
-        "dim": 8,
-        "dim_ffn": 16,
-        "n_routed_experts": 4,
-        "n_shared_experts": 1,
-        "n_activated_experts": 2,
-        "topk_method": "greedy",
-        **overrides,
-    }
-    with pytest.raises(ValueError, match=message):
-        DeepSeekMoE(**kwargs)
-
-
 @pytest.mark.parametrize("decoder_sparse_step", [0, -1])
 def test_moe_rejects_invalid_decoder_sparse_step(decoder_sparse_step):
     with pytest.raises(ValidationError, match="decoder_sparse_step must be at least 1"):
@@ -614,3 +402,57 @@ def test_moe_rejects_invalid_decoder_sparse_step(decoder_sparse_step):
             n_activated_experts=2,
             decoder_sparse_step=decoder_sparse_step,
         )
+
+
+@pytest.mark.parametrize(
+    "moe,training",
+    [(True, True), (True, False), (False, True)],
+    ids=["moe-training", "moe-eval", "dense-training"],
+)
+def test_router_diagnostics_follow_model_mode(moe, training):
+    config = AutoRegressiveLMConfig(**(MOE_CONFIG if moe else TINY_CONFIG))
+    model = AutoRegressiveLM(config).train(training)
+    with torch.set_grad_enabled(training):
+        output = model(torch.randint(0, config.vocab_size, (2, 8)))
+    assert ("router_stats" in output) == (moe and training)
+    if moe and training:
+        assert len(output["router_stats"]) == config.num_hidden_layers
+        for stats in output["router_stats"]:
+            assert stats["probs"].shape == (16, 4)
+            assert stats["topk_indices"].shape == (16, 2)
+    elif not moe:
+        assert "aux_loss" not in output
+
+
+@pytest.mark.parametrize(
+    "factory,base,error",
+    [
+        (AutoRegressiveLMConfig, {**TINY_CONFIG, "ffn_type": "moe"}, ValidationError),
+        (DeepSeekMoE, {"dim": 8, "dim_ffn": 16}, ValueError),
+    ],
+    ids=["config", "component"],
+)
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"n_routed_experts": 0}, "n_routed_experts must be positive"),
+        ({"n_shared_experts": -1}, "n_shared_experts must be non-negative"),
+        ({"n_activated_experts": 0}, "n_activated_experts must be positive"),
+        (
+            {"n_routed_experts": 2, "n_activated_experts": 3},
+            "cannot exceed n_routed_experts",
+        ),
+        ({"topk_method": "group_limited_greedy"}, "unsupported topk_method"),
+    ],
+)
+def test_moe_rejects_inconsistent_expert_topology(
+    factory, base, error, overrides, message
+):
+    kwargs = dict(
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        topk_method="greedy",
+    )
+    with pytest.raises(error, match=message):
+        factory(**{**base, **kwargs, **overrides})

@@ -6,6 +6,7 @@ import torch
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.callbacks import MetricCallback
 from astrai.trainer.strategy import SEQStrategy
+from astrai.trainer.trainer import Trainer
 from tests.support.models import make_tiny_config
 
 
@@ -88,9 +89,6 @@ def test_metric_callback_only_computes_requested_metrics(tmp_path):
     metrics = callback._metrics(context, callback.metrics)
 
     assert metrics == {"loss": 2.0}
-
-
-from astrai.trainer.trainer import Trainer
 
 
 def test_global_window_combines_losses_with_shared_normalizer():

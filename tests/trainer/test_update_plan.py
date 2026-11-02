@@ -1,10 +1,17 @@
 """Replay planning preserves prompt groups and the final data commit boundary."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from astrai.inference.core.versioning import PolicyVersionGuard
+from astrai.trainer.context import TrainContext
+from astrai.trainer.rollout import RolloutRunner
+from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
 from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.step_plan import global_epoch_steps, learner_update_slices
+from astrai.trainer.trainer import Trainer
 
 
 @pytest.mark.parametrize("total", [1, 5, 8])
@@ -41,17 +48,6 @@ def test_contiguous_batch_selection_preserves_views_and_metadata_contract():
     selected = slice_batch(batch, slice(1, 3), 4)
     torch.testing.assert_close(selected["responses"], tensor[1:3])
     assert selected["labels"] == ["b", "c"]
-
-
-from types import SimpleNamespace
-
-import pytest
-
-from astrai.inference.core.versioning import PolicyVersionGuard
-from astrai.trainer.context import TrainContext
-from astrai.trainer.rollout import RolloutRunner
-from astrai.trainer.rollout.async_round import AsyncRoundCoordinator
-from astrai.trainer.trainer import Trainer
 
 
 @pytest.mark.parametrize(

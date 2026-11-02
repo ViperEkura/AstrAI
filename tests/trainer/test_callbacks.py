@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -22,109 +23,55 @@ from tests.support.rollout import RandomTokenDataset
 from tests.support.tokenizers import build_test_tokenizer
 
 
-def test_gradient_checkpointing_enable_disable(test_model):
-    """Enable wraps forward, _disable restores it."""
+@pytest.mark.parametrize(
+    "modules", [[], [DecoderBlock], [MLP]], ids=["disabled", "decoder", "mlp"]
+)
+def test_gradient_checkpointing_preserves_forward_gradients_and_restores(
+    test_model, modules
+):
     model = test_model["model"]
-    callback = GradientCheckpointingCallback(modules=[DecoderBlock])
-
-    originals = [layer.forward for layer in model.model.layers]
-
-    for layer in model.model.layers:
-        callback._enable(layer)
-
-    for i, layer in enumerate(model.model.layers):
-        assert hasattr(layer, "_original_forward")
-        assert layer.forward is not originals[i]
-
-    for layer in model.model.layers:
-        callback._disable(layer)
-
-    for layer in model.model.layers:
-        assert not hasattr(layer, "_original_forward")
-
-
-def test_gradient_checkpointing_empty_modules_noop(test_model):
-    """modules=None should leave forwards untouched."""
-    model = test_model["model"]
-    callback = GradientCheckpointingCallback()
-
-    for layer in model.model.layers:
-        callback._enable(layer)
-
-    for layer in model.model.layers:
-        assert not hasattr(layer, "_original_forward")
-
-
-def test_gradient_checkpointing_forward_unchanged(test_model):
-    """Forward output unchanged after patching (no_grad)."""
-    model = test_model["model"]
-    device = test_model["device"]
-    callback = GradientCheckpointingCallback(modules=[DecoderBlock])
-
-    input_ids = torch.randint(0, 1000, (2, 32)).to(device)
-
-    with torch.no_grad():
-        ref = model(input_ids)["logits"].clone()
-
-    for layer in model.model.layers:
-        callback._enable(layer)
-
-    with torch.no_grad():
-        out = model(input_ids)["logits"]
-
-    assert torch.equal(ref, out)
-
-
-def test_gradient_checkpointing_backward(test_model):
-    """backward passes gradients through checkpointed layers."""
-    model = test_model["model"]
-    device = test_model["device"]
-    callback = GradientCheckpointingCallback(modules=[DecoderBlock])
-
-    for layer in model.model.layers:
-        callback._enable(layer)
-
-    input_ids = torch.randint(0, 1000, (2, 32)).to(device)
-    target_ids = torch.randint(0, 1000, (2, 32)).to(device)
-
-    logits = model(input_ids)["logits"]
-    loss = torch.nn.functional.cross_entropy(
-        logits.flatten(0, 1).float(), target_ids.flatten()
-    )
-    loss.backward()
-
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            assert param.grad is not None, f"{name} gradient is None"
-
-    for layer in model.model.layers:
-        callback._disable(layer)
-
-    model.zero_grad()
-    for name, p in model.named_parameters():
-        assert p.grad is None or p.grad.sum().item() == 0, f"{name} grad not zeroed"
-
-
-def test_mlp_only_checkpoint_keeps_attention_unwrapped(test_model):
-    model = test_model["model"]
-    device = test_model["device"]
-    callback = GradientCheckpointingCallback(modules=[MLP])
+    reference = copy.deepcopy(model)
+    inputs = torch.randint(0, model.config.vocab_size, (2, 8))
+    targets = torch.randint(0, model.config.vocab_size, (2, 8))
+    callback = GradientCheckpointingCallback(modules=modules)
+    originals = {name: module.forward for name, module in model.named_modules()}
     model.apply(callback._enable)
+    assert {
+        name
+        for name, module in model.named_modules()
+        if hasattr(module, "_original_forward")
+    } == {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, tuple(modules))
+    }
 
-    for layer in model.model.layers:
-        assert hasattr(layer.mlp, "_original_forward")
-        assert not hasattr(layer.attention, "_original_forward")
-        assert not hasattr(layer, "_original_forward")
-
-    input_ids = torch.randint(0, 1000, (2, 32)).to(device)
-    target_ids = torch.randint(0, 1000, (2, 32)).to(device)
-    logits = model(input_ids)["logits"]
-    torch.nn.functional.cross_entropy(
-        logits.flatten(0, 1).float(), target_ids.flatten()
-    ).backward()
-    assert all(p.grad is not None for p in model.parameters() if p.requires_grad)
+    with torch.no_grad():
+        torch.testing.assert_close(
+            model(inputs)["logits"], reference(inputs)["logits"], rtol=0, atol=0
+        )
+    expected = reference(inputs)["logits"]
+    actual = model(inputs)["logits"]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for logits in (expected, actual):
+        torch.nn.functional.cross_entropy(
+            logits.flatten(0, 1), targets.flatten()
+        ).backward()
+    for (name, parameter), (ref_name, ref_parameter) in zip(
+        model.named_parameters(), reference.named_parameters()
+    ):
+        assert name == ref_name
+        if parameter.requires_grad:
+            assert parameter.grad is not None
+            torch.testing.assert_close(
+                parameter.grad, ref_parameter.grad, rtol=0, atol=0
+            )
 
     model.apply(callback._disable)
+    assert all(
+        not hasattr(module, "_original_forward") and module.forward == originals[name]
+        for name, module in model.named_modules()
+    )
 
 
 def test_gradient_checkpointing_trainer_integration(

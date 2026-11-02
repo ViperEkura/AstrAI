@@ -1,41 +1,3 @@
-from pathlib import Path
-
-import pytest
-
-from astrai.trainer import Trainer
-
-
-def test_training_runs_with_various_batch_sizes(
-    base_test_env, random_dataset, train_config_factory
-):
-    """Training should complete for a range of batch sizes without error."""
-    for batch_per_device in [1, 2, 4]:
-        train_config = train_config_factory(
-            dataset=random_dataset,
-            test_dir=str(Path(base_test_env["test_dir"]) / f"batch_{batch_per_device}"),
-            device=base_test_env["device"],
-            batch_per_device=batch_per_device,
-        )
-        trainer = Trainer(train_config)
-        trainer.train()
-
-
-@pytest.mark.slow
-def test_gradient_accumulation_runs(
-    base_test_env, random_dataset, train_config_factory
-):
-    """Training with gradient accumulation should complete."""
-    train_config = train_config_factory(
-        dataset=random_dataset,
-        test_dir=base_test_env["test_dir"],
-        device=base_test_env["device"],
-        batch_per_device=2,
-        grad_accum_steps=4,
-    )
-    trainer = Trainer(train_config)
-    trainer.train()
-
-
 from types import SimpleNamespace
 
 import pytest
@@ -45,10 +7,13 @@ from torch.utils.data import Dataset
 import astrai.trainer.context.builder as builder_module
 from astrai.config import ComponentSpec, TrainConfig
 from astrai.factory import BaseFactory
+from astrai.trainer import Trainer
 from astrai.trainer import components as dataset_component
 from astrai.trainer.components import build_scheduler_component
 from astrai.trainer.context import TrainContext, TrainContextBuilder
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
+from tests.support.checkpoint import load_checkpoint_meta
+from tests.support.rollout import RandomTokenDataset
 
 
 class NoCopyDataset(Dataset):
@@ -294,3 +259,22 @@ def test_builder_closes_rollout_after_configuration_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="rollout setup failed"):
         builder.build()
     assert closed == [True]
+
+
+@pytest.mark.parametrize(
+    "batch_per_device,grad_accum_steps", [(1, 1), (2, 1), (4, 1), (2, 4)]
+)
+def test_training_commits_small_epoch(
+    base_test_env, train_config_factory, batch_per_device, grad_accum_steps
+):
+    config = train_config_factory(
+        dataset=RandomTokenDataset(length=8),
+        test_dir=base_test_env["test_dir"],
+        device=base_test_env["device"],
+        batch_per_device=batch_per_device,
+        grad_accum_steps=grad_accum_steps,
+    )
+    Trainer(config).train()
+    meta = load_checkpoint_meta(base_test_env["test_dir"])
+    assert meta["consumed_samples"] == 8
+    assert meta["optimizer_step"] == 8 // (batch_per_device * grad_accum_steps)

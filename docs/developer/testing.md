@@ -78,3 +78,29 @@ existing support modules; do not add forwarding aliases for old names.
 Testing a production private method does not make it a public production API.
 Use fixtures for resource ownership and teardown, and ordinary functions for
 data/model construction.
+
+## Compression priorities
+
+Judge necessity by failure severity, unique regression coverage, an independent
+oracle, tolerance of internal refactoring, and execution cost. Prefer public
+behavior checks; inspect internals when gradients, masks, state ownership, or
+resource release cannot be verified reliably through the public result. One
+behavior does not need paired black-box and white-box tests.
+
+Classify by what a test proves, without adding another marker hierarchy:
+
+| Content | Treatment |
+| --- | --- |
+| Numerical references, gradients, accumulation, checkpoint continuation and resource isolation | Retain independent references, failure boundaries, and algorithm/dtype tolerances. |
+| Functional modes and validation boundaries | Parameterize the same execution path; keep distinct inputs and expected outcomes visible. |
+| Configuration forwarding, reflection and structural smoke checks | Reuse existing fixtures and payloads; merge repeated preparation and prefer observable behavior over private-field checks. |
+| Dead helpers, equivalent wrappers and duplicate setup | Delete them or use the existing shared implementation. |
+
+Checkpointing mode tests compare full gradients and forward outputs against an
+unwrapped model and verify restoration. Small training smoke cases cover batch
+and accumulation choices with a bounded eight-sample epoch; separate numerical
+accumulation and multi-epoch/restart tests retain the deeper guarantees.
+
+Do not lower numerical tolerances, remove an independent reference, or introduce
+a generic test runner just to reduce line count. File/class counts and physical
+line counts are descriptive; acceptance is based on retained behavior.

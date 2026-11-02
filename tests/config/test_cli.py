@@ -159,66 +159,43 @@ def test_uninferrable_type_raises_without_spec_type():
         option_from_spec(OptSpec("mystery", "G"), {})
 
 
-def test_annotation_styles_old_and_new():
-    """Optional[X], Union[X, None], X | None, List[str], and list[str] all
-    infer the same click types."""
-
-    @dataclasses.dataclass
-    class OldStyle:
-        opt_int: t.Optional[int] = None
-        opt_float: t.Optional[float] = None
-        union_int: t.Union[int, None] = None
-        names: t.List[str] = dataclasses.field(default_factory=lambda: ["loss", "lr"])
-        flag: bool = True
-
-    @dataclasses.dataclass
-    class NewStyle:
-        opt_int: Optional[int] = None
-        names: List[str] = dataclasses.field(default_factory=lambda: ["loss"])
-        flag: bool = False
+@pytest.mark.parametrize(
+    "annotation,default,type_name",
+    [
+        (Optional[int], None, "integer"),
+        (int | None, None, "integer"),
+        (Optional[float], None, "float"),
+        (List[str], ["loss", "lr"], "text"),
+        (list[str], ["loss"], "text"),
+        (bool, True, "boolean"),
+    ],
+    ids=[
+        "optional",
+        "union-type",
+        "optional-float",
+        "typing-list",
+        "builtin-list",
+        "bool",
+    ],
+)
+def test_annotation_types_infer_click_options(annotation, default, type_name):
+    value = (
+        dataclasses.field(default_factory=lambda: default)
+        if isinstance(default, list)
+        else default
+    )
+    config = dataclasses.make_dataclass("Options", [("value", annotation, value)])
 
     @click.command()
-    @apply_specs(
-        [
-            OptSpec("opt_int", "G"),
-            OptSpec("opt_float", "G"),
-            OptSpec("union_int", "G"),
-            OptSpec("names", "G"),
-            OptSpec("flag", "G"),
-        ],
-        OldStyle,
-    )
-    def old_cmd(**kwargs):
+    @apply_specs([OptSpec("value", "G")], config)
+    def command(**kwargs):
         pass
 
-    params = {p.name: p for p in old_cmd.params}
-    assert params["opt_int"].type.name == "integer"
-    assert params["opt_int"].default is None
-    assert params["opt_float"].type.name == "float"
-    assert params["union_int"].type.name == "integer"
-    assert params["names"].multiple
-    assert params["names"].type.name == "text"
-    assert params["flag"].secondary_opts == ["--no-flag"]
-    assert params["flag"].default is True
-
-    @click.command()
-    @apply_specs(
-        [
-            OptSpec("opt_int", "G"),
-            OptSpec("names", "G"),
-            OptSpec("flag", "G"),
-        ],
-        NewStyle,
-    )
-    def new_cmd(**kwargs):
-        pass
-
-    params = {p.name: p for p in new_cmd.params}
-    assert params["opt_int"].type.name == "integer"
-    assert params["names"].multiple
-    assert params["names"].default == ("loss",)
-    assert params["flag"].secondary_opts == ["--no-flag"]
-    assert params["flag"].default is False
+    option = command.params[0]
+    assert option.type.name == type_name
+    assert option.default == (tuple(default) if isinstance(default, list) else default)
+    assert option.multiple == isinstance(default, list)
+    assert bool(option.secondary_opts) == (annotation is bool)
 
 
 def test_stringified_annotations_resolve_via_get_type_hints():
@@ -333,7 +310,7 @@ def test_cli_rejects_unknown_yaml_parameters(tmp_path):
     ],
 )
 def test_seq_cli_defers_dataset_construction(
-    tmp_path, monkeypatch, optimizer, flags, expected
+    training_configs, tmp_path, monkeypatch, optimizer, flags, expected
 ):
     make_rollout_config(max_position_embeddings=8).to_file(tmp_path / "config.json")
     data_dir = tmp_path / "packed"
@@ -344,19 +321,11 @@ def test_seq_cli_defers_dataset_construction(
         f"  data_root_path: {data_dir}\n  window_size: 8\n  stride: 8\n"
         "  dp_mode: none\n  batch_per_device: 1\n  grad_accum_steps: 1\n"
     )
-    captured = []
-
-    class Trainer:
-        def __init__(self, config):
-            captured.append(config)
-
-        def train(self, **kwargs):
-            pass
+    captured = training_configs
 
     def reject_parent_load(**kwargs):
         raise AssertionError("DatasetFactory.load ran in the parent")
 
-    monkeypatch.setattr(train_module, "Trainer", Trainer)
     monkeypatch.setattr(DatasetFactory, "load", reject_parent_load)
     result = CliRunner().invoke(
         train_module.train_command,

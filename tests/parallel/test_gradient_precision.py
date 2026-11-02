@@ -17,6 +17,7 @@ from astrai.parallel.executor import DDPExecutor, NoneExecutor
 from astrai.parallel.executor.gradients import parameter_gradient
 from astrai.trainer.callbacks.metric_util import GradSNRTracker, grad_norm
 from astrai.trainer.components import build_optimizer_component
+from tests.support.capabilities import skip_no_multi_device
 from tests.support.precision import assert_precision_state
 
 
@@ -618,9 +619,6 @@ def test_optimizer_ownership_and_checkpoints_stay_inside_ddp_group(tmp_path):
         nprocs=4,
         join=True,
     )
-
-
-from tests.support.capabilities import skip_no_multi_device
 
 
 @pytest.mark.distributed

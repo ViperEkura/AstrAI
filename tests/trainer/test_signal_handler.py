@@ -2,16 +2,21 @@ import multiprocessing as mp
 import os
 import signal
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch.utils.data import Dataset
 
+import astrai.trainer.session as session_module
 from astrai.config import ComponentSpec, TrainConfig
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.signal_handler import register_signal_handlers, unregister_signal_handlers
 from astrai.trainer import Trainer
 from astrai.trainer.context import TrainContext
+from astrai.trainer.context.metric import MetricHistory
+from astrai.trainer.rollout import worker as worker_module
+from astrai.trainer.session import TrainSession
 from tests.support.checkpoint import load_checkpoint_meta
 from tests.support.models import TINY_CONFIG, make_tiny_config
 
@@ -136,16 +141,6 @@ def test_signal_triggers_checkpoint_save(base_test_env, sig):
     meta = load_checkpoint_meta(base_test_env["test_dir"])
     assert "consumed_samples" in meta
     assert meta["consumed_samples"] >= 0
-
-
-from types import SimpleNamespace
-
-import pytest
-
-import astrai.trainer.session as session_module
-from astrai.trainer.context.metric import MetricHistory
-from astrai.trainer.rollout import worker as worker_module
-from astrai.trainer.session import TrainSession
 
 
 def test_train_session_cleans_up_when_start_callback_fails(monkeypatch):

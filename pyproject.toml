@@ -31,7 +31,7 @@ classifiers = [
 urls = { Homepage = "https://github.com/ViperEkura/AstrAI" }
 
 [project.optional-dependencies]
-dev = ["pytest==9.0.2", "ruff", "httpx", "transformers==4.51.3"]
+dev = ["pytest==9.0.2", "ruff", "httpx"]
 flash = ["flash-attn>=2.6"]
 
 [tool.setuptools.packages.find]

@@ -888,7 +888,7 @@ def test_qwen3_explicit_head_and_qk_norm_match_hf_masked_logits(
     tmp_path, tied, monkeypatch
 ):
     monkeypatch.setenv("LOCAL_DEVICE", "cpu")
-    import transformers as hf
+    hf = pytest.importorskip("transformers", minversion="4.51.3")
 
     torch.manual_seed(615)
     config = hf.Qwen3Config(

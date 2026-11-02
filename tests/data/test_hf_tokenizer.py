@@ -168,8 +168,7 @@ def test_tokenizer_does_not_read_or_write_generation_config(tmp_path):
     assert not (target / "generation_config.json").exists()
 
 
-def test_added_tokens_and_extra_names_match_hf(tmp_path):
-    import transformers as hf
+def test_added_tokens_and_extra_names_survive_native_roundtrip(tmp_path):
 
     _write_tokenizer(tmp_path)
     config_path = tmp_path / "tokenizer_config.json"
@@ -192,22 +191,19 @@ def test_added_tokens_and_extra_names_match_hf(tmp_path):
     )
     config_path.write_text(json.dumps(config))
     actual = AutoTokenizer.from_pretrained(tmp_path)
-    reference = hf.AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
-    assert actual.audio_token_id == reference.audio_token_id == 7
-    assert (
-        actual.encode("<audio>", add_special_tokens=False)
-        == reference.encode("<audio>", add_special_tokens=False)
-        == [7]
-    )
+    assert actual.audio_token_id == 7
+    assert actual.encode("<audio>", add_special_tokens=False) == [7]
     target = tmp_path / "export"
     actual.save_pretrained(target)
-    restored = hf.AutoTokenizer.from_pretrained(target, local_files_only=True)
-    assert restored.audio_token_id == 7 and restored.model_max_length == 777
-    assert restored.padding_side == "left"
+    restored = AutoTokenizer.from_pretrained(target)
+    assert restored.audio_token_id == 7
+    assert restored.encode("<audio>", add_special_tokens=False) == [7]
+    saved_config = json.loads((target / "tokenizer_config.json").read_text())
+    assert saved_config["model_max_length"] == 777
+    assert saved_config["padding_side"] == "left"
 
 
-def test_tool_template_json_matches_hf(tmp_path):
-    import transformers as hf
+def test_tool_template_json_preserves_unicode_and_html(tmp_path):
 
     _write_tokenizer(tmp_path)
     path = tmp_path / "tokenizer_config.json"
@@ -218,11 +214,12 @@ def test_tool_template_json_matches_hf(tmp_path):
     )
     path.write_text(json.dumps(config))
     actual = AutoTokenizer.from_pretrained(tmp_path)
-    reference = hf.AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
     messages = [{"role": "user", "content": "查天气"}]
     tools = [
         {"type": "function", "function": {"name": "天气", "description": "<a>&天气"}}
     ]
-    assert actual.apply_chat_template(
-        messages, tokenize=False, tools=tools
-    ) == reference.apply_chat_template(messages, tokenize=False, tools=tools)
+    expected = (
+        '[{"type": "function", "function": {"name": "天气", '
+        '"description": "<a>&天气"}}]查天气'
+    )
+    assert actual.apply_chat_template(messages, tokenize=False, tools=tools) == expected

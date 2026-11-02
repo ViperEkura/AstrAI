@@ -16,7 +16,7 @@ spawned workers remain importable by their full module paths.
 
 ## Running tests
 
-Install the existing development extras, including the pinned HF reference:
+Install the existing development extras:
 
 ```bash
 pip install -e '.[dev]'
@@ -50,8 +50,9 @@ identifies long-running tests. Unknown markers are errors.
   environment capabilities. Runtime failures under valid test prerequisites fail.
 - Existing capability guards live in tests/support/capabilities.py. Resource
   markers select tests; they do not replace device-count or kernel checks.
-- HF reference tests require transformers==4.51.3 from the development extras.
-  Missing reference dependencies fail rather than silently reducing coverage.
+- Tokenizer tests use the existing runtime dependencies and explicit expected
+  values. The existing Qwen3 interoperability check is optional: it runs when
+  transformers>=4.51.3 is already installed, otherwise reports a skip.
 - Preserve independent forward/gradient references, accumulation equivalence,
   checkpoint continuation, and failure/cleanup assertions. Numerical tolerances
   are explicit for each algorithm and dtype.

@@ -49,16 +49,11 @@ def _quant_weight(w):
 @skip_no_kernel
 @pytest.mark.parametrize(("m", "n", "k"), [(64, 64, 64), (256, 384, 512), (17, 9, 33)])
 class TestQuantGemm:
-    def test_w16a16(self, m, n, k):
-        x, w = _rand(m, n, k)
-        out = quant_gemm(x, w)
-        ref = F.linear(x, w)
-        torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
-
     def test_w16a16_layouts(self, m, n, k):
         x, w = _rand(m, n, k)
         ref = F.linear(x, w).float()
         base = quant_gemm(x, w)
+        torch.testing.assert_close(base.float(), ref, atol=ATOL, rtol=RTOL)
         # crosswise activation storage [K][M] (trans_a)
         assert torch.allclose(
             quant_gemm(x.t().contiguous().t(), w).float(),
@@ -73,41 +68,32 @@ class TestQuantGemm:
         out_c = quant_gemm(x, w.t().contiguous(), trans_b=False)
         torch.testing.assert_close(out_c.float(), ref, atol=ATOL, rtol=RTOL)
 
-    def test_w8a16(self, m, n, k):
+    @pytest.mark.parametrize("per_tensor", [False, True])
+    def test_w8a16(self, m, n, k, per_tensor):
         x, w = _rand(m, n, k)
-        w8, ws, w_ref = _quant_weight(w)
+        w8, ws, _ = _quant_weight(w)
+        if per_tensor:
+            ws = (w.float().abs().amax() / 127.0).reshape(1)
+        w_ref = (w8.float() * ws.reshape(-1, 1)).to(torch.bfloat16)
         out = quant_gemm(x, w8, b_scale=ws)
-        ref = F.linear(x, w_ref)
-        torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(
+            out.float(), F.linear(x, w_ref).float(), atol=ATOL, rtol=RTOL
+        )
 
-    def test_w8a16_per_tensor_scale(self, m, n, k):
-        x, w = _rand(m, n, k)
-        w8, _, _ = _quant_weight(w)
-        s = (w.float().abs().amax() / 127.0).reshape(1).float()
-        out = quant_gemm(x, w8, b_scale=s)
-        # Rebuild the reference with the scalar scale.
-        w_pt = (w8.float() * s.item()).to(torch.bfloat16)
-        ref = F.linear(x, w_pt)
-        torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
-
-    def test_w8a8(self, m, n, k):
+    @pytest.mark.parametrize("per_tensor", [False, True])
+    def test_w8a8(self, m, n, k, per_tensor):
         x, w = _rand(m, n, k)
         w8, ws, w_ref = _quant_weight(w)
-        x8, xs = _quant_rows(x)
-        x_ref = (x8.float() * xs.unsqueeze(1)).reshape(x.shape).to(torch.bfloat16)
-        out = quant_gemm(x8.reshape(m, k), w8, a_scale=xs, b_scale=ws)
-        ref = F.linear(x_ref, w_ref)
-        torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
-
-    def test_w8a8_per_tensor_activation_scale(self, m, n, k):
-        x, w = _rand(m, n, k)
-        w8, ws, w_ref = _quant_weight(w)
-        s = (x.float().abs().amax() / 127.0).reshape(1).float()
-        x8, _, _ = quantize(x, s.reciprocal(), dtype=torch.int8)
-        x_ref = (x8.float() * s.item()).to(torch.bfloat16)
-        out = quant_gemm(x8, w8, a_scale=s, b_scale=ws)
-        ref = F.linear(x_ref, w_ref)
-        torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
+        if per_tensor:
+            xs = (x.float().abs().amax() / 127.0).reshape(1)
+            x8, _, _ = quantize(x, xs.reciprocal(), dtype=torch.int8)
+        else:
+            x8, xs = _quant_rows(x)
+        x_ref = (x8.float() * xs.reshape(-1, 1)).to(torch.bfloat16)
+        out = quant_gemm(x8, w8, a_scale=xs, b_scale=ws)
+        torch.testing.assert_close(
+            out.float(), F.linear(x_ref, w_ref).float(), atol=ATOL, rtol=RTOL
+        )
 
     def test_bias_fusion(self, m, n, k):
         x, w = _rand(m, n, k)
@@ -209,29 +195,6 @@ class TestQuantGemmValidation:
         other_bias = torch.ones(8, device="cuda:1", dtype=torch.bfloat16)
         with pytest.raises(RuntimeError, match="same device"):
             quant_gemm(x, w, bias=other_bias)
-
-
-@pytest.mark.cuda
-@skip_no_kernel
-class TestQuantizers:
-    def test_weight_quantizer_contract(self):
-        w = (torch.randn(64, 128, device="cuda") * 0.5).to(torch.bfloat16)
-        w8, ws = _quant_rows(w)
-        assert w8.dtype == torch.int8 and w8.shape == w.shape
-        assert w8.is_contiguous()
-        assert ws.dtype == torch.float32 and ws.shape == (64,)
-        deq = w8.float() * ws.unsqueeze(1)
-        # round-to-nearest per channel: every element sits within half a
-        # quantization step (plus fp32 multiplier slop) of its source.
-        err = (deq - w.float()).abs()
-        assert bool((err <= ws.unsqueeze(1) * 0.5 * 1.001 + 1e-9).all())
-
-    def test_act_quantizer_contract(self):
-        x = (torch.randn(3, 5, 64, device="cuda") * 0.5).to(torch.bfloat16)
-        q, s = _quant_rows(x)
-        assert q.dtype == torch.int8 and q.shape == x.shape
-        assert s.dtype == torch.float32 and s.shape == (15,)
-        assert q.int().abs().max().item() <= 127
 
 
 @pytest.mark.cuda

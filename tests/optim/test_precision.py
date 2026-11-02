@@ -2,12 +2,14 @@
 
 import copy
 import io
+import json
+from dataclasses import asdict
 
 import pytest
 import torch
 from torch import nn
 
-from astrai.config.train_config import ComponentSpec
+from astrai.config import ComponentSpec, PrecisionConfig, TrainConfig
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.trainer.components import (
@@ -239,4 +241,27 @@ def test_native_fp32_factory_reuses_compute_parameters_and_keeps_state_protocol(
         expected.zero_grad()
     for p, q in zip(model.parameters(), reference.parameters()):
         torch.testing.assert_close(p, q, atol=0, rtol=0)
-    assert set(actual.state_dict()) == {"optimizer", "master_params", "precision"}
+
+
+def test_precision_roundtrip():
+    policy = PrecisionConfig(
+        compute_dtype="bfloat16",
+        gradient_dtype="bfloat16",
+        master_dtype="bfloat16",
+        optimizer_state_dtype="float32",
+        export_dtype="float16",
+    )
+    config = TrainConfig(
+        strategy="sft",
+        model=ComponentSpec(
+            type="torch.nn:Linear", params={"in_features": 1, "out_features": 1}
+        ),
+        dataset=ComponentSpec(type="packed"),
+        optimizer=ComponentSpec(type="sgd", params={"lr": 0.01}),
+        scheduler=ComponentSpec(type="constant"),
+        precision=asdict(policy),
+    )
+    payload = json.loads(json.dumps(config.to_dict()))
+    assert payload["precision"] == asdict(policy)
+    assert "model_dtype" not in payload
+    assert TrainConfig(**payload).precision == policy

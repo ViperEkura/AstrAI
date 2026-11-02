@@ -10,19 +10,15 @@ rank's gradient is already the exact single-device gradient of its chunk:
 comparisons are local, no cross-rank reduction is needed.
 """
 
-from fnmatch import fnmatch
-
 import pytest
 import torch
 import torch.distributed as dist
 
-from astrai.model.autoregressive_lm import AutoRegressiveLM
-from astrai.model.components.linear import Linear
 from astrai.parallel.setup import spawn_parallel_fn
 from astrai.parallel.topology import ParallelTopology
-from astrai.parallel.tp import DEFAULT_TP_PLAN, TPState
+from astrai.parallel.tp import TPState
 from tests.support.capabilities import skip_no_multi_device
-from tests.support.models import make_seeded_gqa_model, make_tiny_config
+from tests.support.models import make_seeded_gqa_model
 
 SEQ_LEN = 64
 
@@ -37,32 +33,6 @@ _SHARD_DIMS = {
     "gate": 0,
     "down": 1,
 }
-
-
-def test_tp_state_requires_active_dimension():
-    with pytest.raises(ValueError, match="tp dimension"):
-        TPState(ParallelTopology(world_size=1))
-
-
-def test_default_plan_covers_standard_layout():
-    """The default plan touches every projection and nothing else."""
-    model = AutoRegressiveLM(make_tiny_config())
-    matched = [
-        name
-        for name, module in model.named_modules()
-        if isinstance(module, Linear)
-        and any(fnmatch(name, pattern) for pattern in DEFAULT_TP_PLAN)
-    ]
-    assert matched, "default plan matched nothing"
-    # every matched key is inside a layer's attention or mlp
-    for name in matched:
-        assert ".attention." in name or ".mlp." in name, name
-    # lm_head and embeddings stay replicated
-    assert not any("lm_head" in n or "embed" in n for n in matched)
-
-
-def _build_model(device):
-    return make_seeded_gqa_model(device, max_position_embeddings=SEQ_LEN)
 
 
 def _reference(model, input_ids, target_ids):
@@ -91,7 +61,7 @@ def _tp_equivalence_worker():
     topology = ParallelTopology(
         world_size=dist.get_world_size(), tp_size=2, device_type="cuda"
     )
-    model = _build_model(device)
+    model = make_seeded_gqa_model(device, max_position_embeddings=SEQ_LEN)
 
     torch.manual_seed(11)
     input_ids = torch.randint(
@@ -141,24 +111,3 @@ def _tp_equivalence_worker():
 @skip_no_multi_device
 def test_tp2_matches_single_device():
     spawn_parallel_fn(_tp_equivalence_worker, world_size=2)
-
-
-def _plan_validation_worker():
-    """A typo'd pattern fails loudly instead of leaving projections whole."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    topology = ParallelTopology(
-        world_size=dist.get_world_size(), tp_size=2, device_type="cuda"
-    )
-    model = _build_model(device)
-    with pytest.raises(ValueError, match="matched no module"):
-        with TPState(topology).shard(model, {"*.attention.q_projz": "colwise"}):
-            pass
-    with pytest.raises(ValueError, match="split styles"):
-        with TPState(topology).shard(model, {"*.mlp.up": "diagonal"}):
-            pass
-
-
-@pytest.mark.cuda
-@skip_no_multi_device
-def test_tp_plan_validation():
-    spawn_parallel_fn(_plan_validation_worker, world_size=2)

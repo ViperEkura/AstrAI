@@ -14,15 +14,6 @@ from astrai.extension.policy.quantization.autocast import (
     fp8_linear_enabled,
 )
 
-# --------------------------------------------------------------------------
-# Kernel-level (CUDA)
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Policy-level (CPU-verifiable)
-# --------------------------------------------------------------------------
-
 
 def test_autocast_state_is_thread_local():
     """torch parity: the active config is thread-local — another thread does

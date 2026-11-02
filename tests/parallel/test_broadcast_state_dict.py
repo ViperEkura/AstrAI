@@ -4,6 +4,8 @@ Uses ``spawn_parallel_fn`` with the ``gloo`` backend to simulate a
 multi-rank environment without requiring multiple GPUs.
 """
 
+from types import SimpleNamespace
+
 import torch
 
 from astrai.model.autoregressive_lm import AutoRegressiveLM
@@ -15,69 +17,38 @@ from tests.support.models import make_rollout_config
 
 
 def _broadcast_worker():
-    """Rank-0 builds a state_dict; all ranks verify they receive it."""
-    rank = get_rank()
-
-    if rank == 0:
-        sd = {
-            "layer.weight": torch.randn(4, 8),
-            "layer.bias": torch.randn(4),
+    for reuse_storage in (False, True):
+        expected = {
+            "layer.weight": torch.arange(32, dtype=torch.float32).view(4, 8),
+            "layer.bias": torch.full((4,), -0.5),
         }
-        expected = {k: v.clone() for k, v in sd.items()}
-    else:
-        sd = None
-        expected = None
+        state = (
+            {key: value.clone() for key, value in expected.items()}
+            if get_rank() == 0
+            else {key: torch.zeros_like(value) for key, value in expected.items()}
+            if reuse_storage
+            else None
+        )
+        pointers = {key: value.data_ptr() for key, value in (state or {}).items()}
+        received = broadcast_state_dict(state, src=0)
+        assert set(received) == set(expected)
+        for key, reference in expected.items():
+            torch.testing.assert_close(received[key], reference, atol=0, rtol=0)
+            assert received[key].device.type == "cpu"
+            if key in pointers:
+                assert received[key].data_ptr() == pointers[key]
 
-    received = broadcast_state_dict(sd, src=0)
 
-    assert received is not None, f"rank {rank}: received None"
-    assert set(received.keys()) == {"layer.weight", "layer.bias"}
-    if rank == 0:
-        # rank-0 already had the data
-        for k in received:
-            assert torch.equal(received[k], expected[k])
-    # tensors preserve the source device (cpu here since gloo test)
-    for k, v in received.items():
-        assert v.device.type == "cpu", f"rank {rank}: {k} on {v.device}"
-
-
-def test_broadcast_state_dict():
+def test_broadcast_values_and_compatible_storage():
     spawn_parallel_fn(_broadcast_worker, world_size=2, backend="gloo")
 
 
-def _broadcast_into_local_worker():
-    """Non-source ranks retain compatible rank-local tensor storage."""
-    rank = get_rank()
-    state_dict = {
-        "layer.weight": torch.full((4, 8), float(rank)),
-        "layer.bias": torch.full((4,), float(rank)),
-    }
-    local_pointers = {key: value.data_ptr() for key, value in state_dict.items()}
-
-    received = broadcast_state_dict(state_dict, src=0)
-
-    assert received is not None
-    for key, value in received.items():
-        assert value.data_ptr() == local_pointers[key]
-        assert torch.equal(value, torch.zeros_like(value))
-
-
-def test_broadcast_state_dict_reuses_compatible_local_tensors():
-    spawn_parallel_fn(_broadcast_into_local_worker, world_size=2, backend="gloo")
+def _rank_zero_state_dict(model):
+    return model.state_dict() if get_rank() == 0 else None
 
 
 def _create_ref_model_worker():
     """Verify create_ref_model works when model_state_dict returns None on non-rank-0."""
-
-    class FakeFSDPExecutor:
-        """Simulates FSDP: model_state_dict returns state_dict on rank-0, None elsewhere."""
-
-        use_distributed = True
-
-        def model_state_dict(self, model):
-            if get_rank() == 0:
-                return model.state_dict()
-            return None
 
     rank = get_rank()
     config = make_rollout_config()
@@ -87,7 +58,9 @@ def _create_ref_model_worker():
         for p in model.parameters():
             p.add_(float(rank))
 
-    executor = FakeFSDPExecutor()
+    executor = SimpleNamespace(
+        use_distributed=True, model_state_dict=_rank_zero_state_dict
+    )
 
     ref = create_ref_model(
         model_fn=lambda: AutoRegressiveLM(config),
@@ -130,20 +103,14 @@ def _sync_old_model_worker():
         for p in model.parameters():
             p.add_(float(rank) * 10)
 
-    class _DistExecutor:
-        use_distributed = True
-
-        def model_state_dict(self, m):
-            if get_rank() == 0:
-                return m.state_dict()
-            return None
-
     strategy = GRPOStrategy(
         model=model,
         device="cpu",
         old_model=old_model,
         ref_model=ref_model,
-        executor=_DistExecutor(),
+        executor=SimpleNamespace(
+            use_distributed=True, model_state_dict=_rank_zero_state_dict
+        ),
     )
 
     # Capture rank-0's policy weights for comparison
@@ -162,13 +129,6 @@ def _sync_old_model_worker():
 
 def test_sync_old_model_distributed():
     spawn_parallel_fn(_sync_old_model_worker, world_size=2, backend="gloo")
-
-
-def test_broadcast_state_dict_single_process():
-    """When dist is not initialized, broadcast_state_dict is a no-op."""
-    sd = {"w": torch.randn(3, 3), "b": torch.randn(3)}
-    result = broadcast_state_dict(sd)
-    assert result is sd
 
 
 def test_create_ref_model_single_process():

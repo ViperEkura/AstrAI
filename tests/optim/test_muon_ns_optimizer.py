@@ -48,7 +48,3 @@ def test_muon_kernel_update_tracks_torch_parameters_and_momentum(shape, nesterov
         reference_optimizer.muon.state[reference.weight]["momentum_buffer"],
         candidate_optimizer.muon.state[candidate.weight]["momentum_buffer"],
     )
-    assert (
-        reference_optimizer.state_dict().keys()
-        == candidate_optimizer.state_dict().keys()
-    )

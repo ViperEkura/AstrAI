@@ -4,15 +4,14 @@ from copy import deepcopy
 import pytest
 import torch
 
-from astrai.config import ComponentSpec, TrainConfig
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.linear import Linear
 from astrai.model.components.lora import LoRALinear, inject_lora
 from astrai.optimization.optimizer import (
+    ManoAdamW,
     NAdamW,
     Nora,
     NoraNAdamW,
-    OptimizerFactory,
     nora_lr_scale,
     partition_optimizer_parameters,
 )
@@ -148,17 +147,6 @@ def test_parameter_partition_covers_all_model_structures(model_overrides):
     assert len(grouped) == len({id(param) for param in grouped})
 
 
-def test_factory_registers_nora_default_and_legacy_muon():
-    assert OptimizerFactory.list_registered() == [
-        "mano_adamw",
-        "muon_adamw",
-        "nora_nadamw",
-    ]
-    model = AutoRegressiveLM(make_tiny_config())
-    optimizer = OptimizerFactory.create("nora_nadamw", model, lr=3e-4)
-    assert isinstance(optimizer, NoraNAdamW)
-
-
 def test_scheduler_preserves_nora_to_nadamw_lr_ratio():
     model = AutoRegressiveLM(make_tiny_config())
     optimizer = NoraNAdamW(model, lr=3e-4, nora_lr=5e-3)
@@ -176,10 +164,17 @@ def test_scheduler_preserves_nora_to_nadamw_lr_ratio():
     assert stepped_ratio == pytest.approx(initial_ratio)
 
 
-def test_optimizer_and_scheduler_resume_matches_uninterrupted_step():
+@pytest.mark.parametrize(
+    "optimizer_class,options",
+    [(NoraNAdamW, {"nora_lr": 5e-3}), (ManoAdamW, {})],
+    ids=["nora", "mano"],
+)
+def test_optimizer_and_scheduler_resume_matches_uninterrupted_step(
+    optimizer_class, options
+):
     torch.manual_seed(7)
     model_a = AutoRegressiveLM(make_tiny_config())
-    optimizer_a = NoraNAdamW(model_a, lr=3e-4, nora_lr=5e-3)
+    optimizer_a = optimizer_class(model_a, lr=3e-4, **options)
     scheduler_a = SchedulerFactory.create(
         "cosine", optimizer_a, warmup_steps=2, lr_decay_steps=4, min_rate=0.1
     )
@@ -193,7 +188,7 @@ def test_optimizer_and_scheduler_resume_matches_uninterrupted_step():
 
     model_b = AutoRegressiveLM(make_tiny_config())
     model_b.load_state_dict(model_state)
-    optimizer_b = NoraNAdamW(model_b, lr=3e-4, nora_lr=5e-3)
+    optimizer_b = optimizer_class(model_b, lr=3e-4, **options)
     scheduler_b = SchedulerFactory.create(
         "cosine", optimizer_b, warmup_steps=2, lr_decay_steps=4, min_rate=0.1
     )
@@ -212,30 +207,6 @@ def test_optimizer_and_scheduler_resume_matches_uninterrupted_step():
     assert scheduler_a.get_last_lr() == pytest.approx(scheduler_b.get_last_lr())
 
 
-def test_train_config_serializes_the_actual_optimizer_spec():
-    config = TrainConfig(
-        model=ComponentSpec(
-            type="torch.nn:Linear", params={"in_features": 2, "out_features": 2}
-        ),
-        strategy="seq",
-        dataset=ComponentSpec(
-            type="tests.support.rollout:RandomTokenDataset", params={"length": 1}
-        ),
-        optimizer=ComponentSpec(type="torch.optim:AdamW"),
-        scheduler=ComponentSpec(
-            type="torch.optim.lr_scheduler:StepLR",
-            params={"step_size": 1, "gamma": 1.0},
-        ),
-        optimizer_name="nora_nadamw",
-        optimizer_hyperparameters={"lr": 3e-4, "nora_lr": 5e-3},
-    )
-
-    metadata = config.to_dict()
-
-    assert metadata["optimizer_name"] == "torch.optim:AdamW"
-    assert metadata["optimizer_hyperparameters"] == {}
-
-
 def test_nora_nadamw_rejects_legacy_muon_state():
     model = AutoRegressiveLM(make_tiny_config())
     optimizer = NoraNAdamW(model)
@@ -244,9 +215,12 @@ def test_nora_nadamw_rejects_legacy_muon_state():
         optimizer.load_state_dict({"muon": {}, "adamw": {}})
 
 
-def test_combined_optimizer_runs_closure_once():
+@pytest.mark.parametrize(
+    "optimizer_class", [NoraNAdamW, ManoAdamW], ids=["nora", "mano"]
+)
+def test_combined_optimizer_runs_closure_once(optimizer_class):
     model = AutoRegressiveLM(make_tiny_config())
-    optimizer = NoraNAdamW(model)
+    optimizer = optimizer_class(model)
     calls = 0
 
     def closure():

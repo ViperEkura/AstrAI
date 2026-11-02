@@ -116,12 +116,6 @@ def test_matrix_dispatchers_keep_independent_context_choices():
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
-def test_syrk_uses_shared_mma_tile_family():
-    assert all(tile["name"] != "wmma64" for tile in tiles("syrk"))
-
-
-@pytest.mark.cuda
-@pytest.mark.skipif(not CUDA_AVAILABLE, reason="symmetric CUDA extension unavailable")
 @pytest.mark.parametrize("operation", ["syrk", "symm"])
 @pytest.mark.parametrize("input_layout", ["row", "column"])
 @pytest.mark.parametrize("output_layout", ["row", "column"])

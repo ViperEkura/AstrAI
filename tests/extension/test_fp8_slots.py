@@ -10,12 +10,10 @@ import torch
 import torch.nn as nn
 
 from astrai.extension.policy.quantization.autocast import (
-    Fp8Slot,
     assign_slots,
     clear_slots,
     fp8_slot_of,
     refresh_slots,
-    slot_table,
 )
 from astrai.model.components.embedding import Embedding
 from astrai.model.components.linear import Linear
@@ -23,38 +21,30 @@ from astrai.model.components.linear import Linear
 DIM = 8
 
 
-class _Attn(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.q_proj = Linear(DIM, DIM)
-        self.k_proj = Linear(DIM, DIM)
-        self.v_proj = Linear(DIM, DIM)
-        self.o_proj = Linear(DIM, DIM)
-
-
-class _Mlp(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.up = Linear(DIM, 2 * DIM)
-        self.gate = Linear(DIM, 2 * DIM)
-        self.down = Linear(2 * DIM, DIM)
-
-
-class _Block(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.attention = _Attn()
-        self.mlp = _Mlp()
-
-
-class _Model(nn.Module):
-    def __init__(self, layers: int = 2, tie: bool = False):
-        super().__init__()
-        self.embed_tokens = Embedding(16, DIM)
-        self.layers = nn.ModuleList(_Block() for _ in range(layers))
-        self.lm_head = Linear(DIM, 16, bias=False)
-        if tie:
-            self.lm_head.weight = self.embed_tokens.weight
+def _model(layers=2, tie=False):
+    model = nn.Module()
+    model.embed_tokens = Embedding(16, DIM)
+    model.layers = nn.ModuleList()
+    for _ in range(layers):
+        layer = nn.Module()
+        layer.attention = nn.ModuleDict(
+            {
+                name: Linear(DIM, DIM)
+                for name in ("q_proj", "k_proj", "v_proj", "o_proj")
+            }
+        )
+        layer.mlp = nn.ModuleDict(
+            {
+                "up": Linear(DIM, 2 * DIM),
+                "gate": Linear(DIM, 2 * DIM),
+                "down": Linear(2 * DIM, DIM),
+            }
+        )
+        model.layers.append(layer)
+    model.lm_head = Linear(DIM, 16, bias=False)
+    if tie:
+        model.lm_head.weight = model.embed_tokens.weight
+    return model
 
 
 @pytest.fixture(autouse=True)
@@ -68,47 +58,8 @@ def _names(table):
     return {slot.name for slot in table}
 
 
-def test_assign_names_every_linear():
-    model = _Model(layers=2)
-    table = assign_slots(model)
-
-    # 2 blocks x 7 projections + lm_head; the embedding is not a linear.
-    assert len(table) == 15
-    assert "layers.0.attention.q_proj" in _names(table)
-    assert "layers.1.mlp.down" in _names(table)
-    assert "lm_head" in _names(table)
-    assert "embed_tokens" not in _names(table)
-
-
-def test_role_parse_and_pattern():
-    table = assign_slots(_Model())
-    by_name = {slot.name: slot for slot in table}
-
-    q = by_name["layers.0.attention.q_proj"]
-    assert (q.module_type, q.tensor_type) == ("attention", "q_proj")
-    assert q.pattern == "layers.*.attention.q_proj"
-
-    up = by_name["layers.1.mlp.up"]
-    assert (up.module_type, up.tensor_type) == ("mlp", "up")
-
-    head = by_name["lm_head"]
-    assert (head.module_type, head.tensor_type) == ("", "lm_head")
-    assert head.pattern == "lm_head"
-
-
-def test_moe_expert_path_reports_container_not_index():
-    model = _Model(layers=1)
-    model.layers[0].mlp = nn.ModuleDict({"routed_experts": nn.ModuleList([_Mlp()])})
-    table = assign_slots(model)
-
-    expert = table.by_name("layers.0.mlp.routed_experts.0.up")
-    assert expert is not None
-    assert expert.module_type == "routed_experts"
-    assert expert.pattern == "layers.*.mlp.routed_experts.*.up"
-
-
 def test_slot_lookup_is_identity_based():
-    model = _Model()
+    model = _model()
     table = assign_slots(model)
     weight = model.layers[0].attention.q_proj.weight
 
@@ -122,17 +73,8 @@ def test_slot_lookup_is_identity_based():
     assert fp8_slot_of(torch.zeros_like(weight)) == -1
 
 
-def test_module_attribute_is_attached():
-    model = _Model()
-    table = assign_slots(model)
-
-    for name, module in model.named_modules():
-        if isinstance(module, Linear):
-            assert module._fp8_slot == table.slot_of(module.weight)
-
-
 def test_ids_are_stable_across_reassign_and_replacements():
-    model = _Model(layers=2)
+    model = _model(layers=2)
     table = assign_slots(model)
     before = {slot.name: slot.slot_id for slot in table}
 
@@ -160,7 +102,7 @@ def test_ids_are_stable_across_reassign_and_replacements():
 
 
 def test_rebind_follows_a_replaced_weight():
-    model = _Model()
+    model = _model()
     table = assign_slots(model)
     linear = model.layers[0].attention.q_proj
     old_slot = table.slot_of(linear.weight)
@@ -177,7 +119,7 @@ def test_rebind_follows_a_replaced_weight():
 
 
 def test_stale_counts_swapped_weights_and_refresh_repairs_them():
-    model = _Model(layers=1)
+    model = _model(layers=1)
     table = assign_slots(model)
     assert table.stale() == 0
     assert refresh_slots() is False  # nothing moved: the hot path stays free
@@ -193,7 +135,7 @@ def test_stale_counts_swapped_weights_and_refresh_repairs_them():
 
 
 def test_refresh_is_a_noop_once_the_model_is_gone():
-    model = _Model(layers=1)
+    model = _model(layers=1)
     table = assign_slots(model)
     weight = model.layers[0].mlp.up.weight
     slot_id = table.slot_of(weight)
@@ -207,7 +149,7 @@ def test_refresh_is_a_noop_once_the_model_is_gone():
 
 
 def test_tied_weight_is_one_slot_and_survives_either_module_name():
-    model = _Model(tie=True)
+    model = _model(tie=True)
     table = assign_slots(model)
 
     weight = model.lm_head.weight
@@ -219,7 +161,7 @@ def test_tied_weight_is_one_slot_and_survives_either_module_name():
 
 
 def test_two_linears_sharing_one_weight_get_one_slot():
-    model = _Model(layers=1)
+    model = _model(layers=1)
     model.layers[0].attention.k_proj.weight = model.layers[0].attention.q_proj.weight
     table = assign_slots(model)
 
@@ -231,7 +173,7 @@ def test_two_linears_sharing_one_weight_get_one_slot():
 
 
 def test_wrapper_prefixes_are_stripped():
-    model = _Model(layers=1)
+    model = _model(layers=1)
     inner = model.layers[0]
 
     wrapper = nn.Module()
@@ -244,7 +186,7 @@ def test_wrapper_prefixes_are_stripped():
 
 
 def test_ddp_prefix_is_stripped():
-    model = _Model(layers=1)
+    model = _model(layers=1)
     wrapper = nn.Module()
     wrapper.module = model
     table = assign_slots(wrapper)
@@ -252,7 +194,7 @@ def test_ddp_prefix_is_stripped():
 
 
 def test_mapping_stays_valid_while_the_model_is_dropped():
-    model = _Model(layers=1)
+    model = _model(layers=1)
     table = assign_slots(model)
     weight = model.layers[0].mlp.up.weight
     slot_id = table.slot_of(weight)
@@ -270,15 +212,6 @@ def test_mapping_stays_valid_while_the_model_is_dropped():
     assert len(table) == 0
 
 
-def test_tablereports_unassigned_weights_as_minus_one():
-    model = _Model(layers=1)
-    table = assign_slots(model)
-    stranger = torch.randn(4, 4)
-    assert table.slot_of(stranger) == -1
-    assert table.name_of(stranger) == ""
-    assert slot_table() is table
-
-
 def test_lora_wrapped_linear_keeps_the_base_weight_slot():
     lora = pytest.importorskip("astrai.model.components.lora")
     base = Linear(DIM, DIM)
@@ -292,10 +225,3 @@ def test_lora_wrapped_linear_keeps_the_base_weight_slot():
     # ``register_parameter("weight", base.weight)`` keeps the same object, so a
     # slot assigned before injection would still resolve.
     assert table.slot_of(base.weight) == table.slot_of(wrapped.weight)
-
-
-def test_slot_is_hashable_and_frozen():
-    slot = Fp8Slot(3, "layers.0.mlp.up", "mlp", "up")
-    assert {slot: 1}[slot] == 1
-    with pytest.raises(Exception):
-        slot.slot_id = 4

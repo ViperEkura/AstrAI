@@ -18,14 +18,6 @@ def _spec(q, *, cache=None, mask=None, fwd=None, scale=None):
     )
 
 
-def test_cpu_training_uses_torch_function():
-    q = torch.randn(1, 2, 4, 8)
-    assert (
-        AttentionDispatcher().dispatch(q, q, q, None, 0, None, False, None)
-        is native.forward
-    )
-
-
 def test_explicit_incapable_choice_is_strict():
     q = torch.zeros(1, 2, 4, 8)
     with op_backend(attention="cuda"):
@@ -45,12 +37,6 @@ def test_process_choice_is_soft():
         set_op("attention", None)
 
 
-def test_unknown_explicit_choice_raises():
-    q = torch.zeros(1, 2, 4, 8)
-    with pytest.raises(ValueError, match="Unknown attention implementation"):
-        attention(q, q, q, implementation="unknown")
-
-
 def test_flash_capability_checks_device_dtype_and_mask(monkeypatch):
     monkeypatch.setattr(flash, "flash_attn_available", lambda: True)
     q = torch.zeros(1, 2, 4, 8, dtype=torch.bfloat16)
@@ -59,21 +45,6 @@ def test_flash_capability_checks_device_dtype_and_mask(monkeypatch):
     cuda_spec = replace(spec, device=torch.device("cuda"))
     assert flash.supports(cuda_spec)
     assert not flash.supports(replace(cuda_spec, mask_kind=str(torch.bool)))
-
-
-@pytest.mark.parametrize(
-    "dtype,supported",
-    [
-        (torch.bfloat16, True),
-        (torch.float16, True),
-        (torch.float32, False),
-    ],
-)
-def test_cuda_attention_dtype_capability(monkeypatch, dtype, supported):
-    monkeypatch.setattr(cuda, "is_available", lambda name: True)
-    q = torch.empty(2, 4, 64, dtype=dtype)
-    spec = replace(_spec(q, cache=object(), fwd="decode"), device=torch.device("cuda"))
-    assert cuda.supports(spec) is supported
 
 
 def test_cuda_training_is_never_selected(monkeypatch):

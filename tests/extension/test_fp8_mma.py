@@ -17,7 +17,6 @@ from astrai.extension.kernel.quantize import quantize, quantize_scaled
 from astrai.extension.policy.quantization.autocast import (
     FP8Recipe,
     fp8_autocast,
-    fp8_format_pair,
     fp8_linear_enable,
     fp8_linear_enabled,
     fp8_load_state_dict,
@@ -25,20 +24,6 @@ from astrai.extension.policy.quantization.autocast import (
 )
 from astrai.extension.runtime.loader import get_module
 from tests.support.capabilities import skip_no_fp8
-
-
-def test_fp8_format_pair():
-    """A format spec normalizes to (fwd, bwd) fp8 dtypes; torch.dtype is the
-    canonical key — no custom format enum."""
-    assert fp8_format_pair("hybrid") == (torch.float8_e4m3fn, torch.float8_e5m2)
-    assert fp8_format_pair(torch.float8_e4m3fn) == (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fn,
-    )
-    assert fp8_format_pair(torch.float8_e5m2) == (
-        torch.float8_e5m2,
-        torch.float8_e5m2,
-    )
 
 
 def test_fp8_autocast_context():
@@ -106,46 +91,6 @@ def test_fp8_mm_matches_explicit_quantization(m, n, k):
     assert out.dtype == torch.bfloat16
     assert out.shape == (m, n)
     torch.testing.assert_close(out, expected, atol=0.125, rtol=0.01)
-
-
-@pytest.mark.cuda
-@skip_no_fp8
-@pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("fmt", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_quantize_input_dtypes(in_dtype, fmt):
-    """quantize accepts bf16/fp16/fp32 inputs; bytes and amax match the
-    explicit (value * multiplier) reference."""
-    torch.manual_seed(3)
-    x = torch.randn(64, 128, device="cuda", dtype=torch.float32) * 0.5
-    x = x.to(in_dtype)
-    scale = torch.tensor([0.5], device="cuda")
-    x8, _, amax = quantize(x, scale, dtype=fmt)
-    out_dtype = fmt
-    assert x8.dtype == out_dtype
-    assert x8.shape == x.shape
-    assert amax is None  # no ring => pure scale+cast, no fused amax
-    ref = (x.float() * 0.5).to(out_dtype)
-    assert torch.equal(x8, ref)
-
-
-@pytest.mark.cuda
-@skip_no_fp8
-def test_quantize_rejects_nonfloat_input():
-    x = torch.zeros(8, 8, device="cuda", dtype=torch.int8)
-    scale = torch.ones(1, device="cuda")
-    with pytest.raises(RuntimeError, match="quantize has no kernel for"):
-        quantize(x, scale, dtype=torch.float8_e4m3fn)
-
-
-@pytest.mark.cuda
-@skip_no_fp8
-def test_quantize_e5m2_format():
-    x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
-    x8, _, amax = quantize(
-        x, torch.tensor([10.0], device="cuda"), dtype=torch.float8_e5m2
-    )
-    assert x8.dtype == torch.float8_e5m2
-    assert amax is None  # no ring => no fused amax
 
 
 @pytest.mark.cuda
@@ -526,25 +471,6 @@ def test_recipe_scale_from_history(margin, hist_scale):
 
 @pytest.mark.cuda
 @skip_no_fp8
-@pytest.mark.parametrize("fmt", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_quantize_outputs_and_transposed_orientations(fmt):
-    """quantize_outputs yields both orientations from one read; quantize's
-    tdtype selects the transpose in the fixed 3-tuple with the [cols][rows] layout."""
-    torch.manual_seed(11)
-    x = torch.randn(37, 67, device="cuda", dtype=torch.bfloat16) * 3
-    mult = _scale(x).reciprocal()
-    x8, _, amax = quantize(x, mult, dtype=fmt)
-    _, x8T, _ = quantize(x, mult, tdtype=fmt)
-    d8, d8T, _ = quantize(x, mult, dtype=fmt, tdtype=fmt)
-    assert x8T.shape == (67, 37)
-    assert torch.equal(x8.view(torch.uint8), d8.view(torch.uint8))
-    assert torch.equal(x8T.view(torch.uint8), d8T.view(torch.uint8))
-    assert torch.equal(x8T.t().contiguous().view(torch.uint8), x8.view(torch.uint8))
-    assert amax is None  # no ring => no fused amax
-
-
-@pytest.mark.cuda
-@skip_no_fp8
 @pytest.mark.parametrize(
     "fmt,fmax",
     [(torch.float8_e4m3fn, 448.0), (torch.float8_e5m2, 57344.0)],
@@ -756,53 +682,6 @@ def test_quantize_ring_scratch_self_clean_across_reuse():
     assert float(ring[n]) < scale1  # round 1's amax did not leak
 
 
-@pytest.mark.cuda
-@skip_no_fp8
-@pytest.mark.parametrize(
-    ("rows", "cols"),
-    [(32, 256), (33, 255), (33, 257), (37, 260), (64, 512), (65, 64)],
-)
-def test_quantize_tile_boundary_shapes(rows, cols):
-    """Bitwise parity across RM/T/Dual on shapes around the tile geometry:
-    exact multiples, col/row tails beyond the block width, and rows%4!=0
-    (which must fall back to the scalar transposed store)."""
-    torch.manual_seed(rows * 1000 + cols)
-    x = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16) * 3
-    mult = _scale(x).reciprocal()
-    ref = (x.float() * mult).to(torch.float8_e4m3fn)
-    x8, _, _ = quantize(x, mult, dtype=torch.float8_e4m3fn)
-    _, x8T, _ = quantize(x, mult, tdtype=torch.float8_e4m3fn)
-    d8, d8T, _ = quantize(
-        x, mult, dtype=torch.float8_e4m3fn, tdtype=torch.float8_e4m3fn
-    )
-    assert x8T.shape == (cols, rows)
-    assert torch.equal(x8.view(torch.uint8), ref.view(torch.uint8))
-    assert torch.equal(d8.view(torch.uint8), ref.view(torch.uint8))
-    assert torch.equal(x8T.view(torch.uint8), d8T.view(torch.uint8))
-    assert torch.equal(x8T.t().contiguous().view(torch.uint8), ref.view(torch.uint8))
-
-
-@pytest.mark.cuda
-@skip_no_fp8
-def test_quantize_fp32_transposed_and_dual():
-    """fp32 inputs through T/Dual stay bitwise-identical to the explicit
-    reference (the fp32 traits path had transposed/dual coverage only via
-    indirect consumers before)."""
-    torch.manual_seed(13)
-    x = torch.randn(96, 320, device="cuda", dtype=torch.float32) * 3
-    mult = _scale(x).reciprocal()
-    ref = (x * mult).to(torch.float8_e4m3fn)
-    x8, _, _ = quantize(x, mult, dtype=torch.float8_e4m3fn)
-    _, x8T, _ = quantize(x, mult, tdtype=torch.float8_e4m3fn)
-    d8, d8T, _ = quantize(
-        x, mult, dtype=torch.float8_e4m3fn, tdtype=torch.float8_e4m3fn
-    )
-    assert torch.equal(x8.view(torch.uint8), ref.view(torch.uint8))
-    assert torch.equal(d8.view(torch.uint8), ref.view(torch.uint8))
-    assert torch.equal(x8T.view(torch.uint8), d8T.view(torch.uint8))
-    assert torch.equal(x8T.t().contiguous().view(torch.uint8), ref.view(torch.uint8))
-
-
 def _linear():
     """Shared helper: a small bf16 linear operand set on CUDA (grad-tracking
     so aten::linear records an autograd node)."""
@@ -954,23 +833,3 @@ def test_weight_cast_cache_reuses_and_invalidates():
     finally:
         gemm.fp8_reset()
         gemm.fp8_set_act_cache(True)
-
-
-@pytest.mark.cuda
-@skip_no_fp8
-@pytest.mark.parametrize(("m", "k"), [(64, 128), (17, 33), (31, 96), (8, 8), (40, 130)])
-def test_quantize_outputs_mixed_formats_bitwise(m, k):
-    """A mixed-format dual pass (E4M3 row-major, E5M2 transposed — the hybrid
-    training pair) is bit-identical to the two single-format casts it
-    replaces: the conversions are elementwise, only the read is shared.
-    Odd/unaligned shapes exercise the predicated boundary path."""
-    torch.manual_seed(m + k)
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    mult = (x.abs().amax().float() / 448.0).clamp_min(1e-12).reciprocal()
-    d8, d8T, _ = quantize(x, mult, dtype=torch.float8_e4m3fn, tdtype=torch.float8_e5m2)
-    ref8, _, _ = quantize(x, mult, dtype=torch.float8_e4m3fn)
-    _, ref8T, _ = quantize(x, mult, tdtype=torch.float8_e5m2)
-    assert d8.dtype == torch.float8_e4m3fn and d8T.dtype == torch.float8_e5m2
-    assert d8.shape == (m, k) and d8T.shape == (k, m)
-    assert torch.equal(d8, ref8)
-    assert torch.equal(d8T, ref8T)

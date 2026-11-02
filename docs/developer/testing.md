@@ -82,25 +82,20 @@ data/model construction.
 ## Compression priorities
 
 Judge necessity by failure severity, unique regression coverage, an independent
-oracle, tolerance of internal refactoring, and execution cost. Prefer public
-behavior checks; inspect internals when gradients, masks, state ownership, or
-resource release cannot be verified reliably through the public result. One
-behavior does not need paired black-box and white-box tests.
-
-Classify by what a test proves, without adding another marker hierarchy:
+reference, tolerance of internal refactoring, and execution cost. Prefer public
+behavior checks; inspect internals for gradients, masks, state ownership,
+resource release, and explicit architecture/performance contracts.
 
 | Content | Treatment |
 | --- | --- |
-| Numerical references, gradients, accumulation, checkpoint continuation and resource isolation | Retain independent references, failure boundaries, and algorithm/dtype tolerances. |
-| Functional modes and validation boundaries | Parameterize the same execution path; keep distinct inputs and expected outcomes visible. |
-| Configuration forwarding, reflection and structural smoke checks | Reuse existing fixtures and payloads; merge repeated preparation and prefer observable behavior over private-field checks. |
-| Dead helpers, equivalent wrappers and duplicate setup | Delete them or use the existing shared implementation. |
+| Numerical references, gradients, accumulation, continuation and resource isolation | Preserve independent references, failure boundaries and dtype/algorithm tolerances; share repeated preparation. |
+| Functional modes and transformations | Parameterize the owning module's cases; upper layers cover composition and real I/O. |
+| Simple assignments, forwarding, registration, constant defaults and constructor field readback | Remove standalone checks and their dedicated doubles, even without equivalent replacement. |
+| Weak shape/nonempty smoke, private implementation mirrors and third-party behavior | Remove where they add little protection; retain real ABI, memory and lifecycle boundaries. |
+| Dead helpers and single-consumer wrappers | Delete or move ordinary helpers to their consumer; keep spawned factories importable. |
 
-Checkpointing mode tests compare full gradients and forward outputs against an
-unwrapped model and verify restoration. Small training smoke cases cover batch
-and accumulation choices with a bounded eight-sample epoch; separate numerical
-accumulation and multi-epoch/restart tests retain the deeper guarantees.
-
-Do not lower numerical tolerances, remove an independent reference, or introduce
-a generic test runner just to reduce line count. File/class counts and physical
-line counts are descriptive; acceptance is based on retained behavior.
+Test counts may decrease when low-risk coverage is deliberately removed. Record
+those groups in the PR, separately from merged coverage and protected regressions.
+Do not relax numerical tolerances, move test code elsewhere, or compress layout
+to meet a line quota. Remove section banners and comments that repeat test names;
+retain formulas, tolerance rationale and regression/failure explanations.

@@ -1,9 +1,8 @@
-import pytest
-
 """Kernel-level mask dimension support (2D, 3D, 4D)."""
 
 import math
 
+import pytest
 import torch
 
 from astrai.extension.kernel.attention import attn_prefill
@@ -30,72 +29,29 @@ def _reference(q, k, v, mask):
 
 @pytest.mark.cuda
 @skip_no_kernel
-def test_kernel_accepts_2d_mask():
-    """2D mask [batch, kv_len] gates the softmax, not just parses."""
-    torch.manual_seed(11)
-    batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
-    kv_len = 8
-    q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(batch, kv_len, dtype=torch.bool, device="cuda")
-    mask[:, 4:] = False
-
-    out = attn_prefill(q, k, v, mask=mask, is_causal=False)
-    assert out.shape == (batch, q_len, n_heads, D)
-    torch.testing.assert_close(out, _reference(q, k, v, mask), atol=0.05, rtol=0.05)
-
-
-@pytest.mark.cuda
-@skip_no_kernel
-def test_kernel_accepts_3d_mask():
-    """3D mask [batch, q_len, kv_len] applies per-query-row gating."""
-    torch.manual_seed(12)
-    batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
-    kv_len = 8
-    q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(batch, q_len, kv_len, dtype=torch.bool, device="cuda")
-    mask[:, 0, 5:] = False  # differs per query row: only the 3D path can apply it
-    mask[:, 1, 6:] = False
-
-    out = attn_prefill(q, k, v, mask=mask, is_causal=False)
-    assert out.shape == (batch, q_len, n_heads, D)
-    torch.testing.assert_close(out, _reference(q, k, v, mask), atol=0.05, rtol=0.05)
-
-
-@pytest.mark.cuda
-@skip_no_kernel
-def test_kernel_accepts_4d_mask():
-    """4D mask [batch, 1, q_len, kv_len] broadcasts over heads and gates."""
-    torch.manual_seed(13)
-    batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
-    kv_len = 8
-    q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-    mask = torch.ones(batch, 1, q_len, kv_len, dtype=torch.bool, device="cuda")
-    mask[:, :, :, 4:] = False
-
-    out = attn_prefill(q, k, v, mask=mask, is_causal=False)
-    assert out.shape == (batch, q_len, n_heads, D)
-    torch.testing.assert_close(out, _reference(q, k, v, mask), atol=0.05, rtol=0.05)
-
-
-@pytest.mark.cuda
-@skip_no_kernel
-def test_4d_mask_matches_no_mask_when_all_true():
-    """A 4D all-True mask should produce the same output as no mask."""
-    batch, q_len, n_heads, n_kv_heads = 1, 8, 4, 1
-    kv_len = 8
-    q = torch.randn(batch, q_len, n_heads, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, kv_len, n_kv_heads, D, device="cuda", dtype=torch.bfloat16)
-
-    out_no_mask = attn_prefill(q, k, v, mask=None, is_causal=False)
-    mask = torch.ones(batch, 1, q_len, kv_len, dtype=torch.bool, device="cuda")
-    out_with_mask = attn_prefill(q, k, v, mask=mask, is_causal=False)
-
-    diff = (out_no_mask.float() - out_with_mask.float()).abs().max().item()
-    assert diff == 0.0, f"4D all-True mask diff: {diff}"
+@pytest.mark.parametrize(
+    "dimensions,all_true", [(2, False), (3, False), (4, False), (4, True)]
+)
+def test_mask_layouts_match_reference(dimensions, all_true):
+    torch.manual_seed(9 + dimensions)
+    q = torch.randn(1, 8, 4, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 8, 1, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    shape = (1, 8) if dimensions == 2 else (1, 8, 8)
+    mask = torch.ones(shape, dtype=torch.bool, device="cuda")
+    if not all_true:
+        if dimensions == 3:
+            mask[:, 0, 5:] = False
+            mask[:, 1, 6:] = False
+        else:
+            mask[..., 4:] = False
+    if dimensions == 4:
+        mask = mask[:, None]
+    actual = attn_prefill(q, k, v, mask=mask, is_causal=False)
+    if all_true:
+        expected = attn_prefill(q, k, v, mask=None, is_causal=False)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(
+            actual, _reference(q, k, v, mask), atol=0.05, rtol=0.05
+        )

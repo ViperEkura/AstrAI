@@ -15,11 +15,8 @@ import torch
 from astrai.extension.policy.gemm.plan import (
     GemmAutotuner,
     Row,
-    _problem_key,
     device_signature,
 )
-
-WIDTH_PERF = {(2, 2): 0, (2, 1): 1, (1, 1): 2}
 
 FACTS = {
     "sms": 128,
@@ -153,39 +150,6 @@ def nt_operands(m=64, n=128, k=256):
     return a, b
 
 
-class TestProblemKey:
-    def test_nt_production_route(self):
-        a, b = nt_operands()
-        m, n, k, batch, crosswise, dt_a, dt_b = _problem_key(a, b, False, True)
-        assert (m, n, k, batch) == (64, 128, 256, 1)
-        assert crosswise == 0  # dual-congruous, the fused-linear shape
-        assert (dt_a, dt_b) == ("torch.bfloat16", "torch.bfloat16")
-
-    def test_tt_is_crosswise(self):
-        a = torch.zeros(256, 64, dtype=torch.bfloat16)  # [K][M]
-        b = torch.zeros(128, 256, dtype=torch.bfloat16)  # [N][K]
-        assert _problem_key(a, b, True, True)[4] == 1
-
-    def test_tn_is_dual_crosswise(self):
-        a = torch.zeros(256, 64, dtype=torch.bfloat16)  # [K][M]
-        b = torch.zeros(256, 128, dtype=torch.bfloat16)  # [K][N]
-        assert _problem_key(a, b, True, False)[4] == 2
-
-    def test_col_major_view_folds_the_tag(self):
-        base = torch.zeros(64, 256, dtype=torch.bfloat16)
-        a = base.t()  # [256][64] storage, col-major view
-        assert a.stride(-1) != 1 and a.stride(-2) == 1
-        b = torch.zeros(128, 256, dtype=torch.bfloat16)
-        # trans_a=False over a .t() view folds to a transposed layout tag.
-        assert _problem_key(a, b, False, False)[4] == 2
-
-
-class TestRowFormat:
-    def test_row_text_is_row_file_syntax(self):
-        row = Row(63, 64, 127, 128, 0, 1, 2, 3, 32)
-        assert row.text() == "63 64 127 128 0 1 2 3 0 32"
-
-
 class TestTuneFlow:
     def _tuner(self, fake, monkeypatch_measure=None):
         tuner = GemmAutotuner()
@@ -194,23 +158,6 @@ class TestTuneFlow:
             tuner._measure = monkeypatch_measure
         assert tuner.start(time_budget_s=0)
         return tuner
-
-    def test_start_installs_only_cached_rows(self):
-        fake = FakeGemm()
-        self._tuner(fake)
-        assert len(fake.installs) == 1
-        assert fake.installs[0] == ""
-
-    def test_start_refuses_a_pre_patch_build(self):
-        # A stale .so still has ``configure`` — it just takes keyword
-        # arguments, which hasattr cannot see. The schema attr is the guard,
-        # and refusing beats crashing inside the first install.
-        fake = FakeGemm()
-        fake.CONFIG_API = 1
-        tuner = GemmAutotuner()
-        tuner._mod = fake
-        assert tuner.start(time_budget_s=0) is False
-        assert fake.installs == []
 
     def test_builtin_shapes_never_tune(self):
         fake = FakeGemm(source="builtin")

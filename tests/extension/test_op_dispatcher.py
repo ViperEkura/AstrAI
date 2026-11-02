@@ -5,35 +5,13 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from astrai.extension import (
-    OpDispatcher,
-    OpSpec,
     op_backend,
     op_context,
     snapshot_op_selection,
     swiglu,
     use_op_selection,
 )
-from astrai.extension.backend.attention import AttentionDispatcher, AttentionSpec
-from astrai.extension.backend.newton_schulz import (
-    SymmDispatcher,
-    SymmSpec,
-    SyrkDispatcher,
-    SyrkSpec,
-)
-from astrai.extension.backend.rotary import RotaryDispatcher, RotarySpec
-from astrai.extension.backend.swiglu import SwiGLUDispatcher, SwiGLUSpec
-
-
-def test_each_operation_has_its_own_dispatcher_and_spec():
-    for dispatcher, spec in (
-        (AttentionDispatcher, AttentionSpec),
-        (RotaryDispatcher, RotarySpec),
-        (SwiGLUDispatcher, SwiGLUSpec),
-        (SyrkDispatcher, SyrkSpec),
-        (SymmDispatcher, SymmSpec),
-    ):
-        assert issubclass(dispatcher, OpDispatcher)
-        assert issubclass(spec, OpSpec)
+from astrai.extension.backend.attention import AttentionDispatcher
 
 
 def test_selection_snapshot_moves_to_worker_and_restores():

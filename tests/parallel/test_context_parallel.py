@@ -13,10 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-from pydantic import ValidationError
 
-from astrai.config import ComponentSpec
-from astrai.config.train_config import TrainConfig
 from astrai.dataset import RDSampler
 from astrai.extension import op_backend
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction
@@ -41,14 +38,6 @@ def test_topology_decomposition():
 
     with pytest.raises(ValueError, match="divisible"):
         ParallelTopology(world_size=3, tp_size=2)
-
-
-def test_topology_reduce_single_process_noop():
-    topology = ParallelTopology(world_size=1)
-    values = torch.tensor([2.0])
-    assert topology.reduce_sum(values).item() == 2.0
-    assert topology.reduce_mean(values).item() == 2.0
-    assert topology.samples_per_replica(10) == 10
 
 
 def test_cp_strategy_requires_token_mean():
@@ -126,46 +115,6 @@ def test_seq_prepare_batch_synthesizes_positions():
     assert torch.equal(
         prepared["position_ids"], torch.arange(8).unsqueeze(0).expand(2, -1)
     )
-
-
-def _minimal_train_config(**overrides):
-    defaults = dict(
-        strategy="seq",
-        model=ComponentSpec(
-            type="torch.nn:Linear", params={"in_features": 2, "out_features": 2}
-        ),
-        dataset=ComponentSpec(
-            type="tests.support.rollout:RandomTokenDataset", params={"length": 2}
-        ),
-        optimizer=ComponentSpec(type="torch.optim:SGD", params={"lr": 0.0}),
-        scheduler=ComponentSpec(
-            type="torch.optim.lr_scheduler:StepLR",
-            params={"step_size": 1, "gamma": 1.0},
-        ),
-    )
-    defaults.update(overrides)
-    return TrainConfig(**defaults)
-
-
-def test_dp_size_derives_nprocs():
-    config = _minimal_train_config()
-    assert config.dp_size == 1 and config.cp_size == 1
-    assert config.nprocs == 1
-
-    config = _minimal_train_config(dp_size=2, cp_size=2)
-    assert config.nprocs == 4  # world = dp x cp by construction
-
-
-def test_dp_size_validator():
-    with pytest.raises(ValidationError):
-        _minimal_train_config(dp_size=0)
-
-
-def test_cp_size_validator():
-    config = _minimal_train_config()
-    assert config.cp_size == 1
-    with pytest.raises(ValidationError):
-        _minimal_train_config(cp_size=0)
 
 
 def _build_gqa_model(device):

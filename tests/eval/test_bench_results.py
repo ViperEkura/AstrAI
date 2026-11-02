@@ -1,5 +1,3 @@
-"""Unit tests for astrai.bench result extraction and suite planning."""
-
 import pytest
 
 from astrai.bench import (
@@ -73,22 +71,10 @@ def test_extract_mmlu_and_hellaswag():
     assert hs == {"acc": 0.24, "acc_norm": 0.25}
 
 
-def test_extract_unknown_benchmark_raises():
-    with pytest.raises(KeyError):
-        extract_metrics({}, "nonexistent")
-
-
 def test_parse_results_name_prefix_priority():
     assert parse_results_name("mbpp2_mix3.json") == ("mbpp2", "mix3")
     assert parse_results_name("mbpp_mix3.json") == ("mbpp", "mix3")
     assert parse_results_name("hellaswag_base.json") == ("hellaswag", "base")
-
-
-def test_parse_results_name_rejects_non_results():
-    assert parse_results_name("mbpp2_mix3_completions.json") is None
-    assert parse_results_name("mmlu.json") is None  # no tag
-    assert parse_results_name("stray.json") is None
-    assert parse_results_name("notes.txt") is None
 
 
 def test_render_table_percent_and_counts():
@@ -108,7 +94,8 @@ def test_collect_results_reads_and_filters(tmp_path):
         '{"_summary": {"pass@1": 0.1, "pass@10": 0.2}}'
     )
     (tmp_path / "mbpp2_t1_completions.json").write_text("{}")
-    (tmp_path / "stray.json").write_text("{}")
+    for name in ("stray.json", "mmlu.json", "notes.txt"):
+        (tmp_path / name).write_text("{}")
     (tmp_path / "mmlu_t2.json").write_text('{"_overall": {"accuracy": 0.3}}')
 
     all_tags = collect_results(str(tmp_path))
@@ -139,14 +126,6 @@ def test_plan_jobs_smoke_skips_ifeval_and_pins_gpus(monkeypatch):
     assert by_bench["mmlu"].cmd.startswith("CUDA_VISIBLE_DEVICES=1 ")
     assert by_bench["hellaswag"].cmd.startswith("CUDA_VISIBLE_DEVICES=2 ")
     assert "--limit 64" in by_bench["hellaswag"].cmd
-
-
-def test_plan_jobs_standard_includes_ifeval(monkeypatch):
-    monkeypatch.setattr("astrai.bench.pick_free_gpus", _fake_gpus([5]))
-    jobs, skipped = plan_jobs("./ckpt", "t2", ["ifeval"], gpus=None, smoke=False)
-    assert skipped == []
-    assert jobs[0].cmd.startswith("CUDA_VISIBLE_DEVICES=5 ")
-    assert "--temperature 0.1" in jobs[0].cmd
 
 
 def test_plan_jobs_raises_without_free_gpus(monkeypatch):

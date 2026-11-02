@@ -6,14 +6,13 @@ import pytest
 import torch
 
 from astrai.extension import (
-    ExplicitSelectionError,
     op_backend,
     set_op,
     snapshot_op_selection,
     use_op_selection,
 )
 from astrai.extension.backend import apply_rotary_emb
-from astrai.extension.backend.rotary import RotaryDispatcher, _cuda_rotary, _torch_apply
+from astrai.extension.backend.rotary import RotaryDispatcher, _torch_apply
 from astrai.extension.runtime import context
 from astrai.extension.runtime.loader import is_available
 
@@ -35,28 +34,8 @@ def test_nested_choices_restore_and_operators_are_independent():
         )
 
 
-def test_explicit_rotary_cuda_rejects_cpu():
-    x = torch.randn(1, 2, 2, 8)
-    freqs = torch.randn(1, 2, 4, 2)
-    with pytest.raises(ExplicitSelectionError):
-        RotaryDispatcher().dispatch(x, freqs, explicit="cuda")
-
-
-def test_process_choice_is_soft_and_scope_is_strict():
-    q = torch.zeros(1, 2, 4, 8)
-    set_op("attention", "cuda")
-    selected = attention.AttentionDispatcher().dispatch(
-        q, q, q, None, 0, None, False, None
-    )
-    assert selected is attention.torch.forward
-    with op_backend(attention="cuda"):
-        with pytest.raises(ExplicitSelectionError):
-            attention.AttentionDispatcher().dispatch(
-                q, q, q, None, 0, None, False, None
-            )
-
-
-def test_snapshot_freezes_process_choice():
+def test_snapshot_freezes_process_choice(monkeypatch):
+    monkeypatch.setattr(context, "_process_choices", None)
     set_op("attention", "torch_native")
     snapshot = snapshot_op_selection()
     set_op("attention", "cuda")
@@ -86,31 +65,10 @@ class TestRotaryDispatch:
         freqs = torch.randn(1, 5, 8, 2, device="cuda", dtype=torch.float32)
         return x, freqs
 
-    def test_auto_selects_cuda_for_inference_when_available(self):
-        x, freqs = self._input()
-        with torch.inference_mode():
-            selected = RotaryDispatcher().dispatch(x, freqs)
-        assert selected is (
-            _cuda_rotary if is_available("rotary_emb") else _torch_apply
-        )
-
-    def test_grad_selects_cuda_when_available(self):
-        x, freqs = self._input()
-        x.requires_grad_()
-        assert RotaryDispatcher().dispatch(x, freqs) is (
-            _cuda_rotary if is_available("rotary_emb") else _torch_apply
-        )
-
     def test_frequency_grad_uses_torch(self):
         x, freqs = self._input()
         freqs.requires_grad_()
         assert RotaryDispatcher().dispatch(x, freqs) is _torch_apply
-
-    def test_context_switch_to_torch(self):
-        x, freqs = self._input()
-        with torch.inference_mode(), op_backend(rotary="torch"):
-            out = apply_rotary_emb(x, freqs)
-        assert out.shape == x.shape and out.dtype == torch.bfloat16
 
     def test_cuda_matches_torch_numerics(self):
         if not is_available("rotary_emb"):

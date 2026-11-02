@@ -736,3 +736,48 @@ def test_multiplier_tensor_shape_and_storage_strides(
     assert torch.equal(
         out_t.view(torch.uint8), _cast(ref.t().contiguous(), tdtype).view(torch.uint8)
     )
+
+
+@pytest.mark.cuda
+@skip_no_fp8
+def test_quantize_rejects_nonfloat_input():
+    x = torch.zeros(8, 8, device="cuda", dtype=torch.int8)
+    scale = torch.ones(1, device="cuda")
+    with pytest.raises(RuntimeError, match="quantize has no kernel for"):
+        quantize(x, scale, dtype=torch.float8_e4m3fn)
+
+
+@pytest.mark.cuda
+@skip_no_fp8
+@pytest.mark.parametrize(
+    "input_dtype,shape",
+    [
+        (torch.bfloat16, (32, 256)),
+        (torch.bfloat16, (33, 255)),
+        (torch.bfloat16, (33, 257)),
+        (torch.bfloat16, (37, 260)),
+        (torch.bfloat16, (64, 512)),
+        (torch.bfloat16, (65, 64)),
+        (torch.float32, (96, 320)),
+    ],
+)
+def test_tile_boundary_outputs_match_cast(input_dtype, shape):
+    torch.manual_seed(sum(shape))
+    x = torch.randn(*shape, device="cuda", dtype=input_dtype) * 3
+    multiplier = (x.abs().amax().float() / 448.0).clamp_min(1e-12).reciprocal()
+    values = x.float() * multiplier
+    for dtype, tdtype in [(F4, None), (None, F4), (F4, F4), (F4, F5)]:
+        output, transposed, amax = quantize(x, multiplier, dtype=dtype, tdtype=tdtype)
+        assert amax is None
+        for actual, fmt, reference in [
+            (output, dtype, values),
+            (transposed, tdtype, values.t().contiguous()),
+        ]:
+            if fmt is None:
+                assert actual is None
+            else:
+                assert actual.dtype == fmt
+                assert actual.shape == reference.shape
+                assert torch.equal(
+                    actual.view(torch.uint8), reference.to(fmt).view(torch.uint8)
+                )

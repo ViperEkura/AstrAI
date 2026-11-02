@@ -608,3 +608,52 @@ def test_cli_precision_flags_override_individual_yaml_fields(tmp_path, monkeypat
     assert policy.gradient_dtype == "model"
     assert policy.optimizer_state_dtype == "bfloat16"
     assert policy.export_dtype == "float32"
+
+
+def test_dry_run_uses_resolved_components_without_starting_trainer(
+    tmp_path, monkeypatch
+):
+    make_rollout_config(max_position_embeddings=8).to_file(tmp_path / "config.json")
+    path = tmp_path / "train.yaml"
+    path.write_text(
+        f"model:\n  param_path: {tmp_path}\n"
+        f"data:\n  data_root_path: {tmp_path}\n"
+        "training:\n  train_type: seq\n  batch_per_device: 2\n"
+        "  grad_accum_steps: 3\n"
+        "parallel:\n  dp_size: 2\n  dp_mode: ddp\n"
+        "optimizer:\n  type: torch.optim:SGD\n  params: {lr: 2e-5}\n"
+    )
+
+    def reject_start(*args, **kwargs):
+        raise AssertionError("dry-run started a Trainer")
+
+    monkeypatch.setattr(train_module, "Trainer", reject_start)
+    result = CliRunner().invoke(
+        train_module.train_command, ["--config", str(path), "--dry-run"]
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert "torch.optim:SGD" in result.output
+    assert "'lr': 2e-05" in result.output
+    assert "Global batch" in result.output and ": 12" in result.output
+    assert "'window_size': 8" in result.output
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_dry_run_and_execution_share_config_validation(tmp_path, monkeypatch, dry_run):
+    make_rollout_config().to_file(tmp_path / "config.json")
+    path = tmp_path / "train.yaml"
+    path.write_text(
+        f"training:\n  train_type: seq\n  param_path: {tmp_path}\n"
+        f"  data_root_path: {tmp_path}\n  grad_accum_steps: 0\n"
+    )
+
+    def reject_start(*args, **kwargs):
+        raise AssertionError("invalid configuration started a Trainer")
+
+    monkeypatch.setattr(train_module, "Trainer", reject_start)
+    result = CliRunner().invoke(
+        train_module.train_command,
+        ["--config", str(path)] + (["--dry-run"] if dry_run else []),
+    )
+    assert result.exit_code == 2
+    assert "grad_accum_steps" in result.output

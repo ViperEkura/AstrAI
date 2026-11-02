@@ -4,11 +4,9 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict
 from functools import partial
-from typing import Dict, List
 
 import click
 import torch
-import yaml
 from click.core import ParameterSource
 
 from astrai.config import (
@@ -22,6 +20,7 @@ from astrai.config.cli import (
     GroupedCommand,
     OptSpec,
     apply_specs,
+    load_yaml_config,
     merge_yaml_into_kwargs,
 )
 from astrai.config.train_config import (
@@ -35,9 +34,6 @@ from astrai.model.components.mlp import MLP
 from astrai.optimization.optimizer import OptimizerFactory
 from astrai.trainer import Trainer
 from astrai.trainer.strategy import StrategyFactory
-
-# Re-exported under its historical name for tests importing it from here.
-_merge_yaml_into_kwargs = merge_yaml_into_kwargs
 
 _TRAIN_TYPE = StrategyFactory.list_registered()
 _DP = sorted(DP_MODES)
@@ -588,10 +584,7 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
     kwargs["precision"] = None
     component_blocks = {}
     if config_path:
-        with open(config_path) as stream:
-            raw_config = yaml.safe_load(stream) or {}
-        if not isinstance(raw_config, dict):
-            raise click.UsageError("Training config must be a mapping")
+        raw_config = load_yaml_config(config_path)
         if "precision" in raw_config:
             if not isinstance(raw_config["precision"], dict):
                 raise click.UsageError("precision must be a mapping")
@@ -622,8 +615,8 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
             for key in kwargs
             if ctx.get_parameter_source(key) is ParameterSource.COMMANDLINE
         }
-        kwargs = _merge_yaml_into_kwargs(
-            config_path,
+        kwargs = merge_yaml_into_kwargs(
+            raw_config,
             kwargs,
             explicit_keys,
             sections=tuple(
@@ -665,72 +658,40 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
     kwargs["cp_size"] = kwargs.pop("cp_size") or 1
     kwargs["dp_size"] = kwargs.pop("dp_size") or 1
 
-    if dry_run:
-        _print_dry_run(kwargs)
-        return
-
     try:
-        train(**kwargs)
+        train(dry_run=dry_run, **kwargs)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
 
 
-def _print_dry_run(kwargs: Dict) -> None:
-    """Print training plan summary."""
-    dp_size = kwargs.get("dp_size", 1) or 1
-    cp_size = kwargs.get("cp_size", 1) or 1
-    tp_size = kwargs.get("tp_size", 1) or 1
+def print_dry_run(config: TrainConfig, param_path: str, resume: bool) -> None:
+    """Describe the configuration that execution will actually use."""
     rows = [
-        ("Train type", kwargs.get("train_type")),
-        ("Model path", kwargs.get("param_path")),
+        ("Train type", config.strategy),
+        ("Model path", param_path),
+        ("Model", config.model.type),
+        ("Dataset", asdict(config.dataset)),
+        ("Optimizer", asdict(config.optimizer)),
+        ("Scheduler", asdict(config.scheduler)),
+        ("Precision", asdict(config.precision)),
+        ("DP mode", config.dp_mode),
+        ("DP / CP / TP", (config.dp_size, config.cp_size, config.tp_size)),
+        ("Learner GPUs", config.nprocs),
+        ("Batch/device", config.batch_per_device),
+        ("Grad accum", config.grad_accum_steps),
         (
-            "Model type",
-            (kwargs.get("model_spec") or {}).get("type", "autoregressive_lm"),
+            "Global batch",
+            config.batch_per_device * config.grad_accum_steps * config.dp_size,
         ),
-        (
-            "Optimizer type",
-            (kwargs.get("optimizer_spec") or {}).get("type", kwargs.get("optimizer")),
-        ),
-        (
-            "Scheduler type",
-            (kwargs.get("scheduler_spec") or {}).get(
-                "type", kwargs.get("schedule_type")
-            ),
-        ),
-        (
-            "Data path",
-            (kwargs.get("dataset_spec") or {})
-            .get("params", {})
-            .get("path", kwargs.get("data_root_path")),
-        ),
-        ("Data type", (kwargs.get("dataset_spec") or {}).get("type", "packed")),
-        ("Precision", json.dumps(kwargs.get("precision"), sort_keys=True)),
-        ("DP mode", kwargs.get("dp_mode", "none")),
-        ("DP replicas", str(dp_size)),
-        ("CP size", str(cp_size)),
-        ("TP size", str(tp_size)),
-        ("Learner GPUs", str(dp_size * cp_size * tp_size)),
-        ("Rollout mode", kwargs.get("rollout_mode", "sync")),
-        ("Worker devices", str(kwargs.get("rollout_devices", []))),
-        ("Reward factory", kwargs.get("reward_model")),
-        ("Epochs", str(kwargs.get("n_epoch", 1))),
-        ("Batch/device", str(kwargs.get("batch_per_device", 1))),
-        ("Grad accum", str(kwargs.get("grad_accum_steps", 1))),
-        ("Optimizer", str(kwargs.get("optimizer", "muon_adamw"))),
-        ("Max LR", str(kwargs.get("max_lr", "?"))),
-        ("Schedule", str(kwargs.get("schedule_type", "cosine"))),
-        ("Warmup ratio", str(kwargs.get("warmup_ratio", 0.05))),
-        ("Window size", str(kwargs.get("window_size", "config default"))),
-        ("Checkpoint dir", str(kwargs.get("ckpt_dir", "checkpoint"))),
-        ("Checkpoint interval", str(kwargs.get("ckpt_interval", 5000))),
-        ("Load state dict", str(kwargs.get("load_state_dict") or "defaults")),
-        ("Resume", str(kwargs.get("resume", False))),
+        ("Epochs", config.n_epoch),
+        ("Checkpoint dir", config.ckpt_dir),
+        ("Checkpoint interval", config.ckpt_interval),
+        ("Load state dict", config.state_dict_load_options(resume)),
+        ("Resume", resume),
     ]
-    max_len = max(len(k) for k, _ in rows)
     click.secho("\n=== Training Plan (dry-run) ===", fg="cyan", bold=True)
-    for key, val in rows:
-        click.echo(f"  {key:<{max_len}s} : {val}")
-    click.secho("=" * 40, fg="cyan")
+    for key, value in rows:
+        click.echo(f"  {key:<20s} : {value}")
 
 
 def load_reward_factory(reference: str) -> Callable:
@@ -754,48 +715,25 @@ def create_value_model(config, compute_dtype):
     )
 
 
-def train(
-    train_type: str,
-    param_path: str,
-    data_root_path: str,
-    resume: bool,
-    n_epoch: int,
-    batch_per_device: int,
-    start_epoch: int,
-    start_samples: int,
-    grad_accum_steps: int,
-    warmup_ratio: float,
-    ckpt_interval: int,
-    ckpt_dir: str,
-    val_split: float,
-    val_step: int,
-    metrics: List[str],
-    max_grad_norm: float,
-    random_seed: int,
-    num_workers: int,
-    pin_memory: bool,
-    gradient_checkpointing: bool,
-    window_size: int,
-    stride: int,
-    dp_size: int,
-    cp_size: int,
-    tp_size: int,
-    dp_mode: str,
-    device_type: str,
-    backend: str,
-    master_addr: str,
-    master_port: str,
-    start_method: str,
-    process_group_timeout: float,
-    neftune_alpha: float,
-    schedule_type: str,
-    min_rate: float,
-    cycle_length: int,
-    t_mult: int,
-    stable_steps: int,
-    decay_steps: int,
-    **kwargs,
-):
+def build_train_config(
+    train_type: str, param_path: str, data_root_path=None, **kwargs
+) -> TrainConfig:
+    """Normalize CLI options without constructing a Trainer or dataset."""
+    cycle_length = kwargs.pop("cycle_length")
+    decay_steps = kwargs.pop("decay_steps")
+    gradient_checkpointing = kwargs.pop("gradient_checkpointing")
+    min_rate = kwargs.pop("min_rate")
+    schedule_type = kwargs.pop("schedule_type")
+    stable_steps = kwargs.pop("stable_steps")
+    stride = kwargs.pop("stride")
+    t_mult = kwargs.pop("t_mult")
+    warmup_ratio = kwargs.pop("warmup_ratio")
+    window_size = kwargs.pop("window_size")
+    dp_size, cp_size, tp_size = (
+        kwargs[name] for name in ("dp_size", "cp_size", "tp_size")
+    )
+    dp_mode = kwargs["dp_mode"]
+    neftune_alpha = kwargs["neftune_alpha"]
     if train_type not in _TRAIN_TYPE:
         raise ValueError(
             f"Invalid train_type '{train_type}'. "
@@ -859,20 +797,6 @@ def train(
     elif loss_backend != "torch" or loss_chunk_size != 512:
         raise ValueError("loss_backend and loss_chunk_size require seq or sft training")
 
-    rollout_interval = kwargs.pop("rollout_interval", 512)
-    rollout_max_policy_lag = kwargs.pop("rollout_max_policy_lag", None)
-    rollout_temperature = kwargs.pop("rollout_temperature", 0.7)
-    rollout_top_k = kwargs.pop("rollout_top_k", 0)
-    rollout_top_p = kwargs.pop("rollout_top_p", 0.9)
-    rollout_max_tokens = kwargs.pop("rollout_max_tokens", 1024)
-    rollout_val_temperature = kwargs.pop("rollout_val_temperature", None)
-    rollout_val_top_k = kwargs.pop("rollout_val_top_k", None)
-    rollout_val_top_p = kwargs.pop("rollout_val_top_p", None)
-    rollout_val_max_tokens = kwargs.pop("rollout_val_max_tokens", None)
-    rollout_val_group_size = kwargs.pop("rollout_val_group_size", None)
-    rollout_device = kwargs.pop("rollout_device", None)
-    rollout_val_device = kwargs.pop("rollout_val_device", None)
-    rollout_pool_seq_len = kwargs.pop("rollout_pool_seq_len", None)
     reward_reference = kwargs.pop("reward_model", None)
     reward_model_fn = (
         None if reward_reference is None else load_reward_factory(reward_reference)
@@ -1012,73 +936,31 @@ def train(
             "load_state_dict must be a mapping of component names to booleans"
         )
 
-    train_config = TrainConfig(
+    return TrainConfig(
         strategy=train_type,
         dataset=dataset_spec,
         model=model_spec,
         precision=precision,
         optimizer=optimizer_spec,
         scheduler=scheduler_spec,
-        load_state_dict=load_state_dict,
-        ckpt_dir=ckpt_dir,
-        n_epoch=n_epoch,
-        batch_per_device=batch_per_device,
-        start_epoch=start_epoch,
-        start_samples=start_samples,
-        ckpt_interval=ckpt_interval,
-        grad_accum_steps=grad_accum_steps,
-        max_grad_norm=max_grad_norm,
-        random_seed=random_seed,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        dp_size=dp_size,
-        cp_size=cp_size,
-        tp_size=tp_size,
-        dp_mode=dp_mode,
-        backend=backend,
-        master_addr=master_addr,
-        master_port=master_port,
-        device_type=device_type,
-        start_method=start_method,
-        process_group_timeout=process_group_timeout,
-        val_split=val_split,
-        val_step=val_step,
-        metrics=metrics,
         gradient_checkpointing_modules=grad_ckpt_modules,
+        reward_model_fn=reward_model_fn,
+        critic_model_fn=critic_model_fn,
         compile_mode=compile_mode,
         executor_kwargs=executor_kwargs,
         strategy_kwargs=strategy_kwargs,
-        neftune_alpha=neftune_alpha,
-        rollout_mode=kwargs.pop("rollout_mode", "sync"),
-        rollout_devices=list(kwargs.pop("rollout_devices", [])),
-        rollout_worker_timeout_s=kwargs.pop("rollout_worker_timeout_s", 600.0),
-        rollout_startup_timeout_s=kwargs.pop("rollout_startup_timeout_s", 300.0),
-        rollout_weight_timeout_s=kwargs.pop("rollout_weight_timeout_s", 600.0),
-        async_train_microbatch_prompts=kwargs.pop("async_train_microbatch_prompts", 1),
-        rl_update_epochs=kwargs.pop("rl_update_epochs", 1),
-        rl_minibatch_prompts=kwargs.pop("rl_minibatch_prompts", None),
-        gradient_chunked_logprobs=kwargs.pop("gradient_chunked_logprobs", False),
-        rollout_interval=rollout_interval,
-        rollout_max_policy_lag=rollout_max_policy_lag,
-        rollout_temperature=rollout_temperature,
-        rollout_top_k=rollout_top_k,
-        rollout_top_p=rollout_top_p,
-        rollout_max_tokens=rollout_max_tokens,
-        rollout_val_temperature=rollout_val_temperature,
-        rollout_val_top_k=rollout_val_top_k,
-        rollout_val_top_p=rollout_val_top_p,
-        rollout_val_max_tokens=rollout_val_max_tokens,
-        rollout_val_group_size=rollout_val_group_size,
-        rollout_device=rollout_device,
-        rollout_val_device=rollout_val_device,
-        rollout_pool_seq_len=rollout_pool_seq_len,
-        reward_model_fn=reward_model_fn,
-        critic_model_fn=critic_model_fn,
-        moe_aux_loss_coef=kwargs.pop("moe_aux_loss_coef", 0.01),
+        load_state_dict=load_state_dict,
+        **kwargs,
     )
 
-    trainer = Trainer(train_config)
-    trainer.train(param_path=param_path, resume=resume)
+
+def train(param_path: str, resume: bool = False, dry_run: bool = False, **kwargs):
+    config = build_train_config(param_path=param_path, **kwargs)
+    if dry_run:
+        print_dry_run(config, param_path, resume)
+    else:
+        trainer = Trainer(config)
+        trainer.train(param_path=param_path, resume=resume)
 
 
 if __name__ == "__main__":

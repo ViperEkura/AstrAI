@@ -1,31 +1,14 @@
 import torch
 
 from astrai.config import ComponentSpec, TrainConfig
-from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.model.value import ValueModel
-from astrai.optimization.scheduler import SchedulerFactory
 from astrai.trainer.callbacks import CheckpointCallback
 from astrai.trainer.context import TrainContext
 from tests.support.models import TINY_CONFIG
 
 
-def make_online_model(model_config):
-    """Tiny float32 LM for online-rollout tests (shared by e2e/scheduling)."""
-    return AutoRegressiveLM(model_config).to(dtype=torch.float32)
-
-
 def make_online_value_model(model_config):
     return ValueModel(model_config).to(dtype=torch.float32)
-
-
-def make_online_optimizer(m):
-    return torch.optim.AdamW(m.parameters(), lr=1e-4)
-
-
-def make_online_lr_scheduler(optim, _dataset_len):
-    return SchedulerFactory.create(
-        "cosine", optim, warmup_steps=1, lr_decay_steps=4, min_rate=0.05
-    )
 
 
 def create_train_config(

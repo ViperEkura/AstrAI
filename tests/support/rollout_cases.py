@@ -16,47 +16,14 @@ from tests.support.models import make_model
 from tests.support.tokenizers import FakeTokenizer
 
 
-class ConstantRewardModel(BaseRewardModel):
-    """Returns a constant reward for every response."""
-
-    def __init__(self, value: float = 1.0):
-        self.value = value
-
-    def score(self, prompts, responses):
-        B = len(prompts)
-        G = len(responses[0]) if B else 0
-        return torch.full((B, G), float(self.value))
-
-
-class BadShapeRewardModel(BaseRewardModel):
-    def score(self, prompts, responses):
-        return torch.zeros(len(prompts))
-
-
-class NonFiniteRewardModel(BaseRewardModel):
-    def score(self, prompts, responses):
-        B = len(prompts)
-        G = len(responses[0]) if B else 0
-        return torch.full((B, G), float("nan"))
-
-
-def _make_scheduler(model, tokenizer, max_batch_size=8, max_len=128):
-    return EngineCore(
-        model=model,
-        tokenizer=tokenizer,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_len,
-    )
-
-
-def _make_instruction_batch(n=2):
+def make_instruction_batch(n=2):
     """Build a batch of instruction+input prompts as lists of strings."""
     instructions = [f"Tell me about topic {i}" for i in range(n)]
     inputs = [f"context {i}" for i in range(n)]
     return {"instruction": instructions, "input": inputs}
 
 
-def _blocking_hook(original, started, release):
+def blocking_hook(original, started, release):
     """Wrap a hook so it signals ``started`` then blocks until ``release``."""
 
     def hook(*args, **kwargs):
@@ -67,59 +34,56 @@ def _blocking_hook(original, started, release):
     return hook
 
 
-def _assert_interleaved(first, second, *, started, release, finished):
-    """Run ``first`` until it blocks, then assert ``second`` cannot finish
-    while ``first`` holds the lock; release, join both, and surface errors."""
+def assert_interleaved(first, second, *, started, release, finished):
+    """Check lock exclusion and release workers even if an assertion fails."""
     errors = []
 
-    def run_safely(fn):
-        def run():
-            try:
-                fn()
-            except BaseException as exc:
-                errors.append(exc)
+    def run(fn):
+        try:
+            fn()
+        except BaseException as exc:
+            errors.append(exc)
 
-        return run
-
-    first_thread = threading.Thread(target=run_safely(first))
-    second_thread = threading.Thread(target=run_safely(second))
-    first_thread.start()
-    assert started.wait(timeout=5)
-    second_thread.start()
-    assert not finished.wait(timeout=0.1)
-
-    release.set()
-    first_thread.join(timeout=5)
-    second_thread.join(timeout=5)
-    assert not first_thread.is_alive()
-    assert not second_thread.is_alive()
-    assert errors == []
+    threads = [threading.Thread(target=run, args=(fn,)) for fn in (first, second)]
+    threads[0].start()
+    try:
+        assert started.wait(timeout=5)
+        threads[1].start()
+        assert not finished.wait(timeout=0.1)
+    finally:
+        release.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=5)
+    assert all(not thread.is_alive() for thread in threads)
+    if errors:
+        raise errors[0]
 
 
-def _make_generator(device, **kw):
-    model, _ = make_model(device, max_position_embeddings=128)
+def make_generator(
+    device, *, max_seq_len=128, max_batch_size=8, max_tokens=8, group_size=2
+):
+    model, _ = make_model(device, max_position_embeddings=max_seq_len)
     tokenizer = FakeTokenizer(with_chat_template=True)
-    scheduler = _make_scheduler(
-        model,
-        tokenizer,
-        max_batch_size=kw.get("max_batch_size", 8),
-        max_len=kw.get("max_position_embeddings", 128),
-    )
-    generator = RolloutGenerator(
-        backend=ColocatedBackend(scheduler),
+    engine = EngineCore(
+        model=model,
         tokenizer=tokenizer,
-        params=SamplingParams(
-            max_tokens=kw.get("max_tokens", 8),
-            group_size=kw.get("group_size", 2),
-            temperature=kw.get("temperature", 1.0),
-            top_k=kw.get("top_k", 0),
-            top_p=kw.get("top_p", 1.0),
-        ),
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
     )
-    return generator, model
+    return (
+        RolloutGenerator(
+            backend=ColocatedBackend(engine),
+            tokenizer=tokenizer,
+            params=SamplingParams(
+                max_tokens=max_tokens, group_size=group_size, temperature=1.0, top_p=1.0
+            ),
+        ),
+        model,
+    )
 
 
-def _make_replica_pair():
+def make_replica_pair():
     """A training model on cuda:0 and a diverged replica on cuda:1."""
     train_model, _ = make_model("cuda:0", max_position_embeddings=128)
     replica_model, _ = make_model("cuda:1", max_position_embeddings=128)
@@ -129,27 +93,20 @@ def _make_replica_pair():
     return train_model, replica_model
 
 
-def _make_runner(device, **kw):
-    generator, model = _make_generator(
-        device,
-        group_size=kw.get("group_size", 2),
-        max_tokens=kw.get("max_tokens", 8),
-        max_batch_size=kw.get("max_batch_size", 8),
-        max_len=kw.get("max_position_embeddings", 128),
-    )
-    rm = ConstantRewardModel(1.0)
+def make_runner(device, *, rollout_interval=2, max_policy_lag=None, **generation):
+    generator, model = make_generator(device, **generation)
     return (
         RolloutRunner(
             generator=generator,
-            reward_model=rm,
-            rollout_interval=kw.get("rollout_interval", 2),
-            max_policy_lag=kw.get("max_policy_lag"),
+            reward_model=ConstantRewardModel(),
+            rollout_interval=rollout_interval,
+            max_policy_lag=max_policy_lag,
         ),
         model,
     )
 
 
-def _interleave_before_snapshot(runner, callback):
+def interleave_before_snapshot(runner, callback):
     """Wrap ``with_policy_snapshot`` so ``callback`` runs just before a
     named snapshot callback enters the generator/scheduler locks."""
     original_snapshot = runner.generator.with_policy_snapshot
@@ -160,3 +117,15 @@ def _interleave_before_snapshot(runner, callback):
         return original_snapshot(inspect)
 
     runner.generator.with_policy_snapshot = wrapper
+
+
+class ConstantRewardModel(BaseRewardModel):
+    """Returns a constant reward for every response."""
+
+    def __init__(self, value: float = 1.0):
+        self.value = value
+
+    def score(self, prompts, responses):
+        B = len(prompts)
+        G = len(responses[0]) if B else 0
+        return torch.full((B, G), float(self.value))

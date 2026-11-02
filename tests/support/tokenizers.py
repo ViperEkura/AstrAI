@@ -65,8 +65,8 @@ class FakeTokenizer:
 
     def encode(self, texts, **_):
         if isinstance(texts, str):
-            texts = [texts]
-        return [[b for b in t.encode("utf-8")] for t in texts]
+            return list(texts.encode("utf-8"))
+        return [list(text.encode("utf-8")) for text in texts]
 
     def decode(self, ids, skip_special_tokens=True):
         if isinstance(ids, list):
@@ -83,10 +83,4 @@ class FakeTokenizer:
         rendered = self._chat_template.render(
             messages=messages, add_generation_prompt=add_generation_prompt
         )
-        if tokenize:
-            return (
-                self.encode(rendered)[0]
-                if isinstance(rendered, str)
-                else [self.encode(t)[0] for t in rendered]
-            )
-        return rendered
+        return self.encode(rendered) if tokenize else rendered

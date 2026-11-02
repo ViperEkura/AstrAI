@@ -1,50 +1,80 @@
-# Test suites
+# Tests
 
-Tests are organized by resources and boundaries:
+Tests are organized by module: config, data, extension, inference, module,
+optim, parallel, trainer, and the other existing components. Each behavior has
+one test body; CPU and CUDA variants share parameters where their contracts
+are identical.
 
-- unit/: pure logic and isolated fakes; no CUDA required.
-- integration/: CPU interactions among components, files, HTTP, threads, or processes.
-- gpu/: CUDA tensors, native kernels, CUDA Graphs, or NCCL. Run manually on suitable hardware.
-- support/: reusable builders and capability marks. conftest.py files contain fixtures only.
+The shared cpu_device fixture is an explicit CPU baseline. CUDA-only model
+kernel tests request cuda_device; a directory-wide device override must not
+change the execution device of unrelated tests.
 
-Run the full suite (GPU cases skip when requirements are unavailable):
+Reusable builders remain in tests/support. Domain conftest.py files own fixtures.
+There are no empty package initializers; pytest uses importlib import mode so
+same-named files in different modules do not collide. Component factories and
+spawned workers remain importable by their full module paths.
 
-    python -m pytest tests/ -v
+## Running tests
 
-Run CPU suites only when iterating locally:
+Install the existing development extras, including the pinned HF reference:
 
-    python -m pytest tests/unit tests/integration -q
+```bash
+pip install -e '.[dev]'
+```
 
-Run GPU tests on a machine with the required devices and extensions:
+Run all tests, including available CUDA cases (CI and the pre-commit script use this):
 
-    python -m pytest tests/gpu -q
+```bash
+python -m pytest tests -q
+```
 
-GPU tests skip when CUDA, the required extension, or enough visible devices are unavailable. A successful command with skips does not mean the skipped paths were exercised.
+Run CPU tests without scheduling CUDA cases when other jobs occupy the GPUs:
 
-## Skip rules
+```bash
+python -m pytest tests -m "not cuda" -q
+```
 
-Marks live in `tests/support/capabilities.py`:
+Run CUDA tests on hardware with the required devices and extensions:
 
-| Mark | Skip when |
-|------|-----------|
-| `skip_no_cuda` | `torch.cuda.is_available()` is False |
-| `skip_lt2_cuda` | fewer than two visible CUDA devices |
-| `skip_no_kernel` | any built extension is missing (`astrai.extension.KERNEL_NAMES`) |
-| `skip_no_fp8` | no FP8-capable extension or `device_capability < (8, 9)` |
-| `slow` / `integration` / `unit` | marker-only; no runtime skip |
+```bash
+python -m pytest tests -m cuda -q
+```
 
-Check the skip summary before assuming coverage.
+The distributed marker selects multi-rank/worker scenarios independently of
+device type. CPU/Gloo scenarios remain part of the CPU suite. The slow marker
+identifies long-running tests. Unknown markers are errors.
 
-## Scale
+## Skips and numerical checks
 
-- Use `python -m pytest --collect-only -q` to inspect the current test inventory.
-- `tests/support/` holds reusable builders and capability helpers; it does
-  not contain test modules of its own.
-- `conftest.py` files register fixtures only; assertions live in the test
-  modules.
+- Skip only for unavailable devices, compiled extensions, or explicitly required
+  environment capabilities. Runtime failures under valid test prerequisites fail.
+- Existing capability guards live in tests/support/capabilities.py. Resource
+  markers select tests; they do not replace device-count or kernel checks.
+- HF reference tests require transformers==4.51.3 from the development extras.
+  Missing reference dependencies fail rather than silently reducing coverage.
+- Preserve independent forward/gradient references, accumulation equivalence,
+  checkpoint continuation, and failure/cleanup assertions. Numerical tolerances
+  are explicit for each algorithm and dtype.
+- Inspect skips with -ra. A passing CPU run does not validate CUDA/NCCL kernels.
 
-## CI entry points
+## Inventory and checks
 
-- `scripts/pre_commit.sh` runs format, import sort, then tests.
-- `scripts/pre_commit.sh --skip-deps` skips dependency installation.
-- CI: `.github/workflows/lint.yml` then `.github/workflows/tests.yml`.
+```bash
+python -m pytest tests --collect-only -q
+python -m pytest tests -m cuda --collect-only -q
+bash scripts/pre_commit.sh --skip-deps
+```
+
+scripts/pre_commit.sh runs formatting, import sorting, and the full test suite.
+The existing GitHub lint and full-test workflows remain separate.
+
+## Helper names
+
+Functions shared across test modules use public names without a leading
+underscore, including component/string entrypoints. Functions used only inside
+their defining module keep a leading underscore. Shared builders live in the
+existing support modules; do not add forwarding aliases for old names.
+
+Testing a production private method does not make it a public production API.
+Use fixtures for resource ownership and teardown, and ordinary functions for
+data/model construction.

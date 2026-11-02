@@ -12,22 +12,6 @@ from tests.support.models import make_rollout_config
 from tests.support.tokenizers import FakeTokenizer
 
 
-class _UnwrappingTokenizer:
-    """FakeTokenizer.encode returns the batch shape ([[ids]]); add_request's
-    contract is the flat single-string shape, so unwrap it."""
-
-    def __init__(self, inner):
-        object.__setattr__(self, "_inner", inner)
-        object.__setattr__(self, "eos_token_id", inner.eos_token_id)
-
-    def encode(self, prompt, **kw):
-        out = self._inner.encode(prompt, **kw)
-        return out[0] if isinstance(out[0], list) else out
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
 @pytest.fixture
 def mock_model_and_tokenizer():
     """Create mock model and tokenizer."""
@@ -52,7 +36,7 @@ def mock_model_and_tokenizer():
     return mock_model, mock_tokenizer
 
 
-def _make_mock_scheduler(mock_model_and_tokenizer):
+def make_mock_scheduler(mock_model_and_tokenizer):
     """Build a CPU scheduler over mocks, patching scheduler-internal imports."""
     mock_model, mock_tokenizer = mock_model_and_tokenizer
     return EngineCore(
@@ -63,17 +47,30 @@ def _make_mock_scheduler(mock_model_and_tokenizer):
     )
 
 
-def _run_threads(*workers, timeout=10.0):
-    threads = [threading.Thread(target=worker) for worker in workers]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=timeout)
-    assert all(not t.is_alive() for t in threads)
+def run_threads(*workers, timeout=10.0):
+    errors = []
+
+    def run(worker):
+        try:
+            worker()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(worker,)) for worker in workers]
+    try:
+        for thread in threads:
+            thread.start()
+    finally:
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=timeout)
+    assert all(not thread.is_alive() for thread in threads)
+    if errors:
+        raise errors[0]
 
 
-def _make_contract_scheduler():
-    scheduler, _, _ = _make_real_scheduler("cpu")
+def make_contract_scheduler():
+    scheduler, _, _ = make_real_scheduler("cpu")
     kv = MagicMock()
     scheduler.scheduler._kv_manager = kv
     scheduler.scheduler._planner.kv_manager = kv
@@ -82,7 +79,7 @@ def _make_contract_scheduler():
     return scheduler
 
 
-def _make_real_scheduler(device):
+def make_real_scheduler(device):
     """Build a scheduler backed by a tiny real model for run_batch tests."""
     cfg = make_rollout_config(max_position_embeddings=64)
     model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
@@ -95,18 +92,3 @@ def _make_real_scheduler(device):
         max_seq_len=64,
     )
     return scheduler, tokenizer, model
-
-
-class _MultiPatch:
-    def __init__(self, patches):
-        self._patches = patches
-
-    def __enter__(self):
-        for p in self._patches:
-            p.start()
-        return self
-
-    def __exit__(self, *exc):
-        for p in self._patches:
-            p.stop()
-        return False

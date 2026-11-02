@@ -1,6 +1,26 @@
 import torch
 from torch.utils.data import Dataset
 
+from astrai.trainer.rollout import RolloutResult
+
+
+def make_rollout_result(B=2, G=4, P=6, R=8, device="cpu"):
+    return RolloutResult(
+        prompts=torch.randint(3, 200, (B, P), device=device),
+        prompt_mask=torch.ones(B, P, dtype=torch.bool, device=device),
+        responses=torch.randint(3, 200, (B, G, R), device=device),
+        response_mask=torch.ones(B, G, R, dtype=torch.bool, device=device),
+        rewards=torch.randn(B, G, device=device),
+        logprobs_old=torch.zeros(B, G, R, device=device),
+    )
+
+
+def instruction_collate_fn(batch):
+    return {
+        "instruction": [item["instruction"] for item in batch],
+        "input": [item.get("input", "") for item in batch],
+    }
+
 
 class RandomTokenDataset(Dataset):
     """Random token dataset combining all test dataset variants.
@@ -51,7 +71,7 @@ class RandomTokenDataset(Dataset):
             "target_ids": torch.randint(0, self.vocab_size, (self.max_length,)),
         }
         if self.with_loss_mask:
-            item["loss_mask"] = torch.randint(0, 1, (self.max_length,))
+            item["loss_mask"] = torch.randint(0, 2, (self.max_length,))
         return item
 
 

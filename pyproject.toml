@@ -31,7 +31,7 @@ classifiers = [
 urls = { Homepage = "https://github.com/ViperEkura/AstrAI" }
 
 [project.optional-dependencies]
-dev = ["pytest==9.0.2", "ruff", "httpx"]
+dev = ["pytest==9.0.2", "ruff", "httpx", "transformers==4.51.3"]
 flash = ["flash-attn>=2.6"]
 
 [tool.setuptools.packages.find]
@@ -56,3 +56,11 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 exclude = ["*.md", "*.json", "*.yml", "*.yaml"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --import-mode=importlib"
+markers = [
+    "cuda: requires CUDA devices",
+    "distributed: launches distributed ranks or workers",
+    "slow: long-running tests",
+]

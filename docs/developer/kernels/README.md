@@ -497,13 +497,13 @@ Check rejected template configurations without GPU
 launches (a C++17 compiler and CUDA element headers are required):
 
 ```bash
-.venv/bin/python -m pytest tests/unit/extension/test_torch_dispatch.py -q
+.venv/bin/python -m pytest tests/extension/test_torch_dispatch.py -q
 ```
 
 Check the dependency boundary and compile the host planners independently:
 
 ```bash
-.venv/bin/python -m pytest tests/unit/extension/test_csrc_api.py -q
+.venv/bin/python -m pytest tests/extension/test_csrc_api.py -q
 g++ -std=c++17 -I csrc/include -fsyntax-only \
     csrc/gemm/plan/planner.cpp csrc/gemm/plan/table.cpp \
     csrc/gemm/plan/builtin.cpp

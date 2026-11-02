@@ -9,15 +9,9 @@ from tests.support.rollout import RandomTokenDataset
 from tests.support.tokenizers import build_test_tokenizer
 
 
-def pytest_configure(config):
-    config.addinivalue_line("markers", "slow: marks tests as slow")
-    config.addinivalue_line("markers", "integration: integration tests")
-    config.addinivalue_line("markers", "unit: fast unit tests")
-
-
 @pytest.fixture(scope="session")
-def device():
-    """CPU device for shared fixtures (``"cuda"`` ``"cpu"``)."""
+def cpu_device():
+    """Explicit CPU baseline for shared model and component tests."""
     return "cpu"
 
 
@@ -28,11 +22,11 @@ def test_tokenizer():
 
 
 @pytest.fixture
-def test_model(device):
+def test_model(cpu_device):
     """Function-scoped small AutoRegressiveLM model, isolated per test."""
     config = make_tiny_config()
-    model = AutoRegressiveLM(config).to(device=device)
-    return {"model": model, "device": device, "config": config}
+    model = AutoRegressiveLM(config).to(device=cpu_device)
+    return {"model": model, "device": cpu_device, "config": config}
 
 
 @pytest.fixture

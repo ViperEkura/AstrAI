@@ -15,7 +15,7 @@ from astrai.inference.frontend.engine import InferenceEngine
 from tests.support.tokenizers import FakeTokenizer
 
 
-def _make_engine_mocks(decode=None):
+def make_engine_mocks(decode=None):
     """Build the standard mock model/tokenizer pair used by engine tests."""
     mock_model = MagicMock()
     mock_tokenizer = MagicMock()
@@ -24,27 +24,6 @@ def _make_engine_mocks(decode=None):
     if decode is not None:
         mock_tokenizer.decode.return_value = decode
     return mock_model, mock_tokenizer
-
-
-def _drive_events(engine, events_by_id):
-    """Push output events through the engine's installed sink (mock schedulers
-    emit nothing on their own; tests drive the event protocol directly)."""
-    sink = engine._tracker
-    flat = []
-    for rid, events in events_by_id.items():
-        flat.extend(events)
-    sink(flat)
-
-
-def _mock_add_requests(events_by_id, tokenizer_ids=None):
-    """Build an add_requests side effect that returns ids and, on the NEXT
-    scheduler tick (i.e. when the test drives the sink), replays events."""
-
-    def fake(prompts, **kw):
-        # Return core-minted ids matching the ids the engine registered.
-        return list(events_by_id.keys())[: len(prompts)]
-
-    return fake
 
 
 class _CharacterDecoder:
@@ -69,11 +48,11 @@ def event_engine(monkeypatch):
     engine._core.cancel_request.side_effect = lambda rid: (
         engine._tracker([RequestFinished(rid, FINISH_CANCELLED)]) or True
     )
-    _emit_on_submission(engine)
+    emit_on_submission(engine)
     return engine
 
 
-def _emit_on_submission(engine, text="", reason=None, error=False):
+def emit_on_submission(engine, text="", reason=None, error=False):
     def emit(rid, prompt_ids):
         events = [TokenDelta(rid, ord(char), i + 1) for i, char in enumerate(text)]
         if error:
@@ -96,12 +75,12 @@ def _emit_on_submission(engine, text="", reason=None, error=False):
     engine._core.add_requests.side_effect = add_requests
 
 
-def _assert_frontend_released(engine):
+def assert_frontend_released(engine):
     tracker = engine._tracker
     assert not tracker._requests
 
 
-def _collect_async(stream):
+def collect_async(stream):
     async def collect():
         return [chunk async for chunk in stream]
 

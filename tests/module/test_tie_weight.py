@@ -10,43 +10,22 @@ from astrai.model.autoregressive_lm import AutoRegressiveLM
 from tests.support.models import TINY_CONFIG
 
 
-def test_tie_weight_init(base_test_env):
-    config_path = base_test_env["config_path"]
-
-    config_data = TINY_CONFIG.copy()
-    config_data["tie_word_embeddings"] = True
-
-    with open(config_path, "w") as f:
-        json.dump(config_data, f)
-
-    config = AutoRegressiveLMConfig.from_file(config_path)
-    model = AutoRegressiveLM(config)
-
-    assert torch.equal(model.lm_head.weight, model.model.embed_tokens.weight)
-    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
-
-    original_weight = model.model.embed_tokens.weight.clone()
-    model.model.embed_tokens.weight.data[0, 0] = 100.0
-
-    assert torch.equal(model.lm_head.weight, model.model.embed_tokens.weight)
-    assert not torch.equal(model.lm_head.weight, original_weight)
-
-    config_data["tie_word_embeddings"] = False
-
-    with open(config_path, "w") as f:
-        json.dump(config_data, f)
-
-    config = AutoRegressiveLMConfig.from_file(config_path)
-    model = AutoRegressiveLM(config)
-
-    assert not torch.equal(model.lm_head.weight, model.model.embed_tokens.weight)
-    assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
-
-    original_weight = model.model.embed_tokens.weight.clone()
-    model.model.embed_tokens.weight.data[0, 0] = 100.0
-
-    assert not torch.equal(model.lm_head.weight, model.model.embed_tokens.weight)
-    assert not torch.equal(model.lm_head.weight, original_weight)
+@pytest.mark.parametrize("tied", [False, True])
+def test_tie_weight_mutation_follows_shared_storage(tied):
+    model = AutoRegressiveLM(
+        AutoRegressiveLMConfig(**{**TINY_CONFIG, "tie_word_embeddings": tied})
+    )
+    embedding = model.model.embed_tokens.weight
+    head = model.lm_head.weight
+    assert (head.data_ptr() == embedding.data_ptr()) == tied
+    original = head.detach().clone()
+    with torch.no_grad():
+        embedding[0, 0] += 1
+    if tied:
+        torch.testing.assert_close(head, embedding)
+        assert not torch.equal(head, original)
+    else:
+        torch.testing.assert_close(head, original)
 
 
 def test_model_save_load_with_tie_weight(base_test_env):

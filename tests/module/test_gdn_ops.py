@@ -84,7 +84,6 @@ def test_chunked_matches_recurrent(chunk_size, cpu_device):
 
 
 def test_decode_steps_match_full_sequence(cpu_device):
-    """Threading the state through single-token steps reproduces the full pass."""
     inputs = make_inputs(device=cpu_device)
     reference, reference_state = recurrent_gated_delta_rule(
         *inputs, output_final_state=True
@@ -107,7 +106,6 @@ def test_decode_steps_match_full_sequence(cpu_device):
 
 
 def test_decode_state_is_fixed_size(cpu_device):
-    """Decode state must not grow with history, and must be resettable."""
     inputs = make_inputs(device=cpu_device)
     expected = (BATCH, VALUE_HEADS, KEY_DIM, VALUE_DIM)
 
@@ -147,7 +145,6 @@ def test_batch_elements_are_isolated(cpu_device):
 
 @pytest.mark.parametrize("boundary", [32, 64, 96])
 def test_prefix_does_not_depend_on_suffix(boundary, cpu_device):
-    """Changing a suffix must leave everything before it untouched."""
     inputs = make_inputs(device=cpu_device)
     reference, _ = chunk_gated_delta_rule(*inputs)
     changed = [x.clone() for x in inputs]
@@ -160,7 +157,6 @@ def test_prefix_does_not_depend_on_suffix(boundary, cpu_device):
 
 
 def test_gradients_match_between_interfaces(cpu_device):
-    """The chunked path's autograd must agree with the per-token path's."""
     inputs = make_inputs(seq_len=64, device=cpu_device)
     for tensor in inputs:
         tensor.requires_grad_(True)
@@ -174,7 +170,6 @@ def test_gradients_match_between_interfaces(cpu_device):
 
 
 def test_layer_prefill_decode_matches_training_forward(cpu_device):
-    """The headline inference check: prefill + decode reproduces the training pass."""
     layer = make_layer(cpu_device)
     layer.eval()
     x = torch.randn(2, 48, LAYER_DIM, device=cpu_device)
@@ -189,7 +184,6 @@ def test_layer_prefill_decode_matches_training_forward(cpu_device):
 
 
 def test_layer_decode_from_scratch_matches_prefill(cpu_device):
-    """Decoding with no prior state must equal prefilling the same tokens."""
     layer = make_layer(cpu_device)
     layer.eval()
     x = torch.randn(1, 12, LAYER_DIM, device=cpu_device)
@@ -206,7 +200,6 @@ def test_layer_decode_from_scratch_matches_prefill(cpu_device):
 
 
 def test_layer_prefill_continues_existing_state(cpu_device):
-    """A second prefill must continue the first one's state, not restart it."""
     layer = make_layer(cpu_device)
     layer.eval()
     x = torch.randn(1, 24, LAYER_DIM, device=cpu_device)

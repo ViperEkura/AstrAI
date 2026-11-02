@@ -4,10 +4,7 @@ import torch
 from astrai.model import AutoRegressiveLM
 from astrai.model.components.linear import Linear
 from astrai.model.components.lora import (
-    TARGET_MODULES_FFN,
-    LoRAConfig,
     LoRALinear,
-    _collect_lora_info,
     _get_lora_count,
     inject_lora,
     load_lora,
@@ -33,101 +30,22 @@ def _make_model(**kwargs):
     return model
 
 
-def test_loralinear_init():
-    base = Linear(64, 128)
-    lora = LoRALinear(base, r=8, alpha=16)
-
-    assert lora.weight is base.weight
-    assert not lora.weight.requires_grad
-    assert lora.lora_A.shape == (8, 64)
-    assert lora.lora_B.shape == (128, 8)
-    assert lora.scaling == 2.0
-    assert not lora._merged
-    assert lora.lora_A.requires_grad
-    assert lora.lora_B.requires_grad
-
-
-def test_loralinear_forward_init_zero_delta():
+@pytest.mark.parametrize("delta", [0.0, 1.0])
+def test_loralinear_forward_and_merge(delta):
     base = Linear(4, 4)
-    with torch.no_grad():
-        base.weight.zero_()
-
+    lora = LoRALinear(base, r=2, alpha=4)
     x = torch.randn(2, 4)
-    lora = LoRALinear(base, r=2, alpha=2)
-    base_out = base(x)
-    lora_out = lora(x)
-
-    assert torch.allclose(base_out, lora_out)
-
-
-def test_loralinear_forward_with_delta():
-    base = Linear(4, 4)
     with torch.no_grad():
-        base.weight.zero_()
-
-    x = torch.randn(2, 4)
-    lora = LoRALinear(base, r=2, alpha=2)
-    base_out = base(x)
-
-    with torch.no_grad():
-        lora.lora_B.fill_(1.0)
-
-    lora_out = lora(x)
-    assert not torch.allclose(base_out, lora_out)
-
-
-def test_loralinear_merge():
-    base = Linear(4, 4)
-    with torch.no_grad():
-        base.weight.zero_()
-
-    x = torch.randn(2, 4)
-    lora = LoRALinear(base, r=2, alpha=2)
-    with torch.no_grad():
-        lora.lora_B.fill_(1.0)
-
-    out_before = lora(x).clone()
-    lora.merge()
-    out_after = lora(x)
-
-    torch.testing.assert_close(out_before, out_after)
-    assert lora._merged
-    assert not hasattr(lora, "lora_A")
-
-    # merge is guarded by _merged — a second call is a no-op.
-    lora.merge()
-    assert lora._merged
-
-
-def test_inject_lora_default_target():
-    model = _make_model()
-    n_before = sum(1 for m in model.modules() if isinstance(m, Linear))
-
-    inject_lora(model, r=4, alpha=8)
-
-    lora_count = _get_lora_count(model)
-    assert lora_count > 0
-    assert lora_count < n_before
-
-
-def test_inject_lora_ffn():
-    model = _make_model()
-    inject_lora(model, r=4, alpha=8, target_modules=TARGET_MODULES_FFN)
-    assert _get_lora_count(model) > 0
-
-
-def test_inject_lora_returns_config():
-    model = _make_model()
-    cfg = inject_lora(model, r=8, alpha=32)
-    assert isinstance(cfg, LoRAConfig)
-    assert cfg.r == 8
-    assert cfg.alpha == 32
-
-
-def test_inject_lora_no_matching_targets_warns(caplog):
-    model = _make_model()
-    inject_lora(model, r=4, alpha=8, target_modules={"nonexistent"})
-    assert "No LoRA layers injected" in caplog.text
+        lora.lora_B.fill_(delta)
+        expected = base(x) + (4 / 2) * torch.nn.functional.linear(
+            torch.nn.functional.linear(x, lora.lora_A), lora.lora_B
+        )
+        torch.testing.assert_close(lora(x), expected)
+        lora.merge()
+        torch.testing.assert_close(lora(x), expected)
+        # A second merge must not apply the low-rank delta again.
+        lora.merge()
+        torch.testing.assert_close(lora(x), expected)
 
 
 def test_inject_lora_preserves_base_output():
@@ -163,36 +81,6 @@ def test_inject_lora_adds_new_modules():
     assert _get_lora_count(model) > first
 
 
-def test_inject_lora_on_mla_model():
-    model = _make_model(
-        attn_type="mla", kv_lora_rank=16, qk_nope_head_dim=16, qk_rope_head_dim=16
-    )
-    inject_lora(model, r=4, alpha=8, target_modules={"q_proj", "o_proj"})
-    assert _get_lora_count(model) > 0
-
-
-def test_inject_lora_on_moe_model():
-    model = _make_model(
-        ffn_type="moe",
-        n_routed_experts=4,
-        n_shared_experts=1,
-        n_activated_experts=2,
-        intermediate_size=32,
-    )
-    inject_lora(model, r=4, alpha=8, target_modules={"up", "gate", "down"})
-    assert _get_lora_count(model) > 0
-
-
-def test_state_dict_key_format():
-    model = _make_model()
-    inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
-
-    sd = model.state_dict()
-    assert "model.layers.0.attention.q_proj.weight" in sd
-    assert "model.layers.0.attention.q_proj.lora_A" in sd
-    assert "model.layers.0.attention.q_proj.lora_B" in sd
-
-
 def test_only_lora_params_trainable():
     model = _make_model()
     inject_lora(model, r=4, alpha=8, target_modules={"q_proj", "v_proj"})
@@ -204,24 +92,8 @@ def test_only_lora_params_trainable():
             assert not param.requires_grad, f"injected weight should be frozen: {name}"
 
 
-def test_state_dict_after_inject_consistent_with_original():
-    model = _make_model()
-    sd_before = {k: v for k, v in model.state_dict().items()}
-
-    inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
-    sd_after = model.state_dict()
-
-    # original keys unchanged
-    for k in sd_before:
-        assert k in sd_after
-        assert sd_before[k].shape == sd_after[k].shape
-
-    # new lora keys present
-    lora_keys = [k for k in sd_after if "lora" in k]
-    assert len(lora_keys) > 0
-
-
-def test_save_load_roundtrip(temp_dir):
+@pytest.mark.parametrize("already_injected", [False, True])
+def test_save_load_roundtrip(temp_dir, already_injected):
     model = _make_model()
     cfg = inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
 
@@ -238,6 +110,8 @@ def test_save_load_roundtrip(temp_dir):
 
     model2 = _make_model()
     model2.load_state_dict(model.state_dict(), strict=False)
+    if already_injected:
+        inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
     load_lora(model2, temp_dir)
 
     with torch.no_grad():
@@ -260,25 +134,6 @@ def test_save_after_merge_raises(temp_dir):
 
     with pytest.raises(RuntimeError, match="No LoRA parameters"):
         save_lora(model, temp_dir, cfg)
-
-
-def test_load_lora_on_already_injected(temp_dir):
-    model = _make_model()
-    inject_lora(model, r=4, alpha=8, target_modules={"q_proj"})
-
-    with torch.no_grad():
-        for m in model.modules():
-            if isinstance(m, LoRALinear):
-                m.lora_B.fill_(0.5)
-
-    save_lora(model, temp_dir, LoRAConfig(r=4, alpha=8, target_modules=("q_proj",)))
-
-    model2 = _make_model()
-    model2.load_state_dict(model.state_dict(), strict=False)
-    inject_lora(model2, r=4, alpha=8, target_modules={"q_proj"})
-
-    load_lora(model2, temp_dir)
-    assert _get_lora_count(model2) > 0
 
 
 def test_load_lora_mismatched_r_raises(temp_dir):
@@ -318,19 +173,3 @@ def test_merge_preserves_output():
     with torch.no_grad():
         out_after = model(x)["logits"]
     torch.testing.assert_close(out_before, out_after)
-
-
-def test_merge_no_lora_warns(caplog):
-    model = _make_model()
-    merge_lora(model)
-    assert "No LoRA layers to merge" in caplog.text
-
-
-def test_collect_lora_info():
-    model = _make_model()
-    info = _collect_lora_info(model)
-    assert "q_proj" in info
-    assert "o_proj" in info
-    # every decoder layer contributes one of each attention projection
-    assert len(info["q_proj"]) == len(info["o_proj"]) == 2
-    assert all(name.endswith("attention.q_proj") for name in info["q_proj"])

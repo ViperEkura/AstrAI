@@ -14,7 +14,6 @@ SIMPLE_CHAT_TEMPLATE = (
 
 
 def test_normalize_empty_key():
-    """_normalize with empty tensor list does not crash."""
     store = MmapStore()
     store._normalize({"sequence": []})
     assert len(store) == 0
@@ -23,7 +22,6 @@ def test_normalize_empty_key():
 
 
 def test_normalize_mixed_empty_key():
-    """_normalize with empty + non-empty keys returns min=0 records."""
     store = MmapStore()
     store._normalize({"sequence": [torch.tensor([1, 2, 3])], "loss_mask": []})
     assert len(store) == 0
@@ -33,7 +31,6 @@ def test_normalize_mixed_empty_key():
 
 
 def test_dpo_tokenize_pure_function():
-    """dpo_tokenize returns flat lists with correct mask alignment."""
 
     class FakeTokenizer:
         def apply_chat_template(
@@ -60,7 +57,6 @@ def test_dpo_tokenize_pure_function():
 
 
 def test_dpo_tokenize_malformed_record():
-    """dpo_tokenize returns None for missing fields."""
 
     class FakeTokenizer:
         def apply_chat_template(

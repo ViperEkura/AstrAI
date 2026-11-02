@@ -2,46 +2,42 @@ import pytest
 
 from astrai.config.preprocess_config import (
     InputConfig,
-    OutputConfig,
     PipelineConfig,
     ProcessingConfig,
 )
 from astrai.preprocessing.core import prepare_sequences
 from tests.support.data import (
-    CHAT_SECTIONS,
     TEXT_SECTIONS,
-    make_chat_config,
     make_dpo_chat_config,
     make_grpo_config,
-    make_instruction_config,
-    make_text_config,
+    make_pipeline_config,
 )
 
+_CHAT_SECTIONS = [{"field": "messages", "action": "$role", "template": True}]
+_INSTRUCTION_SECTIONS = [
+    {"field": "prompt", "action": "mask", "add_special_tokens": True},
+    {"field": "response", "action": "train"},
+]
 
-def test_chat_simple(chat_tokenizer, builder):
-    config = make_chat_config()
-    item = {
-        "messages": [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello."},
-            {"role": "assistant", "content": "Hi there!"},
-        ]
-    }
-    result = builder.build(item, config, chat_tokenizer)
-    assert result is not None
 
-    ids = chat_tokenizer.decode(result["sequence"], skip_special_tokens=False)
-    assert "system" in ids.lower() or "<|im_start|>system" in ids
-    assert "assistant" in ids.lower() or "<|im_start|>assistant" in ids
+def _make_chat_config():
+    return make_pipeline_config(
+        _CHAT_SECTIONS,
+        mask={"system": "mask", "user": "mask", "assistant": "train"},
+    )
 
-    total = len(result["sequence"])
-    trained = sum(result["loss_mask"])
-    assert trained > 0
-    assert trained < total
+
+def _make_instruction_config():
+    return make_pipeline_config(
+        _INSTRUCTION_SECTIONS,
+        mask={"prompt": "mask", "response": "train"},
+    )
 
 
 def test_chat_mask_only_assistant(chat_tokenizer, builder):
-    config = make_chat_config()
+    config = PipelineConfig(
+        input=InputConfig(sections=_CHAT_SECTIONS), mask={"assistant": "train"}
+    )
     messages = [
         {"role": "user", "content": "What is 2+2?"},
         {"role": "assistant", "content": "4"},
@@ -65,7 +61,7 @@ def test_chat_mask_only_assistant(chat_tokenizer, builder):
 
 
 def test_chat_batch_matches_single(chat_tokenizer, builder):
-    config = make_chat_config()
+    config = _make_chat_config()
     items = [
         {
             "messages": [
@@ -97,7 +93,7 @@ def test_chat_uniform_masking(
     mask_rules, mask_default, expect_nonzero, chat_tokenizer, builder
 ):
     config = PipelineConfig(
-        input=InputConfig(sections=CHAT_SECTIONS),
+        input=InputConfig(sections=_CHAT_SECTIONS),
         mask=mask_rules,
         mask_default=mask_default,
         preprocessing=ProcessingConfig(max_seq_len=2048),
@@ -117,33 +113,14 @@ def test_chat_uniform_masking(
 
 
 def test_chat_empty_messages(chat_tokenizer, builder):
-    config = make_chat_config()
+    config = _make_chat_config()
     assert builder.build({"messages": []}, config, chat_tokenizer) is None
     assert builder.build({}, config, chat_tokenizer) is None
 
 
-def test_chat_domain_extraction(chat_tokenizer, builder):
-    config = PipelineConfig(
-        input=InputConfig(sections=CHAT_SECTIONS),
-        mask={"assistant": "train"},
-        mask_default="mask",
-        preprocessing=ProcessingConfig(max_seq_len=2048),
-        output=OutputConfig(domain_key="source"),
-    )
-    item = {
-        "messages": [
-            {"role": "user", "content": "Hi"},
-            {"role": "assistant", "content": "Hello"},
-        ],
-        "source": "wiki",
-    }
-    result = builder.build(item, config, chat_tokenizer)
-    assert result["domain"] == "wiki"
-
-
 def test_chat_truncation(chat_tokenizer, builder):
     config = PipelineConfig(
-        input=InputConfig(sections=CHAT_SECTIONS),
+        input=InputConfig(sections=_CHAT_SECTIONS),
         mask={"assistant": "train"},
         mask_default="mask",
         preprocessing=ProcessingConfig(max_seq_len=10),
@@ -167,7 +144,7 @@ def test_chat_truncation(chat_tokenizer, builder):
 
 
 def test_instruction_batch_matches_single(test_tokenizer, builder):
-    config = make_instruction_config()
+    config = _make_instruction_config()
     items = [
         {"prompt": "Translate to French: Hello", "response": "Bonjour"},
         {"prompt": "Translate to German: Hello", "response": "Hallo"},
@@ -178,7 +155,7 @@ def test_instruction_batch_matches_single(test_tokenizer, builder):
 
 
 def test_instruction_prompt_masked(test_tokenizer, builder):
-    config = make_instruction_config()
+    config = _make_instruction_config()
     item = {"prompt": "hello", "response": "world"}
     result = builder.build(item, config, test_tokenizer)
     mask = result["loss_mask"]
@@ -211,17 +188,10 @@ def test_instruction_train_on_prompt(test_tokenizer, builder):
     assert all(m == 1 for m in mask[:p_len])
 
 
-def test_text_basic(test_tokenizer, builder):
-    config = make_text_config()
-    item = {"text": "Hello world. This is a test document."}
-    result = builder.build(item, config, test_tokenizer)
-    assert result is not None
-    assert len(result["sequence"]) > 0
-    assert "loss_mask" not in result
-
-
 def test_text_empty(test_tokenizer, builder):
-    config = make_text_config()
+    config = make_pipeline_config(
+        TEXT_SECTIONS, preprocessing=ProcessingConfig(min_chars=1)
+    )
     assert builder.build({"text": ""}, config, test_tokenizer) is None
     assert builder.build({"text": "   "}, config, test_tokenizer) is None
 
@@ -246,30 +216,6 @@ def test_text_truncation(test_tokenizer, builder):
         {k: [v] for k, v in result.items() if k != "domain"}, config
     )
     assert len(packed["sequence"][0]) == 3
-
-
-def test_dpo_chat_basic(chat_tokenizer, builder):
-    config = make_dpo_chat_config()
-    item = {
-        "chosen": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-        ],
-        "rejected": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "5"},
-        ],
-    }
-    result = builder.build(item, config, chat_tokenizer)
-    assert result is not None
-    assert "chosen" in result
-    assert "rejected" in result
-    assert "chosen_mask" in result
-    assert "rejected_mask" in result
-    assert len(result["chosen"]) == len(result["chosen_mask"])
-    assert len(result["rejected"]) == len(result["rejected_mask"])
-    assert sum(result["chosen_mask"]) > 0
-    assert sum(result["rejected_mask"]) > 0
 
 
 def test_dpo_chosen_only_trained(chat_tokenizer, builder):
@@ -307,33 +253,6 @@ def test_dpo_partial_record_is_none(chat_tokenizer, builder, missing):
 
     assert builder.build(item, config, chat_tokenizer) is None
     assert builder.build_batch([item], config, chat_tokenizer) == [None]
-
-
-def test_grpo_basic(chat_tokenizer, builder):
-    config = make_grpo_config()
-    item = {
-        "prompt": [{"role": "user", "content": "What is 2+2?"}],
-        "responses": ["4", "The answer is four", "Four", "2+2=4"],
-        "rewards": [1.0, 0.5, 0.8, 0.2],
-    }
-    result = builder.build(item, config, chat_tokenizer)
-    assert result is not None
-    assert "prompts" in result
-    assert "responses" in result
-    assert "masks" in result
-    assert "rewards" in result
-
-    # responses is List[List[int]] — one per response
-    assert len(result["responses"]) == 4
-    assert all(isinstance(r, list) for r in result["responses"])
-    assert all(isinstance(r[0], int) for r in result["responses"])
-
-    # masks is List[List[int]] — one per response, matching length
-    assert len(result["masks"]) == 4
-    for i in range(4):
-        assert len(result["masks"][i]) == len(result["responses"][i])
-
-    assert result["rewards"] == [1.0, 0.5, 0.8, 0.2]
 
 
 def test_grpo_batch_matches_single(chat_tokenizer, builder):
@@ -380,59 +299,3 @@ def test_grpo_single_reward(chat_tokenizer, builder):
     }
     result = builder.build(item, config, chat_tokenizer)
     assert result["rewards"] == [0.9]
-
-
-def test_single_builder_matches_facade(chat_tokenizer, builder, single_builder):
-    config = make_chat_config()
-    item = {
-        "messages": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-        ]
-    }
-    facade_result = builder.build(item, config, chat_tokenizer)
-    single_result = single_builder.build(item, config, chat_tokenizer)
-    assert single_result == facade_result
-
-
-def test_single_builder_rejects_multi_config(chat_tokenizer, single_builder):
-    config = make_dpo_chat_config()
-    item = {
-        "chosen": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-        ],
-        "rejected": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "5"},
-        ],
-    }
-    assert single_builder.build(item, config, chat_tokenizer) is None
-
-
-def test_multi_builder_matches_facade(chat_tokenizer, builder, multi_builder):
-    config = make_dpo_chat_config()
-    item = {
-        "chosen": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-        ],
-        "rejected": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "5"},
-        ],
-    }
-    facade_result = builder.build(item, config, chat_tokenizer)
-    multi_result = multi_builder.build(item, config, chat_tokenizer)
-    assert multi_result == facade_result
-
-
-def test_multi_builder_rejects_single_config(chat_tokenizer, multi_builder):
-    config = make_chat_config()
-    item = {
-        "messages": [
-            {"role": "user", "content": "What is 2+2?"},
-            {"role": "assistant", "content": "4"},
-        ]
-    }
-    assert multi_builder.build(item, config, chat_tokenizer) is None

@@ -1,5 +1,3 @@
-"""Tests for preprocessing pipeline bucket alignment."""
-
 from astrai.preprocessing.core import accumulate_record
 
 

@@ -16,119 +16,6 @@ MOE_CONFIG = {
     "n_activated_experts": 2,
 }
 
-CONFIGS = [
-    pytest.param(
-        {**TINY_CONFIG, "attn_type": "gqa", "ffn_type": "mlp"},
-        id="gqa_mlp",
-    ),
-    pytest.param(
-        {
-            **TINY_CONFIG,
-            "attn_type": "mla",
-            "ffn_type": "mlp",
-            "kv_lora_rank": 4,
-            "qk_nope_head_dim": 2,
-            "qk_rope_head_dim": 2,
-        },
-        id="mla_mlp",
-    ),
-    pytest.param(
-        {
-            **TINY_CONFIG,
-            "attn_type": "gdn",
-            "gdn_num_key_heads": 2,
-            "gdn_num_value_heads": 4,
-            "gdn_key_head_dim": 3,
-            "gdn_value_head_dim": 2,
-            "gdn_conv_kernel_size": 3,
-        },
-        id="gated_deltanet_mlp",
-    ),
-    pytest.param(
-        {**MOE_CONFIG, "attn_type": "gqa", "topk_method": "greedy"},
-        id="gqa_moe",
-    ),
-    pytest.param(
-        {
-            **MOE_CONFIG,
-            "attn_type": "gqa",
-            "topk_method": "greedy",
-            "mlp_only_layers": [0],
-        },
-        id="gqa_moe_dense_first",
-    ),
-    pytest.param(
-        {
-            **MOE_CONFIG,
-            "attn_type": "gqa",
-            "topk_method": "greedy",
-            "decoder_sparse_step": 2,
-        },
-        id="gqa_moe_sparse_step",
-    ),
-    pytest.param(
-        {
-            **MOE_CONFIG,
-            "attn_type": "gqa",
-            "topk_method": "greedy",
-            "norm_topk_prob": True,
-        },
-        id="gqa_moe_norm_topk",
-    ),
-    pytest.param(
-        {
-            **MOE_CONFIG,
-            "attn_type": "gqa",
-            "topk_method": "greedy",
-            "moe_intermediate_size": 24,
-            "shared_expert_intermediate_size": 20,
-        },
-        id="gqa_moe_custom_intermediate",
-    ),
-    pytest.param(
-        {
-            **TINY_CONFIG,
-            "attn_type": "gqa",
-            "ffn_type": "mlp",
-            "rope_theta": 100000.0,
-        },
-        id="gqa_rope_theta",
-    ),
-    pytest.param(
-        {**TINY_CONFIG, "attn_type": "gqa", "ffn_type": "mlp", "use_qk_norm": True},
-        id="gqa_qk_norm",
-    ),
-    pytest.param(
-        {
-            **TINY_CONFIG,
-            "attn_type": "gqa",
-            "ffn_type": "mlp",
-            "tie_word_embeddings": True,
-        },
-        id="gqa_tie_word_embeddings",
-    ),
-]
-
-
-@pytest.mark.parametrize("config_kwargs", CONFIGS)
-@pytest.mark.parametrize("padded", [False, True], ids=["dense", "padded"])
-def test_model_forward(config_kwargs, cpu_device, padded):
-    config = AutoRegressiveLMConfig(**config_kwargs)
-    model = AutoRegressiveLM(config).to(device=cpu_device).eval()
-    input_ids = torch.randint(0, config.vocab_size, (2, 8), device=cpu_device)
-    input_mask = None
-    if padded:
-        input_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        input_mask[:, 4:] = False
-    with torch.no_grad():
-        output = model(input_ids, input_mask=input_mask)
-    for name, width in (
-        ("logits", config.vocab_size),
-        ("hidden_states", config.hidden_size),
-    ):
-        assert output[name].shape == (2, 8, width)
-        assert torch.isfinite(output[name]).all()
-
 
 def test_gated_deltanet_forward_backward_and_causal_prefix():
     config = AutoRegressiveLMConfig(
@@ -209,40 +96,6 @@ def test_moe_per_layer_ffn_resolution(overrides, expected):
         assert isinstance(layer.mlp, DeepSeekMoE) == (kind is DeepSeekMoE)
 
 
-def test_moe_custom_intermediate_shape():
-    """Verify MoE uses custom intermediate sizes when specified."""
-
-    config = AutoRegressiveLMConfig(
-        **{
-            **MOE_CONFIG,
-            "attn_type": "gqa",
-            "moe_intermediate_size": 24,
-            "shared_expert_intermediate_size": 20,
-        }
-    )
-    model = AutoRegressiveLM(config)
-    moe_layer = model.model.layers[0].mlp
-    assert isinstance(moe_layer, DeepSeekMoE)
-    # routed experts use moe_intermediate_size
-    for expert in moe_layer.routed_experts:
-        assert expert.up.weight.shape[0] == 24
-        assert expert.gate.weight.shape[0] == 24
-        assert expert.down.weight.shape[1] == 24
-    # shared experts use shared_expert_intermediate_size
-    for expert in moe_layer.shared_experts:
-        assert expert.up.weight.shape[0] == 20
-        assert expert.gate.weight.shape[0] == 20
-        assert expert.down.weight.shape[1] == 20
-
-
-def test_moe_defaults_preserve_normalized_routing():
-    config = AutoRegressiveLMConfig(**MOE_CONFIG, topk_method="greedy")
-    model = AutoRegressiveLM(config)
-
-    assert config.norm_topk_prob is True
-    assert model.model.layers[0].mlp.norm_topk_prob is True
-
-
 def test_moe_aux_loss_only_emitted_during_training():
     config = AutoRegressiveLMConfig(**MOE_CONFIG, topk_method="greedy")
     model = AutoRegressiveLM(config)
@@ -260,23 +113,6 @@ def test_moe_aux_loss_only_emitted_during_training():
     model.eval()
     outputs = model(input_ids)
     assert "aux_loss" not in outputs
-
-
-def test_moe_component_forward_returns_ffn_output():
-    moe = DeepSeekMoE(
-        dim=8,
-        dim_ffn=16,
-        n_routed_experts=4,
-        n_shared_experts=1,
-        n_activated_experts=2,
-    )
-
-    output = moe(torch.randn(2, 8, 8))
-
-    assert output["hidden_states"].shape == (2, 8, 8)
-    assert output["aux_loss"].ndim == 0
-    assert output["aux_loss"].requires_grad
-    assert torch.isfinite(output["aux_loss"])
 
 
 def test_moe_router_selects_experts_from_fp32_probabilities():

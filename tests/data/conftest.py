@@ -4,9 +4,7 @@ import os
 import pytest
 
 from astrai.preprocessing.builder import (
-    MultiOutputMaskBuilder,
     SectionedMaskBuilder,
-    SingleOutputMaskBuilder,
 )
 from tests.support.tokenizers import build_test_tokenizer
 
@@ -60,7 +58,8 @@ _CHAT_TOKENIZER_MAP = {
 }
 
 
-def _build_chat_tokenizer():
+@pytest.fixture(scope="session")
+def chat_tokenizer():
     return build_test_tokenizer(
         vocab_size=512,
         special_tokens=_SPECIAL_TOKENS,
@@ -71,13 +70,7 @@ def _build_chat_tokenizer():
     )
 
 
-@pytest.fixture(scope="session")
-def chat_tokenizer():
-    return _build_chat_tokenizer()
-
-
 def _write_tokenizer_dir(dir_path, tokenizer, tokenizer_config):
-    """Persist a tokenizer plus ``tokenizer_config.json`` into *dir_path*."""
     tokenizer._tokenizer.save(os.path.join(dir_path, "tokenizer.json"))
     with open(os.path.join(dir_path, "tokenizer_config.json"), "w") as f:
         json.dump(tokenizer_config, f)
@@ -86,16 +79,6 @@ def _write_tokenizer_dir(dir_path, tokenizer, tokenizer_config):
 @pytest.fixture
 def builder():
     return SectionedMaskBuilder()
-
-
-@pytest.fixture
-def single_builder():
-    return SingleOutputMaskBuilder()
-
-
-@pytest.fixture
-def multi_builder():
-    return MultiOutputMaskBuilder()
 
 
 @pytest.fixture

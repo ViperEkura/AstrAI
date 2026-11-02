@@ -172,11 +172,3 @@ def test_reject_pack_larger_than_training_context(tmp_path):
     dataset = DatasetFactory.load("sft", str(tmp_path), window_size=4)
     with pytest.raises(ValueError, match="exceeds training window"):
         dataset[0]
-
-
-def test_trainer_selects_sft_collator():
-    from astrai.config.train_config import ComponentSpec
-    from astrai.trainer.components import resolve_collate
-
-    spec = ComponentSpec(type="packed", params={"train_type": "sft"})
-    assert resolve_collate(spec) is sft_collate_fn

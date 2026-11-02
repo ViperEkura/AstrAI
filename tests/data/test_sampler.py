@@ -2,7 +2,6 @@ from astrai.dataset import RDSampler
 
 
 def test_random_sampler_consistency(random_dataset):
-    """Test RandomSampler produces consistent results with same seed"""
     dataset = random_dataset
 
     # Create two samplers with same seed
@@ -16,7 +15,6 @@ def test_random_sampler_consistency(random_dataset):
 
 
 def test_random_sampler_different_seeds(random_dataset):
-    """Test RandomSampler produces different results with different seeds"""
     dataset = random_dataset
 
     # Create two samplers with different seeds
@@ -31,7 +29,6 @@ def test_random_sampler_different_seeds(random_dataset):
 
 
 def test_sampler_across_epochs(random_dataset):
-    """Test sampler behavior across multiple epochs"""
     dataset = random_dataset
     n = len(dataset)
 

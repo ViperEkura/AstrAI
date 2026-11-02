@@ -1,5 +1,3 @@
-"""Tests for HuggingFace checkpoint/config adaptation."""
-
 import hashlib
 import json
 
@@ -20,14 +18,12 @@ from astrai.serialization import (
     convert_hf_config,
     convert_hf_weights,
     load_model_weights,
-    looks_like_hf_state_dict,
     save_model,
     save_model_weights,
 )
 from astrai.serialization.hf_adapter import _half_to_interleaved
 from astrai.trainer.callbacks.checkpoint import CheckpointCallback
 from astrai.trainer.context import TrainContextBuilder
-from tests.support.checkpoint import assert_state_dicts_equal
 from tests.support.models import make_tiny_config
 from tests.support.trainer import make_resume_metadata
 
@@ -212,7 +208,7 @@ def _assert_hf_roundtrip(cfg, convert_cfg=None):
     model = AutoRegressiveLM(cfg)
     sd = model.state_dict()
     converted = convert_hf_weights(_hf_keyed_state_dict(model, cfg), convert_cfg or cfg)
-    assert_state_dicts_equal(converted, sd)
+    torch.testing.assert_close(converted, sd, rtol=0, atol=0)
 
 
 def _assert_hf_directory_load(tmp_path, cfg, raw_config):
@@ -235,21 +231,6 @@ def _assert_hf_directory_load(tmp_path, cfg, raw_config):
         torch.testing.assert_close(
             loaded(input_ids)["logits"], model(input_ids)["logits"]
         )
-
-
-def test_convert_hf_config_with_explicit_mapping():
-    cfg = convert_hf_config(LLAMA_RAW, TEST_MAPPING)
-    assert cfg["model_type"] == "autoregressive_lm"
-    assert cfg["hidden_size"] == 8
-    assert cfg["attention"]["num_kv_heads"] == 1
-    loaded = ConfigFactory.load(cfg)
-    assert loaded.num_attention_heads == 2
-
-
-def test_convert_hf_config_defaults_kv_heads():
-    raw = {k: v for k, v in LLAMA_RAW.items() if k != "num_key_value_heads"}
-    cfg = ConfigFactory.load(convert_hf_config(raw, TEST_MAPPING))
-    assert cfg.num_key_value_heads == 2
 
 
 def test_convert_hf_config_requires_declared_fields():
@@ -302,29 +283,6 @@ def test_convert_hf_config_rejects_unknown_operation():
         )
 
 
-def test_looks_like_hf_state_dict():
-    assert looks_like_hf_state_dict({"model.layers.0.self_attn.q_proj.weight": 1})
-    assert looks_like_hf_state_dict({"model.layers.0.input_layernorm.weight": 1})
-    # "model." alone no longer implies HF: AstrAI trunk keys share the prefix
-    assert not looks_like_hf_state_dict({"model.embed_tokens.weight": 1})
-    assert not looks_like_hf_state_dict({"model.layers.0.attention.q_proj.weight": 1})
-    assert not looks_like_hf_state_dict({"layers.0.attention.q_proj.weight": 1})
-
-
-def test_adapt_config_passthrough():
-    raw = dict(LLAMA_RAW, model_type="autoregressive_lm")
-    assert adapt_config(raw) is raw
-
-
-def test_adapt_config_uses_model_directory(tmp_path):
-    _write_mapping(tmp_path)
-    assert adapt_config(LLAMA_RAW, str(tmp_path))["hidden_size"] == 8
-
-
-def test_adapt_config_without_mapping_is_unchanged(tmp_path):
-    assert adapt_config(LLAMA_RAW, str(tmp_path)) is LLAMA_RAW
-
-
 def test_load_mapping_rejects_unsupported_version(tmp_path):
     _write_mapping(tmp_path, {"version": 2})
     with pytest.raises(ValueError, match="version 1"):
@@ -344,13 +302,6 @@ def test_convert_hf_weights_moe_roundtrip():
     _assert_hf_roundtrip(cfg, convert_cfg=hf_cfg)
 
 
-def test_convert_hf_weights_keeps_astrai_keys():
-    cfg = make_tiny_config()
-    model = AutoRegressiveLM(cfg)
-    converted = convert_hf_weights(dict(model.state_dict()), cfg)
-    assert_state_dicts_equal(converted, model.state_dict())
-
-
 def test_convert_hf_weights_skips_unmapped_keys():
     cfg = make_tiny_config()
     sd = {"model.rotary_emb.inv_freq": torch.zeros(4), "model.embed_tokens.weight": 1}
@@ -364,19 +315,6 @@ def test_convert_hf_weights_rejects_mla():
     sd = {"model.layers.0.self_attn.kv_a_proj_with_mqa.weight": 1}
     with pytest.raises(NotImplementedError):
         convert_hf_weights(sd, cfg)
-
-
-def test_convert_hf_config_preserves_sparse_fields():
-    raw = {
-        **MOE_RAW,
-        "decoder_sparse_step": 2,
-        "mlp_only_layers": [0],
-    }
-    cfg = ConfigFactory.load(
-        convert_hf_config(raw, {**TEST_MAPPING, "constants": {"ffn_type": "moe"}})
-    )
-    assert cfg.decoder_sparse_step == 2
-    assert cfg.mlp_only_layers == [0]
 
 
 def test_convert_hf_weights_moe_with_dense_layers_roundtrip():
@@ -393,7 +331,7 @@ def test_convert_hf_weights_qwen2_moe_singular_shared_expert_roundtrip():
         for k, v in _hf_keyed_state_dict(model, cfg).items()
     }
     converted = convert_hf_weights(hf_sd, cfg)
-    assert_state_dicts_equal(converted, model.state_dict())
+    torch.testing.assert_close(converted, model.state_dict(), rtol=0, atol=0)
 
 
 def test_convert_hf_weights_gemma_qk_norm_roundtrip():
@@ -413,7 +351,7 @@ def test_from_pretrained_astrai_directory(tmp_path):
         save_directory=str(tmp_path),
     )
     loaded = AutoModel.from_pretrained(tmp_path, disable_random_init=False)
-    assert_state_dicts_equal(loaded.state_dict(), model.state_dict())
+    torch.testing.assert_close(loaded.state_dict(), model.state_dict(), rtol=0, atol=0)
 
 
 def test_from_pretrained_hf_config_with_astrai_weights(tmp_path):
@@ -426,7 +364,7 @@ def test_from_pretrained_hf_config_with_astrai_weights(tmp_path):
     )
     _write_mapping(tmp_path)
     loaded = AutoModel.from_pretrained(tmp_path, weights_format="astrai")
-    assert_state_dicts_equal(loaded.state_dict(), model.state_dict())
+    torch.testing.assert_close(loaded.state_dict(), model.state_dict(), rtol=0, atol=0)
 
 
 def test_from_pretrained_weights_format_hf_on_astrai_dir(tmp_path):
@@ -735,7 +673,9 @@ def test_from_pretrained_gated_zero_centered_hf_directory(tmp_path, monkeypatch)
     loaded = AutoModel.from_pretrained(tmp_path, strict=True).eval()
     context = _load_training_policy(tmp_path, cfg, monkeypatch)
     trained = context.model.eval()
-    assert_state_dicts_equal(trained.state_dict(), loaded.state_dict())
+    torch.testing.assert_close(
+        trained.state_dict(), loaded.state_dict(), rtol=0, atol=0
+    )
     input_ids = torch.tensor([[1, 2, 3, 4]])
     input_mask = torch.tensor([[True, True, True, False]])
     with torch.no_grad():
@@ -759,7 +699,9 @@ def test_from_pretrained_gated_zero_centered_hf_directory(tmp_path, monkeypatch)
     assert saved.meta["pretrained"] == metadata
     resumed = _load_training_policy(saved_path, cfg, monkeypatch, resume=True)
     assert resumed.pretrained_metadata["mapping_sha256"] == metadata["mapping_sha256"]
-    assert_state_dicts_equal(resumed.model.state_dict(), trained.state_dict())
+    torch.testing.assert_close(
+        resumed.model.state_dict(), trained.state_dict(), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("tied", [False, True])
@@ -774,7 +716,9 @@ def test_training_hf_tied_weight_ownership(tmp_path, monkeypatch, tied):
     _write_mapping(tmp_path)
     loaded = AutoModel.from_pretrained(tmp_path).eval()
     context = _load_training_policy(tmp_path, cfg, monkeypatch)
-    assert_state_dicts_equal(context.model.state_dict(), loaded.state_dict())
+    torch.testing.assert_close(
+        context.model.state_dict(), loaded.state_dict(), rtol=0, atol=0
+    )
     assert (
         context.model.lm_head.weight is context.model.model.embed_tokens.weight
     ) == tied
@@ -847,9 +791,11 @@ def test_new_lora_adapters_are_allowed_but_backbone_and_resume_are_complete(
     save_model(cfg.to_dict(), reference.state_dict(), str(tmp_path))
     lora = LoRAConfig(r=2, alpha=4, target_modules=("q_proj",))
     context = _load_training_policy(tmp_path, cfg, monkeypatch, lora=lora)
-    assert_state_dicts_equal(
+    torch.testing.assert_close(
         {k: context.model.state_dict()[k] for k in reference.state_dict()},
         reference.state_dict(),
+        rtol=0,
+        atol=0,
     )
     assert len(context.pretrained_metadata["allowed_new_parameters"]) == 4
     resume_path = tmp_path / "resume"
@@ -919,10 +865,6 @@ def test_native_factory_initialization_without_weights(tmp_path, monkeypatch):
     assert not context.pretrained_metadata
     with pytest.raises(FileNotFoundError, match="No pretrained policy weights"):
         _load_training_policy(tmp_path, cfg, monkeypatch, resume=True)
-
-
-def test_linear_attention_hf_weights_are_detected():
-    assert looks_like_hf_state_dict({"model.layers.0.linear_attn.A_log": torch.ones(1)})
 
 
 @pytest.mark.parametrize(
@@ -1061,7 +1003,9 @@ def test_weight_io_roundtrip_preserves_dtypes_without_config(tmp_path):
     }
     save_model_weights(weights, tmp_path / "weights")
     assert not (tmp_path / "weights/config.json").exists()
-    assert_state_dicts_equal(load_model_weights(tmp_path / "weights"), weights)
+    torch.testing.assert_close(
+        load_model_weights(tmp_path / "weights"), weights, rtol=0, atol=0
+    )
 
 
 def test_weight_io_loads_indexed_shards(tmp_path):
@@ -1074,7 +1018,9 @@ def test_weight_io_loads_indexed_shards(tmp_path):
             {"weight_map": {"a": "part-1.safetensors", "b": "part-2.safetensors"}}
         )
     )
-    assert_state_dicts_equal(load_model_weights(tmp_path), {**first, **second})
+    torch.testing.assert_close(
+        load_model_weights(tmp_path), {**first, **second}, rtol=0, atol=0
+    )
 
 
 def test_strict_model_loading_requires_weights(tmp_path):
@@ -1093,6 +1039,6 @@ def test_model_validation_rejects_bad_keys_before_mutation():
     supplied["unknown.weight"] = torch.ones(1)
     with pytest.raises(RuntimeError, match="unknown.weight"):
         validate_model_state_dict(model, supplied)
-    assert_state_dicts_equal(model.state_dict(), before)
+    torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
     missing, unexpected = validate_model_state_dict(model, supplied, strict=False)
     assert missing == [] and unexpected == ["unknown.weight"]

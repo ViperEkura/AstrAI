@@ -17,10 +17,39 @@ from astrai.inference.core.events import RequestError, RequestFinished, TokenDel
 from astrai.inference.core.request import Request
 from astrai.inference.worker.pending import PendingExecution, ResultRing
 from astrai.trainer.backend import run_batch
-from tests.support.core_contracts import admit, output, pending
 from tests.support.core_contracts import scheduler as scheduler
 from tests.support.inference import make_cpu_model, make_cpu_scheduler
 from tests.support.tokenizers import FakeTokenizer
+
+
+def _admit(sched, rid="r", max_tokens=8, prompt=(10, 11)):
+    sched.add_request(
+        "input", request_id=rid, prompt_ids=list(prompt), max_tokens=max_tokens
+    )
+    sched.scheduler.admit_requests()
+    return sched.scheduler._states[rid]
+
+
+def _output(plan, tokens=7, *, reverse=False):
+    rows = [
+        RequestOutput(r.identity, r.materialized_end, tokens if r.samples else None)
+        for r in plan.requests
+    ]
+    return ModelRunnerOutput(
+        plan.step_id,
+        plan.policy_version,
+        tuple(reversed(rows)) if reverse else tuple(rows),
+    )
+
+
+def _pending(plan, token=7, fence=None):
+    sampled = tuple(r.identity for r in plan.requests if r.samples)
+    return PendingExecution(
+        plan,
+        tokens=torch.tensor([token] * len(sampled)),
+        sampled_identities=sampled,
+        completion_event=fence,
+    )
 
 
 def test_execution_freezes_state_and_reuses_large_immutable_inputs():
@@ -47,7 +76,7 @@ def test_execution_freezes_state_and_reuses_large_immutable_inputs():
 def test_policy_and_reordered_result_rows_apply_by_identity_once(scheduler):
     sched, events = scheduler
     sched.update_weights(7)
-    a, b = admit(sched, "a"), admit(sched, "b")
+    a, b = _admit(sched, "a"), _admit(sched, "b")
     plan = sched.scheduler.schedule([a, b])
     assert plan.policy_version == 7
     rows = ModelRunnerOutput(
@@ -67,12 +96,12 @@ def test_policy_and_reordered_result_rows_apply_by_identity_once(scheduler):
 
 def test_future_results_wait_for_prior_step(scheduler):
     sched, events = scheduler
-    request = admit(sched)
+    request = _admit(sched)
     first = sched.scheduler.schedule([request])
     second = sched.scheduler.schedule([request])
-    sched.scheduler.update_from_output(output(second, 22))
+    sched.scheduler.update_from_output(_output(second, 22))
     assert request.output_ids == []
-    sched.scheduler.update_from_output(output(first, 11))
+    sched.scheduler.update_from_output(_output(first, 11))
     assert request.output_ids == [11, 22]
     assert [e.sequence_no for e in events] == [1, 2]
     assert not sched.scheduler._ready and not sched.scheduler._planned
@@ -80,9 +109,9 @@ def test_future_results_wait_for_prior_step(scheduler):
 
 def test_wrong_version_or_incarnation_does_not_consume_valid_plan(scheduler):
     sched, _events = scheduler
-    request = admit(sched)
+    request = _admit(sched)
     plan = sched.scheduler.schedule([request])
-    valid = output(plan, 19)
+    valid = _output(plan, 19)
     sched.scheduler.update_from_output(replace(valid, policy_version=999))
     bad = replace(valid.results[0], identity=RequestIdentity("r", "stale"))
     sched.scheduler.update_from_output(replace(valid, results=(bad,)))
@@ -93,12 +122,12 @@ def test_wrong_version_or_incarnation_does_not_consume_valid_plan(scheduler):
 
 def test_reused_public_id_cannot_receive_predecessor_output(scheduler):
     sched, events = scheduler
-    old = admit(sched, max_tokens=1)
+    old = _admit(sched, max_tokens=1)
     plan = sched.scheduler.schedule([old])
-    result = output(plan, 17)
+    result = _output(plan, 17)
     sched.scheduler.update_from_output(result)
     sched.scheduler.release_finished()
-    new = admit(sched)
+    new = _admit(sched)
     assert new.identity != old.identity
     before = len(events)
     sched.scheduler.update_from_output(result)
@@ -107,11 +136,11 @@ def test_reused_public_id_cannot_receive_predecessor_output(scheduler):
 
 def test_late_output_after_policy_epoch_change_is_reclaimed_not_applied(scheduler):
     sched, events = scheduler
-    request = admit(sched)
+    request = _admit(sched)
     plan = sched.scheduler.schedule([request])
     # Simulate a world transition; the real guard prevents it while queued.
     sched._policy_guard._policy_version = 1
-    sched.scheduler.update_from_output(output(plan), sched.policy_version)
+    sched.scheduler.update_from_output(_output(plan), sched.policy_version)
     sched.scheduler.release_finished()
     assert request.output_ids == []
     assert request.error_reason == "stale_execution"
@@ -126,7 +155,7 @@ def test_cancel_has_one_event_terminal_and_no_late_token(scheduler, active):
     if active:
         sched.scheduler.admit_requests()
         plan = sched.scheduler.schedule()
-        sched._pending.append(pending(plan))
+        sched._pending.append(_pending(plan))
     assert sched.cancel_request(rid)
     assert not sched.cancel_request(rid)
     assert len(events) == 1 and events[0].finish_reason == "cancelled"
@@ -153,15 +182,15 @@ def test_zero_output_admission_terminates_without_forward(scheduler, limit, prom
 
 def test_eos_discards_later_inflight_output_but_retires_all_resources(scheduler):
     sched, events = scheduler
-    request = admit(sched)
+    request = _admit(sched)
     first, second = (
         sched.scheduler.schedule([request]),
         sched.scheduler.schedule([request]),
     )
-    sched.scheduler.update_from_output(output(first, 0))
+    sched.scheduler.update_from_output(_output(first, 0))
     sched.scheduler.release_finished()
     assert sched.scheduler.kv_manager.request_count == 1
-    sched.scheduler.update_from_output(output(second, 77))
+    sched.scheduler.update_from_output(_output(second, 77))
     sched.scheduler.release_finished()
     assert request.output_ids == [0]
     assert [type(e) for e in events] == [TokenDelta, RequestFinished]
@@ -171,14 +200,14 @@ def test_eos_discards_later_inflight_output_but_retires_all_resources(scheduler)
 
 def test_stop_drains_every_group_before_free_and_never_duplicates_terminal(scheduler):
     sched, events = scheduler
-    a, b = admit(sched, "a", 1), admit(sched, "b", 1)
+    a, b = _admit(sched, "a", 1), _admit(sched, "b", 1)
     plan = sched.scheduler.schedule([a, b])
     calls = []
     for entry in plan.requests:
         fence = SimpleNamespace(
             synchronize=lambda rid=entry.request_id: calls.append(("fence", rid))
         )
-        sched._pending.append(pending(plan.select([entry]), fence=fence))
+        sched._pending.append(_pending(plan.select([entry]), fence=fence))
     original = sched.scheduler.kv_manager.free_slots
 
     def free(rid):
@@ -198,7 +227,7 @@ def test_stop_drains_every_group_before_free_and_never_duplicates_terminal(sched
 
 def test_bad_pending_fences_then_errors_and_frees(scheduler):
     sched, events = scheduler
-    request = admit(sched)
+    request = _admit(sched)
     plan = sched.scheduler.schedule([request])
     bad = PendingExecution(plan, tokens=torch.tensor([1]))  # no row identity
     sched._pending.append(bad)
@@ -224,7 +253,7 @@ def test_bad_pending_fences_then_errors_and_frees(scheduler):
 
 def test_failed_fence_retains_kv_until_successful_retry(scheduler):
     sched, _events = scheduler
-    request = admit(sched)
+    request = _admit(sched)
     plan = sched.scheduler.schedule([request])
     sched._pending.append(PendingExecution(plan, tokens=torch.tensor([1])))
     with patch.object(
@@ -244,7 +273,7 @@ def test_failed_fence_retains_kv_until_successful_retry(scheduler):
 def test_chunk_cache_publication_uses_confirmed_not_optimistic_watermark(scheduler):
     sched, events = scheduler
     sched.scheduler._planner._token_budget = 1
-    request = admit(sched, prompt=(10, 11, 12))
+    request = _admit(sched, prompt=(10, 11, 12))
     first, second = (
         sched.scheduler.schedule([request]),
         sched.scheduler.schedule([request]),
@@ -252,13 +281,13 @@ def test_chunk_cache_publication_uses_confirmed_not_optimistic_watermark(schedul
     assert request.num_computed_tokens == 2
     calls = []
     fence = SimpleNamespace(synchronize=lambda: calls.append("completed"))
-    p = pending(first, fence=fence)
+    p = _pending(first, fence=fence)
     with patch.object(sched.scheduler.kv_manager, "record_block_hashes") as record:
         sched.scheduler.update_from_output(p.commit())
         assert calls == ["completed"]
         assert record.call_args.kwargs["materialized_end"] == 1
     assert request.num_materialized_tokens == 1 and events == []
-    sched.scheduler.update_from_output(output(second))
+    sched.scheduler.update_from_output(_output(second))
 
 
 def test_result_ring_never_overwrites_an_unconsumed_completed_copy():
@@ -269,7 +298,7 @@ def test_result_ring_never_overwrites_an_unconsumed_completed_copy():
         {"in_use": True, "tokens": torch.tensor([29]), "event": MagicMock()},
     ]
     entry = Request("r", [1]).execution("prefill", 0, 1)
-    p = pending(SchedulerOutput(1, 0, (entry,)))
+    p = _pending(SchedulerOutput(1, 0, (entry,)))
     assert ring.post(p) is False
     assert [s["tokens"].item() for s in ring._slots] == [19, 29]
     for slot in ring._slots:

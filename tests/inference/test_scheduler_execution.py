@@ -1,7 +1,4 @@
 from contextlib import ExitStack
-
-"""Tests for scheduler concurrency."""
-
 from types import SimpleNamespace
 from typing import List
 from unittest.mock import MagicMock, patch

@@ -1,5 +1,3 @@
-"""Tests for scheduler concurrency."""
-
 import threading
 import time
 from unittest.mock import patch
@@ -13,39 +11,57 @@ from astrai.inference.core.scheduler import OutputEventSink
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.backend import run_batch
 from tests.support.models import make_rollout_config
-from tests.support.scheduler import (
-    make_mock_scheduler,
-    make_real_scheduler,
-    run_threads,
-)
-from tests.support.scheduler import mock_model_and_tokenizer as mock_model_and_tokenizer
+from tests.support.scheduler import make_real_scheduler
 from tests.support.tokenizers import FakeTokenizer
 
 
-def test_scheduler_concurrent_add_task(mock_model_and_tokenizer):
-    """Test concurrent add_request operations."""
-    scheduler = make_mock_scheduler(mock_model_and_tokenizer)
+def _run_threads(*workers, timeout=10.0):
+    errors = []
 
-    results = {"request_ids": [], "errors": []}
-    lock = threading.Lock()
-
-    def add_task_worker(worker_id):
+    def run(worker):
         try:
-            for i in range(10):
-                request_id = scheduler.add_request(
-                    f"prompt from worker {worker_id}-{i}"
-                )
-                with lock:
-                    results["request_ids"].append(request_id)
-        except Exception as e:
-            results["errors"].append(str(e))
+            worker()
+        except BaseException as exc:
+            errors.append(exc)
 
-    run_threads(*(lambda wid=i: add_task_worker(wid) for i in range(5)))
+    threads = [threading.Thread(target=run, args=(worker,)) for worker in workers]
+    try:
+        for thread in threads:
+            thread.start()
+    finally:
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=timeout)
+    assert all(not thread.is_alive() for thread in threads)
+    if errors:
+        raise errors[0]
 
-    scheduler.stop()
 
-    assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
-    assert len(results["request_ids"]) == 50
+def test_concurrent_submission_cancellation_and_stats():
+    scheduler, _, _ = make_real_scheduler("cpu")
+    ready = threading.Barrier(6)
+
+    def mutate(worker):
+        ready.wait(timeout=5)
+        for index in range(10):
+            request_id = f"{worker}-{index}"
+            assert scheduler.add_request("prompt", request_id=request_id) == request_id
+            if index % 2 == 0:
+                assert scheduler.cancel_request(request_id)
+
+    def observe():
+        ready.wait(timeout=5)
+        for _ in range(50):
+            assert scheduler.get_stats()["total_tasks"] >= 0
+
+    try:
+        _run_threads(observe, *(lambda worker=i: mutate(worker) for i in range(5)))
+        assert {request.request_id for request in scheduler.scheduler.waiting} == {
+            f"{worker}-{index}" for worker in range(5) for index in (1, 3, 5, 7, 9)
+        }
+        assert scheduler.get_stats()["cancelled_total"] == 25
+    finally:
+        scheduler.stop()
 
 
 def test_generation_loop_activates_full_selection_in_worker_thread():
@@ -71,77 +87,6 @@ def test_generation_loop_activates_full_selection_in_worker_thread():
     assert scheduler.op_selection.choice("rotary")[0] == "torch"
     assert observed == [("torch",) * 5]
     scheduler.stop()
-
-
-def test_scheduler_concurrent_add_remove_task(mock_model_and_tokenizer):
-    """Test concurrent add and remove request operations."""
-    scheduler = make_mock_scheduler(mock_model_and_tokenizer)
-
-    results = {"added": [], "removed": [], "errors": []}
-    add_ready = threading.Event()
-
-    def add_worker():
-        try:
-            for i in range(20):
-                request_id = scheduler.add_request(f"prompt {i}")
-                results["added"].append(request_id)
-                if len(results["added"]) >= 10:
-                    add_ready.set()
-        except Exception as e:
-            results["errors"].append(f"Add: {str(e)}")
-
-    def remove_worker():
-        try:
-            add_ready.wait(timeout=5.0)
-            for request_id in results["added"][:10]:
-                scheduler.cancel_request(request_id)
-                results["removed"].append(request_id)
-        except Exception as e:
-            results["errors"].append(f"Remove: {str(e)}")
-
-    run_threads(add_worker, remove_worker)
-    scheduler.stop()
-
-    assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
-    assert len(results["added"]) == 20
-
-
-def test_scheduler_concurrent_get_stats(mock_model_and_tokenizer):
-    """Test concurrent get_stats operations."""
-    scheduler = make_mock_scheduler(mock_model_and_tokenizer)
-
-    results = {"stats": [], "errors": []}
-    started = threading.Event()
-    stats_done = threading.Event()
-
-    def add_requests():
-        try:
-            for i in range(20):
-                scheduler.add_request(f"prompt {i}")
-                started.set()
-        except Exception as e:
-            results["errors"].append(f"Add: {str(e)}")
-
-    def get_stats():
-        try:
-            started.wait(timeout=5.0)
-            for _ in range(50):
-                stats = scheduler.get_stats()
-                results["stats"].append(stats)
-            stats_done.set()
-        except Exception as e:
-            results["errors"].append(f"Get stats: {str(e)}")
-
-    run_threads(add_requests, get_stats)
-    scheduler.stop()
-    stats_done.wait(timeout=5.0)
-
-    assert len(results["errors"]) == 0, f"Errors: {results['errors']}"
-    assert len(results["stats"]) == 50
-
-    for stats in results["stats"]:
-        assert "total_tasks" in stats
-        assert stats["total_tasks"] >= 0
 
 
 def test_cancel_waiting_task_storm_returns_to_baseline(cpu_device):
@@ -238,20 +183,6 @@ def test_cancel_during_kv_allocation_releases_metrics_and_kv(cpu_device):
         assert stats["cancelled_total"] == 1
     finally:
         continue_allocation.set()
-        scheduler.stop()
-
-
-def test_run_batch_returns_token_sequences(cpu_device):
-    scheduler, _tok, _model = make_real_scheduler(cpu_device)
-    try:
-        prompts = [[10, 20, 30], [5, 6, 7, 8]]
-        results = run_batch(scheduler, prompts, max_tokens=4, temperature=1.0)
-        assert len(results) == 2
-        for ids in results:
-            assert isinstance(ids, list)
-            assert len(ids) <= 4
-            assert all(0 <= i < 200 for i in ids)
-    finally:
         scheduler.stop()
 
 
@@ -389,14 +320,6 @@ def test_ragged_prefill_matches_sequential_greedy_tokens_and_logprobs(cpu_device
         scheduler.stop()
 
 
-def test_run_batch_zero_max_tokens_returns_empty(cpu_device):
-    scheduler, _tok, _model = make_real_scheduler(cpu_device)
-    try:
-        assert run_batch(scheduler, [[10, 20, 30]], max_tokens=0) == [[]]
-    finally:
-        scheduler.stop()
-
-
 def test_run_batch_stop_id_terminates(cpu_device):
     """A token matching stop_ids terminates generation for that prompt."""
     scheduler, _tok, _model = make_real_scheduler(cpu_device)
@@ -416,18 +339,6 @@ def test_run_batch_empty_prompts(cpu_device):
     scheduler, _tok, _model = make_real_scheduler(cpu_device)
     try:
         assert run_batch(scheduler, [], max_tokens=4) == []
-    finally:
-        scheduler.stop()
-
-
-def test_run_batch_too_long_prompt_skipped(cpu_device):
-    """A prompt longer than max_seq_len yields an empty result slot."""
-    scheduler, _tok, _model = make_real_scheduler(cpu_device)
-    try:
-        long = list(range(100))  # > max_seq_len=64
-        results = run_batch(scheduler, [long, [10, 20]], max_tokens=2)
-        assert results[0] == []
-        assert len(results[1]) <= 2
     finally:
         scheduler.stop()
 

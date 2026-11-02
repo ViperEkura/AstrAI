@@ -1,5 +1,3 @@
-"""Unit tests for request admission and lifecycle."""
-
 from unittest.mock import MagicMock
 
 from astrai.inference.core.scheduler import Scheduler

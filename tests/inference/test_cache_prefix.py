@@ -1,21 +1,19 @@
-"""Unit tests for inference cache components."""
-
 import pytest
 import torch
 
+from astrai.inference.core.cache import KVCacheManager
 from tests.support.cache import (
     assert_allocator_cache_consistent,
     make_cache_workspace,
     make_paged_pool,
     make_paged_pool_ps64,
-    make_task_cache,
 )
 from tests.support.cache import kv_device as kv_device
 
 
 def test_page_pool_prefix_hit_populates_request_mapping():
     pool = make_paged_pool_ps64(page_size=2, max_seq_len=8, n_tokens=16)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     prompt = [11, 12, 13, 14]
 
     assert task_cache.alloc_slots("first", prompt)
@@ -39,7 +37,7 @@ def test_page_pool_prefix_hit_populates_request_mapping():
 
 def test_task_cache_invalidation_drops_cross_version_prefix_hits():
     pool = make_paged_pool_ps64(page_size=2, max_seq_len=8, n_tokens=16)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     prompt = [11, 12, 13, 14]
 
     assert task_cache.alloc_slots("first", prompt)
@@ -59,7 +57,7 @@ def test_task_cache_invalidation_drops_cross_version_prefix_hits():
 
 def test_record_block_hashes_requires_explicit_materialized_end():
     pool = make_paged_pool(page_size=4)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     prompt = list(range(8))
     assert task_cache.alloc_slots("writer", prompt)
 
@@ -73,7 +71,7 @@ def test_record_block_hashes_is_bounded_by_token_ids_and_allocated_pages(
     allocated, ids_len, end
 ):
     pool = make_paged_pool(page_size=4)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     assert task_cache.alloc_slots("writer", list(range(allocated)))
     task_cache.record_block_hashes("writer", list(range(ids_len)), materialized_end=end)
     assert pool.strategy._prefix.lookup(list(range(8))) == [
@@ -84,7 +82,7 @@ def test_record_block_hashes_is_bounded_by_token_ids_and_allocated_pages(
 @pytest.mark.parametrize("start, end", [(-1, 4), (0, -1)])
 def test_record_block_hashes_rejects_negative_watermark_or_page(start, end):
     pool = make_paged_pool(page_size=4)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     prompt = list(range(8))
     assert task_cache.alloc_slots("writer", prompt)
     with pytest.raises(ValueError, match="nonnegative"):
@@ -94,7 +92,7 @@ def test_record_block_hashes_rejects_negative_watermark_or_page(start, end):
 
 def test_chunked_prefix_only_reuses_fully_written_kv(kv_device):
     pool = make_paged_pool(page_size=4, max_seq_len=16, n_tokens=64, device=kv_device)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     ws = make_cache_workspace(pool)
     prompt = list(range(8))
     assert task_cache.alloc_slots("writer", prompt)
@@ -137,7 +135,7 @@ def test_chunked_prefix_only_reuses_fully_written_kv(kv_device):
 @pytest.mark.parametrize("release_first", [False, True])
 def test_prefix_replacement_keeps_allocator_identity_consistent(release_first):
     pool = make_paged_pool(page_size=4, max_seq_len=16, n_tokens=32)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     prompt = list(range(8))
     # Both prefills reserve private pages before either publishes its KV.
     assert task_cache.alloc_slots("first", prompt)

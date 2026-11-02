@@ -1,10 +1,12 @@
 """Deterministic CPU gates for execution identity, lifecycle and resource ownership."""
 
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 from astrai.inference.core.engine_core import EngineCore
 from tests.support.core_contracts import scheduler as scheduler
+from tests.support.task import make_mock_tokenizer, make_scheduler
 
 
 def test_stop_cannot_clear_a_restarted_successor_after_join():
@@ -96,3 +98,21 @@ def test_start_waits_for_weight_mutation(scheduler):
     assert not update.is_alive() and not start.is_alive()
     assert sched.policy_version == 1
     sched.stop()
+
+
+def test_scheduler_wake():
+    tm = make_scheduler(tokenizer=make_mock_tokenizer())
+    called = threading.Event()
+
+    def waiter():
+        tm.wait_for_requests(timeout=5.0)
+        called.set()
+
+    t = threading.Thread(target=waiter)
+    t.start()
+
+    time.sleep(0.05)
+    tm.wake()
+    t.join(timeout=2.0)
+    assert not t.is_alive()
+    assert called.is_set()

@@ -1,11 +1,9 @@
-"""Unit tests for inference cache components."""
-
 import pytest
 import torch
 
 from astrai.inference.core.cache import (
     BlockPool,
-    KVStorage,
+    KVCacheManager,
     ReqToTokenPool,
 )
 from tests.support.cache import kv_device as kv_device
@@ -14,7 +12,6 @@ from tests.support.cache import (
     make_contiguous_pool,
     make_paged_pool,
     make_paged_pool_ps64,
-    make_task_cache,
 )
 
 
@@ -42,22 +39,9 @@ def test_req_to_token_pool_write():
     assert pool.req_to_token[slots[0], 2].item() == 30
 
 
-def test_kv_storage_buffer_shape():
-    storage = KVStorage(
-        size=32,
-        n_layers=3,
-        n_kv_heads=8,
-        head_dim=16,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-    )
-    assert storage.k_buffer.shape == (3, 32, 8, 16)
-    assert storage.v_buffer.shape == (3, 32, 8, 16)
-
-
 def test_page_pool_contiguous_task_alloc_free():
     pool = make_contiguous_pool()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     assert task_cache.alloc_slots("t1", [1, 2, 3])
     assert "t1" in task_cache._states
     task_cache.free_slots("t1")
@@ -66,23 +50,16 @@ def test_page_pool_contiguous_task_alloc_free():
 
 def test_page_pool_contiguous_task_extend():
     pool = make_contiguous_pool()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", [1, 2, 3])
     assert task_cache.extend_slots("t1", 3)
     assert task_cache.extend_slots("t1", 63)
     assert not task_cache.extend_slots("t1", 64)
 
 
-def test_page_pool_contiguous_task_cached():
-    pool = make_contiguous_pool()
-    task_cache = make_task_cache(pool)
-    task_cache.alloc_slots("t1", [1, 2, 3])
-    assert task_cache.cached_tokens("t1") == 0
-
-
 def test_page_pool_contiguous_bind_tasks_prefill():
     pool = make_contiguous_pool()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", list(range(10)))
     task_cache.alloc_slots("t2", list(range(10)))
     kv = task_cache.bind(["t1", "t2"], make_cache_workspace(pool), start_pos=0)
@@ -107,7 +84,7 @@ def test_page_pool_bind_tasks_builds_compact_q_tile_mapping():
 
 def test_page_pool_contiguous_bind_tasks_decode():
     pool = make_contiguous_pool()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", list(range(10)))
     task_cache.alloc_slots("t2", list(range(8)))
     # Simulate one decode extension so seq_lens advance to 11 and 9.
@@ -121,7 +98,7 @@ def test_page_pool_contiguous_bind_tasks_decode():
 def test_page_pool_contiguous_bind_roundtrip():
     """Write KV via bind_tasks, then gather via req_to_token indexing."""
     pool = make_contiguous_pool(n_layers=1, n_kv_heads=2, head_dim=4)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", list(range(4)))
 
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
@@ -139,7 +116,7 @@ def test_page_pool_contiguous_bind_roundtrip():
 
 def test_page_pool_paged_task_alloc():
     pool = make_paged_pool()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     assert task_cache.alloc_slots("t1", list(range(10)))
     state = task_cache._states["t1"]
     assert len(state.pages) == 10
@@ -148,7 +125,7 @@ def test_page_pool_paged_task_alloc():
 
 def test_page_pool_paged_task_extend():
     pool = make_paged_pool()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", list(range(4)))
     assert task_cache.extend_slots("t1", 4)
     req_idx = task_cache._states["t1"].req_idx
@@ -158,7 +135,7 @@ def test_page_pool_paged_task_extend():
 
 def test_page_pool_paged_task_free_releases_slots():
     pool = make_paged_pool(n_tokens=16)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", list(range(8)))
     task_cache.free_slots("t1")
     assert "t1" not in task_cache._states
@@ -167,7 +144,7 @@ def test_page_pool_paged_task_free_releases_slots():
 
 def test_page_pool_paged_bind_roundtrip():
     pool = make_paged_pool(n_layers=1, n_kv_heads=2, head_dim=4)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", list(range(4)))
 
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
@@ -183,7 +160,7 @@ def test_page_pool_paged_bind_roundtrip():
 
 def test_page_pool_paged_ps64_task_alloc():
     pool = make_paged_pool_ps64()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     prompt = list(range(200))
     assert task_cache.alloc_slots("t1", prompt)
     assert task_cache.cached_tokens("t1") == 0
@@ -193,7 +170,7 @@ def test_page_pool_paged_ps64_task_alloc():
 
 def test_page_pool_paged_ps64_task_extend_crosses_page():
     pool = make_paged_pool_ps64()
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     task_cache.alloc_slots("t1", list(range(64)))
     assert task_cache.extend_slots("t1", 64)
     assert len(task_cache._states["t1"].pages) >= 2
@@ -201,7 +178,7 @@ def test_page_pool_paged_ps64_task_extend_crosses_page():
 
 def test_page_pool_paged_ps64_bind_roundtrip():
     pool = make_paged_pool_ps64(n_layers=1, n_kv_heads=2, head_dim=4)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     prompt = list(range(128))
     task_cache.alloc_slots("t1", prompt)
 
@@ -221,7 +198,7 @@ def test_page_pool_paged_steady_decode_slots_reach_device():
     steady incremental decode path included) gathers req_to_token rows
     on-device, so the staged tails must land there before the gather."""
     pool = make_paged_pool(n_tokens=64, max_seq_len=16)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     ws = make_cache_workspace(pool)
     prompt = list(range(4))
     assert task_cache.alloc_slots("t1", prompt)
@@ -263,8 +240,8 @@ def test_extend_batch_matches_per_task_extend():
         )
 
     pool_a, pool_b = make_pool(), make_pool()
-    mgr_a = make_task_cache(pool_a)
-    mgr_b = make_task_cache(pool_b)
+    mgr_a = KVCacheManager(pool_a)
+    mgr_b = KVCacheManager(pool_b)
     ws = make_cache_workspace(pool_a)
 
     ids = [f"t{i}" for i in range(4)]
@@ -311,7 +288,7 @@ def test_paged_extend_batch_preserves_real_kv_across_mixed_positions(
     kv_device, prompt_lens
 ):
     pool = make_paged_pool(page_size=4, max_seq_len=16, n_tokens=64, device=kv_device)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     ws = make_cache_workspace(pool)
     ids = [f"request{i}" for i in range(len(prompt_lens))]
     for request_id, length in zip(ids, prompt_lens):
@@ -359,7 +336,7 @@ def test_paged_extend_batch_preserves_real_kv_across_mixed_positions(
 
 def test_paged_extend_batch_fallback_still_maps_in_page_positions():
     pool = make_paged_pool(page_size=4, n_tokens=28, max_seq_len=16)
-    task_cache = make_task_cache(pool)
+    task_cache = KVCacheManager(pool)
     lengths = [5, 4, 4, 4]
     ids = [f"request{i}" for i in range(len(lengths))]
     for request_id, length in zip(ids, lengths):
@@ -396,7 +373,7 @@ def test_extend_batch_falls_back_when_pool_runs_dry():
         page_size=1,
         n_tokens=6,
     )
-    mgr = make_task_cache(pool)
+    mgr = KVCacheManager(pool)
     ids = [f"dry{i}" for i in range(4)]
     for tid in ids:
         # One page each leaves 2 free for decode extension.

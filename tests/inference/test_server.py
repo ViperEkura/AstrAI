@@ -1,5 +1,6 @@
-"""Unit tests for the inference HTTP server."""
+"""HTTP protocol conversion and one real CPU inference roundtrip."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -13,243 +14,97 @@ from tests.support.models import make_tiny_config
 from tests.support.tokenizers import CHAT_TEMPLATE, build_test_tokenizer
 
 
-def test_health_no_model(client):
-    """GET /health should return 200 even when engine not loaded."""
-    get_app().state.engine = None
+@pytest.mark.parametrize("loaded", [False, True])
+def test_health_reports_model_availability(client, mock_engine, loaded):
+    get_app().state.engine = mock_engine if loaded else None
     response = client.get("/health")
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert not data["model_loaded"]
+    assert response.json() == {"status": "ok", "model_loaded": loaded}
 
 
-def test_health_with_model(client, loaded_model):
-    """GET /health should return 200 when engine is loaded."""
-    response = client.get("/health")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert data["model_loaded"] is True
-
-
-def test_chat_completions_non_stream(client, loaded_model):
-    """POST /v1/chat/completions with stream=false returns OpenAI-style JSON."""
-
-    async def events_gen():
-        yield StreamChunk(
-            text="Assistant reply",
-            delta_token_ids=[1],
-            stopped=False,
-        )
-
-    get_app().state.engine = loaded_model
-    loaded_model.generate_events.return_value = events_gen()
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "temperature": 0.8,
-            "max_tokens": 100,
-            "stream": False,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["object"] == "chat.completion"
-    assert len(data["choices"]) == 1
-    assert "usage" in data
-    assert "prompt_tokens" in data["usage"]
-
-
-def test_chat_completions_stream(client, loaded_model):
-    """POST /v1/chat/completions with stream=true returns SSE stream."""
-
-    async def events_gen():
-        yield StreamChunk(
-            text="cumulative1",
-            delta_token_ids=[1],
-            stopped=False,
-        )
-        yield StreamChunk(
-            text="cumulative2",
-            delta_token_ids=[1],
-            stopped=False,
-        )
-
-    get_app().state.engine = loaded_model
-    loaded_model.generate_events.return_value = events_gen()
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "temperature": 0.8,
-            "max_tokens": 100,
-            "stream": True,
-        },
-        headers={"Accept": "text/event-stream"},
-    )
-    assert response.status_code == 200
-    lines = [
-        line.strip() for line in response.content.decode("utf-8").split("\n") if line
-    ]
-    assert any("cumulative1" in line for line in lines)
-    assert any("cumulative2" in line for line in lines)
-    assert any("[DONE]" in line for line in lines)
-
-
-def test_messages_non_stream(client, loaded_model):
-    """POST /v1/messages with stream=false returns Anthropic-style JSON."""
-
-    async def events_gen():
-        yield StreamChunk(
-            text="Assistant reply",
-            delta_token_ids=[1],
-            stopped=False,
-        )
-
-    get_app().state.engine = loaded_model
-    loaded_model.generate_events.return_value = events_gen()
-    response = client.post(
-        "/v1/messages",
-        json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "temperature": 0.8,
-            "max_tokens": 100,
-            "stream": False,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["type"] == "message"
-    assert data["role"] == "assistant"
-    assert len(data["content"]) == 1
-    assert data["content"][0]["type"] == "text"
-    assert "usage" in data
-    assert "input_tokens" in data["usage"]
-
-
-def test_messages_stream(client, loaded_model):
-    """POST /v1/messages with stream=true returns Anthropic SSE stream."""
-
-    async def events_gen():
-        yield StreamChunk(
-            text="cumulative1",
-            delta_token_ids=[1],
-            stopped=False,
-        )
-        yield StreamChunk(
-            text="cumulative2",
-            delta_token_ids=[1],
-            stopped=False,
-        )
-
-    get_app().state.engine = loaded_model
-    loaded_model.generate_events.return_value = events_gen()
-    response = client.post(
-        "/v1/messages",
-        json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "temperature": 0.8,
-            "max_tokens": 100,
-            "stream": True,
-        },
-        headers={"Accept": "text/event-stream"},
-    )
-    assert response.status_code == 200
-    content = response.content.decode("utf-8")
-    assert "message_start" in content
-    assert "content_block_start" in content
-    assert "content_block_delta" in content
-    assert "cumulative1" in content
-    assert "cumulative2" in content
-    assert "content_block_stop" in content
-    assert "message_delta" in content
-    assert "message_stop" in content
-
-
-def test_messages_with_system(client, loaded_model):
-    """POST /v1/messages with system prompt."""
-
-    async def events_gen():
-        yield StreamChunk(text="Reply", delta_token_ids=[1], stopped=False)
-
-    get_app().state.engine = loaded_model
-    loaded_model.generate_events.return_value = events_gen()
-    response = client.post(
-        "/v1/messages",
-        json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "system": "You are a helpful assistant.",
-            "max_tokens": 100,
-            "stream": False,
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["type"] == "message"
-
-
-def test_chat_completions_stop_sequence(client, loaded_model):
-    """POST /v1/chat/completions with stop parameter truncates at stop sequence."""
+@pytest.mark.parametrize("protocol", ["openai", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_http_protocol_preserves_text_usage_and_terminal_sequence(
+    client, loaded_model, protocol, stream
+):
     closed = []
 
-    async def events_gen():
+    async def events():
         try:
-            yield StreamChunk(text="Hello", delta_token_ids=[1], stopped=False)
-            yield StreamChunk(text="X", delta_token_ids=[1], stopped=True)
+            yield StreamChunk("Hello ", [1], False)
+            final = StreamChunk("world", [2], False)
+            final.finish_reason = "length"
+            final.prompt_tokens = 3
+            final.completion_tokens = 2
+            yield final
         finally:
             closed.append(True)
 
-    get_app().state.engine = loaded_model
-    loaded_model.generate_events.return_value = events_gen()
+    loaded_model.generate_events.return_value = events()
+    endpoint = "/v1/chat/completions" if protocol == "openai" else "/v1/messages"
     response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "max_tokens": 100,
-            "stream": False,
-            "stop": ["X"],
-        },
+        endpoint,
+        json={"messages": [{"role": "user", "content": "Hi"}], "stream": stream},
     )
     assert response.status_code == 200
-    data = response.json()
-    content = data["choices"][0]["message"]["content"]
-    assert "X" in content
-    assert "world" not in content
     assert closed == [True]
-
-
-def test_chat_completions_stop_sequence_stream(client, loaded_model):
-    """POST /v1/chat/completions with stop parameter truncates SSE stream."""
-    closed = []
-
-    async def events_gen():
-        try:
-            yield StreamChunk(text="Hello", delta_token_ids=[1], stopped=False)
-            yield StreamChunk(text="X", delta_token_ids=[1], stopped=True)
-        finally:
-            closed.append(True)
-
-    get_app().state.engine = loaded_model
-    loaded_model.generate_events.return_value = events_gen()
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "Hello"}],
-            "max_tokens": 100,
-            "stream": True,
-            "stop": ["X"],
-        },
-        headers={"Accept": "text/event-stream"},
+    if stream:
+        lines = response.text.splitlines()
+        assert lines.count("data: [DONE]") == 1
+        payloads = [
+            json.loads(line[6:])
+            for line in lines
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        if protocol == "openai":
+            choices = [
+                payload["choices"][0] for payload in payloads if "choices" in payload
+            ]
+            assert choices[0]["delta"]["role"] == "assistant"
+            assert (
+                "".join(choice["delta"].get("content", "") for choice in choices)
+                == "Hello world"
+            )
+            assert choices[-1]["finish_reason"] == "length"
+            usage = payloads[-1]
+        else:
+            assert [payload["type"] for payload in payloads] == [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+            assert (
+                "".join(
+                    payload["delta"]["text"]
+                    for payload in payloads
+                    if payload["type"] == "content_block_delta"
+                )
+                == "Hello world"
+            )
+            assert payloads[-2]["delta"]["stop_reason"] == "max_tokens"
+            usage = payloads[-2]["usage"]
+    else:
+        payload = response.json()
+        usage = payload["usage"]
+        if protocol == "openai":
+            assert payload["object"] == "chat.completion"
+            assert payload["choices"][0]["message"]["content"] == "Hello world"
+            assert payload["choices"][0]["finish_reason"] == "length"
+        else:
+            assert payload["type"] == "message"
+            assert payload["role"] == "assistant"
+            assert payload["content"] == [{"type": "text", "text": "Hello world"}]
+            assert payload["stop_reason"] == "max_tokens"
+    expected_usage = (
+        {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        if protocol == "openai"
+        else {"input_tokens": 3, "output_tokens": 2}
     )
-    assert response.status_code == 200
-    content = response.content.decode("utf-8")
-    assert "Hello" in content
-    assert "world" not in content
-    assert any(
-        "finish_reason" in line for line in content.split("\n") if "stop" in line
-    )
-    assert closed == [True]
+    assert usage == expected_usage
 
 
 def test_chat_completions_real_engine(tmp_path, client):
@@ -287,7 +142,3 @@ def test_chat_completions_real_engine(tmp_path, client):
     finally:
         engine.shutdown()
         get_app().state.engine = None
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

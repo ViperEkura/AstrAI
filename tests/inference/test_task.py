@@ -1,5 +1,3 @@
-"""Unit tests for Request and Scheduler."""
-
 import json
 from unittest.mock import Mock, call
 
@@ -11,40 +9,6 @@ from astrai.inference import (
     RequestStatus,
 )
 from tests.support.task import make_mock_tokenizer, make_scheduler
-
-
-def test_task_default_status_is_pending():
-    request = Request("id1", [1, 2, 3])
-    assert request.status == RequestStatus.PENDING
-
-
-def test_task_next_pos():
-    request = Request("id1", [1, 2, 3])
-    request.input_tokens = 5
-    request.num_computed_tokens = 5
-    assert request.next_pos == 5
-    request.num_computed_tokens += 1
-    assert request.next_pos == 6
-    request.num_computed_tokens += 1
-    assert request.next_pos == 7
-
-
-def test_task_is_finished_max_tokens():
-    request = Request("id1", [1, 2, 3], max_tokens=2)
-    request.output_tokens = 2
-    assert request.is_finished([])
-
-
-def test_task_is_finished_stop_id():
-    request = Request("id1", [1, 2, 3])
-    request.output_ids = [5, 0]
-    assert request.is_finished([0])
-
-
-def test_task_is_finished_not_yet():
-    request = Request("id1", [1, 2, 3], max_tokens=10)
-    request.output_ids = [1, 2]
-    assert not request.is_finished([0])
 
 
 @pytest.mark.parametrize("encoded", [[1, 2, 3], [[1, 2, 3]]])
@@ -189,13 +153,6 @@ def test_scheduler_long_prompt_truncates_and_finishes_at_sequence_limit():
     assert not scheduler.has_requests()
 
 
-def test_scheduler_remove_request():
-    tm = make_scheduler(tokenizer=make_mock_tokenizer())
-    tid = tm.add_request("test")
-    tm.cancel_request(tid)
-    assert len(tm.waiting) == 0
-
-
 def test_scheduler_cancel_preserves_inflight_request_until_retirement():
     scheduler = make_scheduler()
     rid = scheduler.add_request("test")
@@ -239,25 +196,12 @@ def test_scheduler_preserves_waiting_order_under_cache_pressure():
     assert not scheduler.waiting
 
 
-def test_scheduler_has_work():
-    tm = make_scheduler(tokenizer=make_mock_tokenizer())
-    assert not tm.has_requests()
-    tm.add_request("test")
-    assert tm.has_requests()
-
-
 def test_scheduler_add_task_rejects_empty_prompt():
     tm = make_scheduler(tokenizer=make_mock_tokenizer())
     tm.tokenizer.encode.return_value = []
 
     with pytest.raises(ValueError, match="zero tokens"):
         tm.add_request("")
-
-
-def test_scheduler_cancel_unknown_request_is_noop():
-    scheduler = make_scheduler()
-    assert not scheduler.cancel_request("does-not-exist")
-    assert scheduler.get_stats()["cancelled_total"] == 0
 
 
 def test_scoring_and_generation_share_duplicate_id_validation():

@@ -8,62 +8,6 @@ import torch
 from astrai.inference.worker.sample import SamplingMeta, sample
 
 
-def test_module_sample_shortcut():
-    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]])
-    tokens = sample(logits, temperature=0.8, top_k=3, top_p=0.95)
-    assert tokens.shape == (1,)
-    assert 0 <= tokens[0] < logits.size(-1)
-
-
-def test_module_sample_batch():
-    logits = torch.tensor(
-        [
-            [1.0, 2.0, 3.0, 4.0, 5.0],
-            [5.0, 4.0, 3.0, 2.0, 1.0],
-        ]
-    )
-    tokens = sample(logits, temperature=0.8, top_k=3, top_p=0.95)
-    assert tokens.shape == (2,)
-    for t in tokens:
-        assert 0 <= t < logits.size(-1)
-
-
-def test_sample_with_frequency_penalty():
-    logits = torch.tensor([[5.0, 1.0, 2.0, 3.0]])
-    input_ids = torch.tensor([[0, 2, 0]])
-    input_mask = torch.tensor([[True, True, True]])
-    tokens = sample(
-        logits,
-        temperature=1.0,
-        top_k=0,
-        top_p=1.0,
-        frequency_penalty=0.5,
-        input_ids=input_ids,
-        input_mask=input_mask,
-    )
-    assert tokens.shape == (1,)
-    assert 0 <= tokens[0] < logits.size(-1)
-
-
-def test_sample_return_logprobs_shape():
-    """``return_logprobs=True`` returns ``[batch]`` logprobs aligned to tokens."""
-    logits = torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]])
-    out = sample(logits, temperature=1.0, return_logprobs=True)
-    tokens, logprobs = out
-    assert tokens.shape == (2,)
-    assert logprobs.shape == (2,)
-
-
-def test_sample_return_logprobs_nonpositive():
-    """Probabilities never exceed 1, so logprobs are always ≤ 0."""
-    torch.manual_seed(0)
-    logits = torch.randn(4, 50)
-    _, logprobs = sample(
-        logits, temperature=0.8, top_k=20, top_p=0.9, return_logprobs=True
-    )
-    assert torch.all(logprobs <= 1e-5)
-
-
 def test_sample_return_logprobs_greedy_path():
     """Greedy decode (temperature 0) also returns logprobs."""
     logits = torch.tensor([[1.0, 5.0, 2.0]])

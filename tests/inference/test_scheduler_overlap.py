@@ -1,5 +1,3 @@
-"""Tests for scheduler concurrency."""
-
 import threading
 import time
 import uuid

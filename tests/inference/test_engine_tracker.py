@@ -1,5 +1,3 @@
-"""Unit tests for InferenceEngine.generate() and the frontend event protocol."""
-
 from unittest.mock import MagicMock
 
 from astrai.inference.core.events import (

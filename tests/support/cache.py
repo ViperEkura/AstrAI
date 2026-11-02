@@ -1,11 +1,8 @@
-"""Unit tests for inference cache components."""
-
 import pytest
 import torch
 
 from astrai.inference.core.cache import (
     BlockPool,
-    KVCacheManager,
 )
 from astrai.inference.worker.workspace import InferenceWorkspace
 
@@ -20,10 +17,6 @@ def make_cache_workspace(pool: BlockPool) -> InferenceWorkspace:
         device=pool.device,
         dtype=pool.dtype,
     )
-
-
-def make_task_cache(pool: BlockPool) -> KVCacheManager:
-    return KVCacheManager(pool)
 
 
 @pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
@@ -89,16 +82,6 @@ def make_paged_pool(**kwargs):
 
 
 def make_paged_pool_ps64(**kwargs):
-    defaults = dict(
-        n_layers=1,
-        n_kv_heads=2,
-        head_dim=4,
-        max_batch_size=4,
-        max_seq_len=256,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        page_size=64,
-        n_tokens=512,
+    return make_paged_pool(
+        **{"max_seq_len": 256, "page_size": 64, "n_tokens": 512, **kwargs}
     )
-    defaults.update(kwargs)
-    return BlockPool(**defaults)

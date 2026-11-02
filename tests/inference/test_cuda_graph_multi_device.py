@@ -1,7 +1,6 @@
-import pytest
-
 """CUDA Graph capture must use a stream on each replica's own device."""
 
+import pytest
 import torch
 
 from astrai.inference.worker.graph import CUDAGraphRunner

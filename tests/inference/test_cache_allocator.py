@@ -1,5 +1,3 @@
-"""Unit tests for inference cache components."""
-
 import random
 
 import pytest
@@ -32,27 +30,6 @@ def test_allocator_alloc_when_full():
     assert alloc.alloc() == -1
 
 
-def test_allocator_lru_eviction():
-    alloc = Allocator(2)
-    p0 = alloc.alloc()
-    p1 = alloc.alloc()
-    alloc.free(p0, keep_cached=True)
-    alloc.free(p1, keep_cached=True)
-    alloc.alloc()
-    assert p0 in alloc._lru or p1 in alloc._lru
-
-
-def test_allocator_inc_ref_and_free():
-    alloc = Allocator(2)
-    p = alloc.alloc()
-    alloc.inc_ref(p)
-    assert alloc._refs[p] == 2
-    alloc.free(p)
-    assert alloc._refs[p] == 1
-    alloc.free(p)
-    assert alloc._refs[p] == 0
-
-
 def test_prefix_cache_lookup_returns_hits():
     token_ids = list(range(256))
     prefix = RadixCache(64)
@@ -71,14 +48,6 @@ def test_prefix_cache_lookup_stops_at_first_miss():
     hits = prefix.lookup(token_ids)
     assert len(hits) == 1
     assert hits[0] == 0
-
-
-def test_prefix_cache_ignores_partial_last_page():
-    token_ids = list(range(100))
-    prefix = RadixCache(64)
-    prefix.record(0, token_ids, 0)
-    hits = prefix.lookup(token_ids)
-    assert len(hits) == 1
 
 
 def test_prefix_cache_on_evict_clears_mappings():

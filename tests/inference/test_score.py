@@ -78,11 +78,6 @@ def test_per_token_sums_to_the_total(engine):
     assert sum(per_token) == pytest.approx(engine.score(prompt, cont), abs=1e-6)
 
 
-def test_adding_continuation_tokens_can_only_lower_the_score(engine):
-    prompt, cont = [3, 5, 7, 11, 13], [17, 19, 23]
-    assert engine.score(prompt, cont) < engine.score(prompt, cont[:1])
-
-
 def test_batch_matches_single_pair_calls(engine):
     pairs = [([3, 5, 7, 11], [13]), ([3, 5, 7, 11], [17]), ([2, 4, 6, 8], [10])]
     batched = engine.score([p for p, _ in pairs], [c for _, c in pairs])

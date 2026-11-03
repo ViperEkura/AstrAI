@@ -24,6 +24,7 @@ from astrai.trainer.strategy.ops import (
     ForwardResult,
     _is_packed,
     make_doc_boundary_mask,
+    make_doc_packed_mask,
 )
 
 
@@ -210,9 +211,13 @@ class SFTStrategy(_CEStrategy):
         # pass None and take the is_causal fast path — the only form ring
         # attention accepts.  shard_spec has rejected packed documents
         # before a sharded forward gets here.
-        input_mask = (
-            make_doc_boundary_mask(position_ids) if _is_packed(position_ids) else None
-        )
+        input_mask = None
+        if _is_packed(position_ids):
+            input_mask = (
+                make_doc_packed_mask(position_ids)
+                if position_ids.is_cuda
+                else make_doc_boundary_mask(position_ids)
+            )
         targets = batch["target_ids"]
         if self.loss_backend == "cuda_linear_ce":
             targets = targets.masked_fill(~batch["loss_mask"], -100)

@@ -35,10 +35,6 @@ class StopSequenceChecker:
         self._buffer = ""
         self.matched: Optional[str] = None
 
-    @property
-    def has_stops(self) -> bool:
-        return bool(self._sequences)
-
     def push(self, text: str) -> Tuple[str, bool]:
         """Append ``text``; return ``(releasable_text, stopped)``.
 

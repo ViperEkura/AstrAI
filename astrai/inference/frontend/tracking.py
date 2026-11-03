@@ -74,12 +74,6 @@ class RequestTracker(OutputEventSink):
             state.subscriber = (loop, queue)
         return queue, pending
 
-    def unsubscribe_async(self, request_id: str) -> None:
-        with self._condition:
-            state = self._requests.get(request_id)
-            if state is not None:
-                state.subscriber = None
-
     def __call__(self, events: List[Any]) -> None:
         by_loop: Dict[
             asyncio.AbstractEventLoop, List[Tuple[str, asyncio.Queue, List[Any]]]

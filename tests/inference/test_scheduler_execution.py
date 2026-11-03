@@ -149,15 +149,14 @@ def test_decode_does_not_reuse_previous_batch_state():
     workspace.max_batch_size = 16
     workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids.return_value = torch.tensor([7], dtype=torch.long)
-    workspace.decode_mask.return_value = torch.ones(1, 1, 9, dtype=torch.bool)
     executor._workspace = workspace
     executor.model = MagicMock(
         return_value={"logits": torch.zeros(1, 1, 10, dtype=torch.float32)}
     )
 
     old_info = object()
-    new_info = SimpleNamespace(has_freq=False)
-    executor._decode_cache = DecodeSteadyState(("old",), [2], old_info)
+    new_info = SimpleNamespace(meta=SimpleNamespace(has_freq=False))
+    executor._decode_cache = DecodeSteadyState(("old",), old_info)
     request = Request("new", list(range(8)), temperature=0)
     request.output_ids = [7]
     request = request.execution("decode", 8, 1)
@@ -173,7 +172,9 @@ def test_decode_does_not_reuse_previous_batch_state():
         "astrai.inference.worker.model_runner._build_sampling_batch_info",
         return_value=new_info,
     ):
-        assert executor.execute_decode([request], plan=plan) == [3]
+        pending = executor.submit_decode([request], plan=plan)
+        assert pending is not None
+        assert [r.token_id for r in pending.commit().results] == [3]
 
     assert workspace.position_ids.tolist() == [8]
     assert executor._decode_cache.task_sig == (request.identity,)
@@ -204,14 +205,14 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
         return_value={"logits": torch.zeros(1, 1, 10, dtype=torch.float32)}
     )
 
-    info = SimpleNamespace(has_freq=False)
+    info = SimpleNamespace(meta=SimpleNamespace(has_freq=False))
     tokens = torch.tensor([3], dtype=torch.long)
     request = Request("t1", list(range(8)), temperature=0)
     request.output_ids = [7]
     request = request.execution("decode", 3, 1)
     plan = SchedulerOutput(1, 2, (request,))
     executor._decode_cache = DecodeSteadyState(
-        (request.identity,), [2], info, last_tokens=tokens
+        (request.identity,), info, last_tokens=tokens
     )
     executor._pending = None
     executor._result_ring = ResultRing(16, executor.device)
@@ -225,7 +226,9 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
         "astrai.inference.worker.model_runner._build_sampling_batch_info",
         return_value=info,
     ):
-        assert executor.execute_decode([request], plan=plan) == [3]
+        pending = executor.submit_decode([request], plan=plan)
+        assert pending is not None
+        assert [r.token_id for r in pending.commit().results] == [3]
 
     workspace.fill_input_ids.assert_not_called()
     workspace.fill_input_ids_from_device.assert_called_once_with(tokens)
@@ -238,7 +241,7 @@ def test_steady_decode_submit_path_is_sync_free(cpu_device):
     """Gate: no hidden device-to-host syncs on the steady decode hot path.
 
     After the first decode step of an unchanged batch (the steady state the
-    serving loop lives in), one ``execute_decode`` call must not resolve any
+    serving loop lives in), one decode submission must not resolve any
     device predicate or scalar to host: ``Tensor.item``/``any``/``all``
     probes are patched to raise, and only ``tolist`` stays legal (it is
     the single intentional commit point that yields the sampled tokens).

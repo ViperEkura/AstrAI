@@ -470,7 +470,10 @@ def make_doc_packed_mask(position_ids: Tensor) -> PackedDocumentMask:
     """Describe packed documents for one varlen causal attention call."""
     boundaries = position_ids[:, 1:] <= position_ids[:, :-1]
     doc_ids = torch.cat(
-        [torch.zeros_like(position_ids[:, :1], dtype=torch.long), boundaries.long().cumsum(dim=1)],
+        [
+            torch.zeros_like(position_ids[:, :1], dtype=torch.long),
+            boundaries.long().cumsum(dim=1),
+        ],
         dim=1,
     )
     starts = torch.cat(

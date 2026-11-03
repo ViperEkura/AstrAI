@@ -235,3 +235,85 @@ def test_fsdp_head_fused_ce(tmp_path):
     mp.spawn(
         _fsdp_worker, args=(os.fspath(tmp_path / "init_fsdp"),), nprocs=2, join=True
     )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_sft_varlen_matches_dense_without_compile(monkeypatch):
+    from astrai.extension.backend.attention import torch as attention_torch
+    from astrai.trainer.strategy import supervised
+
+    torch.manual_seed(0)
+    net = model("cuda")
+    positions = torch.cat([torch.arange(40), torch.arange(24)]).repeat(2, 1)
+    data = {
+        "input_ids": torch.randint(0, 257, (2, 64), device="cuda"),
+        "target_ids": torch.randint(0, 257, (2, 64), device="cuda"),
+        "position_ids": positions.cuda(),
+        "loss_mask": torch.ones(2, 64, dtype=torch.bool, device="cuda"),
+    }
+
+    def no_compile(*args, **kwargs):
+        raise AssertionError("packed SFT must not call torch.compile")
+
+    monkeypatch.setattr(torch, "compile", no_compile)
+    build = supervised.make_doc_packed_mask
+    calls = []
+    varlen_calls = []
+    flash = attention_torch._flash_attn
+    use_flash = (
+        flash is not None
+        and hasattr(flash, "flash_attn_varlen_func")
+        and attention_torch.flash_attn_available()
+    )
+    if use_flash:
+        original_varlen = flash.flash_attn_varlen_func
+
+        def record_varlen(*args, **kwargs):
+            varlen_calls.append(1)
+            return original_varlen(*args, **kwargs)
+
+        monkeypatch.setattr(flash, "flash_attn_varlen_func", record_varlen)
+    monkeypatch.setattr(
+        supervised, "make_doc_packed_mask", lambda p: calls.append(1) or build(p)
+    )
+    with op_backend(attention="torch"):
+        packed_loss = SFTStrategy(net, "cuda").compute_loss(dict(data))
+        packed_loss.backward()
+        packed_grads = [p.grad.clone() for p in net.parameters()]
+        net.zero_grad()
+        monkeypatch.setattr(
+            supervised, "make_doc_packed_mask", supervised.make_doc_boundary_mask
+        )
+        dense_loss = SFTStrategy(net, "cuda").compute_loss(dict(data))
+        dense_loss.backward()
+    assert calls == [1]
+    assert bool(varlen_calls) == use_flash
+    torch.testing.assert_close(packed_loss, dense_loss, rtol=2e-2, atol=2e-2)
+    for actual, param in zip(packed_grads, net.parameters()):
+        torch.testing.assert_close(
+            actual.float(), param.grad.float(), rtol=5e-2, atol=5e-2
+        )
+    assert torch.isfinite(packed_loss)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_sft_without_flash_uses_dense_fallback(monkeypatch):
+    from astrai.extension.backend.attention import torch as attention_torch
+    from astrai.trainer.strategy import supervised
+
+    torch.manual_seed(1)
+    net = model("cuda")
+    data = batch("cuda")
+    data["position_ids"] = torch.cat(
+        [torch.arange(10), torch.arange(9)]
+    ).repeat(2, 1).cuda()
+    monkeypatch.setattr(attention_torch, "flash_attn_available", lambda: False)
+    with op_backend(attention="torch"):
+        packed_loss = SFTStrategy(net, "cuda").compute_loss(dict(data))
+        monkeypatch.setattr(
+            supervised, "make_doc_packed_mask", supervised.make_doc_boundary_mask
+        )
+        dense_loss = SFTStrategy(net, "cuda").compute_loss(dict(data))
+    torch.testing.assert_close(packed_loss, dense_loss, rtol=0, atol=0)

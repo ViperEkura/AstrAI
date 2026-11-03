@@ -6,7 +6,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension.backend.attention.common import _check_fwd, repeat_kv
+from astrai.extension.backend.attention.common import (
+    _check_fwd,
+    _flash_attn,
+    flash_attn_available,
+    repeat_kv,
+)
+from astrai.model.masking import PackedDocumentMask
 
 if TYPE_CHECKING:
     from astrai.model.kv_cache import KVCache
@@ -62,13 +68,38 @@ def forward(
     v: Tensor,
     kv_cache: Optional["KVCache"],
     layer_id: int,
-    attn_mask: Optional[Tensor] = None,
+    attn_mask: Optional[Tensor | PackedDocumentMask] = None,
     is_causal: bool = False,
     fwd: Optional[str] = None,
     *,
     scale: Optional[float] = None,
 ) -> Tensor:
     _check_fwd(fwd)
+    if isinstance(attn_mask, PackedDocumentMask):
+        if q.ndim != 4 or fwd is not None or kv_cache is not None:
+            raise ValueError("packed document mask requires full-sequence training")
+        if (
+            q.is_cuda
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and _flash_attn is not None
+            and hasattr(_flash_attn, "flash_attn_varlen_func")
+            and flash_attn_available()
+        ):
+            batch, seq_len = q.shape[:2]
+            out = _flash_attn.flash_attn_varlen_func(
+                q.reshape(batch * seq_len, *q.shape[2:]).contiguous(),
+                k.reshape(batch * seq_len, *k.shape[2:]).contiguous(),
+                v.reshape(batch * seq_len, *v.shape[2:]).contiguous(),
+                attn_mask.cu_seqlens,
+                attn_mask.cu_seqlens,
+                attn_mask.max_seqlen,
+                attn_mask.max_seqlen,
+                dropout_p=0.0,
+                causal=True,
+                softmax_scale=scale,
+            )
+            return out.reshape(q.shape).contiguous()
+        attn_mask = attn_mask.to_dense()
     if q.ndim == 4:
         n_rep = q.size(2) // k.size(2)
         if n_rep > 1:

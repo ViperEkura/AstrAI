@@ -47,7 +47,7 @@ def test_greedy_respects_frequency_penalty():
         logits.clone(),
         temperature=0.0,
         frequency_penalty=2.0,
-        input_ids=torch.tensor([[0, 0, 0, 0]]),
+        frequency_counts=torch.tensor([[4.0, 0.0, 0.0]]),
     )
     # Token 0 saw four occurrences: 5 - 2*4 < 4, so the argmax flips.
     assert penalized.tolist() == [1]
@@ -73,8 +73,7 @@ def test_seeded_sampling_is_independent_of_global_rng_and_order():
 @pytest.mark.parametrize("meta_cached", [False, True])
 def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
     logits = torch.tensor([[5.0, 4.0, 3.0, 2.0], [1.0, 2.0, 3.0, 4.0]])
-    ids = torch.tensor([[0, 0, 1], [3, 3, 0]])
-    mask = torch.tensor([[True, True, False], [True, False, False]])
+    counts = torch.tensor([[2.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
     captured = []
 
     def draw(probabilities, num_samples):
@@ -88,11 +87,13 @@ def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
             top_k=torch.tensor([2, 0]),
             top_p=torch.tensor([1.0, 0.0]),
             frequency_penalty=torch.tensor([1.0, -1.0]),
-            input_ids=ids,
-            input_mask=mask,
+            frequency_counts=counts,
             return_logprobs=True,
             meta=SamplingMeta(False, True, 2, True, True) if meta_cached else None,
         )
+    torch.testing.assert_close(
+        counts, torch.tensor([[2.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    )
     # Top-k preserves ties at the cutoff: all three first-row candidates remain.
     expected = torch.softmax(
         torch.tensor(

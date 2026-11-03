@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from unittest.mock import MagicMock
 
 from astrai.inference.core.events import (
@@ -27,7 +29,7 @@ def test_request_tracker_events_only_reach_registered_requests():
 
 def test_tracker_accepts_one_terminal_and_reclaims_all_state():
     tracker = RequestTracker()
-    done = tracker.register("r", maxlen=4)
+    done = tracker.register("r", event_capacity=4)
     terminal = RequestFinished("r", FINISH_CANCELLED, 2, 1)
     tracker([TokenDelta("r", 11, 1), terminal, terminal, TokenDelta("r", 12, 2)])
     tracker([RequestError("r", "late", "ignored")])
@@ -86,3 +88,26 @@ def test_tracker_closed_loop_preserves_interleaved_terminal_backlog():
         ]
         tracker.unregister(rid)
     assert all(state.subscriber is None for state in tracker._requests.values())
+
+
+def test_stream_wait_wakes_for_any_request_before_completion(monkeypatch):
+    tracker = RequestTracker()
+    for rid in ("a", "b"):
+        tracker.register(rid)
+    waiting = Event()
+    wait = tracker._condition.wait
+
+    def signal_wait(timeout=None):
+        waiting.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(tracker._condition, "wait", signal_wait)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        ready = pool.submit(tracker.wait_for_events, ["a", "b"], 5)
+        assert waiting.wait(5)
+        tracker([TokenDelta("b", 12, 1)])
+        assert ready.result(timeout=5)
+    assert not tracker.wait("b", timeout=0)
+    assert tracker.wait_for_events(["a", "b"], timeout=0)
+    assert tracker.drain("b") == [TokenDelta("b", 12, 1)]
+    assert not tracker.wait_for_events(["a", "b"], timeout=0)

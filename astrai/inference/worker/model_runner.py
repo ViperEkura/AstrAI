@@ -668,27 +668,28 @@ class GPUModelRunner:
         pending step instead of being resolved to host lists.
         """
         info = info or _build_sampling_batch_info(requests, self.device)
+        counts = None
         if info.has_freq:
-            history_lists = [
-                t.prompt_ids[-t.sampling.rep_window :] + t.output_ids for t in requests
-            ]
-            history_lens = [len(ids) for ids in history_lists]
-            max_len = max(history_lens, default=0)
-            padded_ids = torch.zeros(
-                len(requests), max_len, dtype=torch.long, device=self.device
+            vocab = logits.size(-1)
+            # Encode each token's request row; ragged histories need no padding.
+            indices = torch.tensor(
+                [
+                    row * vocab + token
+                    for row, request in enumerate(requests)
+                    for token in (
+                        request.prompt_ids[-request.sampling.rep_window :]
+                        + request.output_ids
+                    )
+                ],
+                dtype=torch.long,
+                device="cpu",
+            ).to(logits.device, non_blocking=True)
+            counts = torch.zeros(
+                logits.shape, dtype=torch.float32, device=logits.device
             )
-            padded_mask = torch.zeros(
-                len(requests), max_len, dtype=torch.bool, device=self.device
+            counts.view(-1).index_add_(
+                0, indices, torch.ones_like(indices, dtype=counts.dtype)
             )
-            for i, ids in enumerate(history_lists):
-                length = len(ids)
-                padded_ids[i, :length] = torch.as_tensor(
-                    ids, dtype=torch.long, device=self.device
-                )
-                padded_mask[i, :length] = True
-        else:
-            padded_ids = None
-            padded_mask = None
 
         # Stateless per-request/per-position streams survive request reordering,
         # worker repartitioning and scheduler compaction without touching global RNG.
@@ -708,8 +709,7 @@ class GPUModelRunner:
             top_k=info.top_ks,
             top_p=info.top_ps,
             frequency_penalty=info.freq_penalties,
-            input_ids=padded_ids,
-            input_mask=padded_mask,
+            frequency_counts=counts,
             return_logprobs=return_logprobs,
             **seed_kwargs,
             meta=info.meta,

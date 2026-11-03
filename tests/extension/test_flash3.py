@@ -17,7 +17,16 @@ def test_flash3_4d_dense_and_document_packed_forward(monkeypatch):
 
     def varlen(q, k, v, cu_q, cu_k, max_q, max_k, **kwargs):
         calls.append(
-            ("varlen", q.shape, k.shape, cu_q.tolist(), cu_k.tolist(), max_q, max_k, kwargs)
+            (
+                "varlen",
+                q.shape,
+                k.shape,
+                cu_q.tolist(),
+                cu_k.tolist(),
+                max_q,
+                max_k,
+                kwargs,
+            )
         )
         return q
 
@@ -32,7 +41,12 @@ def test_flash3_4d_dense_and_document_packed_forward(monkeypatch):
 
     out = flash3.forward(q, k, v, None, 0, is_causal=True)
     torch.testing.assert_close(out, q)
-    assert calls.pop(0) == ("dense", q.shape, k.shape, {"causal": True, "softmax_scale": None})
+    assert calls.pop(0) == (
+        "dense",
+        q.shape,
+        k.shape,
+        {"causal": True, "softmax_scale": None},
+    )
 
     packed = PackedDocumentMask(
         doc_ids=torch.tensor([[0, 0, 1, 1], [0, 0, 0, 0]]),
@@ -58,8 +72,7 @@ def test_flash3_3d_packed_inference_forward(monkeypatch):
 
     def varlen(q, k, v, cu_q, cu_k, max_q, max_k, **kwargs):
         captured.update(
-            q=q, k=k, v=v, cu_q=cu_q, cu_k=cu_k,
-            max_q=max_q, max_k=max_k, kwargs=kwargs
+            q=q, k=k, v=v, cu_q=cu_q, cu_k=cu_k, max_q=max_q, max_k=max_k, kwargs=kwargs
         )
         return q
 

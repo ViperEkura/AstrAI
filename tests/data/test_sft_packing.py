@@ -172,3 +172,43 @@ def test_reject_pack_larger_than_training_context(tmp_path):
     dataset = DatasetFactory.load("sft", str(tmp_path), window_size=4)
     with pytest.raises(ValueError, match="exceeds training window"):
         dataset[0]
+
+
+def test_packed_document_offsets_match_dense_boundary_mask():
+    from astrai.trainer.strategy.ops import make_doc_packed_mask
+
+    positions = torch.tensor([[0, 1, 2, 0, 1, 0], [0, 1, 0, 1, 2, 3]])
+    packed = make_doc_packed_mask(positions)
+    assert packed.cu_seqlens.dtype == torch.int32
+    assert packed.cu_seqlens.tolist() == [0, 3, 5, 6, 8, 12]
+    assert packed.max_seqlen == 4
+    torch.testing.assert_close(packed.to_dense(), make_doc_boundary_mask(positions))
+    assert packed.to_dense() is packed.to_dense()
+
+
+def test_packed_document_attention_cpu_fallback():
+    from astrai.extension.backend.attention import attention
+    from astrai.trainer.strategy.ops import make_doc_packed_mask
+
+    positions = torch.tensor([[0, 1, 2, 0, 1, 0], [0, 1, 0, 1, 2, 3]])
+    packed = make_doc_packed_mask(positions)
+    torch.manual_seed(7)
+    q = torch.randn(2, 6, 4, 8, requires_grad=True)
+    k = torch.randn(2, 6, 2, 8, requires_grad=True)
+    v = torch.randn(2, 6, 2, 8, requires_grad=True)
+    actual = attention(q, k, v, attn_mask=packed, implementation="torch")
+    expected = attention(
+        q,
+        k,
+        v,
+        attn_mask=make_doc_boundary_mask(positions),
+        implementation="torch",
+    )
+    torch.testing.assert_close(actual, expected)
+    actual.square().sum().backward(retain_graph=True)
+    grads = [x.grad.clone() for x in (q, k, v)]
+    for x in (q, k, v):
+        x.grad = None
+    expected.square().sum().backward()
+    for actual_grad, x in zip(grads, (q, k, v)):
+        torch.testing.assert_close(actual_grad, x.grad)

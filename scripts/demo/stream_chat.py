@@ -35,6 +35,12 @@ def parse_args():
         help="Top-k sampling threshold",
     )
     parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=4096,
+        help="Maximum input + output tokens (default: %(default)s)",
+    )
+    parser.add_argument(
         "--max_tokens",
         type=int,
         default=2048,
@@ -72,9 +78,7 @@ def parse_args():
 
 def chat():
     args = parse_args()
-    model_path = args.model_path
-
-    engine = build_engine(model_path)
+    engine = build_engine(args.model_path, max_seq_len=args.max_seq_len)
     tokenizer = engine.tokenizer
     msgs = []
     if args.system_prompt:

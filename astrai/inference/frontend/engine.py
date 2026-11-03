@@ -540,7 +540,7 @@ def build_engine(
     tokenizer: Optional[AutoTokenizer] = None,
     device: Optional[str] = "cuda",
     dtype: Optional[torch.dtype] = torch.bfloat16,
-    max_batch_size: int = 16,
+    max_batch_size: int = 1,
     max_seq_len: Optional[int] = None,
     **engine_kwargs: Any,
 ) -> InferenceEngine:

@@ -306,9 +306,9 @@ def test_packed_sft_without_flash_uses_dense_fallback(monkeypatch):
     torch.manual_seed(1)
     net = model("cuda")
     data = batch("cuda")
-    data["position_ids"] = torch.cat(
-        [torch.arange(10), torch.arange(9)]
-    ).repeat(2, 1).cuda()
+    data["position_ids"] = (
+        torch.cat([torch.arange(10), torch.arange(9)]).repeat(2, 1).cuda()
+    )
     monkeypatch.setattr(attention_torch, "flash_attn_available", lambda: False)
     with op_backend(attention="torch"):
         packed_loss = SFTStrategy(net, "cuda").compute_loss(dict(data))

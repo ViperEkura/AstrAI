@@ -16,6 +16,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from astrai.model.components.mlp import RouterStats
+from astrai.model.masking import PackedDocumentMask
 
 
 class LossOutput(TypedDict):
@@ -463,6 +464,25 @@ def make_doc_boundary_mask(position_ids: Tensor) -> Tensor:
     same_doc = doc_ids.unsqueeze(-1) == doc_ids.unsqueeze(-2)
     causal = torch.tril(torch.ones(S, S, dtype=torch.bool, device=device))
     return (same_doc & causal).unsqueeze(1)
+
+
+def make_doc_packed_mask(position_ids: Tensor) -> PackedDocumentMask:
+    """Describe packed documents for one varlen causal attention call."""
+    boundaries = position_ids[:, 1:] <= position_ids[:, :-1]
+    doc_ids = torch.cat(
+        [torch.zeros_like(position_ids[:, :1], dtype=torch.long), boundaries.long().cumsum(dim=1)],
+        dim=1,
+    )
+    starts = torch.cat(
+        [torch.ones_like(position_ids[:, :1], dtype=torch.bool), boundaries],
+        dim=1,
+    ).flatten()
+    offsets = starts.nonzero().flatten()
+    offsets = torch.cat([offsets, offsets.new_tensor([position_ids.numel()])]).to(
+        torch.int32
+    )
+    max_seqlen = int((offsets[1:] - offsets[:-1]).max().item())
+    return PackedDocumentMask(doc_ids, offsets, max_seqlen)
 
 
 def _collect_moe_diagnostics(

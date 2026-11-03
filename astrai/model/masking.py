@@ -1,6 +1,7 @@
 """Mask contracts for full and recurrent decoder attention."""
 
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -8,22 +9,43 @@ from torch import Tensor
 
 
 @dataclass(frozen=True)
+class PackedDocumentMask:
+    """Document boundaries for varlen causal attention over packed SFT rows."""
+
+    doc_ids: Tensor
+    cu_seqlens: Tensor
+    max_seqlen: int
+
+    @cached_property
+    def dense(self) -> Tensor:
+        seq_len = self.doc_ids.size(1)
+        same_doc = self.doc_ids.unsqueeze(-1) == self.doc_ids.unsqueeze(-2)
+        causal = torch.ones(
+            seq_len, seq_len, dtype=torch.bool, device=self.doc_ids.device
+        ).tril()
+        return (same_doc & causal).unsqueeze(1)
+
+    def to_dense(self) -> Tensor:
+        return self.dense
+
+
+@dataclass(frozen=True)
 class LayerAttentionMask:
-    tensor: Optional[Tensor]
+    tensor: Optional[Tensor | PackedDocumentMask]
     is_causal: bool
 
 
 def process_attention_mask(
-    input_mask: Optional[Tensor],
+    input_mask: Optional[Tensor | PackedDocumentMask],
     *,
     causal: bool = False,
-) -> Optional[Tensor]:
+) -> Optional[Tensor | PackedDocumentMask]:
     """Expand masks, optionally adding causality to a 2-D key-padding mask.
 
     Explicit 3-D/4-D masks already define which query/key pairs may attend.
     """
-    if input_mask is None:
-        return None
+    if input_mask is None or isinstance(input_mask, PackedDocumentMask):
+        return input_mask
     if input_mask.dim() == 2:
         mask = input_mask[:, None, None, :]
         if causal:
@@ -45,7 +67,7 @@ def process_attention_mask(
 
 
 def prepare_decoder_masks(
-    input_mask: Optional[Tensor],
+    input_mask: Optional[Tensor | PackedDocumentMask],
     layer_types: Tuple[str, ...],
 ) -> Dict[str, LayerAttentionMask]:
     """Prepare one mask per attention type, shared by all matching layers."""
@@ -55,7 +77,7 @@ def prepare_decoder_masks(
     if full_attention:
         # Keep a 2-D padding mask on its key axis. The attention backend applies
         # causality using each request's query position, including cached chunks.
-        key_padding = input_mask is not None and input_mask.ndim == 2
+        key_padding = isinstance(input_mask, Tensor) and input_mask.ndim == 2
         full = LayerAttentionMask(
             process_attention_mask(input_mask),
             is_causal=input_mask is None or key_padding,
@@ -64,7 +86,7 @@ def prepare_decoder_masks(
             result[kind] = full
     if "gdn" in kinds:
         if input_mask is not None:
-            if input_mask.ndim != 2:
+            if isinstance(input_mask, PackedDocumentMask) or input_mask.ndim != 2:
                 raise ValueError(
                     "Packed document masks need GDN state resets; train with "
                     "unpacked sequences until boundary resets are supported"

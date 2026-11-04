@@ -121,6 +121,9 @@ def test_record_padding_labels_and_boundary_mask(tmp_path):
         [22, -100, -100, -100, -100],
     ]
     assert batch["loss_mask"].sum().item() == 4
+    assert batch["varlen_cu_seqlens"].tolist() == [0, 3, 5, 7]
+    assert batch["varlen_indices"].tolist() == [0, 1, 2, 3, 4, 5, 6]
+    assert batch["varlen_max_seqlen"] == 3
     attention = make_doc_boundary_mask(batch["position_ids"])
     assert not attention[0, 0, 3:, :3].any()
     assert not attention[0, 0].triu(1).any()

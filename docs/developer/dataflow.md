@@ -154,7 +154,7 @@ Stream mode (SEQ and stream-format SFT):
     → Store.sample_window(idx) → [begin, end)
     → Store.fetch(begin, end, keys) → Tensor / Dict[str, Tensor]
 
-Record mode (DPO, GRPO and SFT packs with seq_lengths):
+Record mode (DPO, GRPO and SEQ/SFT packs with seq_lengths):
   Dataset.__getitem__(idx)
     → Store.fetch_record(idx, keys) → Tensor / Dict[str, Tensor]
 ```
@@ -162,7 +162,7 @@ Record mode (DPO, GRPO and SFT packs with seq_lengths):
 Class hierarchy: `BaseDataset` is the direct base of `SEQDataset`, `SFTDataset`,
 `DPODataset`, and `GRPODataset`. Record access is selected by the dataset and storage metadata.
 
-`window_size` = max input length, `stride` = step between consecutive samples (defaults to `window_size`, optional). Stream mode uses both for slicing. DPO/GRPO ignore them; SFT record mode
+`window_size` = max input length, `stride` = step between consecutive samples (defaults to `window_size`, optional). Stream mode uses both for slicing. DPO/GRPO ignore them; SEQ/SFT record mode
 uses `window_size` to reject oversized packs rather than re-slicing them. `storage_type` defaults to `None` (auto-detect via `detect_format`).
 
 For raw JSONL, `tokenizer_path` builds the lazy processor only for DPO. For

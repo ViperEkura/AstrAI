@@ -18,6 +18,8 @@ def supports(spec: AttentionSpec) -> bool:
     if (
         spec.device.type != "cuda"
         or spec.dtype not in (torch.float16, torch.bfloat16)
+        or not 0 < spec.head_dim <= 256
+        or spec.head_dim % 8 != 0
         or not torch.backends.cuda.is_flash_attention_available()
     ):
         return False

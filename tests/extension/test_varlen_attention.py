@@ -8,6 +8,7 @@ import torch
 from astrai.attention_layout import VarlenAttentionLayout
 from astrai.extension.backend.attention import torch as native
 from astrai.extension.backend.attention import varlen
+from astrai.extension.backend.attention.dispatcher import attention
 
 
 def _layout(device: str) -> VarlenAttentionLayout:
@@ -96,9 +97,28 @@ def test_3d_varlen_uses_kv_cache_offsets(monkeypatch):
     assert captured["kwargs"]["window_size"] == (-1, 0)
 
 
+@pytest.mark.parametrize("head_dim", [0, 8, 30, 32, 192, 256, 264, 320])
+@pytest.mark.parametrize("fwd", [None, "prefill", "decode"])
+def test_varlen_supports_head_dimension(monkeypatch, head_dim, fwd):
+    monkeypatch.setattr(
+        torch.backends.cuda, "is_flash_attention_available", lambda: True
+    )
+    spec = SimpleNamespace(
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        head_dim=head_dim,
+        mask_kind="varlen" if fwd is None else "none",
+        ndim=4 if fwd is None else 3,
+        fwd=fwd,
+        kv_cache_kind="none" if fwd is None else "KVCache",
+    )
+    assert varlen.supports(spec) == (head_dim in (8, 32, 192, 256))
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_builtin_varlen_matches_dense_sft_attention(monkeypatch):
+@pytest.mark.parametrize("head_dim", [32, 256, 36, 320])
+def test_builtin_varlen_matches_dense_sft_attention(monkeypatch, head_dim):
     if not torch.backends.cuda.is_flash_attention_available():
         pytest.skip("PyTorch FlashAttention kernel unavailable")
 
@@ -109,15 +129,15 @@ def test_builtin_varlen_matches_dense_sft_attention(monkeypatch):
     layout = _layout("cuda")
     torch.manual_seed(9)
     q = torch.randn(
-        2, 5, 2, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        2, 5, 2, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     k = torch.randn(
-        2, 5, 1, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        2, 5, 1, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     v = torch.randn(
-        2, 5, 1, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        2, 5, 1, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
-    actual = varlen.forward_4d(q, k, v, layout, None)
+    actual = attention(q, k, v, attn_mask=layout)
     expected = native.forward(q, k, v, None, 0, layout)
     valid = layout.indices
     torch.testing.assert_close(
@@ -126,7 +146,9 @@ def test_builtin_varlen_matches_dense_sft_attention(monkeypatch):
         rtol=2e-2,
         atol=2e-2,
     )
-    actual.float().square().sum().backward(retain_graph=True)
+    actual.flatten(0, 1).index_select(0, valid).float().square().sum().backward(
+        retain_graph=True
+    )
     grads = [tensor.grad.float().clone() for tensor in (q, k, v)]
     for tensor in (q, k, v):
         tensor.grad = None

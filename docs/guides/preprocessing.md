@@ -492,7 +492,7 @@ part of the writer. `output.storage_format` accepts only `"bin"`, including
 when loading a configuration file. This restriction concerns output;
 `JsonlStore` and JSONL input tokenization remain available.
 
-### SFT packs with explicit boundaries
+### Training packs with explicit boundaries
 
 Use the independent defaults `overflow: truncate` and `packing: bfd`.
 Set both `max_seq_len` and `max_packed_len` to the training context length
@@ -515,8 +515,19 @@ and padding are ignored by the loss. Token ID zero is a valid masked
 filler, not an assumed tokenizer padding symbol. Existing SFT attention
 constructs a same-segment causal mask from the position resets. Resets
 and EOS tokens alone do not isolate attention. This path uses the
-existing dense attention mask and requires a compatible model/backend;
-packed context parallelism remains unsupported.
+existing dense attention mask on CPU. On supported CUDA builds, document
+offsets feed PyTorch's varlen attention operator without `torch.compile`.
+Packed context parallelism remains unsupported.
+
+For document-isolated pretraining, use
+`output.record_keys: ["sequence", "seq_lengths"]` with the same
+`doc_reset` position mode and set the training dataset's `train_type` to
+`seq`. The trainer selects `seq_collate_fn`; each document-ending target
+is ignored, so the model does not predict the first token of the next
+document from the previous one. Ordinary SEQ stream datasets keep their
+continuous causal attention behavior. The collators pass offsets and
+valid-token indices as batch metadata; padding is excluded from varlen
+attention and from the loss.
 
 The old `packing_strategy` option and strategy classes have been removed.
 Migrate `simple` to `packing: none`, `bfd` to `packing: bfd`, and

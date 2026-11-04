@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
+from astrai.attention_layout import VarlenAttentionLayout
 from astrai.extension.kernel.cross_entropy import is_available as ce_available
 from astrai.extension.kernel.cross_entropy import linear_cross_entropy
 from astrai.model.components.linear import LinearCrossEntropyHead
@@ -128,6 +129,15 @@ class _CEStrategy(BaseStrategy):
             reduction="sum",
         )
 
+    @staticmethod
+    def _attention_layout(batch: Dict[str, Tensor]) -> VarlenAttentionLayout:
+        return VarlenAttentionLayout(
+            cu_seqlens=batch["varlen_cu_seqlens"],
+            indices=batch["varlen_indices"],
+            max_seqlen=batch["varlen_max_seqlen"],
+            position_ids=batch["position_ids"],
+        )
+
 
 @StrategyFactory.register("seq")
 class SEQStrategy(_CEStrategy):
@@ -154,16 +164,25 @@ class SEQStrategy(_CEStrategy):
         return batch
 
     def shard_spec(self, batch: Dict[str, Tensor]) -> Tuple[List[Tensor], List[int]]:
+        if "varlen_cu_seqlens" in batch:
+            raise NotImplementedError(
+                "document-isolated pretraining cannot shard across cp ranks"
+            )
         return (
             [batch["input_ids"], batch["target_ids"], batch["position_ids"]],
             [1, 1, 1],
         )
 
     def forward_tokens(self, batch: Dict[str, Tensor]) -> ForwardResult:
+        model_kwargs = {
+            "input_ids": batch["input_ids"],
+            "position_ids": batch["position_ids"],
+        }
+        if "varlen_cu_seqlens" in batch:
+            model_kwargs["input_mask"] = self._attention_layout(batch)
         return self._forward_ce(
             batch["target_ids"],
-            input_ids=batch["input_ids"],
-            position_ids=batch["position_ids"],
+            **model_kwargs,
         )
 
     def reduce_loss(
@@ -171,9 +190,7 @@ class SEQStrategy(_CEStrategy):
     ) -> TokenLoss:
         target_ids = batch["target_ids"]
         loss_sum = self._ce_sum(forward, target_ids)
-        token_count = torch.tensor(
-            target_ids.numel(), dtype=torch.float32, device=target_ids.device
-        )
+        token_count = (target_ids != -100).sum().to(dtype=torch.float32)
         return TokenLoss(loss_sum, token_count)
 
 
@@ -188,7 +205,7 @@ class SFTStrategy(_CEStrategy):
     loss_reduction = LossReduction.TOKEN_MEAN
 
     def shard_spec(self, batch: Dict[str, Tensor]) -> Tuple[List[Tensor], List[int]]:
-        if _is_packed(batch["position_ids"]):
+        if "varlen_cu_seqlens" in batch or _is_packed(batch["position_ids"]):
             raise NotImplementedError(
                 "packed multi-document SFT cannot shard across cp ranks: "
                 "the doc-boundary attention mask cannot ride the ring "
@@ -211,7 +228,11 @@ class SFTStrategy(_CEStrategy):
         # attention accepts.  shard_spec has rejected packed documents
         # before a sharded forward gets here.
         input_mask = (
-            make_doc_boundary_mask(position_ids) if _is_packed(position_ids) else None
+            self._attention_layout(batch)
+            if "varlen_cu_seqlens" in batch
+            else make_doc_boundary_mask(position_ids)
+            if _is_packed(position_ids)
+            else None
         )
         targets = batch["target_ids"]
         if self.loss_backend == "cuda_linear_ce":

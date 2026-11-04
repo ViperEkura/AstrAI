@@ -30,7 +30,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, default_collate
 
 from astrai.config.preprocess_config import PipelineConfig
 from astrai.dataset.storage import (
@@ -271,36 +271,79 @@ def validate_keys(store: Store, required: List[str]) -> None:
         )
 
 
-def sft_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-    """Pad packs at batch time; never predict across a segment or pack boundary."""
+def _collate_segment_records(
+    batch: List[Dict[str, Tensor]], *, with_loss_mask: bool
+) -> Dict[str, Tensor]:
+    """Build padded model rows and unpadded attention offsets on the CPU."""
     from torch.nn.utils.rnn import pad_sequence
 
     rows = []
+    segment_lengths = []
+    row_lengths = []
     for sample in batch:
-        if "seq_lengths" not in sample:
-            rows.append(sample)
-            continue
         tokens = sample["input_ids"]
         lengths = sample["seq_lengths"].tolist()
+        if not lengths or any(length <= 0 for length in lengths):
+            raise ValueError("segment lengths must be positive")
+        if sum(lengths) != tokens.numel():
+            raise ValueError("segment lengths must cover the input row")
         targets = torch.full_like(tokens, -100)
-        mask = torch.zeros_like(tokens, dtype=torch.bool)
         targets[:-1] = tokens[1:]
-        mask[:-1] = sample["loss_mask"][1:]
         ends = sample["seq_lengths"].cumsum(0) - 1
         targets[ends] = -100
-        mask[ends] = False
         positions = torch.cat([torch.arange(length) for length in lengths])
-        rows.append(
-            {
-                "input_ids": tokens,
-                "target_ids": targets,
-                "loss_mask": mask,
-                "position_ids": positions,
-            }
-        )
-    return {
+        row = {"input_ids": tokens, "target_ids": targets, "position_ids": positions}
+        if with_loss_mask:
+            mask = torch.zeros_like(tokens, dtype=torch.bool)
+            mask[:-1] = sample["loss_mask"][1:]
+            mask[ends] = False
+            row["loss_mask"] = mask
+        rows.append(row)
+        segment_lengths.extend(lengths)
+        row_lengths.append(tokens.numel())
+
+    keys = ("input_ids", "target_ids", "position_ids")
+    if with_loss_mask:
+        keys += ("loss_mask",)
+    result = {
         key: pad_sequence(
             [row[key] for row in rows],
+            batch_first=True,
+            padding_value=-100 if key == "target_ids" else 0,
+        )
+        for key in keys
+    }
+    lengths = torch.tensor(segment_lengths, dtype=torch.int32)
+    result["varlen_cu_seqlens"] = torch.cat(
+        [lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)]
+    )
+    row_width = max(row_lengths)
+    result["varlen_indices"] = torch.cat(
+        [
+            torch.arange(length) + row * row_width
+            for row, length in enumerate(row_lengths)
+        ]
+    )
+    result["varlen_max_seqlen"] = max(segment_lengths)
+    return result
+
+
+def seq_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+    """Collate optional document-isolated pretraining records."""
+    if "seq_lengths" not in batch[0]:
+        return default_collate(batch)
+    return _collate_segment_records(batch, with_loss_mask=False)
+
+
+def sft_collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+    """Pad SFT packs while keeping their document-boundary metadata."""
+    if "seq_lengths" in batch[0]:
+        return _collate_segment_records(batch, with_loss_mask=True)
+    from torch.nn.utils.rnn import pad_sequence
+
+    return {
+        key: pad_sequence(
+            [sample[key] for sample in batch],
             batch_first=True,
             padding_value=-100 if key == "target_ids" else 0,
         )
@@ -469,13 +512,35 @@ class DatasetFactory(BaseFactory["BaseDataset"]):
 class SEQDataset(BaseDataset):
     """Dataset for sequential next-token prediction training.
 
-    Stream mode: ``store.fetch(begin, end, "sequence")`` returns the
-    input window; the +1 shifted call returns the next-token target.
+    Stream mode returns a shifted token window. Records with ``seq_lengths``
+    preserve document boundaries for isolated pretraining.
     """
 
     required_keys = ["sequence"]
 
+    def __init__(self, store: Store):
+        self.record_mode = "seq_lengths" in store.keys
+        super().__init__(store)
+        if self.record_mode and isinstance(store, MmapStore):
+            store.validate_record_alignment(["sequence"])
+            store.validate_record_alignment(["seq_lengths"])
+
+    def __len__(self) -> int:
+        return self.store.num_records if self.record_mode else super().__len__()
+
     def __getitem__(self, index: int):
+        if self.record_mode:
+            sequence = self.store.fetch_record(index, "sequence").long()
+            lengths = self.store.fetch_record(index, "seq_lengths").long()
+            if (
+                lengths.numel() == 0
+                or (lengths <= 0).any()
+                or lengths.sum().item() != sequence.numel()
+            ):
+                raise ValueError("Invalid SEQ record segment lengths")
+            if self.store.window_size and sequence.numel() > self.store.window_size:
+                raise ValueError("SEQ pack exceeds training window; preprocess again")
+            return {"input_ids": sequence, "seq_lengths": lengths}
         begin, end = self.store.sample_window(index)
         x = self.store.fetch(begin, end, "sequence")
         y = self.store.fetch(begin + 1, end + 1, "sequence")

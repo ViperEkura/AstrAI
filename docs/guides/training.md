@@ -66,6 +66,22 @@ clipping interval. Optional `overlong_max_len`, `overlong_buffer_len` and
 `overlong_penalty_scale` apply a linear length penalty before group normalization.
 See [CLI options](params.md#strategy-specific) for defaults.
 
+Synchronous GRPO reduces each optimizer update over the data-parallel group:
+every rank backpropagates its local response-loss sum, and the trainer divides
+the accumulated gradient by the global valid-token count (nonempty responses
+for sequence aggregation). Policy and KL terms share this denominator, and a
+rank without valid response tokens contributes zero.
+
+Set `rl_microbatch_prompts` to backpropagate that many complete prompt groups
+at a time within one update; the result matches the unchunked update. Ranks pad
+to the same microbatch schedule with zero-weight rows, which never enter the
+denominator or the data cursor. The trainer still performs one optimizer step,
+scheduler step and version publication after the last microbatch.
+`rl_minibatch_prompts` and `rl_update_epochs` keep creating independent
+updates. Async rounds use `async_train_microbatch_prompts` instead. A nonzero
+MoE auxiliary coefficient is rejected with `rl_microbatch_prompts`: summing
+microbatch auxiliary means cannot reproduce the whole-batch router objective.
+
 ### Online Rollout
 
 `online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with

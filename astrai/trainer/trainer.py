@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from astrai.config import TrainConfig
 from astrai.dataset import GlobalBatchSampler
@@ -213,6 +214,54 @@ class Trainer:
             "normalizer": count,
         }
 
+    @staticmethod
+    def _learner_microbatches(
+        context: TrainContext, chunks: List[Tuple[Dict[str, Any], int]]
+    ) -> List[List[Tuple[Dict[str, Any], int]]]:
+        """Split each chunk into prompt-group microbatches of one update.
+
+        Without ``rl_microbatch_prompts`` every chunk is its own single
+        backward. With it, each microbatch backpropagates its local loss sum
+        immediately, and the update's shared global denominator is applied
+        once after the last one. Ranks pad to the same per-chunk schedule
+        with zero-weight rows, so every collective forward/backward matches.
+        """
+        size = getattr(context.config, "rl_microbatch_prompts", None)
+        if size is None:
+            return [[chunk] for chunk in chunks]
+        plan = []
+        for batch, real_count in chunks:
+            total = next(
+                value.shape[0]
+                for value in batch.values()
+                if isinstance(value, torch.Tensor) and value.ndim
+            )
+            pieces = []
+            # A placeholder chunk keeps its one row, still at zero weight.
+            for begin in range(0, real_count or 1, size):
+                end = min(begin + size, real_count or 1)
+                pieces.append(
+                    (
+                        slice_batch(batch, slice(begin, end), total),
+                        end - begin if real_count else 0,
+                    )
+                )
+            plan.append((batch, total, pieces))
+        device = next(context.model.parameters()).device
+        lengths = torch.tensor(
+            [len(pieces) for _, _, pieces in plan], dtype=torch.int64, device=device
+        )
+        if context.dp_size > 1 and dist.is_initialized():
+            dist.all_reduce(
+                lengths, op=dist.ReduceOp.MAX, group=context.topology.dp_group
+            )
+        for (batch, total, pieces), length in zip(plan, lengths.tolist()):
+            pieces.extend(
+                (slice_batch(batch, slice(0, 1), total), 0)
+                for _ in range(length - len(pieces))
+            )
+        return [pieces for _, _, pieces in plan]
+
     def _run_global_update(
         self,
         context: TrainContext,
@@ -225,24 +274,35 @@ class Trainer:
         local_count = 0.0
         local_loss = 0.0
         local_metrics: Dict[str, float] = {}
-        for index, (batch, real_count) in enumerate(chunks):
-            with context.executor.accumulate_explicit(
-                context.model, sync=index + 1 == len(chunks)
-            ):
-                self._call_callbacks("on_batch_begin", context)
-                output = self._window_loss_output(context.strategy, batch, real_count)
-                count = (
-                    float(output.get("normalizer", real_count)) if real_count else 0.0
-                )
-                context.executor.backward(output["loss"] * count)
-                local_count += count
-                reported_loss = float(output["loss"].detach().item())
-                if context.config.cp_size > 1:
-                    reported_loss = output["metrics"]["task_loss"]
-                local_loss += reported_loss * count
-                for name, value in output["metrics"].items():
-                    local_metrics[name] = local_metrics.get(name, 0.0) + value * count
-                self._call_callbacks("on_batch_end", context)
+        plan = self._learner_microbatches(context, chunks)
+        for index, pieces in enumerate(plan):
+            for piece, (batch, real_count) in enumerate(pieces):
+                with context.executor.accumulate_explicit(
+                    context.model,
+                    sync=index + 1 == len(plan) and piece + 1 == len(pieces),
+                ):
+                    if piece == 0:
+                        self._call_callbacks("on_batch_begin", context)
+                    output = self._window_loss_output(
+                        context.strategy, batch, real_count
+                    )
+                    count = (
+                        float(output.get("normalizer", real_count))
+                        if real_count
+                        else 0.0
+                    )
+                    context.executor.backward(output["loss"] * count)
+                    local_count += count
+                    reported_loss = float(output["loss"].detach().item())
+                    if context.config.cp_size > 1:
+                        reported_loss = output["metrics"]["task_loss"]
+                    local_loss += reported_loss * count
+                    for name, value in output["metrics"].items():
+                        local_metrics[name] = (
+                            local_metrics.get(name, 0.0) + value * count
+                        )
+                    if piece + 1 == len(pieces):
+                        self._call_callbacks("on_batch_end", context)
 
         device = next(context.model.parameters()).device
         totals = torch.tensor(

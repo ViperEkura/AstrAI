@@ -121,6 +121,16 @@ class TrainContextBuilder:
                 "tp_size > 1 does not support MoE yet: expert dispatch and "
                 "the per-token aux loss assume full-feature router inputs"
             )
+        if (
+            getattr(self.config, "rl_microbatch_prompts", None) is not None
+            and self.config.moe_aux_loss_coef != 0
+            and str(preloaded_state.model_config.get("ffn_type", "mlp")) == "moe"
+        ):
+            raise NotImplementedError(
+                "rl_microbatch_prompts with a nonzero MoE auxiliary loss needs its "
+                "own global router-statistics reduction; use an unchunked update "
+                "or moe_aux_loss_coef=0"
+            )
 
         # Build the core training components and restore their persisted state.
         executor = self._create_executor()

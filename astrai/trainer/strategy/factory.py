@@ -36,8 +36,6 @@ class StrategyFactory(BaseFactory[BaseStrategy]):
         allowed = {
             "executor",
             "moe_aux_loss_coef",
-            "rl_update_epochs",
-            "rl_minibatch_prompts",
             "gradient_chunked_logprobs",
         }
         for base in component_cls.__mro__:

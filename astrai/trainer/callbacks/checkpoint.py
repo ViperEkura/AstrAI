@@ -9,7 +9,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
 
-from astrai.serialization import Checkpoint
+from astrai.config.inference_config import load_generation_config
+from astrai.serialization import Checkpoint, save_json
+from astrai.tokenize import AutoTokenizer
 from astrai.trainer.callbacks.base import TrainCallback
 from astrai.trainer.optional_extras import (
     component_optimizers,
@@ -22,31 +24,19 @@ if TYPE_CHECKING:
     from astrai.trainer.context.metric import MetricSnapshot
 
 
-_TOKENIZER_FILES = (
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-)
-
-
 def _copy_tokenizer_files(param_path: Optional[str], save_path: str):
-    """Snapshot tokenizer files into the checkpoint directory.
-
-    ``param_path`` is the launch model directory (or, on resume, a
-    previous self-contained checkpoint), so the copy makes every
-    checkpoint independently resumable for online training, which
-    loads its tokenizer from ``param_path``.
-    """
+    """Export HF tokenizer and generation files before checkpoint publication."""
     if not param_path:
         return
-    for name in _TOKENIZER_FILES:
-        src = os.path.join(param_path, name)
-        dst = os.path.join(save_path, name)
-        if not os.path.isfile(src) or (
-            os.path.isfile(dst) and os.path.samefile(src, dst)
-        ):
-            continue
-        shutil.copy2(src, dst)
+    source, target = Path(param_path), Path(save_path)
+    if source.resolve() == target.resolve():
+        return
+    if (source / "tokenizer.json").is_file():
+        AutoTokenizer.from_pretrained(source).save_pretrained(target)
+    generation = load_generation_config(source)
+    if generation or (source / "generation_config.json").is_file():
+        target.mkdir(parents=True, exist_ok=True)
+        save_json(generation, target / "generation_config.json")
 
 
 def _write_metric_snapshot(snapshot: MetricSnapshot, destination: Path) -> None:
@@ -154,7 +144,11 @@ class CheckpointCallback(TrainCallback):
             rl_update_epochs=cfg.rl_update_epochs,
             rl_minibatch_prompts=cfg.rl_minibatch_prompts,
         )
-        policy_version = context.strategy.policy_version
+        if context.pretrained_metadata:
+            meta["pretrained"] = context.pretrained_metadata
+        policy_version = (
+            context.rollout.policy_version if context.rollout is not None else None
+        )
         if policy_version is not None:
             meta["policy_version"] = policy_version
         return meta

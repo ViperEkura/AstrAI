@@ -28,8 +28,8 @@ A single config file captures the entire pipeline, reusable and version-controll
 ```json
 {
   "version":       1,
-  "input":         {},   // sections (single) or sources (multi)
-  "mask":          {},   // role -> "train" | "mask"
+  "input":         {},
+  "mask":          {},
   "mask_default":  "mask",
   "preprocessing": {},
   "output":        {}
@@ -465,7 +465,6 @@ Pipeline(
 ).run()
 ```
 
-> Document Update Time: 2026-07-09
 
 ## Python API migration
 

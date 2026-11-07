@@ -2,18 +2,6 @@
 
 This guide walks you through installing AstrAI, downloading a model, running inference, preprocessing data, and launching your first training job.
 
-## Contents
-
-- [Prerequisites](#prerequisites)
-- [1. Install](#1-install)
-- [2. Download Model Weights](#2-download-model-weights)
-- [3. Run Inference](#3-run-inference)
-- [4. Preprocess Data](#4-preprocess-data)
-- [5. Train](#5-train)
-- [6. Evaluate](#6-evaluate)
-- [7. Docker](#7-docker)
-- [Next Steps](#next-steps)
-
 ## Prerequisites
 
 - **Python 3.12+**
@@ -36,46 +24,25 @@ pip install -e .
 # pip install -e ".[dev]"
 ```
 
-> **CUDA kernels** build automatically when `nvcc` is on `PATH` and
-> `torch.cuda.is_available()` returns `True`; set `CSRC_KERNELS=false` to skip
-> them, or `CSRC_KERNELS=true` to force them (required when building in an
-> isolated environment with `--no-build-isolation`). Attention automatically
-> tries CUDA, FlashAttention, then torch for each compatible call.
-> Select with `with op_backend(attention="cuda")` or set a soft process
-> default with `set_op("attention", "cuda")` / `ASTR_OPS=attention=cuda`.
-> Fused rotary embedding kernel is auto-dispatched when available. Skip for
-> CPU-only usage.
+Optional kernel build and backend selection are documented in
+[CUDA kernels](developer/kernels/README.md).
 
 ## 2. Download Model Weights
 
-AstrAI uses HuggingFace-style model directories. Download the default 1B instruction-tuned model:
+Run the download script; files are saved to `params/`:
 
 ```bash
 python scripts/demo/download.py
-# → Downloads to params/
 ```
 
-To use a different model:
+For another repository or destination:
 
 ```bash
 python scripts/demo/download.py --repo-id <HF_REPO_ID> --local-dir ./my_model
 ```
 
-The model directory contains:
-- `config.json` — model architecture configuration
-- `model.safetensors` — model weights
-- `tokenizer.json` + `tokenizer_config.json` — tokenizer files (including chat template)
-
-External Hugging Face checkpoints need an `hf_mapping.json` beside
-`config.json` in the model directory. The mapping declares how to construct
-AstrAI's model config; see [HF config mapping](developer/hf-config-specs.md).
-`AutoModel.from_pretrained` then detects compatible HF weight keys and
-converts them. An unsupported checkpoint layout may need additional tensor
-conversion. Pass `weights_format="astrai"` for native weights, or `"hf"`
-to require a mapping and force HF weight conversion.
-
-The imported config stores attention settings under `attention`. Older
-flat AstrAI attention fields are accepted when reading a config.
+Use the downloaded directory directly. File conventions and external checkpoint
+imports are described in [HF files](developer/huggingface.md).
 
 ## 3. Run Inference
 
@@ -83,7 +50,7 @@ flat AstrAI attention fields are accepted when reading a config.
 
 ```bash
 python scripts/demo/stream_chat.py
-# Type your message after >>, type !exit to quit
+# Type your message after >>, press Ctrl+C or Ctrl+D to exit
 ```
 
 This starts a single-turn interactive prompt loop with streaming output. Each prompt is independent; conversation history is not retained.
@@ -140,29 +107,9 @@ Config (`pretrain.json`):
 }
 ```
 
-### SFT (Supervised Fine-Tuning)
-
-Input JSONL:
-```json
-{"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}]}
-```
-
-Config (`sft.json`):
-```json
-{
-    "input": {
-        "sections": [{"field": "messages", "action": "$role", "template": true}]
-    },
-    "mask": {
-        "system": "mask",
-        "user": "mask",
-        "assistant": "train"
-    },
-    "mask_default": "mask",
-    "preprocessing": {"max_seq_len": 2048},
-    "output": {"storage_format": "bin", "dtype": {"loss_mask": "bool"}}
-}
-```
+For SFT, DPO and GRPO schemas, use the
+[preprocessing guide](guides/preprocessing.md); their masks and record fields
+are part of the data contract.
 
 ### Run Preprocessing
 
@@ -190,37 +137,10 @@ python scripts/tools/train.py \
     --dp_mode=none
 ```
 
-### Multi-GPU (DDP)
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-# Only if this host's NCCL transport is broken; see docs/guides/distributed.md:
-# export NCCL_P2P_DISABLE=1
-# export NCCL_NET_GDR_LEVEL=0
-
-python scripts/tools/train.py \
-    --train_type=seq \
-    --data_root_path=/path/to/dataset \
-    --param_path=./params \
-    --dp_mode=ddp \
-    --dp_size=4 \
-    --batch_per_device=4 \
-    --grad_accum_steps=8 \
-    --max_lr=1e-4 \
-    --window_size=2048 \
-    --ckpt_dir=./checkpoint
-```
-
-### Training Types
-
-| `--train_type` | Description | Data Keys |
-|----------------|-------------|-----------|
-| `seq` | Pre-training (next-token prediction) | `sequence` |
-| `sft` | Supervised fine-tuning (masked loss) | `sequence`, `loss_mask` |
-| `dpo` | Direct Preference Optimization | `chosen`, `rejected`, `*_mask` |
-| `grpo` | Group Relative Policy Optimization | `prompts`, `responses`, `masks`, `rewards` |
-
-See [Training Guide](guides/training.md) for loss formulas and strategies. See [Distributed Guide](guides/distributed.md) for DDP/FSDP details.
+For multi-GPU launch settings, see [distributed training](guides/distributed.md).
+For other objectives, precision settings and resume behavior, see
+[training](guides/training.md). Run `python scripts/tools/train.py --help` for
+all CLI options.
 
 ## 6. Evaluate
 
@@ -246,17 +166,9 @@ See [Evaluation Guide](guides/evaluation.md) for all benchmarks.
 
 ## 7. Docker
 
-```bash
-# Build
-docker build -t astrai:latest .
-
-# Run inference server with GPU
-docker run --gpus all -p 8000:8000 astrai:latest \
-  python scripts/tools/server.py --port 8000 --device cuda
-
-# Docker Compose (GPU)
-docker compose up -d
-```
+Use the repository wrappers for image, device and volume configuration:
+[Docker serving](developer/docker/serving.md) and
+[Docker training](developer/docker/training.md).
 
 ## Next Steps
 
@@ -272,5 +184,3 @@ docker compose up -d
 | Data pipeline internals | [Data Flow](developer/dataflow.md) |
 | YAML-driven containerized serving | [Docker Serving](developer/docker/serving.md) |
 | YAML-driven containerized training | [Docker Training](developer/docker/training.md) |
-
-> Document Update Time: 2026-08-22

@@ -74,7 +74,7 @@ run_ruff_lint_import() {
 # Run tests
 run_tests() {
     print_info "Running tests..."
-    if python -m pytest tests/ -v; then
+    if python -m pytest tests -q; then
         print_success "All tests passed"
     else
         print_error "Tests failed"

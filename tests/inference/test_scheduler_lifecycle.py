@@ -1,0 +1,459 @@
+import threading
+import time
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from astrai.extension import op_backend, snapshot_op_selection
+from astrai.inference import EngineCore, GenerationResult
+from astrai.inference.core.scheduler import OutputEventSink
+from astrai.model.autoregressive_lm import AutoRegressiveLM
+from astrai.trainer.backend import run_batch
+from tests.support.models import make_rollout_config
+from tests.support.scheduler import make_real_scheduler
+from tests.support.tokenizers import FakeTokenizer
+
+
+def _run_threads(*workers, timeout=10.0):
+    errors = []
+
+    def run(worker):
+        try:
+            worker()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(worker,)) for worker in workers]
+    try:
+        for thread in threads:
+            thread.start()
+    finally:
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=timeout)
+    assert all(not thread.is_alive() for thread in threads)
+    if errors:
+        raise errors[0]
+
+
+def test_concurrent_submission_cancellation_and_stats():
+    scheduler, _, _ = make_real_scheduler("cpu")
+    ready = threading.Barrier(6)
+
+    def mutate(worker):
+        ready.wait(timeout=5)
+        for index in range(10):
+            request_id = f"{worker}-{index}"
+            assert scheduler.add_request("prompt", request_id=request_id) == request_id
+            if index % 2 == 0:
+                assert scheduler.cancel_request(request_id)
+
+    def observe():
+        ready.wait(timeout=5)
+        for _ in range(50):
+            assert scheduler.get_stats()["total_tasks"] >= 0
+
+    try:
+        _run_threads(observe, *(lambda worker=i: mutate(worker) for i in range(5)))
+        assert {request.request_id for request in scheduler.scheduler.waiting} == {
+            f"{worker}-{index}" for worker in range(5) for index in (1, 3, 5, 7, 9)
+        }
+        assert scheduler.get_stats()["cancelled_total"] == 25
+    finally:
+        scheduler.stop()
+
+
+def test_generation_loop_activates_full_selection_in_worker_thread():
+    with op_backend(
+        attention="torch", rotary="torch", swiglu="torch", syrk="torch", symm="torch"
+    ):
+        scheduler, _, _ = make_real_scheduler("cpu")
+    observed = []
+
+    def observe_backend(*args, **kwargs):
+        observed.append(
+            tuple(
+                snapshot_op_selection().choice(op)[0]
+                for op in ("attention", "rotary", "swiglu", "syrk", "symm")
+            )
+        )
+        scheduler.stop_event.set()
+
+    scheduler.scheduler.wait_for_requests = observe_backend
+    scheduler.start()
+    scheduler.loop_thread.join(timeout=5)
+    assert not scheduler.loop_thread.is_alive()
+    assert scheduler.op_selection.choice("rotary")[0] == "torch"
+    assert observed == [("torch",) * 5]
+    scheduler.stop()
+
+
+def test_cancel_waiting_task_storm_returns_to_baseline(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        request_ids = [
+            scheduler.add_request(f"waiting-{index}", max_tokens=32)
+            for index in range(32)
+        ]
+
+        assert all(scheduler.cancel_request(request_id) for request_id in request_ids)
+        stats = scheduler.get_stats()
+        assert stats["running"] == 0
+        assert stats["waiting_tasks"] == 0
+        assert stats["in_flight_tasks"] == 0
+        assert stats["kv_cache_tasks"] == 0
+        assert stats["cancelled_total"] == len(request_ids)
+    finally:
+        scheduler.stop()
+
+
+def test_cancel_active_task_releases_metrics_and_kv(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        request_id = scheduler.add_request("active", max_tokens=32)
+        scheduler.scheduler.admit_requests()
+
+        before = scheduler.get_stats()
+        assert before["running"] == 1
+        assert before["in_flight_tasks"] == 1
+        assert before["kv_cache_tasks"] == 1
+
+        assert scheduler.cancel_request(request_id)
+        scheduler.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            after = scheduler.get_stats()
+            if (
+                after["running"] == 0
+                and after["in_flight_tasks"] == 0
+                and after["kv_cache_tasks"] == 0
+            ):
+                break
+            time.sleep(0.01)
+
+        assert after["running"] == 0
+        assert after["waiting_tasks"] == 0
+        assert after["in_flight_tasks"] == 0
+        assert after["kv_cache_tasks"] == 0
+        assert after["cancelled_total"] == 1
+    finally:
+        scheduler.stop()
+
+
+def test_cancel_during_kv_allocation_releases_metrics_and_kv(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    allocation_started = threading.Event()
+    continue_allocation = threading.Event()
+    original_alloc = scheduler.scheduler.kv_manager.alloc_slots
+
+    def blocking_alloc(*args, **kwargs):
+        allocation_started.set()
+        assert continue_allocation.wait(timeout=5)
+        return original_alloc(*args, **kwargs)
+
+    try:
+        with patch.object(
+            scheduler.scheduler.kv_manager,
+            "alloc_slots",
+            side_effect=blocking_alloc,
+        ):
+            scheduler.start()
+            request_id = scheduler.add_request("allocation-race", max_tokens=32)
+            assert allocation_started.wait(timeout=5)
+            assert scheduler.cancel_request(request_id)
+            continue_allocation.set()
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                stats = scheduler.get_stats()
+                if (
+                    stats["running"] == 0
+                    and stats["waiting_tasks"] == 0
+                    and stats["in_flight_tasks"] == 0
+                    and stats["kv_cache_tasks"] == 0
+                ):
+                    break
+                time.sleep(0.01)
+
+        assert stats["running"] == 0
+        assert stats["waiting_tasks"] == 0
+        assert stats["in_flight_tasks"] == 0
+        assert stats["kv_cache_tasks"] == 0
+        assert stats["cancelled_total"] == 1
+    finally:
+        continue_allocation.set()
+        scheduler.stop()
+
+
+def test_run_batch_queues_beyond_active_capacity(cpu_device):
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=cpu_device, dtype=torch.bfloat16).eval()
+    scheduler = EngineCore(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        max_batch_size=2,
+        max_seq_len=64,
+        enable_cuda_graph=False,
+    )
+    prompts = [[10, 20 + index] for index in range(5)]
+    seeds = [100 + index for index in range(5)]
+    try:
+        batch = run_batch(
+            scheduler,
+            prompts,
+            max_tokens=3,
+            top_k=0,
+            seeds=seeds,
+            return_logprobs=True,
+        )
+        single = [
+            run_batch(
+                scheduler,
+                [prompt],
+                max_tokens=3,
+                top_k=0,
+                seeds=[seed],
+                return_logprobs=True,
+            )[0]
+            for prompt, seed in zip(prompts, seeds)
+        ]
+        assert [tokens for tokens, _ in batch] == [tokens for tokens, _ in single]
+        for (_, actual), (_, expected) in zip(batch, single):
+            assert actual == pytest.approx(expected)
+        assert scheduler.get_stats()["kv_cache_tasks"] == 0
+        assert scheduler.get_stats()["waiting"] == 0
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_execution_failure_releases_queued_kv(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    scheduler.scheduler.max_batch_size = 2
+    try:
+        with patch.object(
+            scheduler.model_runner,
+            "execute_model",
+            side_effect=RuntimeError("injected execution failure"),
+        ):
+            with pytest.raises(RuntimeError, match="injected execution failure"):
+                run_batch(
+                    scheduler,
+                    [[10, 20], [11, 21], [12, 22]],
+                    max_tokens=2,
+                )
+        assert scheduler.get_stats()["waiting"] == 0
+        assert scheduler.get_stats()["kv_cache_tasks"] == 0
+        assert scheduler.scheduler.metrics._timings == {}
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_tokens_match_full_sequence_forward(cpu_device):
+    scheduler, _tok, model = make_real_scheduler(cpu_device)
+    prompt = [10, 20, 30, 40]
+    try:
+        expected = []
+        sequence = list(prompt)
+        for _ in range(2):
+            input_ids = torch.tensor([sequence], dtype=torch.long, device=cpu_device)
+            position_ids = torch.arange(len(sequence), device=cpu_device).unsqueeze(0)
+            input_mask = torch.ones(
+                1, len(sequence), len(sequence), dtype=torch.bool, device=cpu_device
+            ).tril()
+            with torch.inference_mode():
+                logits = model(
+                    input_ids,
+                    input_mask=input_mask,
+                    position_ids=position_ids,
+                )["logits"][:, -1, :]
+            token = logits.argmax(dim=-1).item()
+            expected.append(token)
+            sequence.append(token)
+
+        result = run_batch(
+            scheduler, prompt_ids_list=[prompt], max_tokens=2, temperature=0
+        )
+        assert result == [expected]
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_return_logprobs_aligned(cpu_device):
+    """return_logprobs=True gives (token_ids, logprobs) tuples with equal len."""
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        prompts = [[10, 20, 30, 40]]
+        results = run_batch(
+            scheduler, prompts, max_tokens=5, temperature=1.0, return_logprobs=True
+        )
+        assert len(results) == 1
+        token_ids, logprobs = results[0]
+        assert len(token_ids) == len(logprobs)
+        assert all(lp <= 1e-5 for lp in logprobs)  # logprobs ≤ 0
+    finally:
+        scheduler.stop()
+
+
+def test_ragged_prefill_matches_sequential_greedy_tokens_and_logprobs(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    prompts = [
+        [10, 20, 30],
+        [5, 6, 7, 8],
+        [40, 41, 42, 43, 44],
+    ]
+    try:
+        ragged = run_batch(
+            scheduler, prompts, max_tokens=1, temperature=0, return_logprobs=True
+        )
+        sequential = [
+            run_batch(
+                scheduler, [prompt], max_tokens=1, temperature=0, return_logprobs=True
+            )[0]
+            for prompt in prompts
+        ]
+
+        assert [result[0] for result in ragged] == [result[0] for result in sequential]
+        for ragged_result, sequential_result in zip(ragged, sequential):
+            assert ragged_result[1] == pytest.approx(sequential_result[1], abs=1e-6)
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_stop_id_terminates(cpu_device):
+    """A token matching stop_ids terminates generation for that prompt."""
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        # Make every token a stop id: generation must end after exactly
+        # one token (the stop token itself) instead of running to max_tokens.
+        scheduler.scheduler.generation_config["eos_token_id"] = list(range(200))
+        prompts = [[10, 20, 30]]
+        results = run_batch(scheduler, prompts, max_tokens=32, temperature=1.0)
+        assert len(results[0]) == 1
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_empty_prompts(cpu_device):
+    """Empty prompt list yields empty result list."""
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        assert run_batch(scheduler, [], max_tokens=4) == []
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_distinguish_rejection_from_success(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        long_prompt = list(range(100))
+        results = run_batch(
+            scheduler,
+            [long_prompt, [10, 20]],
+            max_tokens=2,
+            temperature=0,
+            return_logprobs=True,
+            return_details=True,
+        )
+
+        assert results[0] == GenerationResult(
+            token_ids=[],
+            logprobs=[],
+            finish_reason="rejected",
+            error_reason="prompt_too_long",
+        )
+        assert results[1].finish_reason in ("stop", "length")
+        assert results[1].error_reason is None
+        assert len(results[1].token_ids) == len(results[1].logprobs)
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_report_non_positive_max_tokens(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        result = run_batch(scheduler, [[10, 20]], max_tokens=0, return_details=True)[0]
+        assert result.finish_reason == "rejected"
+        assert result.error_reason == "max_tokens_non_positive"
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_report_allocation_failure(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        with patch.object(
+            scheduler.scheduler.kv_manager, "alloc_slots", return_value=False
+        ):
+            result = run_batch(
+                scheduler, [[10, 20]], max_tokens=2, return_details=True
+            )[0]
+        assert result.finish_reason == "rejected"
+        assert result.error_reason == "kv_cache_allocation_failed"
+    finally:
+        scheduler.stop()
+
+
+def test_run_batch_details_report_extension_failure_and_cleanup(cpu_device):
+    scheduler, _tok, _model = make_real_scheduler(cpu_device)
+    try:
+        with patch.object(
+            scheduler,
+            "execute_synchronously",
+            side_effect=lambda requests, **_kwargs: ([], list(requests)),
+        ):
+            result = run_batch(
+                scheduler, [[10, 20]], max_tokens=2, return_details=True
+            )[0]
+
+        assert result.finish_reason == "rejected"
+        assert result.error_reason == "kv_cache_extension_failed"
+        assert scheduler.scheduler.kv_manager._states == {}
+        assert scheduler.scheduler.metrics._timings == {}
+    finally:
+        scheduler.stop()
+
+
+def test_admission_rejects_requests_that_can_never_fit(cpu_device):
+    """The livelock guard: a prompt larger than the whole paged pool is
+    terminated (FINISH_REJECTED) instead of retrying alloc forever."""
+    cfg = make_rollout_config(max_position_embeddings=64)
+    model = AutoRegressiveLM(cfg).to(device=cpu_device, dtype=torch.bfloat16).eval()
+    scheduler = EngineCore(
+        model=model,
+        tokenizer=FakeTokenizer(),
+        max_batch_size=2,
+        max_seq_len=64,
+        enable_cuda_graph=False,
+        page_size=2,
+        kv_tokens=16,  # 8 pages × 2 tokens = 16 token slots total
+    )
+    sink_events = []
+
+    class _Capture(OutputEventSink):
+        def __call__(self, events):
+            sink_events.extend(events)
+
+    scheduler.set_event_sink(_Capture())
+    try:
+        scheduler.start()
+        # 60-token prompt can never fit a 16-slot pool.
+        rid = scheduler.add_request(prompt="x" * 60, max_tokens=4)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if any(
+                getattr(e, "request_id", None) == rid
+                and getattr(e, "finish_reason", None) == "rejected"
+                for e in sink_events
+            ):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("oversized request was never rejected")
+        # And the queue drained: no spinning leftovers.
+        deadline = time.time() + 5
+        while time.time() < deadline and scheduler.scheduler.waiting:
+            time.sleep(0.05)
+        assert not scheduler.scheduler.waiting
+    finally:
+        scheduler.stop()

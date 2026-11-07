@@ -8,7 +8,7 @@ optimizer loop. Shared tensor operations live in ops.py.
 
 | Module | Responsibility |
 | --- | --- |
-| base.py | Offline/online lifecycle, loss output, rollout conversion and optimizer-step hooks |
+| base.py | Loss outputs, rollout conversion and algorithm post-update hooks |
 | factory.py | Registry, capability declarations and strict internal construction |
 | ops.py | ForwardResult and LossOutput, log probabilities, values, GAE and common rollout tensor operations |
 | supervised.py | Shared cross-entropy path, sequence and SFT masking/reduction |
@@ -18,36 +18,33 @@ optimizer loop. Shared tensor operations live in ops.py.
 
 ## Loss boundary
 
-BaseStrategy.prepare_batch() places objective inputs on the target device;
-strategy overrides may synthesize missing inputs.
-prepare_rollout_batch() collects or reuses a rollout, refreshes objective state
-only when the rollout is fresh, and calls prepare_from_rollout() once before
-learner replay. compute_loss_output() returns loss and metrics.
-The token-mean forward/reduce path supports context parallelism; each
-algorithm retains its own reduction semantics. training_steps() and
-training_updates() express microbatch or update shape while Trainer retains
-commit ownership. ops.py also supplies chunked log-probability calculation
-for the memory-sensitive path.
+Trainer obtains scored results from `context.rollout`, calls
+`prepare_from_rollout(result)`, and schedules replay with
+`learner_update_slices()`. Only Trainer reads `rl_update_epochs` and
+`rl_minibatch_prompts`. PPO advantages and returns stay pinned to their rollout,
+so replay neither regenerates responses nor recomputes those targets.
 
-For offline training with the global cursor, one data microbatch must yield one
-`training_updates()` group. That group may contain several loss outputs if they
-share the same `normalizer`; their losses are added before the global target
-count is applied. The trainer rejects additional groups because it owns the
-optimizer-window boundary. Synchronous online training collects the rollout
-window first and schedules learner updates in the trainer, then calls
-`compute_loss_output()` on each prepared chunk.
+`loss_outputs(batch, microbatch_prompts=None)` yields losses for **one optimizer
+update**, with one output by default. Global-window outputs must share a
+`normalizer`; Trainer sums their losses before applying the global target count.
+Async GRPO splits complete prompt groups and weights each loss by its share of
+valid tokens or nonempty responses. It skips empty microbatches and rejects an
+entire round without targets.
 
-`step_plan.learner_update_slices()` supplies the common replay-epoch and prompt
-minibatch order for synchronous Trainer windows and direct strategy iteration.
-Its final-update marker controls when a complete global window can commit its
-data cursor. Slicing never divides a prompt's response group or recomputes PPO's
-rollout-pinned advantages and returns.
+`compute_loss_output()` returns loss and metrics; `compute_loss()` returns the
+scalar loss. `__call__()` only computes the supplied batch's loss.
+`prepare_batch()` handles device placement and objective inputs. The token-mean
+forward/reduce path supports context parallelism: CPStrategy explicitly implements
+`loss_outputs()` through its own shard path.
 
-`rollout.batching.slice_batch()` accepts index lists or continuous slices; the
-latter retain tensor views. Direct strategy replay uses
-`slice_sequences=False` to keep its existing shared non-tensor metadata behavior.
-Worker and global-window batches also select aligned Python sequences. Async
-GRPO retains its weighted microbatch iterator and one update per round.
+After actor update and version publication, Trainer calls `after_update()`.
+PPO updates and clears critic gradients outside the actor version lock; offline
+GRPO refreshes its old policy. Strategies hold neither rollout runners nor
+publishers and do not schedule replay or step the actor optimizer.
+
+`rollout.batching.slice_batch()` preserves complete prompt groups and aligned
+Python metadata. `ops.py` supplies chunked log probabilities for the
+memory-sensitive path.
 
 ## Registry and capabilities
 

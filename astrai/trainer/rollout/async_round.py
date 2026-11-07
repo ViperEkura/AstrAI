@@ -306,9 +306,6 @@ class AsyncRoundCoordinator:
         self.weights.mark_committed(target)
         return result
 
-    def step(self):
-        """Compatibility with BaseStrategy.optimizer_step."""
-
     def iter_rounds(
         self, batches, stop_requested: Callable[[], bool]
     ) -> Iterator[RolloutResult]:

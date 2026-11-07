@@ -11,9 +11,9 @@ FP8_AVAIL = (
     and torch.cuda.get_device_capability() >= (8, 9)
 )
 skip_no_cuda = pytest.mark.skipif(not CUDA_AVAIL, reason="CUDA not available")
-skip_lt2_cuda = pytest.mark.skipif(
+skip_no_multi_device = pytest.mark.skipif(
     not CUDA_AVAIL or torch.cuda.device_count() < 2,
-    reason="two-rank spawn tests need two CUDA devices",
+    reason="multiple CUDA devices required",
 )
 skip_no_kernel = pytest.mark.skipif(not KERNEL_AVAIL, reason="CUDA kernels not built")
 skip_no_fp8 = pytest.mark.skipif(

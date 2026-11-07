@@ -42,29 +42,30 @@ class RequestTracker(OutputEventSink):
     share one lock; decoding and protocol formatting stay on consumer threads.
     """
 
-    def __init__(self, maxlen: int = 4096):
-        self._lock = threading.Lock()
+    def __init__(self, event_capacity: int = 4096):
+        self._condition = threading.Condition(threading.Lock())
         self._requests: Dict[str, TrackedRequest] = {}
-        self._maxlen = maxlen
+        self._event_capacity = event_capacity
 
     def register(
-        self, request_id: str, maxlen: Optional[int] = None
+        self, request_id: str, event_capacity: Optional[int] = None
     ) -> threading.Event:
-        with self._lock:
-            bound = self._maxlen if maxlen is None else maxlen
+        with self._condition:
+            bound = self._event_capacity if event_capacity is None else event_capacity
             state = TrackedRequest(deque(maxlen=bound))
             self._requests[request_id] = state
             return state.finished
 
     def unregister(self, request_id: str) -> None:
-        with self._lock:
+        with self._condition:
             self._requests.pop(request_id, None)
+            self._condition.notify_all()
 
     def subscribe_async(
         self, request_id: str, loop: asyncio.AbstractEventLoop
     ) -> Tuple[asyncio.Queue, List[Any]]:
         queue = asyncio.Queue()
-        with self._lock:
+        with self._condition:
             state = self._requests.get(request_id)
             if state is None:
                 raise KeyError(f"request {request_id!r} is not registered")
@@ -73,17 +74,11 @@ class RequestTracker(OutputEventSink):
             state.subscriber = (loop, queue)
         return queue, pending
 
-    def unsubscribe_async(self, request_id: str) -> None:
-        with self._lock:
-            state = self._requests.get(request_id)
-            if state is not None:
-                state.subscriber = None
-
     def __call__(self, events: List[Any]) -> None:
         by_loop: Dict[
             asyncio.AbstractEventLoop, List[Tuple[str, asyncio.Queue, List[Any]]]
         ] = {}
-        with self._lock:
+        with self._condition:
             for event in events:
                 rid = event.request_id
                 state = self._requests.get(rid)
@@ -101,13 +96,14 @@ class RequestTracker(OutputEventSink):
                     state.events.append(event)
                 if isinstance(event, (RequestFinished, RequestError)):
                     state.finished.set()
+            self._condition.notify_all()
 
         for loop, deliveries in by_loop.items():
             scheduled = [(queue, batch) for _, queue, batch in deliveries]
             try:
                 loop.call_soon_threadsafe(_deliver_async_events, scheduled)
             except RuntimeError:
-                with self._lock:
+                with self._condition:
                     restored = set()
                     for rid, queue, batch in deliveries:
                         state = self._requests.get(rid)
@@ -119,15 +115,16 @@ class RequestTracker(OutputEventSink):
                             state.subscriber = None
                             restored.add(rid)
                         state.events.extend(batch)
+                    self._condition.notify_all()
 
     def is_finished(self, request_id: str) -> bool:
-        with self._lock:
+        with self._condition:
             state = self._requests.get(request_id)
             return state is not None and state.finished.is_set()
 
     def drain(self, request_id: str) -> List[Any]:
         """Pop all pending events for one request (non-blocking)."""
-        with self._lock:
+        with self._condition:
             state = self._requests.get(request_id)
             if state is None:
                 return []
@@ -135,8 +132,21 @@ class RequestTracker(OutputEventSink):
             state.events.clear()
         return out
 
+    def wait_for_events(
+        self, request_ids: List[str], timeout: Optional[float] = None
+    ) -> bool:
+        """Wait until any requested stream has events ready to drain."""
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: any(
+                    rid not in self._requests or self._requests[rid].events
+                    for rid in request_ids
+                ),
+                timeout=timeout,
+            )
+
     def wait(self, request_id: str, timeout: Optional[float] = None) -> bool:
-        with self._lock:
+        with self._condition:
             state = self._requests.get(request_id)
         return state is None or state.finished.wait(timeout=timeout)
 

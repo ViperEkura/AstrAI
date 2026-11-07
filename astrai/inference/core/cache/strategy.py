@@ -268,11 +268,6 @@ class Allocator:
         with self._lock:
             return self._refs[idx]
 
-    def touch(self, idx: int):
-        with self._lock:
-            if idx in self._lru:
-                self._lru.move_to_end(idx)
-
     def clear_cached(self) -> int:
         """Release every unreferenced LRU page back to the free pool."""
         with self._lock:

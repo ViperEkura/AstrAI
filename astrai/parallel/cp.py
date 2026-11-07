@@ -224,7 +224,7 @@ class CPStrategy:
     specifics — entering the shard between batch preparation and the
     forward, keeping the reduction inside it, and rescaling the local
     token loss to the global mean.  Everything else (model, optimizer
-    hooks, rollout plumbing) proxies to the wrapped strategy, so trainer
+    hooks) proxies to the wrapped strategy, so trainer
     code is unaware of the wrapping.
     """
 
@@ -248,15 +248,9 @@ class CPStrategy:
         # are refused at construction, so there is no rollout dispatch here.
         return self.compute_loss_output(batch)
 
-    def training_steps(self, batch: Dict[str, Tensor]) -> Any:
-        # Must not fall through to __getattr__: the inner strategy's default
-        # training_steps calls its own compute_loss_output, bypassing the
-        # CP shard. Re-yield through the wrapper instead.
+    def loss_outputs(self, batch: Dict[str, Tensor], microbatch_prompts=None):
+        # Resolve through this wrapper so the inner loss cannot bypass CP.
         yield self.compute_loss_output(batch)
-
-    def training_updates(self, batch: Dict[str, Tensor], microbatch_prompts=None):
-        for output in self.training_steps(batch):
-            yield iter((output,))
 
     def compute_loss(self, batch: Dict[str, Tensor]) -> Tensor:
         return self.compute_loss_output(batch)["loss"]

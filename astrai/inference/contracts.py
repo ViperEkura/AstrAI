@@ -64,10 +64,6 @@ class ExecutionRequest:
         return self.identity.request_id
 
     @property
-    def next_pos(self) -> int:
-        return self.position
-
-    @property
     def materialized_end(self) -> int:
         return self.position + self.num_tokens
 
@@ -76,26 +72,6 @@ class ExecutionRequest:
         return self.phase == "decode" or (
             self.phase == "prefill" and self.materialized_end == len(self.prompt_ids)
         )
-
-    @property
-    def temperature(self) -> float:
-        return self.sampling.temperature
-
-    @property
-    def top_p(self) -> float:
-        return self.sampling.top_p
-
-    @property
-    def top_k(self) -> int:
-        return self.sampling.top_k
-
-    @property
-    def frequency_penalty(self) -> float:
-        return self.sampling.frequency_penalty
-
-    @property
-    def rep_window(self) -> int:
-        return self.sampling.rep_window
 
 
 @dataclass(frozen=True)

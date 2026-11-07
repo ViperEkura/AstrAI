@@ -24,7 +24,7 @@ JSON / JSONL Records → Pipeline (mask builder) → Tokenized Tensors
                                               ↓
                                        Dataset.__getitem__(idx)
                                                ↓
-                                       RDSampler → DataLoader → Training
+                                       Batch sampling → DataLoader → Training
 ```
 
 ## Data Preparation
@@ -63,8 +63,12 @@ metadata. It does not contain a storage-format or total-token field:
 }
 ```
 
-Record-aware binary data may also include `"offsets": [0, ...]` inside a key's
-metadata, but the preprocessing `BinWriter` currently does not write offsets.
+Record-aware binary data includes `"offsets": [0, ...]` inside each record key's
+metadata. `Pipeline` forwards `output.record_keys` to `BinWriter`, which writes
+offsets only for explicitly selected fields. DPO configs list all four standard
+fields, preserving each pair independently within each shard. The default empty
+list preserves the original stream-only writer behavior, including custom
+outputs whose field names happen to resemble DPO fields.
 
 ### Format Detection
 
@@ -104,7 +108,21 @@ Only DPO gets an automatic lazy route from `DatasetFactory`: raw JSONL plus
 `tokenizer_path` installs `dpo_processor` and tokenizes each record in
 `fetch_record`. GRPO does not currently have an automatic lazy processor.
 
-Eager-loaded stores normalize tensors into `Store._data[Dict[str, List[Tensor]]]` + `Store._cum[Dict[str, List[int]]]` (cumulative lengths for stream indexing) + `Store._offsets[Dict[str, List[int]]]` (per-record offsets for record indexing). Nested JSONL keys such as GRPO `responses`/`masks` are kept as record values and excluded from stream bookkeeping. Lazy DPO instead retains raw records and processes them in `fetch_record`.
+Eager-loaded stores normalize tensors into `Store._data[Dict[str, List[Tensor]]]`
+and `Store._cum[Dict[str, List[int]]]` (cumulative lengths for stream indexing).
+Binary record indexing uses `Store._offsets[Dict[str, List[List[int]]]]`, with
+one offset array per shard and key, plus `_record_cum` (cumulative shard record
+counts). A binary search maps each global record index to a shard before slicing
+its mmap tensor. `MmapStore` retains shard discovery order rather than sorting
+paths. It builds and validates the binary record index lazily when records or
+their count are requested; `DPODataset` requests validation during construction.
+Token-stream access does not require a valid record index. Record fields must
+have offsets and equal record counts in every shard. In record mode, `store[i]`
+requests all fields and fails explicitly if any lack offsets, while
+`fetch_record(i, key)` can select an indexed field from a mixed store.
+Nested JSONL keys such as GRPO `responses`/`masks` remain record
+values and are excluded from stream bookkeeping. Lazy DPO instead retains raw
+records and processes them in `fetch_record`.
 
 ## Data Keys by Training Type
 
@@ -115,11 +133,11 @@ Eager-loaded stores normalize tensors into `Store._data[Dict[str, List[Tensor]]]
 | `dpo` | `chosen`, `rejected`, `chosen_mask`, `rejected_mask` | record (`fetch_record`) |
 | `grpo` | `prompts`, `responses`, `masks`, `rewards` | record (`fetch_record`) |
 
-Offline `.bin` output from DPO/GRPO preprocessing is not currently loadable for
-training. DPO shards are written without record offsets, while GRPO response
-groups are flattened without preserving record/group boundaries. Supported raw
-routes are eager JSONL for SEQ/SFT and automatic lazy JSONL for DPO. GRPO
-requires a caller-built, already-loaded record store.
+Offline DPO `.bin` output supports single and multiple shards with per-record
+offsets. Legacy DPO binary output without offsets requires reprocessing. GRPO
+binary response groups are still flattened without preserving record/group
+boundaries. Supported raw routes are eager JSONL for SEQ/SFT and automatic lazy
+JSONL for DPO. GRPO requires a caller-built, already-loaded record store.
 
 ## Dataset Architecture
 
@@ -131,20 +149,21 @@ DatasetFactory.load(...)
   → Store.load(load_path, transform=... or processor=...)
   → DatasetFactory.create(train_type, store=store)
 
-Stream datasets (SEQ/SFT):
-  BaseDataset.__getitem__(idx)
+Stream mode (SEQ and stream-format SFT):
+  Dataset.__getitem__(idx)
     → Store.sample_window(idx) → [begin, end)
     → Store.fetch(begin, end, keys) → Tensor / Dict[str, Tensor]
 
-Record datasets (DPO/GRPO):
-  DPODataset/GRPODataset.__getitem__(idx)
+Record mode (DPO, GRPO and SFT packs with seq_lengths):
+  Dataset.__getitem__(idx)
     → Store.fetch_record(idx, keys) → Tensor / Dict[str, Tensor]
 ```
 
 Class hierarchy: `BaseDataset` is the direct base of `SEQDataset`, `SFTDataset`,
-`DPODataset`, and `GRPODataset`. There is no `RecordDataset` class.
+`DPODataset`, and `GRPODataset`. Record access is selected by the dataset and storage metadata.
 
-`window_size` = max input length, `stride` = step between consecutive samples (defaults to `window_size`, optional). Only meaningful for stream datasets — record datasets ignore both. `storage_type` defaults to `None` (auto-detect via `detect_format`).
+`window_size` = max input length, `stride` = step between consecutive samples (defaults to `window_size`, optional). Stream mode uses both for slicing. DPO/GRPO ignore them; SFT record mode
+uses `window_size` to reject oversized packs rather than re-slicing them. `storage_type` defaults to `None` (auto-detect via `detect_format`).
 
 For raw JSONL, `tokenizer_path` builds the lazy processor only for DPO. For
 SEQ/SFT it is forwarded to `JsonlStore` so the built-in eager `messages`
@@ -158,14 +177,19 @@ window, and stride setup entirely.
 
 ## Sampler
 
-`RDSampler` supports checkpoint-aware distributed sampling:
+Synchronous training uses `GlobalBatchSampler` to divide one epoch permutation
+into global optimizer windows, then select each DP rank's microbatches.
+`start_offset` identifies a committed global cursor, not the DataLoader's
+prefetched position. Tail handling follows `drop` or `flush`.
 
-- Tracks `start_epoch` / `start_iter` for resume
-- Shuffle via `torch.Generator(seed + epoch)`
-- Per-replica index slicing for DDP
+Validation and asynchronous rollout use `RDSampler` with padded rank shards.
+Both samplers use epoch-seeded ordering. See
+[training lifecycle](trainer/lifecycle.md) for commit and resume ownership.
 
 ## DataLoader
 
-Standard PyTorch `DataLoader` with configurable `batch_size`, `num_workers`, `pin_memory`, `prefetch_factor`. Sampler produces indices; dataloader fetches tensor batches via `__getitem__`.
-
-> Document Update Time: 2026-07-19
+PyTorch `DataLoader` handles workers, pinned memory and collation. Record-format
+SFT uses `sft_collate_fn` to pad rows, reconstruct positions and shift labels
+within each segment. Targets at segment ends and padding positions are excluded.
+See [SFT packs](../guides/preprocessing.md#sft-packs-with-explicit-boundaries)
+for the stored schema and attention constraints.

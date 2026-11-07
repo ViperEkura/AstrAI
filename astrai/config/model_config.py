@@ -8,10 +8,8 @@ from pydantic_core import ArgsKwargs
 from astrai.config.base import BaseConfig
 from astrai.factory import BaseFactory
 
-_ENCODER_ATTN_TYPES = frozenset({"gqa", "mla"})
-_FFN_TYPES = frozenset({"mlp", "moe"})
-
 ATTENTION_TYPES = frozenset({"gqa", "mla", "gdn"})
+FFN_TYPES = frozenset({"mlp", "moe"})
 
 
 @dataclass(config=ConfigDict(extra="forbid"))
@@ -221,6 +219,38 @@ class AutoRegressiveLMConfig(BaseModelConfig):
     mlp_only_layers: Optional[List[int]] = None
     moe_aux_loss_coef: float = 0.01
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize active model settings, omitting unset dataclass fields."""
+        result = asdict(
+            self,
+            dict_factory=lambda items: {k: v for k, v in items if v is not None},
+        )
+        if self.neftune_alpha == 0:
+            result.pop("neftune_alpha")
+        active = set(
+            self.attention.layers
+            if self.attention.layers is not None
+            else [self.attention.default_type]
+        )
+        for name in ATTENTION_TYPES:
+            if name not in active or not result["attention"][name]:
+                result["attention"].pop(name)
+        if self.ffn_type != "moe":
+            for name in (
+                "n_routed_experts",
+                "n_shared_experts",
+                "n_activated_experts",
+                "topk_method",
+                "moe_intermediate_size",
+                "shared_expert_intermediate_size",
+                "norm_topk_prob",
+                "decoder_sparse_step",
+                "mlp_only_layers",
+                "moe_aux_loss_coef",
+            ):
+                result.pop(name, None)
+        return result
+
     @model_validator(mode="before")
     @classmethod
     def _migrate_flat_attention(cls, data):
@@ -272,8 +302,8 @@ class AutoRegressiveLMConfig(BaseModelConfig):
 
     @field_validator("ffn_type")
     def _validate_ffn_type(cls, v: str) -> str:
-        if v not in _FFN_TYPES:
-            raise ValueError(f"ffn_type must be one of {sorted(_FFN_TYPES)}, got {v!r}")
+        if v not in FFN_TYPES:
+            raise ValueError(f"ffn_type must be one of {sorted(FFN_TYPES)}, got {v!r}")
         return v
 
     @field_validator("decoder_sparse_step")
@@ -429,14 +459,13 @@ class EncoderConfig(BaseModelConfig):
 
     @field_validator("attn_type")
     def _validate_attn_type(cls, v: str) -> str:
-        if v not in _ENCODER_ATTN_TYPES:
-            raise ValueError(
-                f"attn_type must be one of {sorted(_ENCODER_ATTN_TYPES)}, got {v!r}"
-            )
+        allowed = ATTENTION_TYPES - {"gdn"}
+        if v not in allowed:
+            raise ValueError(f"attn_type must be one of {sorted(allowed)}, got {v!r}")
         return v
 
     @field_validator("ffn_type")
     def _validate_ffn_type(cls, v: str) -> str:
-        if v not in _FFN_TYPES:
-            raise ValueError(f"ffn_type must be one of {sorted(_FFN_TYPES)}, got {v!r}")
+        if v not in FFN_TYPES:
+            raise ValueError(f"ffn_type must be one of {sorted(FFN_TYPES)}, got {v!r}")
         return v

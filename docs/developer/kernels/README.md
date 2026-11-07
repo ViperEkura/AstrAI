@@ -26,8 +26,8 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 
 | Variant | File | Optimization |
 |---------|------|--------------|
-| Split-KV MMA decode | `attention/decode_split_kv_mma.cuh` | Split KV across warps + MMA (sm_80+) |
-| Split-Q MMA prefill | `attention/prefill_split_q_mma.cuh` | Split Q across warps + MMA (sm_80+) |
+| Split-KV MMA decode | `kernel/attention/mainloop.cuh` | Split KV across warps + MMA (sm_80+) |
+| Split-Q MMA prefill | `kernel/attention/mainloop.cuh` | Split Q across warps + MMA (sm_80+) |
 
 ## Kernel index
 
@@ -335,9 +335,9 @@ csrc/
 │   ├── kernel/                       # device kernels and launch helpers, grouped by operator
 │   │   ├── attention/
 │   │   │   ├── mma.cuh               # attention fragments and softmax helpers
-│   │   │   ├── split_kv.cuh          # decode and split-combine kernels
-│   │   │   ├── split_q.cuh           # prefill kernel
-│   │   │   └── launch.cuh            # attention launch and dispatch
+│   │   │   ├── mainloop.cuh          # prefill and decode mainloops
+│   │   │   ├── epilogue.cuh          # output stores and split-KV combine
+│   │   │   └── kernel.cuh            # mainloop/epilogue composition
 │   │   ├── gemm/
 │   │   │   ├── sm80.cuh              # staged mma.sync mainloop
 │   │   │   └── kernel.cuh            # cp.async and TMA entry kernels
@@ -497,13 +497,13 @@ Check rejected template configurations without GPU
 launches (a C++17 compiler and CUDA element headers are required):
 
 ```bash
-.venv/bin/python -m pytest tests/unit/extension/test_torch_dispatch.py -q
+.venv/bin/python -m pytest tests/extension/test_torch_dispatch.py -q
 ```
 
 Check the dependency boundary and compile the host planners independently:
 
 ```bash
-.venv/bin/python -m pytest tests/unit/extension/test_csrc_api.py -q
+.venv/bin/python -m pytest tests/extension/test_csrc_api.py -q
 g++ -std=c++17 -I csrc/include -fsyntax-only \
     csrc/gemm/plan/planner.cpp csrc/gemm/plan/table.cpp \
     csrc/gemm/plan/builtin.cpp
@@ -531,5 +531,3 @@ gains a directory when it gains a second file; single-file families
 (`rotary_emb.cu`) stay at the top level.
 
 Compiled `.so` modules are placed directly in `astrai/extension/`.
-
-> Document Update Time: 2026-10-05

@@ -13,8 +13,8 @@ import re
 import types
 import typing as t
 from collections import OrderedDict
-from collections.abc import Sequence
-from typing import Dict, List, Optional, Set, Tuple, Type
+from collections.abc import Mapping, Sequence
+from typing import Dict, List, Optional, Set, Tuple, Type, Union
 
 import click
 import yaml
@@ -77,8 +77,20 @@ def _enable_yaml12_floats() -> None:
     )
 
 
+def load_yaml_config(config_path: str) -> Dict:
+    """Read a CLI config with scientific notation and mapping validation."""
+    _enable_yaml12_floats()
+    with open(config_path) as stream:
+        cfg = yaml.safe_load(stream)
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise click.UsageError(f"config must be a mapping: {config_path}")
+    return cfg
+
+
 def merge_yaml_into_kwargs(
-    config_path: str,
+    config_path: Union[str, Mapping],
     passed_kwargs: Dict,
     explicit_keys: Optional[Set[str]] = None,
     sections: Sequence[str] = DEFAULT_YAML_SECTIONS,
@@ -87,16 +99,16 @@ def merge_yaml_into_kwargs(
 ) -> Dict:
     """Merge option defaults, YAML values, then explicit CLI values.
 
+    ``config_path`` accepts a path or an already parsed mapping.
     ``sections`` selects which top-level YAML mappings feed the flat kwargs
     namespace. ``allowed_keys`` optionally restricts the accepted keys across
     those sections: unknown keys are warned about once and dropped.
     """
-    _enable_yaml12_floats()
-
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f) or {}
-    if not isinstance(cfg, dict):
-        raise click.UsageError(f"config must be a mapping: {config_path}")
+    cfg = (
+        config_path
+        if isinstance(config_path, Mapping)
+        else load_yaml_config(config_path)
+    )
 
     merged = dict(passed_kwargs)
     seen: Set[str] = set()

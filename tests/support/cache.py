@@ -1,16 +1,13 @@
-"""Unit tests for inference cache components."""
-
 import pytest
 import torch
 
 from astrai.inference.core.cache import (
     BlockPool,
-    KVCacheManager,
 )
 from astrai.inference.worker.workspace import InferenceWorkspace
 
 
-def _ws(pool: BlockPool) -> InferenceWorkspace:
+def make_cache_workspace(pool: BlockPool) -> InferenceWorkspace:
     """Workspace sized to the pool (bind_tasks requires it)."""
     return InferenceWorkspace(
         pool.max_batch_size,
@@ -22,18 +19,14 @@ def _ws(pool: BlockPool) -> InferenceWorkspace:
     )
 
 
-def _make_task_cache(pool: BlockPool) -> KVCacheManager:
-    return KVCacheManager(pool)
-
-
-@pytest.fixture(params=["cpu"])
+@pytest.fixture(params=["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
 def kv_device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
     return torch.device(request.param)
 
 
-def _assert_prefix_reachable(prefix):
+def assert_prefix_reachable(prefix):
     reachable = {}
     pending = list(prefix._root.children.values())
     while pending:
@@ -46,8 +39,8 @@ def _assert_prefix_reachable(prefix):
     assert prefix._page_to_node == reachable
 
 
-def _assert_allocator_cache_consistent(alloc, prefix):
-    _assert_prefix_reachable(prefix)
+def assert_allocator_cache_consistent(alloc, prefix):
+    assert_prefix_reachable(prefix)
     for page in range(alloc._n_pages):
         cached = prefix.has_page(page)
         free = bool(alloc._free_mask & (1 << page))
@@ -58,7 +51,7 @@ def _assert_allocator_cache_consistent(alloc, prefix):
     )
 
 
-def _make_contiguous_pool(**kwargs):
+def make_contiguous_pool(**kwargs):
     defaults = dict(
         n_layers=2,
         n_kv_heads=4,
@@ -72,7 +65,7 @@ def _make_contiguous_pool(**kwargs):
     return BlockPool(**defaults)
 
 
-def _make_paged_pool(**kwargs):
+def make_paged_pool(**kwargs):
     defaults = dict(
         n_layers=1,
         n_kv_heads=2,
@@ -88,17 +81,7 @@ def _make_paged_pool(**kwargs):
     return BlockPool(**defaults)
 
 
-def _make_paged_pool_ps64(**kwargs):
-    defaults = dict(
-        n_layers=1,
-        n_kv_heads=2,
-        head_dim=4,
-        max_batch_size=4,
-        max_seq_len=256,
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        page_size=64,
-        n_tokens=512,
+def make_paged_pool_ps64(**kwargs):
+    return make_paged_pool(
+        **{"max_seq_len": 256, "page_size": 64, "n_tokens": 512, **kwargs}
     )
-    defaults.update(kwargs)
-    return BlockPool(**defaults)

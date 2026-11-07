@@ -2,7 +2,6 @@
 
 from abc import ABC
 from typing import (
-    Any,
     Callable,
     ClassVar,
     Dict,
@@ -15,11 +14,9 @@ from typing import (
 
 import torch.nn as nn
 from torch import Tensor
-from torch.optim import Optimizer
 
 from astrai.model.components.mlp import RouterStats
 from astrai.parallel.cp import LossReduction, TokenLoss
-from astrai.trainer.backend import WeightPublisher
 from astrai.trainer.rollout import RolloutResult
 from astrai.trainer.strategy.ops import (
     ForwardResult,
@@ -30,15 +27,7 @@ from astrai.trainer.strategy.ops import (
 
 
 class BaseStrategy(ABC):
-    """Abstract base class for training strategies.
-
-    When a :class:`~astrai.trainer.rollout.RolloutRunner` is injected via
-    :meth:`set_rollout_runner`, the strategy transparently switches to
-    online mode: each ``__call__`` produces a :class:`RolloutResult`,
-    converts it to a training batch via :meth:`prepare_from_rollout`, and
-    then computes the loss.  Without a runner the strategy runs in
-    offline mode and consumes the batch directly.
-    """
+    """Batch conversion, loss semantics, and algorithm-specific post-update work."""
 
     #: Declared loss reduction (see :class:`astrai.parallel.cp.LossReduction`).
     #: Token-mean strategies compose with
@@ -56,29 +45,11 @@ class BaseStrategy(ABC):
         self.device = device
         self.executor = kwargs.pop("executor", None)
         self.moe_aux_loss_coef = kwargs.pop("moe_aux_loss_coef", 0.01)
-        self.rl_update_epochs = self._validate_update_epochs(
-            kwargs.pop("rl_update_epochs", 1)
-        )
-        self.rl_minibatch_prompts = kwargs.pop("rl_minibatch_prompts", None)
-        if self.rl_minibatch_prompts is not None and (
-            isinstance(self.rl_minibatch_prompts, bool)
-            or not isinstance(self.rl_minibatch_prompts, int)
-            or self.rl_minibatch_prompts < 1
-        ):
-            raise ValueError("rl_minibatch_prompts must be a positive integer or None")
         self.gradient_chunked_logprobs = bool(
             kwargs.pop("gradient_chunked_logprobs", False)
         )
         self._moe_metrics: Dict[str, float] = {}
         self.strategy_kwargs = kwargs
-        self._rollout_runner = None
-        self._weight_publishers: Tuple[WeightPublisher, ...] = ()
-
-    @staticmethod
-    def _validate_update_epochs(value: Any) -> int:
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError("rl_update_epochs must be a positive integer")
-        return value
 
     # ---------- token-mean two-phase protocol ----------
     # CP composes between the phases: astrai.parallel.cp.CPStrategy shards
@@ -146,21 +117,6 @@ class BaseStrategy(ABC):
             normalizer=float(tokens.token_count.item()),
         )
 
-    def validate_online(self, batch: Dict[str, Any]) -> Optional[LossOutput]:
-        """Validate one batch through a one-off rollout.
-
-        Online strategies with an injected rollout runner evaluate a
-        fresh, throw-away rollout so the training replay cache and its
-        cadence stay untouched. Returns ``None`` when no runner is
-        configured (offline mode); callers then fall back to
-        ``strategy(batch)``.
-        """
-        if self._rollout_runner is None:
-            return None
-        result = self._rollout_runner.evaluate(batch)
-        prepared = self.prepare_from_rollout(result)
-        return self.compute_loss_output(prepared)
-
     def _loss_output(
         self,
         task_loss: Tensor,
@@ -193,16 +149,6 @@ class BaseStrategy(ABC):
         """
         return False
 
-    def set_rollout_runner(self, runner):
-        """Inject a :class:`RolloutRunner` to enable online rollout mode."""
-        self._rollout_runner = runner
-
-    @property
-    def policy_version(self) -> Optional[int]:
-        if self._rollout_runner is None:
-            return None
-        return self._rollout_runner.policy_version
-
     def prepare_from_rollout(self, result: RolloutResult) -> Dict[str, Tensor]:
         """Map a :class:`RolloutResult` to the batch layout expected by
         :meth:`compute_loss`.
@@ -213,14 +159,6 @@ class BaseStrategy(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not support online rollout"
         )
-
-    def _on_rollout_refresh(self):
-        """Hook fired when a fresh rollout result is produced.
-
-        Override to refresh stale state (e.g. syncing the behaviour
-        policy).  Default is a no-op.
-        """
-        pass
 
     def _refresh_moe_diagnostics(
         self,
@@ -236,123 +174,14 @@ class BaseStrategy(ABC):
         self._moe_metrics = _collect_moe_diagnostics(router_stats or [])
         self._moe_metrics["aux_loss"] = float(aux_loss.detach().cpu().item())
 
-    def on_optimizer_step(self):
-        """Reject unsafe post-hoc publication for an online shared model."""
-        if self._rollout_runner is not None:
-            raise RuntimeError(
-                "online training must call strategy.optimizer_step(optimizer) "
-                "so weight mutation and policy-version publication are atomic"
-            )
-
-    def optimizer_step(self, optimizer: Optimizer):
-        """Step the optimizer at an atomic online-rollout version boundary."""
-        if self._rollout_runner is None:
-            return optimizer.step()
-
-        def commit(policy_version: int):
-            result = optimizer.step()
-            # Publishers run inside the version lock so a backend can
-            # never observe new-version weights that are still stale.
-            for publisher in self._weight_publishers:
-                publisher.publish(policy_version, self.model)
-            return result
-
-        # None lets the scheduler derive live+1 under the policy lock,
-        # avoiding a read-compute-write race on policy_version.
-        result = self._rollout_runner.apply_weight_update(None, commit)
-        self._rollout_runner.step()
-        return result
-
-    def set_weight_publishers(self, publishers) -> None:
-        """Inject :class:`~astrai.trainer.rollout.WeightPublisher` instances.
-
-        Each publisher is invoked inside the policy-version lock on every
-        online optimizer step, after ``optimizer.step()`` and before the
-        version commit — the seam where rollout-backend replicas receive
-        fresh weights atomically with the trainer's own publication.
-        """
-        self._weight_publishers = tuple(publishers)
-
     def __call__(self, batch: Dict[str, Tensor]) -> LossOutput:
-        """Run offline or online forward depending on runner injection."""
-        if self._rollout_runner is None:
-            return self.compute_loss_output(batch)
+        return self.compute_loss_output(batch)
 
-        result, is_fresh = self._rollout_runner(batch)
-        if is_fresh:
-            self._on_rollout_refresh()
+    def loss_outputs(
+        self, batch: Dict[str, Tensor], microbatch_prompts: Optional[int] = None
+    ) -> Iterator[LossOutput]:
+        """Yield losses whose gradients belong to one optimizer update."""
+        yield self.compute_loss_output(batch)
 
-        train_batch = self.prepare_from_rollout(result)
-        return self.compute_loss_output(train_batch)
-
-    def training_steps(self, batch: Dict[str, Tensor]) -> Iterator[LossOutput]:
-        """Yield one :class:`LossOutput` per learner update for this batch.
-
-        The trainer iterates this instead of calling the strategy once, so
-        one incoming batch can expand into several backward/optimizer-step
-        cycles.  In online mode that is the RL scheduling split — one
-        rollout round is collected once under a fixed policy, then consumed
-        for ``rl_update_epochs`` passes of ``rl_minibatch_prompts``-sized
-        learner updates (classic PPO-style multiple epochs over one batch).
-        Offline mode yields exactly once, preserving the historical
-        one-call-per-batch contract.
-
-        Each optimizer step still goes through
-        :meth:`optimizer_step`, so weight publication and policy-version
-        advancement happen once per learner update. The global-window trainer
-        collects rollout microbatches first and accumulates each corresponding
-        learner update explicitly; this legacy iterator remains for callers
-        that operate on one batch at a time.
-        """
-        if self._rollout_runner is None:
-            yield self.compute_loss_output(batch)
-            return
-
-        result, is_fresh = self._rollout_runner(batch)
-        if is_fresh:
-            self._on_rollout_refresh()
-        prepared = self.prepare_from_rollout(result)
-        slices = self._split_rollout_batch(prepared)
-        for _ in range(self.rl_update_epochs):
-            for chunk in slices:
-                yield self.compute_loss_output(chunk)
-
-    def training_updates(
-        self, batch: Any, microbatch_prompts: Optional[int] = None
-    ) -> Iterator[Iterator[LossOutput]]:
-        """Group loss outputs by optimizer update.
-
-        The default keeps the existing one-loss-per-update contract.  A
-        strategy can yield several losses in one group when their gradients
-        must be accumulated before a single optimizer step.
-        """
-        for output in self.training_steps(batch):
-            yield iter((output,))
-
-    def _split_rollout_batch(self, prepared: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Slice one prepared rollout batch along the prompt dimension.
-
-        Every prepared tensor's leading dim is the prompt count B, and the
-        group dimension rides along inside each slice — GRPO advantages are
-        group-normalized from per-group rewards, so slicing along B never
-        re-mixes groups, and PPO's rollout-pinned advantages/returns are
-        shared views rather than recomputed targets.
-        """
-        size = self.rl_minibatch_prompts
-        if size is None:
-            return [prepared]
-        first = prepared[next(iter(prepared))]
-        total = first.shape[0]
-        if size >= total:
-            return [prepared]
-        return [
-            {
-                key: (
-                    value[begin : begin + size]
-                    if isinstance(value, Tensor) and value.shape[0] == total
-                    else value
-                )
-                for key, value in prepared.items()
-            }
-            for begin in range(0, total, size)
-        ]
+    def after_update(self) -> None:
+        """Update algorithm state after the actor's weight publication."""

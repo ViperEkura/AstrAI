@@ -8,7 +8,7 @@ optimizer loop. Shared tensor operations live in ops.py.
 
 | Module | Responsibility |
 | --- | --- |
-| base.py | Offline/online lifecycle, loss output, rollout conversion and optimizer-step hooks |
+| base.py | Loss outputs, rollout conversion and algorithm post-update hooks |
 | factory.py | Registry, capability declarations and strict internal construction |
 | ops.py | ForwardResult and LossOutput, log probabilities, values, GAE and common rollout tensor operations |
 | supervised.py | Shared cross-entropy path, sequence and SFT masking/reduction |
@@ -18,21 +18,33 @@ optimizer loop. Shared tensor operations live in ops.py.
 
 ## Loss boundary
 
-BaseStrategy.prepare_batch() receives an offline batch or converts a
-RolloutResult in online mode. compute_loss_output() returns loss and metrics.
-The token-mean forward/reduce path supports context parallelism; each
-algorithm retains its own reduction semantics. training_steps() and
-training_updates() express microbatch or update shape while Trainer retains
-commit ownership. ops.py also supplies chunked log-probability calculation
-for the memory-sensitive path.
+Trainer obtains scored results from `context.rollout`, calls
+`prepare_from_rollout(result)`, and schedules replay with
+`learner_update_slices()`. Only Trainer reads `rl_update_epochs` and
+`rl_minibatch_prompts`. PPO advantages and returns stay pinned to their rollout,
+so replay neither regenerates responses nor recomputes those targets.
 
-For offline training with the global cursor, one data microbatch must yield one
-`training_updates()` group. That group may contain several loss outputs if they
-share the same `normalizer`; their losses are added before the global target
-count is applied. The trainer rejects additional groups because it owns the
-optimizer-window boundary. Synchronous online training collects the rollout
-window first and schedules learner updates in the trainer, then calls
-`compute_loss_output()` on each prepared chunk.
+`loss_outputs(batch, microbatch_prompts=None)` yields losses for **one optimizer
+update**, with one output by default. Global-window outputs must share a
+`normalizer`; Trainer sums their losses before applying the global target count.
+Async GRPO splits complete prompt groups and weights each loss by its share of
+valid tokens or nonempty responses. It skips empty microbatches and rejects an
+entire round without targets.
+
+`compute_loss_output()` returns loss and metrics; `compute_loss()` returns the
+scalar loss. `__call__()` only computes the supplied batch's loss.
+`prepare_batch()` handles device placement and objective inputs. The token-mean
+forward/reduce path supports context parallelism: CPStrategy explicitly implements
+`loss_outputs()` through its own shard path.
+
+After actor update and version publication, Trainer calls `after_update()`.
+PPO updates and clears critic gradients outside the actor version lock; offline
+GRPO refreshes its old policy. Strategies hold neither rollout runners nor
+publishers and do not schedule replay or step the actor optimizer.
+
+`rollout.batching.slice_batch()` preserves complete prompt groups and aligned
+Python metadata. `ops.py` supplies chunked log probabilities for the
+memory-sensitive path.
 
 ## Registry and capabilities
 
@@ -57,9 +69,8 @@ Register custom strategies before constructing TrainConfig. Offline
 strategies can use the default capability declaration. An online strategy
 must declare the capabilities it needs and implement the online strategy
 contract. Constructor options should appear in its signature or in
-accepted_options; internal StrategyFactory.create_checked rejects unknown
-options. The legacy BaseFactory.create path warns when it discards an
-argument for one minor version before becoming strict.
+accepted_options; internal StrategyFactory.create rejects unknown
+options. The legacy filtering construction API has been removed.
 
 ```python
 from astrai.trainer.strategy import BaseStrategy, StrategyFactory
@@ -76,5 +87,5 @@ class CustomStrategy(BaseStrategy):
 Register a custom strategy before constructing TrainConfig, since its
 validator checks the registry. Declare online, reference, old-policy, critic
 and async-round requirements in StrategyCapabilities. Internal creation uses
-create_checked() to reject unknown options; the legacy BaseFactory.create()
-warns for one minor version when it filters an option.
+`create()` to reject unknown options. Unknown arguments are no longer
+filtered; pass only supported options.

@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from astrai.config.inference_config import load_generation_config
 from astrai.parallel.setup import die_with_parent
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.backend import ReplicaBackend
@@ -92,6 +93,7 @@ def run_rollout_worker(conn, spec: RolloutWorkerSpec):
             ),
         )
         tokenizer = AutoTokenizer.from_pretrained(spec.param_path)
+        model.generation_config = load_generation_config(spec.param_path)
         backend = ReplicaBackend(
             model=model,
             tokenizer=tokenizer,

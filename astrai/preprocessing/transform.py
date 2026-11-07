@@ -2,7 +2,7 @@
 
 Bridges the Reader layer (``JsonlStore`` reads raw JSON records) and the
 Dataset layer (expects per-record tensors).  Holds the tokenizer,
-mask-builder and position-id strategy together so that I/O code stays
+mask-builder and position-id configuration together so that I/O code stays
 free of model dependencies.
 
 The record-processing core (mask building, primary-id extraction,
@@ -15,13 +15,13 @@ import json
 from pathlib import Path
 from typing import Dict, List
 
-import torch
-
 from astrai.config.preprocess_config import PipelineConfig
 from astrai.preprocessing.core import (
-    build_position_ids,
+    accumulate_record,
     build_preprocessing_components,
     iter_raw_records,
+    prepare_sequences,
+    primary_ids,
     to_per_record_tensors,
 )
 
@@ -41,8 +41,8 @@ class TokenizeTransform:
 
     def __init__(self, config: PipelineConfig, tokenizer_path: str):
         self.config = config
-        self.tokenizer, self.mask_builder, self.position_strategy = (
-            build_preprocessing_components(config, tokenizer_path)
+        self.tokenizer, self.mask_builder = build_preprocessing_components(
+            tokenizer_path
         )
 
     @classmethod
@@ -68,25 +68,13 @@ class TokenizeTransform:
         multi-response keys such as GRPO ``responses``).
         """
         raw: Dict[str, List] = {}
-        doc_sequences: List[List[int]] = []
 
         for result in iter_raw_records(
             records, self.mask_builder, self.config, self.tokenizer
         ):
-            primary = None
-            for val in result.values():
-                if isinstance(val, list) and val and isinstance(val[0], int):
-                    primary = val
-                    break
-            if primary is not None:
-                doc_sequences.append(primary)
-            for key, ids in result.items():
-                raw.setdefault(key, []).append(ids)
-
-        tensors = to_per_record_tensors(raw)
-
-        pos_ids = build_position_ids(doc_sequences, self.position_strategy)
-        if pos_ids is not None:
-            tensors["position_ids"] = [torch.tensor(pos_ids, dtype=torch.int32)]
-
-        return tensors
+            if "sequence" in result:
+                accumulate_record(raw, result, primary_ids(result))
+            else:
+                for key, ids in result.items():
+                    raw.setdefault(key, []).append(ids)
+        return to_per_record_tensors(prepare_sequences(raw, self.config))

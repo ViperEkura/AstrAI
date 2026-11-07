@@ -11,7 +11,6 @@ from astrai.inference.core.planner import StepPlanner
 from astrai.inference.core.request import (
     GenerationResult,
     Request,
-    RequestManager,
     RequestStatus,
     StreamDecoder,
 )
@@ -22,7 +21,6 @@ __all__ = [
     "GenerationResult",
     "OutputEventSink",
     "Request",
-    "RequestManager",
     "RequestStatus",
     "Scheduler",
     "StepPlanner",

@@ -16,9 +16,6 @@ class Embedding(nn.Module):
         # Same contract as Linear: never leak torch.empty bytes to callers.
         self.reset_parameters()
 
-    def set_neftune_alpha(self, alpha: float):
-        self.neftune_noise_alpha = alpha
-
     def reset_parameters(self):
         if not should_initialize():
             return

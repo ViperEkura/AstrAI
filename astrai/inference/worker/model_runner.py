@@ -24,8 +24,6 @@ from astrai.inference.worker.pending import (
 )
 from astrai.inference.worker.sample import (
     SamplingMeta,
-    SamplingPipeline,
-    build_sampling_pipeline,
     sample,
 )
 from astrai.inference.worker.workspace import InferenceWorkspace
@@ -81,19 +79,15 @@ class SamplingBatchInfo:
     changes.  ``top_ks`` is int32 to match the native consumers.
 
     ``meta`` holds the host-resolved facts (greedy, active filters) derived
-    from the same request attributes, and ``pipeline`` the strategy chain
-    built from them — both constant for the same ordered request set, so the
-    steady-state decode path reuses the whole bundle instead of rebuilding
-    strategy objects and re-probing device tensors every step.
+    from the same request attributes, so steady-state decode avoids
+    re-probing device tensors every step.
     """
 
     temperatures: Tensor  # float32 [B]
     top_ks: Tensor  # int32  [B]
     top_ps: Tensor  # float32 [B]
     freq_penalties: Tensor  # float32 [B]
-    has_freq: bool  # any frequency_penalty != 0 (avoids per-step GPU .any())
-    meta: Optional[SamplingMeta] = None
-    pipeline: Optional[SamplingPipeline] = None
+    meta: SamplingMeta
 
 
 @dataclass
@@ -108,7 +102,6 @@ class DecodeSteadyState:
     """
 
     task_sig: Any
-    positions: List[int]
     sampling_info: SamplingBatchInfo
     last_tokens: Optional[Tensor] = None
 
@@ -117,10 +110,10 @@ def _build_sampling_batch_info(
     requests: List[ExecutionRequest], device
 ) -> SamplingBatchInfo:
     pin = str(device).startswith("cuda")
-    freq_list = [t.frequency_penalty for t in requests]
-    temps = [t.temperature for t in requests]
-    top_ks = [t.top_k for t in requests]
-    top_ps = [t.top_p for t in requests]
+    freq_list = [t.sampling.frequency_penalty for t in requests]
+    temps = [t.sampling.temperature for t in requests]
+    top_ks = [t.sampling.top_k for t in requests]
+    top_ps = [t.sampling.top_p for t in requests]
     freq_penalties = torch.tensor(freq_list, dtype=torch.float32, pin_memory=pin).to(
         device, non_blocking=True
     )
@@ -128,13 +121,12 @@ def _build_sampling_batch_info(
     # them on device would force a synchronize right after the non-blocking
     # H2D copies — draining whatever prefill work is still queued
     # (measured 0.6 s stall at batch 128).
-    has_freq = any(f != 0.0 for f in freq_list)
     meta = SamplingMeta(
         greedy=all(t == 0.0 for t in temps),
         any_temp_not_one=any(t != 1.0 for t in temps),
         max_top_k=max(top_ks, default=0),
         any_topp_lt1=any(tp < 1.0 for tp in top_ps),
-        has_freq=has_freq,
+        has_freq=any(f != 0.0 for f in freq_list),
     )
     temperatures = torch.tensor(temps, dtype=torch.float32, pin_memory=pin).to(
         device, non_blocking=True
@@ -150,14 +142,6 @@ def _build_sampling_batch_info(
         top_ks=top_ks_t,
         top_ps=top_ps_t,
         freq_penalties=freq_penalties,
-        has_freq=has_freq,
-        meta=meta,
-    )
-    info.pipeline = build_sampling_pipeline(
-        temperatures,
-        top_ks_t,
-        top_ps_t,
-        freq_penalties,
         meta=meta,
     )
     return info
@@ -575,7 +559,7 @@ class GPUModelRunner:
         ws = self._workspace
         request_ids = [t.request_id for t in requests]
         task_sig = tuple(t.identity for t in requests)
-        cur_positions = [t.next_pos for t in requests]
+        cur_positions = [t.position for t in requests]
 
         # ---- pre-replay: update input buffers in-place ----
 
@@ -618,13 +602,13 @@ class GPUModelRunner:
             ws.position_ids[:b].copy_(
                 torch.tensor(cur_positions, dtype=torch.long, device=self.device)
             )
-        if info.has_freq and pending_same_batch:
+        if info.meta.has_freq and pending_same_batch:
             # Frequency penalty subtracts per-token counts computed from the
             # host history (prompt tail + full output). With a pending step
             # in flight the histories are one step behind the device relay,
             # so the penalty would be computed against the wrong prefix.
             return None
-        self._decode_cache = DecodeSteadyState(task_sig, cur_positions, info)
+        self._decode_cache = DecodeSteadyState(task_sig, info)
 
         # ---- forward (graph replay or live run + capture) ----
 
@@ -675,32 +659,33 @@ class GPUModelRunner:
     ) -> PendingExecution:
         """Sample from ``logits`` into a :class:`PendingExecution`.
 
-        Same strategy pipeline and frequency-penalty history assembly as
+        Same sampling order and frequency-penalty history assembly as
         the pre-split host path, but the result stays on device inside a
         pending step instead of being resolved to host lists.
         """
         info = info or _build_sampling_batch_info(requests, self.device)
-        if info.has_freq:
-            history_lists = [
-                t.prompt_ids[-t.rep_window :] + t.output_ids for t in requests
-            ]
-            history_lens = [len(ids) for ids in history_lists]
-            max_len = max(history_lens, default=0)
-            padded_ids = torch.zeros(
-                len(requests), max_len, dtype=torch.long, device=self.device
+        counts = None
+        if info.meta.has_freq:
+            vocab = logits.size(-1)
+            # Encode each token's request row; ragged histories need no padding.
+            indices = torch.tensor(
+                [
+                    row * vocab + token
+                    for row, request in enumerate(requests)
+                    for token in (
+                        request.prompt_ids[-request.sampling.rep_window :]
+                        + request.output_ids
+                    )
+                ],
+                dtype=torch.long,
+                device="cpu",
+            ).to(logits.device, non_blocking=True)
+            counts = torch.zeros(
+                logits.shape, dtype=torch.float32, device=logits.device
             )
-            padded_mask = torch.zeros(
-                len(requests), max_len, dtype=torch.bool, device=self.device
+            counts.view(-1).index_add_(
+                0, indices, torch.ones_like(indices, dtype=counts.dtype)
             )
-            for i, ids in enumerate(history_lists):
-                length = len(ids)
-                padded_ids[i, :length] = torch.as_tensor(
-                    ids, dtype=torch.long, device=self.device
-                )
-                padded_mask[i, :length] = True
-        else:
-            padded_ids = None
-            padded_mask = None
 
         # Stateless per-request/per-position streams survive request reordering,
         # worker repartitioning and scheduler compaction without touching global RNG.
@@ -714,27 +699,16 @@ class GPUModelRunner:
         seed_kwargs = (
             {"seeds": seeds} if any(seed is not None for seed in seeds) else {}
         )
-        result = (
-            info.pipeline.sample(
-                logits,
-                input_ids=padded_ids,
-                input_mask=padded_mask,
-                return_logprobs=return_logprobs,
-                **seed_kwargs,
-            )
-            if info.pipeline is not None
-            else sample(
-                logits,
-                temperature=info.temperatures,
-                top_k=info.top_ks,
-                top_p=info.top_ps,
-                frequency_penalty=info.freq_penalties,
-                input_ids=padded_ids,
-                input_mask=padded_mask,
-                return_logprobs=return_logprobs,
-                **seed_kwargs,
-                meta=info.meta,
-            )
+        result = sample(
+            logits,
+            temperature=info.temperatures,
+            top_k=info.top_ks,
+            top_p=info.top_ps,
+            frequency_penalty=info.freq_penalties,
+            frequency_counts=counts,
+            return_logprobs=return_logprobs,
+            **seed_kwargs,
+            meta=info.meta,
         )
         if return_logprobs:
             tokens, logprobs = result
@@ -762,19 +736,6 @@ class GPUModelRunner:
         pending = self._pending
         self._pending = None
         return pending
-
-    def can_overlap_submit(self) -> bool:
-        """Whether the next submit may overlap the in-flight step.
-
-        Frequency penalty is the one refusal: its per-step history rebuild
-        reads host-side ``output_ids``, which a pending step has not yet
-        produced — the overlap would penalise against a stale prefix.
-        """
-        pending = self._pending
-        if pending is None or pending.committed:
-            return True
-        cached = self._decode_cache
-        return cached is None or not getattr(cached.sampling_info, "has_freq", False)
 
     def execute_model(self, plan: SchedulerOutput):
         """Yield every launched group's handle, including KV-only prefills.
@@ -811,18 +772,3 @@ class GPUModelRunner:
         """Fence work that threw before it could return an execution handle."""
         if torch.device(self.device).type == "cuda":
             torch.cuda.synchronize(self.device)
-
-    def execute_decode(
-        self,
-        requests: List[ExecutionRequest],
-        return_logprobs: bool = False,
-        *,
-        plan: SchedulerOutput,
-    ) -> List[int]:
-        pending = self.submit_decode(requests, return_logprobs, plan=plan)
-        if pending is None:
-            raise RuntimeError("execute_decode: submit refused")
-        payload = pending.commit()
-        if return_logprobs:
-            return [(r.token_id, r.logprob) for r in payload.results]
-        return [r.token_id for r in payload.results]

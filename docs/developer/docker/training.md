@@ -213,5 +213,3 @@ the Docker timeout expires.
 5. The image user is built with the host UID/GID so mounted checkpoints retain usable ownership.
 6. Scope `runtime.environment` to the job YAML that needs it; do not copy NCCL
    workarounds into every config.
-
-> Document Update Time: 2026-10-06

@@ -1,9 +1,9 @@
 # Run lifecycle and construction
 
 The run loop is in trainer.py, startup and cleanup in session.py, and object
-assembly in train_context.py, and component construction in components.py.
-TrainConfig remains the public configuration. schedule.py supplies registered
-learning-rate policies.
+assembly in context/builder.py, and component construction in components.py.
+TrainConfig remains the public configuration. The optimization/scheduler package
+supplies registered learning-rate policies.
 
 ## Source modules
 
@@ -11,9 +11,9 @@ learning-rate policies.
 | --- | --- |
 | trainer.py | Epoch/batch loop, gradient accumulation, optimizer and scheduler commits, loop callbacks |
 | session.py | Signal handlers, startup callbacks, error and end callbacks, rollout closure, final barrier |
-| train_context.py | Context state and rank-local assembly order, strategy and rollout wiring, checkpoint restore |
+| context/builder.py, context/state.py | Context state and rank-local assembly order, strategy and rollout wiring, checkpoint restore |
 | components.py | Model, dataset, DataLoader, optimizer, scheduler and reference-model construction |
-| schedule.py | Cosine, SGDR and WSD learning-rate implementations and scheduler registry |
+| ../../optimization/scheduler/ | Cosine, SGDR and WSD learning-rate implementations and scheduler registry |
 
 ## Loop and lifetime
 
@@ -29,34 +29,38 @@ classDiagram
     TrainContextBuilder --> TrainContext : assembles
     TrainContext --> BaseExecutor
     TrainContext --> BaseStrategy
-    TrainContext --> AsyncRoundCoordinator
+    TrainContext --> RolloutRunner
+    RolloutRunner --> AsyncRoundCoordinator
     TrainSession --> TrainContext : callbacks and teardown
 ```
 
 The builder resolves topology and persisted state, creates the executor and
 context, then prepares the model, optimizer, datasets, strategy and rollout.
-After a context exists, a failed build closes its assigned async rollout and
+After a context exists, a failed build closes its context-owned rollout and
 re-raises the original error. AsyncRoundCoordinator also closes workers and
 its weight channel if its own constructor fails before assignment.
 
 On a successful build, the session registers signal handlers and calls
-on_train_begin. The training loop then sets model.train(), walks epochs and
-batches, and calls the normal batch/optimizer callbacks. A stop request calls
-on_error to allow an emergency checkpoint before leaving the loop.
+`on_train_begin`. Trainer runs epochs and optimizer windows. A requested stop
+is observed at a safe boundary; the session handles publication and cleanup.
 
-| Exit point | Cleanup and callback behavior |
-| --- | --- |
-| Build fails before returning a context | Builder closes any assigned async rollout. Session callbacks and signal registration have not started. |
-| Signal registration or on_train_begin fails | Session calls on_error, closes rollout, calls on_train_end and unregisters signal handlers. The startup error is re-raised. |
-| Epoch or batch loop raises | Session calls on_error, closes rollout, calls on_train_end and unregisters signal handlers. It skips the final distributed barrier and re-raises the loop error. |
-| Normal completion or requested stop | Session closes rollout, calls on_train_end, attempts the distributed barrier when initialized, then restores the prior signal handlers. A requested stop already called on_error in Trainer. |
+The shutdown order is the same for normal completion, a stop request and errors:
 
-Each cleanup action is attempted even if an earlier one fails. A cleanup
-failure is logged without replacing an existing startup or loop exception.
-With no earlier exception, the first cleanup failure is raised after the
-remaining actions. Signal registration preserves the previous SIGTERM and
-SIGINT handlers and restores them on exit. TrainSession is internal; callers
-continue to use Trainer.train().
+1. Run registered cleanup hooks, including stopping DataLoader workers.
+2. Discard pending metric records and dispatch `on_shutdown`.
+3. Close context-owned rollout, then dispatch `on_train_end`.
+4. On a successful run, attempt the distributed barrier.
+5. Restore the prior signal handlers.
+
+Every cleanup action is attempted even after another fails. A cleanup exception
+does not replace the original startup or training exception. Without an earlier
+exception, the first cleanup error is raised after the remaining actions.
+
+A build failure before the context returns is handled by the builder; session
+callbacks have not started. A failure during signal registration or
+`on_train_begin` uses the session cleanup plan. Checkpoint callbacks still check
+`checkpoint_safe`: an exception does not authorize publishing partially updated
+weights. See [checkpoint semantics](../../guides/training.md#checkpoint).
 
 ## Context and checkpoint settings
 

@@ -388,6 +388,15 @@ python scripts/tools/train.py --config train.yaml --dry-run
 python scripts/tools/train.py --config train.yaml
 ```
 
+The dry run builds and validates the same TrainConfig as execution, including
+component parameters, precision, strategy options, and distributed settings. It
+prints the resolved dataset window, optimizer/scheduler parameters, effective
+batch size, and component loading policy. It reads model configuration and may
+import a configured reward factory, but does not construct a trainer, load model
+weights or datasets, or start distributed workers. Checkpoint/data compatibility
+is still validated when training loads those resources.
+
+
 Explicit CLI flags override YAML. The dry run validates configuration without
 starting training. See [Quick Start](../quick-start.md#5-train) for a direct
 single-GPU command and [distributed training](distributed.md) for launch settings.

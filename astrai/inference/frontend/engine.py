@@ -106,7 +106,7 @@ class InferenceEngine:
         """Register every consumer before admitting the prepared requests."""
         request_ids = [item.request_id for item in processed]
         for request_id in request_ids:
-            self._tracker.register(request_id, maxlen=self._max_seq_len + 1)
+            self._tracker.register(request_id, event_capacity=self._max_seq_len + 1)
         try:
             self._core.add_requests(
                 prompts=[item.prompt_text or "" for item in processed],
@@ -506,10 +506,9 @@ class InferenceEngine:
                                 remaining -= 1
                                 break
                     if remaining > 0 and not progressed:
-                        waiting_id = next(
-                            rid for rid in request_ids if not finished[idx_of[rid]]
+                        self._tracker.wait_for_events(
+                            [rid for rid in request_ids if not finished[idx_of[rid]]]
                         )
-                        self._tracker.wait(waiting_id, timeout=0.05)
             finally:
                 self._release_requests(request_ids)
 
@@ -540,7 +539,7 @@ def build_engine(
     tokenizer: Optional[AutoTokenizer] = None,
     device: Optional[str] = "cuda",
     dtype: Optional[torch.dtype] = torch.bfloat16,
-    max_batch_size: int = 16,
+    max_batch_size: int = 1,
     max_seq_len: Optional[int] = None,
     **engine_kwargs: Any,
 ) -> InferenceEngine:

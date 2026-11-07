@@ -56,3 +56,11 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 exclude = ["*.md", "*.json", "*.yml", "*.yaml"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --import-mode=importlib"
+markers = [
+    "cuda: requires CUDA devices",
+    "distributed: launches distributed ranks or workers",
+    "slow: long-running tests",
+]

@@ -70,7 +70,7 @@ configured CMake `cross_entropy` target. The loader discovers the module; it
 is not registered as an attention implementation.
 
 ```bash
-.venv/bin/python -m pytest tests/gpu/extension/test_cross_entropy.py tests/gpu/trainer/test_ce_backends.py -q
+.venv/bin/python -m pytest tests/extension/test_cross_entropy.py tests/trainer/test_ce_backends.py -q
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \
   --mode head --warmup 20 --steps 100 --rounds 3 --out results/ce-head.json
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/benchmark/cross_entropy.py \

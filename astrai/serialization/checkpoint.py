@@ -189,32 +189,42 @@ def save_model(config: Dict, state_dict: Dict, save_directory: str):
     save_path = Path(save_directory)
     save_path.mkdir(parents=True, exist_ok=True)
     save_json(config, save_path / _CONFIG_FILE)
-    save_safetensors(state_dict, save_path / _WEIGHTS_FILE)
+    save_model_weights(state_dict, save_path)
 
 
 def load_model_config(save_directory: str) -> Dict:
     return load_json(Path(save_directory) / _CONFIG_FILE)
 
 
-def load_model_weights(save_directory: str) -> Dict:
+def save_model_weights(state_dict: Dict, save_directory: Union[str, Path]) -> None:
+    """Write model.safetensors only; callers own configuration and metadata."""
+    save_path = Path(save_directory)
+    save_path.mkdir(parents=True, exist_ok=True)
+    save_safetensors(state_dict, save_path / _WEIGHTS_FILE)
+
+
+def load_model_weights(
+    save_directory: Union[str, Path], broadcast: bool = False
+) -> Dict:
+    """Read model.safetensors or its indexed shards without modifying a model."""
     save_path = Path(save_directory)
     weights_file = save_path / _WEIGHTS_FILE
     if weights_file.exists():
-        return load_state_dict(weights_file)
+        return _load_weight_file(weights_file, broadcast=broadcast)
 
     index_path = save_path / "model.safetensors.index.json"
     if index_path.exists():
-        index = load_json(index_path)
+        index = load_json(index_path, broadcast=broadcast)
         weight_map = index.get("weight_map", {})
         state_dict = {}
         for shard in sorted(set(weight_map.values())):
-            state_dict.update(load_state_dict(save_path / shard))
+            state_dict.update(_load_weight_file(save_path / shard, broadcast=broadcast))
         return state_dict
 
     raise FileNotFoundError(f"No model weights found in {save_directory}")
 
 
-def load_state_dict(path: Union[str, Path], broadcast: bool = False) -> Dict:
+def _load_weight_file(path: Union[str, Path], broadcast: bool = False) -> Dict:
     path = Path(path)
     if not broadcast or not dist.is_initialized():
         return load_safetensors(path)
@@ -289,7 +299,7 @@ class Checkpoint:
         try:
             save_json(meta, staging_path / _META_FILE)
             save_json(self.config, staging_path / _CONFIG_FILE)
-            save_safetensors(self.state_dict, staging_path / _WEIGHTS_FILE)
+            save_model_weights(self.state_dict, staging_path)
             for key, value in self.extra.items():
                 save_torch(value, staging_path / f"{key}.pt")
             if prepare_staging is not None:
@@ -360,9 +370,7 @@ class Checkpoint:
         meta = load_json(save_path / _META_FILE, broadcast)
         config = load_json(save_path / _CONFIG_FILE, broadcast)
         state_dict = (
-            load_state_dict(save_path / _WEIGHTS_FILE, broadcast=broadcast)
-            if load_weights
-            else {}
+            load_model_weights(save_path, broadcast=broadcast) if load_weights else {}
         )
 
         extra = {}
@@ -404,7 +412,11 @@ class Checkpoint:
         weights_path = save_path / _WEIGHTS_FILE
         index_path = save_path / "model.safetensors.index.json"
         if weights_path.exists() or index_path.exists():
-            state_dict = load_model_weights(save_dir) if load_weights else {}
+            state_dict = (
+                load_model_weights(save_dir, broadcast=broadcast)
+                if load_weights
+                else {}
+            )
             config = {}
             config_path = save_path / _CONFIG_FILE
             if config_path.exists():

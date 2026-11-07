@@ -133,8 +133,6 @@ protocol responses forward the deltas directly. Only tool parsing retains a
 streaming text body; non-streaming responses collect fragments and join once.
 Terminal protocol events carry finish metadata without replaying output text.
 
-
-
 ## Blocking generate is completion-driven
 
 Non-streaming `generate` runs **no helper thread**. It submits, parks the

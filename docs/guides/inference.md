@@ -1,187 +1,51 @@
 # Inference
 
-## Contents
-
-- [KV Cache](#kv-cache)
-- [KVCache System](#kvcache-system)
-- [Attention Backend](#attention-backend)
-- [Continuous Batching](#continuous-batching)
-- [Sampling](#sampling-strategy-pattern)
-- [Protocol Handlers](#protocol-handlers-strategy-pattern)
-- [Engine](#engine)
-- [HTTP API](#http-api) — endpoints, SSE, errors, stats
-- [Engine API](#engine-api)
-
-## KV Cache
-
-At decode time, only the last query token matters. All previous K/V are cached to avoid recomputation:
-
-$$
-o_n = \sum_j \text{softmax}\left(\frac{q_n k_j}{\sqrt{d_k}}\right) v_j
-$$
-
-RoPE is applied **before** KV cache write, not after — otherwise position encoding drift occurs.
-
-## KVCache System
-
-Three-layer separation (SGLang-inspired): storage, index table, allocator.
-
-```
-KVCacheManager (per-request accounting; core/kv_cache_manager.py)
-  └── BlockPool (physical buffers + strategy; core/cache/pool.py)
-        ├── KVStorage          k_buffer / v_buffer [n_layers, size, n_kv_heads, head_dim]
-        ├── ReqToTokenPool     req_to_token [num_reqs, max_ctx_len] → physical token slot
-        ├── Allocator          bitmask-based page allocator + ref-count + LRU (paged mode only)
-        └── RadixCache         exact, page-aligned prefix matching (paged mode, page_size > 1)
-```
-
-`BlockPool` supports two modes:
-
-- **Contiguous (default)**: pre-allocates `max_batch_size * max_seq_len` token slots. `req_to_token` is a trivial linear mapping (`slot = req_idx * max_seq_len + pos`). No dynamic allocation.
-- **Paged** (`page_size=1` or `>1` with `n_tokens` set): shared token pool with on-demand allocation. `Allocator` provides ref-counted allocation and LRU eviction. When `page_size > 1`, `RadixCache` also enables prefix sharing.
-
-`RadixCache` indexes complete token pages as parent-linked radix edges. Lookup walks from the root and compares each page's exact token tuple, so an identical page can only be reused under the same parent prefix. Hash values are retained for introspection, but never determine a match.
-
-Only fully materialized KV pages enter the radix. A partial final page remains private to its request and is released when the request ends. On completion, the scheduler records the prompt plus generated tokens already decoded into KV; it excludes the final sampled token because that token has not yet passed through the model. A later request resumes prefill immediately after the longest complete-page hit.
-
-`bind_tasks()` returns a `KVCache` dataclass — pure data, no methods:
-
-```
-KVCache
-  ├── k_buffer, v_buffer     [n_layers, size, n_kv_heads, head_dim]
-  ├── req_to_token           [num_reqs, max_ctx_len]
-  ├── req_pool_indices       [batch_size]
-  ├── seq_lens               [batch_size]
-  ├── out_cache_loc          [batch, seq_len] — write indices for this forward
-  ├── max_len                int — max(seq_lens), avoids GPU sync in decode
-  ├── kv_indptr              [batch + 1] int32 — prefix sum of seq_lens, precomputed once per step
-  ├── qo_indptr              [batch + 1] int32 — prefix sum of per-request q_lens (prefill), precomputed once per step
-  ├── q_tile_to_batch        [num_q_tiles] int32 — prefill: Q tile → request (precomputed once per step)
-  ├── q_tile_to_index        [num_q_tiles] int32 — prefill: Q tile → request-local tile index
-  ├── decode_o_part          [batch, n_heads, head_dim] — decode split-K partial output buffer
-  ├── decode_ml_part         [batch, n_heads] — decode split-K partial max/logsum buffer
-  └── decode_out             [batch, n_heads, head_dim] — decode output accumulator
-```
-
-Attention layers do raw buffer indexing: `k_buffer[layer_id, out_cache_loc] = k` to write, `k_buffer[layer_id, indices]` to gather.
-
-## Attention dispatch
-
-Inference calls `astrai.extension.attention`. Its `AttentionDispatcher` builds
-an `AttentionSpec` and selects a function from the CUDA, FlashAttention, or
-torch modules. The `kernel` package contains exact CUDA wrappers and does not
-choose fallbacks.
-
-Automatic selection tries CUDA, FlashAttention, then torch. Set a soft process
-default with `set_op("attention", "cuda")` or `ASTR_OPS=attention=cuda`. A
-`with op_backend(attention="cuda")` scope is strict: an unsupported call raises.
+## Engine API
 
 ```python
-from astrai.extension import op_backend
-from astrai.inference.frontend.engine import build_engine
+from astrai import build_engine
 
-with op_backend(attention="cuda"):
-    engine = build_engine(param_path="path/to/weights")
+engine = build_engine("./params")
+try:
+    print(engine.generate("Hello", max_new_tokens=128, do_sample=True, temperature=0.8))
+    for text in engine.generate("Hello", stream=True, max_new_tokens=128):
+        print(text, end="", flush=True)
+finally:
+    engine.shutdown()
 ```
 
-The scheduler snapshots the selection when it is created and installs it in
-its worker. Select the scope around engine construction; requests do not carry
-an attention choice. CUDA Graph eligibility and capture are decided in the
-inference worker using that selection.
+A string prompt returns a string, or text deltas with `stream=True`.
+A list of prompts returns a list, or `(prompt_index, text_delta)` pairs.
+`generate_async()` yields text asynchronously; `generate_events()` yields
+structured chunks with incremental `delta_token_ids`, text and terminal usage.
+Consumers needing token history must accumulate those deltas.
 
-CUDA decode writes K/V via `new_k`/`new_v` and calls
-`attn_paged_decode`. The `req_to_token` table is its page table with one token
-per slot. CUDA prefill writes K/V and calls `attn_paged_prefill`, using
-`qo_indptr` and `kv_indptr` for ragged requests. If automatic CUDA selection
-cannot handle a call, FlashAttention is tried next, then torch SDPA.
+Direct engine calls inherit the model's generation settings. Without a sampling
+setting they use greedy decoding; `temperature` alone does not enable sampling.
+Set `do_sample=True` explicitly. `max_tokens` aliases `max_new_tokens`;
+passing both is an error. See [generation configuration](../developer/huggingface.md#tokenizer-and-generation-files)
+for EOS and length precedence.
 
-The scheduler groups prefill requests by prefix-cache start position, even
-when prompt lengths differ. Requests with different prefix hit lengths
-remain separate batches.
+The HTTP adapter and demo scripts select sampling when temperature is positive
+and greedy decoding when it is zero. Their defaults differ from direct engine calls.
 
-### Rotary Embedding Backend
+## Cache and backend selection
 
-Rotary embedding is applied via `apply_rotary_emb` in `astrai/extension/backend/rotary.py`, which auto-dispatches:
+The default contiguous cache reserves `max_batch_size × max_seq_len` slots.
+Pass a finite `kv_tokens` to select paged allocation; `page_size > 1` also
+enables prefix reuse. Sequence limits apply to prompt plus output.
+Chunked prefill is disabled by default.
 
-- **CUDA kernel** (`rotary_emb.cu`): fused cos/sin lookup + rotation in a single kernel, used when the kernel is available, the input is bf16 on CUDA, and `torch.is_grad_enabled()` is `False` (inference mode)
-- **Torch fallback**: complex multiply path (`torch.view_as_complex` → `torch.complex` multiply → `torch.view_as_real`), used during training (supports autograd backward) or when the CUDA kernel is not available
+Automatic attention dispatch tries compatible CUDA, FlashAttention and Torch
+implementations. Use `set_op("attention", "cuda")` for a soft default or
+`op_backend(attention="cuda")` for a strict scope around engine construction.
+The worker snapshots that selection when created.
 
-`RotaryEmbedding` stores a cos/sin table `freqs_cis` of shape
-`[max_len, dim/2, 2]` (f32 — `[cos, sin]` pairs) and `forward()` returns
-a `[batch, seq_len, dim/2, 2]` slice indexed by `position_ids`. Rotary dispatch is independent of attention selection.
-
-## Continuous Batching
-
-`Scheduler` runs a daemon thread (`run_busy_loop`) with a 4-phase loop:
-
-```
-1. Cleanup → Record complete materialized pages, then release request-owned KV resources
-2. Refill  → Pop from waiting, alloc_slots resources, activate
-3. Prefill → Group by (prompt_len, start_pos), run full forward
-4. Decode  → Run single-token forward for each same-position group
-```
-
-Each step's results leave the loop as output events (`TokenDelta` /
-`RequestFinished`); text rendering happens in the frontend's
-`OutputProcessor`, never on the loop thread.
-
-For in-process training rollout, `Scheduler.update_weights(version)`
-acknowledges that the shared model was updated in place. Versions are monotonic;
-the scheduler rejects updates while requests are queued and invalidates reusable
-prefix KV pages before exposing the new version. Synchronous `run_batch()` and
-weight updates are serialized so a generation cannot straddle two versions.
-
-## Sampling
-
-`sample()` applies frequency penalties, temperature, top-k and top-p in order,
-then samples token IDs. `SamplingMeta` caches batch facts on the host to avoid
-GPU synchronization during decode. Optional returned log probabilities use
-the raw model distribution, before penalties and filtering.
-
-## Protocol Handlers (Strategy Pattern)
-
-```python
-class ProtocolHandler:  # concrete orchestrator
-    def __init__(self, request, engine, builder): ...
-    async def handle(self):
-        prompt, ctx, stops = builder.prepare(request, engine)
-        agen = engine.generate_async(prompt, ...)
-        if stream: self._handle_stream(agen, ctx, stops)
-        else:      return await self._handle_non_stream(agen, ctx, stops)
-```
-
-`ResponseBuilder` (ABC): `prepare()`, `format_stream_start()`, `format_chunk()`, `format_stream_end()`, `format_response()`.
-
-`OpenAIResponseBuilder` → `/v1/chat/completions`, `AnthropicResponseBuilder` → `/v1/messages`.
-
-Adding a protocol = one builder file, no handler subclassing needed.
-
-## Engine
-
-```
-InferenceEngine (frontend layer)
-  ├── generate(prompt, stream, ...)   → str | List[str] | Generator
-  ├── generate_async(prompt, ...)     → AsyncGenerator[str]
-  ├── generate_events(prompt, ...)    → AsyncGenerator[StreamChunk]  (text + token ids + usage)
-  ├── score(prompt, continuation, ...) → log-probabilities
-  ├── get_stats()                     → Dict
-  └── shutdown()
-```
-
-`generate_events` is the structured entry for protocol adapters: each chunk
-carries the incremental `text`, `delta_token_ids`, and — on the final chunk —
-exact `usage` and a mapped `finish_reason` (no re-tokenizing text to count
-tokens). Token deltas include IDs buffered while decoding or stop matching
-produced no text. Consumers needing the complete history should accumulate
-`delta_token_ids`; chunks no longer carry `current_token_ids` snapshots.
-Internally the engine mints request ids up front (`InputProcessor`),
-folds scheduler events through `OutputProcessor` (detokenize, stop matching,
-usage), and calls the public operations of `EngineCore` directly. Blocking `generate` folds
-the request's events on the caller's thread once the terminal event lands;
-there is no intermediate accumulator object.
-
-See [developer/inference/](../developer/inference/) for per-layer class
-diagrams and the end-to-end event flow.
+For cache layout, scheduling, CUDA graphs and ownership, see
+[inference internals](../developer/inference/README.md). Cache views are
+`PrefillKVCache` and `DecodeKVCache`, defined on the model side in
+[model/kv_cache.py](../../astrai/model/kv_cache.py).
+For strict backend contracts, see [attention kernels](../developer/kernels/attention.md).
 
 ## Launching the Server
 
@@ -338,7 +202,9 @@ data: [DONE]
 ### Error Responses
 
 The server returns standard HTTP status codes. Pydantic validation errors (e.g. missing required fields)
-are handled automatically by FastAPI with 422 status. The only application-level error is engine initialization:
+are handled automatically by FastAPI with 422 status. An uninitialized engine
+returns 503. Other request-processing failures can still propagate as server errors;
+these statuses are not an exhaustive error taxonomy:
 
 | Status | Meaning |
 |--------|---------|
@@ -360,44 +226,13 @@ Error response body (503):
 GET /stats
 ```
 
-Response:
+Example fields (additional timing statistics are also returned):
 
 ```json
 {
     "total_tasks": 128,
     "total_tokens": 10240,
-    "active_tasks": 3,
-    "waiting_queue": 2
+    "running": 3,
+    "waiting_tasks": 2
 }
 ```
-
-## Engine API
-
-```python
-# Non-streaming
-engine.generate("Hello", stream=False)          # -> str
-engine.generate(["A", "B"], stream=False)       # -> List[str]
-
-# Streaming
-engine.generate("Hello", stream=True)           # -> Generator[str]
-engine.generate(["A", "B"], stream=True)        # -> Generator[Tuple[int, str]]
-
-# Async
-async for token in engine.generate_async("Hello", ...):    # -> AsyncGenerator[str]
-    print(token)
-```
-
-> Document Update Time: 2026-08-22
-
-## Core injection API migration
-
-Pass an `EngineCore` (or a test double implementing the same operations) as
-`InferenceEngine(model, tokenizer, core=core)`. The frontend installs its event
-sink, starts the supplied core and stops it on shutdown, as it does for a core
-it constructs itself. A supplied core should belong to this frontend lifecycle.
-
-`core_client=`, `EngineCoreClient`, `InprocClient` and the deprecated
-`InferenceEngine.scheduler` property have been removed. Migrate custom clients
-to the core methods: `add_requests`, `cancel_request`, `get_stats`, `stop`,
-`set_event_sink`, `start`, and `score_ids`; retain `max_batch_size`,
-`op_selection`, and `cuda_graph_enabled`. Generation and HTTP APIs are unchanged.

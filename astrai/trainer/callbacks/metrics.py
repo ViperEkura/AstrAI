@@ -101,12 +101,7 @@ class MetricCallback(TrainCallback):
 
         with torch.no_grad():
             for batch in context.val_dataloader:
-                # Online strategies evaluate a one-off rollout (leaving
-                # the replay cache untouched) via the public hook; None
-                # means offline — validate the batch directly.
-                loss_output = context.strategy.validate_online(batch)
-                if loss_output is None:
-                    loss_output = context.strategy(batch)
+                loss_output = context.strategy(batch)
                 total_loss += loss_output["loss"].item()
                 num_batches += 1
 
@@ -150,7 +145,7 @@ class MetricCallback(TrainCallback):
             # Async rollout observes the pre-update step; offline training
             # advances the counter before calling before_optimizer_step.
             self._next_val_step = next_slot + (
-                0 if context.async_rollout is not None else 1
+                0 if context.config.rollout_mode == "async_round" else 1
             )
 
     def before_optimizer_step(self, context):

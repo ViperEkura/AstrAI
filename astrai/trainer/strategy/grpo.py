@@ -3,7 +3,6 @@
 import math
 from numbers import Real
 from typing import (
-    Any,
     Dict,
     Iterator,
     Optional,
@@ -13,7 +12,6 @@ from typing import (
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.optim import Optimizer
 
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.rollout import RolloutResult
@@ -180,18 +178,10 @@ class GRPOStrategy(BaseStrategy):
         if state_dict is not None:
             self.old_model.load_state_dict(state_dict)
 
-    def optimizer_step(self, optimizer: Optimizer):
-        """Step the optimizer, then refresh the offline behaviour policy.
-
-        Without this sync the frozen ``old_model`` drifts away from the
-        training policy, so the PPO ratio degenerates and clipping shuts
-        learning down. Online GRPO passes ``logprobs_old`` instead and
-        runs with ``old_model=None``, skipping the sync.
-        """
-        result = super().optimizer_step(optimizer)
+    def after_update(self) -> None:
+        """Refresh the offline behaviour policy after the actor update."""
         if self.old_model is not None:
             self.sync_old_model()
-        return result
 
     def compute_loss_output(self, batch: Dict[str, Tensor]) -> LossOutput:
         batch = move_to_device(batch, self.device)
@@ -293,38 +283,33 @@ class GRPOStrategy(BaseStrategy):
     def supports_online(self) -> bool:
         return True
 
-    def training_updates(
-        self, batch: Any, microbatch_prompts: Optional[int] = None
-    ) -> Iterator[Iterator[LossOutput]]:
-        if not isinstance(batch, RolloutResult):
-            yield from super().training_updates(batch, microbatch_prompts)
+    def loss_outputs(
+        self, batch: Dict[str, Tensor], microbatch_prompts: Optional[int] = None
+    ) -> Iterator[LossOutput]:
+        if microbatch_prompts is None:
+            yield self.compute_loss_output(batch)
             return
-
-        self._on_rollout_refresh()
-        prepared = self.prepare_from_rollout(batch)
-        total = prepared["prompts"].shape[0]
-        masks = prepared["masks"]
-        denominator = self._response_count(masks)
+        total = batch["prompts"].shape[0]
+        denominator = self._response_count(batch["masks"])
         if denominator == 0:
             raise RuntimeError("async GRPO round has no valid response tokens")
-
-        def microbatches() -> Iterator[LossOutput]:
-            size = microbatch_prompts or total
-            for begin in range(0, total, size):
-                indices = list(range(begin, min(begin + size, total)))
-                chunk = slice_batch(prepared, indices, total)
-                count = self._response_count(chunk["masks"])
-                if count == 0:
-                    continue
-                weight = count / denominator
-                output = self.compute_loss_output(chunk)
-                metrics = {}
-                for name, value in output["metrics"].items():
-                    metric = value.detach() if isinstance(value, Tensor) else value
-                    metrics[name] = float(metric) * weight
-                yield {"loss": output["loss"] * weight, "metrics": metrics}
-
-        yield microbatches()
+        for begin in range(0, total, microbatch_prompts):
+            chunk = slice_batch(
+                batch, list(range(begin, min(begin + microbatch_prompts, total))), total
+            )
+            count = self._response_count(chunk["masks"])
+            if count == 0:
+                continue
+            weight = count / denominator
+            output = self.compute_loss_output(chunk)
+            yield {
+                "loss": output["loss"] * weight,
+                "metrics": {
+                    name: float(value.detach() if isinstance(value, Tensor) else value)
+                    * weight
+                    for name, value in output["metrics"].items()
+                },
+            }
 
     def _response_count(self, masks: Tensor) -> int:
         if self.loss_aggregation == "sequence":

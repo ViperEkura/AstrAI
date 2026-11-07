@@ -109,6 +109,7 @@ class ProtocolHandler:
             prompt,
             max_tokens=self.request.max_tokens,
             temperature=self.request.temperature,
+            do_sample=self.request.temperature is None or self.request.temperature > 0,
             top_p=self.request.top_p,
             top_k=self.request.top_k,
             frequency_penalty=getattr(self.request, "frequency_penalty", 0.0),

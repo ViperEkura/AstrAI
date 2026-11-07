@@ -107,5 +107,3 @@ working with defaults (port 8000, `./params`).
    `8000`); change `runtime.port` to publish on a different host port.
 5. The image user is built with the host UID/GID so the mounted model
    directory stays readable.
-
-> Document Update Time: 2026-10-06

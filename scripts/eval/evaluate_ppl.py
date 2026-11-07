@@ -75,14 +75,14 @@ def _compute_batch(
     return token_log_probs, valid[:, 1:].float().cpu()
 
 
-def _token_type(token_id: int, stop_ids: FrozenSet, decode_fn) -> str:
+def _token_type(token_id: int, special_ids: FrozenSet, decode_fn) -> str:
     """Classify a token into a coarse type for analysis.
 
-    *stop_ids* is a pre-built set of special token IDs.
+    *special_ids* is a pre-built set of special token IDs.
     *decode_fn* is ``tokenizer.decode`` (or a wrapper) for single-token
     decoding.
     """
-    if token_id in stop_ids:
+    if token_id in special_ids:
         return "special"
     decoded = decode_fn([token_id], skip_special_tokens=True)
     if any("\u4e00" <= ch <= "\u9fff" for ch in decoded):
@@ -237,7 +237,7 @@ def process_file(
     per_sample: List[Dict] = []
 
     if token_level:
-        stop_ids = frozenset(tokenizer.stop_ids)
+        special_ids = frozenset(tokenizer.all_special_ids)
         decode_fn = tokenizer.decode
 
     num_batches = (len(texts) + batch_size - 1) // batch_size
@@ -275,7 +275,7 @@ def process_file(
                 )
                 typed_losses: Dict[str, List[float]] = {}
                 for tid, loss in zip(ids, losses):
-                    ttype = _token_type(tid, stop_ids, decode_fn)
+                    ttype = _token_type(tid, special_ids, decode_fn)
                     typed_losses.setdefault(ttype, []).append(loss)
                 for ttype, tl in typed_losses.items():
                     acc.add_typed(ttype, tl)

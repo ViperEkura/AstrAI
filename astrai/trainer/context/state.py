@@ -48,6 +48,7 @@ class TrainContext:
     checkpoint: Checkpoint = field(default=None)
     config: TrainConfig = field(default=None)
     model_config: Dict = field(default_factory=dict)
+    pretrained_metadata: Dict = field(default_factory=dict)
     executor: BaseExecutor = field(default=None)
     epoch: int = field(default=0)
     consumed_samples: int = field(default=0)
@@ -64,9 +65,9 @@ class TrainContext:
     val_dataloader: Optional[DataLoader] = field(default=None)
     val_loss: Optional[float] = field(default=None)
     #: Online-strategy validation: reward-statistics evaluator under its
-    #: own sampling params. ``None`` keeps the legacy validate_online path.
+    #: own sampling params. Offline validation computes the strategy loss.
     val_evaluator: Optional[RolloutEvaluator] = field(default=None)
-    async_rollout: Optional[RolloutRunner] = field(default=None)
+    rollout: Optional[RolloutRunner] = field(default=None)
     #: Committed optimizer steps. Advanced once per commit in every rollout
     #: mode, so a checkpoint's step number never has to be derived from the
     #: data cursor (a batch that is replayed yields several steps).

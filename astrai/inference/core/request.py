@@ -5,11 +5,15 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
 )
 
 from tokenizers.decoders import DecodeStream
 
-from astrai.config.inference_config import InferenceConfig
+from astrai.config.inference_config import (
+    InferenceConfig,
+    normalize_eos_token_ids,
+)
 from astrai.inference.contracts import ExecutionRequest, RequestIdentity, SamplingParams
 from astrai.tokenize.tokenizer import AutoTokenizer
 
@@ -83,12 +87,18 @@ class Request:
         rep_window: int = _config.default_rep_window,
         *,
         seed: Optional[int] = None,
+        eos_token_ids: Optional[Sequence[int]] = None,
     ):
         self.request_id = request_id
         self.identity = RequestIdentity(request_id, uuid.uuid4().hex)
         self.prompt_ids = list(prompt_ids)
         self._prompt_snapshot = tuple(prompt_ids)
         self.max_tokens = max_tokens
+        self.eos_token_ids = (
+            None
+            if eos_token_ids is None
+            else frozenset(normalize_eos_token_ids(eos_token_ids))
+        )
         self.sampling = SamplingParams(
             temperature, top_p, top_k, frequency_penalty, rep_window, seed
         )

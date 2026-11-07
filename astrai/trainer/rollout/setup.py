@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Type
 
 import torch
 
+from astrai.config.inference_config import load_generation_config
 from astrai.config.rollout import resolve_rollout_devices
 from astrai.config.train_config import TrainConfig
 from astrai.parallel.executor import BaseExecutor
@@ -96,6 +97,11 @@ def configure_rollout(
         raise ValueError(f"Strategy '{cfg.strategy}' does not support online rollout")
     validate(context.executor)
     inference_model = context.executor.model_for_inference(context.model)
+    inference_model.generation_config = (
+        load_generation_config(param_path)
+        if param_path
+        else getattr(inference_model, "generation_config", {})
+    )
     tokenizer = tokenizer_cls.from_pretrained(param_path)
     group_size = getattr(
         context.strategy, "group_size", strategy_kwargs.get("group_size", 1)
@@ -159,6 +165,7 @@ def configure_rollout(
         # Match the training dtype so the replica's sampling space
         # agrees with the training-side logprob recomputation.
         model.to(dtype=next(context.model.parameters()).dtype)
+        model.generation_config = dict(inference_model.generation_config)
         return ReplicaBackend(
             model=model,
             tokenizer=tokenizer,
@@ -200,8 +207,7 @@ def configure_rollout(
             policy_version=policy_version,
             model_dtype=next(context.model.parameters()).dtype,
         )
-        context.async_rollout = RolloutRunner(coordinator=coordinator)
-        context.strategy.set_rollout_runner(context.async_rollout)
+        context.rollout = RolloutRunner(coordinator=coordinator)
         return
 
     batch_capacity = group_size * max(1, cfg.batch_per_device)
@@ -225,14 +231,6 @@ def configure_rollout(
         output_device=train_device,
     )
     reward_model = cfg.reward_model_fn()
-    context.strategy.set_rollout_runner(
-        RolloutRunner(
-            generator=generator,
-            reward_model=reward_model,
-            rollout_interval=cfg.rollout_interval,
-            max_policy_lag=cfg.rollout_max_policy_lag,
-        )
-    )
     # Validation rolls out under its own sampling params (e.g. greedy
     # decode, val-specific group size), inheriting every unset field
     # from the training rollout; with rollout_val_device set it runs
@@ -256,5 +254,10 @@ def configure_rollout(
         reward_model=reward_model,
         params=val_params,
     )
-    if publishers:
-        context.strategy.set_weight_publishers(publishers)
+    context.rollout = RolloutRunner(
+        generator=generator,
+        reward_model=reward_model,
+        rollout_interval=cfg.rollout_interval,
+        max_policy_lag=cfg.rollout_max_policy_lag,
+        publishers=publishers,
+    )

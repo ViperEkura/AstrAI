@@ -46,8 +46,7 @@ def sample(
     top_k: Union[int, Tensor] = 0,
     top_p: Union[float, Tensor] = 1.0,
     frequency_penalty: Union[float, Tensor] = 0.0,
-    input_ids: Optional[Tensor] = None,
-    input_mask: Optional[Tensor] = None,
+    frequency_counts: Optional[Tensor] = None,
     filter_value: float = -float("inf"),
     return_logprobs: bool = False,
     meta: Optional[SamplingMeta] = None,
@@ -56,7 +55,8 @@ def sample(
     """Apply frequency penalty, temperature, top-k and top-p, then sample.
 
     Returned log probabilities use the original model distribution, before
-    penalties or filtering. Per-request seeds do not advance the global RNG.
+    penalties or filtering. Frequency counts are supplied by the caller and
+    remain unchanged. Per-request seeds do not advance the global RNG.
     The worker supplies cached metadata; standalone callers may use scalars
     or per-row tensors without it.
     """
@@ -84,23 +84,7 @@ def sample(
     if meta.greedy and not meta.has_freq:
         tokens = logits.argmax(dim=-1)
     else:
-        if meta.has_freq and input_ids is not None:
-            ids = input_ids.to(logits.device, non_blocking=True)
-            batch, vocab = logits.shape
-            offsets = torch.arange(batch, device=logits.device).unsqueeze(1) * vocab
-            flat = offsets + ids
-            if input_mask is not None:
-                flat = torch.where(
-                    input_mask.to(logits.device, non_blocking=True),
-                    flat,
-                    torch.full_like(ids, batch * vocab),
-                )
-            flat = flat.reshape(-1)
-            counts = torch.zeros(
-                batch * vocab + 1, device=logits.device, dtype=torch.float32
-            )
-            counts.index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
-            counts = counts[: batch * vocab].view(batch, vocab)
+        if meta.has_freq and frequency_counts is not None:
             penalty = (
                 frequency_penalty.to(device=logits.device, dtype=torch.float32).view(
                     -1, 1
@@ -108,7 +92,7 @@ def sample(
                 if isinstance(frequency_penalty, Tensor)
                 else float(frequency_penalty)
             )
-            logits = logits - (counts * penalty).to(logits.dtype)
+            logits = logits - (frequency_counts * penalty).to(logits.dtype)
         if meta.any_temp_not_one:
             temp = (
                 temperature.to(logits.device, non_blocking=True)

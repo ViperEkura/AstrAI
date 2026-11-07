@@ -1,138 +1,46 @@
 # Training
 
-## Contents
-
-- [Autoregression](#autoregression)
-- [Causal Mask](#causal-mask)
-- [Rotary Position Embedding (RoPE)](#rotary-position-embedding-rope)
-- [Training Loop](#training-loop)
-- [Strategies](#strategies) — SEQ, SFT, DPO, GRPO, online rollout
-- [Cross-entropy backends](#cross-entropy-backends) — SEQ/SFT loss selection
-- [LR Schedulers](#lr-schedulers)
-- [Gradient Checkpointing](#gradient-checkpointing)
-- [Checkpoint](#checkpoint)
-- [TrainContextBuilder](#traincontextbuilder-builder-pattern)
-- [Training CLI](#training-cli)
-
-### Autoregression
-
-Given a token sequence, the model predicts the probability of the next token. Each generated token is appended to the input and fed back, repeating until an end-of-sequence token or max length.
-
-### Causal Mask
-
-```
-sequence : [[1, 2, 3, 4, 5, 6]]
-input_ids: [[1, 2, 3, 4, 5]]
-target_ids: [[2, 3, 4, 5, 6]]
-```
-
-Lower-triangular mask prevents attending to future positions:
-
-```
-[[0, -inf, -inf, -inf, -inf],
- [0,    0, -inf, -inf, -inf],
- [0,    0,    0, -inf, -inf],
- [0,    0,    0,    0, -inf],
- [0,    0,    0,    0,    0]]
-```
-
-### Rotary Position Embedding (RoPE)
-
-RoPE embeds position into Q/K vectors via complex rotation:
-
-$$ q_i = R_i W_q x_i, \quad k_j = R_j W_k x_j, \quad q_i^T k_j = x_i^T W_q^T R_{i-j} W_k x_j $$
-
-`RotaryEmbedding` pre-computes a cos/sin table `freqs_cis` of shape
-`[max_len, dim/2, 2]` (f32 — `[cos, sin]` pairs). `forward()` returns
-a `[batch, seq_len, dim/2, 2]` slice indexed by `position_ids`.
-`apply_rotary_emb` applies the rotation: during training it uses torch
-complex multiply (autograd-compatible); during inference it auto-dispatches
-to a fused CUDA kernel when available.
+Use [Quick Start](../quick-start.md) for the first run and
+[CLI reference](params.md) for options. This guide covers objective selection,
+precision, rollout and checkpoint behavior.
 
 ## Training Loop
 
-Synchronous training groups the epoch permutation into global optimizer
-windows using `GlobalBatchSampler`. All ranks see the same window boundaries;
-each rank receives only its portion. The default `epoch_tail_policy: drop`
-discards an incomplete final window; `flush` commits its real samples with
-loss normalization across ranks. Online strategies can replay a window through
-several updates, and publish a checkpoint only after the last update.
+Trainer groups the epoch permutation into global optimizer windows. The default
+`epoch_tail_policy: drop` records and skips an incomplete tail; `flush` updates
+using the real sample and target counts. CP and TP ranks do not multiply the
+data count. Online replay publishes only after the complete data window.
 
-```
-on_train_begin
-  model.train()
-  on_epoch_begin
-    for global_window in epoch:
-      checkpoint_safe = false
-      for update in global_window:
-        for microbatch in update:
-          on_batch_begin
-          backward(loss * real_target_count)
-          on_batch_end
-        reduce_target_counts_and_normalize_gradients()
-        before_optimizer_step
-        strategy.optimizer_step(optimizer)
-        optimizer.zero_grad()
-        scheduler.step()
-        if final_update:
-          commit_sample_cursor()
-          checkpoint_safe = true
-        after_optimizer_step
-    on_epoch_end
-on_train_end
-```
-
-Async rollout retains its round-based loop. It records the same explicit
-resume fields and publishes only committed learner updates.
-
-### Callback Lifecycle
-
-| Hook | Fires | Default callback |
-|------|-------|-----------------|
-| `on_train_begin` | Before training starts | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
-| `on_epoch_begin` | Start of each epoch | `ProgressBarCallback` |
-| `on_batch_begin` | Every batch | — |
-| `before_optimizer_step` | Every accumulation window, before `optimizer.step()` | `MetricCallback`, `ProgressBarCallback`, `GradientClippingCallback` |
-| `on_batch_end` | Every batch | — |
-| `after_optimizer_step` | Every accumulation window, after `optimizer.step()` and `scheduler.step()` | `CheckpointCallback` |
-| `on_epoch_end` | End of each epoch | `MetricCallback`, `ProgressBarCallback` |
-| `on_shutdown` | The run is ending: a graceful stop or a failure | `CheckpointCallback`, `MetricCallback` |
-| `on_train_end` | Training exits after `on_train_begin` completes (via `finally`) | `GradientCheckpointingCallback`, `CheckpointCallback`, `MetricCallback` |
-
-Default callbacks (in order): `gradient_checkpointing` (activation checkpointing, optional), `checkpoint` (safetensors, rank-0), `metric` (JSONL + validation, rank-0), `progress_bar` (tqdm, rank-0), `gradient_clipping`. The gradient-clipping callback is always registered and always calls `executor.clip_grad_norm()` with the numeric `max_grad_norm` value.
-
-Strategies return `{"loss": Tensor, "metrics": Dict[str, float]}` when called by the trainer. Built-in metrics include the task-specific loss and, for MoE models, `moe_aux_loss` plus `moe_aux_loss_weighted`. Direct `compute_loss(batch)` calls continue to return a single loss tensor.
+See [lifecycle](../developer/trainer/lifecycle.md) for startup and cleanup,
+[callbacks](../developer/trainer/callbacks.md) for metric commit boundaries,
+and [accumulation](../developer/internals.md#gradient-accumulation-mechanics)
+for normalization and step counts.
 
 ## Strategies
 
-### SEQ (Pre-training)
+| Training type | Objective and data |
+| --- | --- |
+| `seq` | Next-token cross-entropy over token sequences |
+| `sft` | Cross-entropy over targets selected by `loss_mask` |
+| `dpo` | Preferred/rejected responses with aligned masks and a frozen reference |
+| `grpo` | Grouped responses, masks, rewards and behavior log-probabilities |
+| `online_grpo`, `online_dpo` | Generate and score responses through rollout |
+| `online_ppo` | Online actor-critic updates with GAE and a separate critic optimizer |
 
-Next-token cross-entropy with optional label smoothing:
-
-$$
-L_{\text{PT}} = -\frac{1}{T}\sum_{t=1}^{T} \log P(x_t \mid x_{\lt t}; \theta)
-$$
-
-Keys: `input_ids`, `target_ids`. Optional: `label_smoothing`.
-
-### SFT (Supervised Fine-Tuning)
-
-Masked cross-entropy (`ignore_index=-100`) over response tokens:
-
-$$
-L_{\text{SFT}} = -\frac{1}{L}\sum_{t=P+1}^{P+L} \log P(s_t \mid s_{\lt t}; \theta)
-$$
-
-Keys: `input_ids`, `target_ids`, `loss_mask`, `position_ids`. Optional: `label_smoothing`.
+Use [preprocessing](preprocessing.md) for on-disk schemas,
+[loss formulas](../developer/internals.md#training-loss-formulas) for the
+objectives, and [strategy contracts](../developer/trainer/strategy.md) for
+programmatic batches and capability declarations.
 
 ### Cross-entropy backends
 
 SEQ and SFT use Torch cross-entropy by default. For a bias-free
 `AutoRegressiveLM` head, configure the experimental fused linear CE backend
-through `TrainConfig.strategy_kwargs` to avoid materializing full head logits:
+with the CLI options below to avoid materializing full head logits.
+Python callers put these keys in `TrainConfig.strategy_kwargs`:
 
 ```yaml
-strategy_kwargs:
+training:
   loss_backend: cuda_linear_ce
   loss_chunk_size: 512
 ```
@@ -146,66 +54,23 @@ for higher-order gradients or exact trajectory debugging. DTensor weights contin
 See [cross-entropy kernels](../developer/kernels/cross_entropy.md) for the
 implementation contract, numerical limits, and benchmark procedure.
 
-### DPO (Direct Preference Optimization)
+### GRPO options
 
-Frozen reference model, preference margin via log-ratio:
+Online rollout carries aligned `logprobs_old`, avoiding a second old-policy
+forward. Offline callers without these values must synchronize `old_model`
+between generation rounds. Only masked response targets contribute to the loss.
 
-$$
-L_{\text{DPO}} = -\mathbb{E}\left[\log\sigma\left(\beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\text{ref}}(y_w\mid x)} - \beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\text{ref}}(y_l\mid x)}\right)\right]
-$$
-
-Parameters: `beta=0.1`, `reduction="sum"`. Keys: `chosen`, `rejected`, `chosen_mask`, `rejected_mask`.
-
-### GRPO (Group Relative Policy Optimization)
-
-Token-level PPO with group-normalized advantages. Advantages are derived from
-scalar per-response rewards, group-normalized, and broadcast across all response
-tokens. Only response tokens contribute to the loss (prompt tokens are masked
-out):
-
-$$
-\text{Advantage}_i = \frac{r_i - \mu}{\sigma + \epsilon}
-$$
-
-$$
-L_{\text{GRPO}} = -\mathbb{E}_t\left[\min\left(\rho_t A,\; \text{clip}\left(\rho_t, 1-\epsilon, 1+\epsilon\right)A\right)\right] + \lambda \cdot \mathbb{E}_t\left[\frac{\pi_{\text{ref}}}{\pi_\theta} - \log\frac{\pi_{\text{ref}}}{\pi_\theta} - 1\right]
-$$
-
-where $\rho_t = \pi_\theta(a_t|s_t) / \pi_{\text{old}}(a_t|s_t)$ is the
-per-token importance sampling ratio against the behaviour policy
-and the expectations are over valid response tokens. Online GRPO reuses the
-per-token `logprobs_old` captured by the rollout sampler, avoiding an
-`old_model` copy and a repeated forward pass. Offline GRPO keeps `old_model` as
-a compatibility fallback. The KL term regularises $\pi_\theta$ towards a frozen
-reference model (`ref_model`, typically the SFT checkpoint).
-
-Parameters: `group_size=4`, `clip_eps=0.2`, `kl_coef=0.01`. The optional
-`clip_eps_low` and `clip_eps_high` parameters replace the symmetric interval
-with $[1-\epsilon_{low}, 1+\epsilon_{high}]$. Leaving both unset preserves the
-existing symmetric objective. DAPO Clip-Higher can be selected explicitly, for
-example with `clip_eps_low=0.2` and `clip_eps_high=0.28`. Offline callers that
-do not provide `logprobs_old` must sync `old_model` weights via
-`sync_old_model()` between data-generation rounds.
-
-`loss_aggregation="token"` (the default) divides by the total number of valid
-response tokens, matching DAPO's token-level policy-gradient loss. Set it to
-`"sequence"` to first average each response and then weight responses equally,
-matching the original GRPO reduction for controlled ablations.
-
-DAPO soft overlong shaping is enabled by setting `overlong_max_len` and a
-positive `overlong_buffer_len`. If $L$ is the valid response length, the added
-reward is zero through $L_{max}-L_{buffer}$, falls linearly to -1 at $L_{max}$,
-and is multiplied by `overlong_penalty_scale`. It is disabled by default and
-does not alter the reward-model output in place.
-
-Keys: `prompts`, `responses`, `masks`, `rewards`, and optional
-`logprobs_old` (required when `old_model` is not configured).
+`loss_aggregation="token"` weights valid tokens equally; `"sequence"` weights
+responses equally. `clip_eps_low` and `clip_eps_high` override the symmetric
+clipping interval. Optional `overlong_max_len`, `overlong_buffer_len` and
+`overlong_penalty_scale` apply a linear length penalty before group normalization.
+See [CLI options](params.md#strategy-specific) for defaults.
 
 ### Online Rollout
 
 `online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with
 a `RolloutRunner`. The runner renders prompts through the tokenizer chat
-template, generates grouped responses through `Scheduler`, then scores
+template, generates grouped responses through the inference backend, then scores
 them with a `BaseRewardModel`. It refreshes cached rollouts every
 `rollout_interval` optimizer steps. `online_grpo` carries the sampler's aligned
 behaviour log-probabilities into the loss, so it does not allocate or synchronize
@@ -235,9 +100,9 @@ version or beyond `rollout_max_policy_lag` are rejected before training. The
 final version check and rollout-cache publication share that policy lock, so a
 concurrent update cannot land between validation and cache insertion.
 
-Online strategies require `TrainConfig.reward_model_fn`. `train.py` exposes the
-rollout sampling parameters but does not yet offer a CLI argument for the reward
-model factory.
+Online strategies require `TrainConfig.reward_model_fn`. The CLI accepts
+`--reward_model module:qualified_name`, or `training.reward_model` in YAML,
+pointing to a callable reward factory.
 
 ### Rollout backends and validation sampling
 
@@ -253,38 +118,11 @@ prompts. The learner accumulates prompt microbatches
 The next round generates while the current round trains, with at most one
 optimizer-version lag; a stale or failed round is never partially trained.
 
-The process control plane uses one ordered duplex `multiprocessing.Pipe` per
-worker. Messages have an explicit kind, request ID, round ID and policy version:
-`MODEL_READY`, `READY`, `GENERATE`/`RESULT`, `WEIGHT_SYNC`/`WEIGHT_SYNC_ACK`,
-`ERROR`, and `STOP`.
-The coordinator accepts a reply only when its request ID, round and version
-match the pending command. `RESULT` carries CPU rollout tensors, while
-`WEIGHT_SYNC` carries only a version notification; policy tensors are broadcast
-from the learner through an NCCL group containing the learner and all workers.
-Worker process sentinels and finite deadlines are polled alongside the pipes,
-so a crash or hang aborts the entire round. This is a local one-to-one
-protocol; no network broker or cross-worker traffic is required.
-
-Each worker first allocates its replica, joins the NCCL group, and receives the
-initial learner weights before
-constructing its inference backend and capturing CUDA Graphs. After each
-optimizer step, the learner advances its policy version. At the next idle
-round boundary it broadcasts the live weights once through NCCL; every worker
-synchronizes its CUDA device before returning `WEIGHT_SYNC_ACK`. All workers
-participate in each broadcast, even when a short final round has fewer prompts
-than workers. The application does not allocate a shared-memory weight buffer;
-NCCL selects its own transport. Token IDs, masks, aligned
-behaviour log-probabilities and CPU rewards are assembled on the host before
-the learner moves them to its device; KV cache and full logits remain on the
-generation devices. The async mode is programmatic-only, supports
-`online_grpo` with one CUDA learner and dense models, and does not yet support
-validation. Each worker owns its Scheduler and CUDA Graph state in its own
-process. The worker factory must be pickleable, and a Python script that calls
-`Trainer.train()` must use an `if __name__ == "__main__":` guard. Worker startup
-has a 300-second deadline; `rollout_worker_timeout_s` (default 600) bounds
-generation and weight transfer. A failed worker aborts the whole round and
-the coordinator terminates the remaining workers.
-The existing synchronous backend remains the default.
+Async mode supports one CUDA learner with dense models and `online_grpo`;
+validation is not supported. It is available through both Python configuration
+and the CLI example below. See [async rounds](../developer/trainer/async_round.md)
+for worker startup, NCCL weight transfer, version checks and failure deadlines.
+Synchronous rollout remains the default.
 
 Where generation physically runs is a *backend* choice
 (`astrai/trainer/backend.py`): by default the scheduler wraps the training
@@ -310,6 +148,14 @@ runs through a `RolloutEvaluator` that reports reward statistics
 (`reward_mean`/`reward_std`/`reward_max`/`response_len_mean`) in the
 `validation` metric events instead of the training RL loss, which is
 degenerate under greedy decoding or `group_size == 1`.
+
+## Precision
+
+Use the top-level YAML `precision` section or the CLI dtype flags, rather than
+`model.dtype`. CLI defaults use BF16 computation and FP32 gradients, master
+weights and optimizer state; export follows the resolved compute dtype unless
+overridden. Supported parallel layouts and CPU state offload are documented in
+[training configuration](../developer/trainer/configuration.md).
 
 ## LR Schedulers
 
@@ -479,45 +325,62 @@ The equivalent CLI override takes JSON:
 
 Model config (`context.model_config`) saved into `config.json` during training via `CheckpointCallback`.
 
-## TrainContextBuilder (Builder Pattern)
+## Model loading
 
-```python
-context = TrainContextBuilder(config).with_param_path(param_path, resume=True).build()
-# Returns TrainContext with model, strategy, optimizer, scheduler, dataloader, checkpoint
-```
+Construction and restore order are described in
+[trainer lifecycle](../developer/trainer/lifecycle.md).
 
-- Loads checkpoint weights before the model is wrapped
-- Creates executor via `ExecutorFactory.create(cfg.dp_mode, grad_accum_steps=cfg.grad_accum_steps, **cfg.executor_kwargs)`
-- Calls `executor.prepare(model_fn, optimizer_fn, scheduler_fn, before_wrap=...)`; the executor creates, wraps, then builds the optimizer and scheduler for the wrapped model
-- Creates `RDSampler` for shuffle+resume
-- Builds strategy via `StrategyFactory.create(train_type, model, device, **kwargs)`
+Pretrained policy loading uses the same model-owned `hf_mapping.json` weight
+conversion as `AutoModel.from_pretrained`, including norm offsets and declared
+vision/MTP exclusions. Missing required tensors or unsupported HF weight keys
+fail before the optimizer is created. An untied output head must be present in
+the checkpoint; a tied embedding/head uses the model's canonical embedding key.
+New LoRA adapter parameters may be initialized when loading a base policy, while
+resume requires the saved adapters as well as the backbone. Critic head
+initialization remains separate from policy loading.
+
+The generic model-loading API defaults to strict loading:
+`AutoModel.from_pretrained(path, strict=True)`. Deliberate partial loading uses
+`strict=False`; missing parameters keep their initialized values, unexpected
+keys are ignored, and shape mismatches still fail. To train that deliberately
+initialized model, save it as a complete model directory first. Training and
+full resume always require complete policy weights, except newly created LoRA
+adapter parameters during a warm start.
+
+`load_model_weights(directory)` and `save_model_weights(state_dict, directory)`
+read and write weight dictionaries only. They do not construct a model, convert
+HF layouts, or decide resume semantics. Checkpoint metadata records the available
+source revision, mapping SHA-256, explicit exclusions and adapter initialization.
+An unavailable source revision is recorded as `null`.
+
+Tokenizer and generation file ownership, export behavior and stop settings are
+defined in [HF file conventions](../developer/huggingface.md#tokenizer-and-generation-files).
+Native AstrAI weights and optimizer state do not become a Transformers model
+merely by using those file names.
+
+For factory-initialized native training, `param_path` may supply only the native
+config/tokenizer directory. A directory declaring an HF mapping must contain
+policy weights, and resume always requires checkpoint weights.
 
 ## Training CLI
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
-nohup python scripts/tools/train.py \
-    --dp_size=4 \
-    --dp_mode=ddp \
-    --train_type=seq \
-    --data_root_path=/path/to/dataset \
-    --param_path=/path/to/model \
-    --batch_per_device=4 \
-    --grad_accum_steps=8 \
-    --warmup_ratio=0.05 \
-    --max_lr=1e-4 \
-    --max_grad_norm=1.0 \
-    --weight_decay=0.1 \
-    --window_size=2048 \
-    --ckpt_interval=10000 \
-    --ckpt_dir=./checkpoint \
-    --random_seed=3407 \
-    --label_smoothing=0.05 \
-    > out.log 2> err.log &
+python scripts/tools/train.py --config train.yaml --dry-run
+python scripts/tools/train.py --config train.yaml
 ```
 
-Full parameter reference at [params.md](params.md).
+The dry run builds and validates the same TrainConfig as execution, including
+component parameters, precision, strategy options, and distributed settings. It
+prints the resolved dataset window, optimizer/scheduler parameters, effective
+batch size, and component loading policy. It reads model configuration and may
+import a configured reward factory, but does not construct a trainer, load model
+weights or datasets, or start distributed workers. Checkpoint/data compatibility
+is still validated when training loads those resources.
+
+
+Explicit CLI flags override YAML. The dry run validates configuration without
+starting training. See [Quick Start](../quick-start.md#5-train) for a direct
+single-GPU command and [distributed training](distributed.md) for launch settings.
 
 ### Switching training components
 
@@ -530,8 +393,9 @@ of import paths.
 ```yaml
 model:
   type: my_package.models:MyModel
-  dtype: bfloat16
   params: {width: 2048}
+precision:
+  compute_dtype: bfloat16
 dataset:
   type: packed
   params:
@@ -559,7 +423,6 @@ reserved setting used to compute `$warmup_steps`; the other available
 placeholders are `$decay_steps` and `$dataset_len`. The usual flat CLI
 options remain supported and normalize to these component specs.
 
-> Document Update Time: 2026-09-20
 
 ### Configuring asynchronous rollout from the CLI
 
@@ -598,9 +461,9 @@ should construct models on CPU; worker placement is resolved afterward. Guard
 `Trainer.train()` with `if __name__ == "__main__":` when using a custom script.
 
 
-## Component construction API migration
+## Component construction
 
-Use `Factory.create(name, ...)` for registered components. It now validates
+Use `Factory.create(name, ...)` for registered components. It validates
 constructor arguments strictly instead of discarding unknown arguments.
 `create_from_config()` remains the explicit adapter for selecting constructor
 parameters from a broad model configuration; explicit overrides are validated.
@@ -611,7 +474,6 @@ Built-in top-level models accept a validated `config` object. Extra
 from the full model configuration. Custom constructors declaring `**kwargs`
 remain responsible for validating those extra options.
 
-Built-in callbacks are constructed directly; `CallbackFactory` is removed.
+Built-in callbacks are constructed directly.
 Pass custom instances with `Trainer(config, callbacks=[MyCallback()])`.
-The `TrainCallback` protocol, its default empty hooks, callback order and
-lifecycle dispatch are unchanged.
+See [callback contracts](../developer/trainer/callbacks.md) for lifecycle hooks.

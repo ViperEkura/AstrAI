@@ -7,12 +7,12 @@ The `--dp_mode` setting selects the data-parallel gradient-sync strategy: **sing
 - [Quick Start](#quick-start)
 - [DP Modes](#dp-modes)
 - [Context Parallelism](#context-parallelism)
+- [Tensor Parallelism](#tensor-parallelism)
 - [Gradient Accumulation](#gradient-accumulation)
 - [Process Launching](#process-launching)
 - [NCCL Troubleshooting](#nccl-troubleshooting)
 - [Checkpoint Saving](#checkpoint-saving)
 - [Total Steps Calculation](#total-steps-calculation)
-- [Real Examples](#real-examples)
 - [CLI Parameters](#cli-parameters)
 
 ## Quick Start
@@ -53,12 +53,17 @@ python scripts/tools/train.py \
     --param_path ./params \
     --data_root_path ./dataset \
     --dp_mode=fsdp \
+    --compute_dtype=float32 \
     --dp_size=4 \
     --batch_per_device=4 \
     --grad_accum_steps=8
 ```
 
-> `--dp_mode` defaults to `fsdp`. You can omit it for FSDP.
+`--dp_mode` defaults to `fsdp`, but precision must match the layout.
+The current master-weight wrapper does not support DTensor parameters.
+Use FP32 compute parameters for FSDP as above; default BF16 compute with FP32
+masters is intended for replicated none/DDP execution. See
+[precision restrictions](../developer/trainer/configuration.md#optimizer-precision).
 
 ## DP Modes
 
@@ -76,19 +81,27 @@ update boundary. Checkpoint saving is a plain `state_dict()` call.
 
 ### DDPExecutor
 
-Wraps the model with `torch.nn.parallel.DistributedDataParallel`. Each rank has a full copy of the model; gradients are all-reduced across ranks. Uses `gradient_as_bucket_view=True` and `broadcast_buffers=False` by default (hardcoded in `train.py`).
+Each rank holds a full model replica. The default BF16 compute / FP32-gradient
+path accumulates and asynchronously all-reduces persistent main-gradient buckets.
+With native gradients, the executor uses PyTorch DistributedDataParallel.
+See [gradient accumulation](../developer/trainer/configuration.md#gradient-accumulation)
+for the supported layouts.
 
-During gradient accumulation, non-sync micro-steps use `model.no_sync()` to skip gradient all-reduce. Only the final micro-step triggers the all-reduce.
+Non-final microbatches suppress synchronization; the final backward synchronizes
+the accumulated gradients through the selected path.
 
 ### FSDPExecutor (FSDP2 / `fully_shard`)
 
-Uses PyTorch's FSDP2 per-module API (`torch.distributed.fsdp.fully_shard`). Each model child (e.g., each `DecoderBlock`) is individually sharded — parameters become `DTensor`s distributed across ranks. No `FlatParameter`, original parameter names are preserved.
+Uses PyTorch's FSDP2 per-module API (`torch.distributed.fsdp.fully_shard`). By default, decoder layers are sharded before their parent; direct children
+are also wrapped. `executor_kwargs.layerwise: false` keeps coarse child wrapping.
+Parameters become `DTensor`s distributed across ranks. No `FlatParameter`, original parameter names are preserved.
 
 Key differences from DDP:
 - **Lower memory**: parameters are sharded, not replicated.
-- **Custom grad norm**: FSDP gradients are `DTensor`s, so `clip_grad_norm` computes the local norm, then all-reduces to get the global norm.
+- **Custom grad norm**: PyTorch `get_total_norm` produces the distributed norm from DTensor gradients;
+the executor materializes that scalar without a second manual all-reduce.
 - **Collective checkpoint ops**: `unshard()` and `full_tensor()` are collective — all ranks must call them even though only rank-0 saves. The executor handles this via `dist.barrier()` in `checkpoint_context`.
-- **Root skipped**: `fully_shard` is applied to direct children only (not the root model) due to an `ABC + Generic[T]` MRO incompatibility.
+- **Root skipped**: the executor wraps layers and children, but not the root model due to an `ABC + Generic[T]` MRO incompatibility.
 
 ## Context Parallelism
 
@@ -101,7 +114,7 @@ ASTR_OPS=attention=torch python scripts/tools/train.py \
     --train_type=seq \
     --param_path ./params \
     --data_root_path ./dataset/cached \
-    --dp_mode=fsdp \
+    --dp_mode=ddp \
     --dp_size=1 \
     --cp_size=2 \
     --window_size=32768 \
@@ -135,6 +148,7 @@ python scripts/tools/train.py \
     --param_path ./params \
     --data_root_path ./dataset/cached \
     --dp_mode=fsdp \
+    --compute_dtype=float32 \
     --dp_size=1 \
     --tp_size=2 \
     --batch_per_device=4 \
@@ -147,7 +161,7 @@ How it works:
 - Everything between a colwise and a rowwise projection is per-feature elementwise (RoPE per head, SiLU per channel, norms over the fully reduced hidden), so the model code between the two ends of a shard never observes the split. The `lm_head` and the embedding stay replicated.
 - Communication rides megatron-style autograd functions: rowwise all-reduces on forward and passes gradients through; colwise passes the forward and all-reduces gradients on backward.
 - Every rank evaluates the **full** loss (the hidden state is whole at each rowwise boundary), so a rank's gradient on its own shard is already the exact single-device gradient — no loss rescaling. DDP/FSDP gradient sync is forced onto the dp group: tp peers hold different shards, and a world-group default would all-reduce unrelated shards together.
-- Sharding happens after the full weights load and before the executor wraps and builds the optimizer (`train_context.before_wrap`); the shard is final, never restored. A tp=2 test pins forward logits/loss and gradients exactly against the single-device run.
+- Sharding happens after the full weights load and before the executor wraps and builds the optimizer (`context/builder.py`); the shard is final, never restored. A tp=2 test pins forward logits/loss and gradients exactly against the single-device run.
 
 Constraints (enforced with explicit errors at launch):
 
@@ -205,7 +219,7 @@ AstrAI auto-detects the launch method:
 
 ### Local (default)
 
-When you run `python scripts/tools/train.py --dp_size=4`, AstrAI derives the process count (`dp_size × cp_size`) and uses `torch.multiprocessing.start_processes` to spawn the child processes. The parent process manages signal forwarding (SIGTERM/SIGINT) and waits for all children to finish.
+When you run `python scripts/tools/train.py --dp_size=4`, AstrAI derives the process count (`dp_size × cp_size × tp_size`) and uses `torch.multiprocessing.start_processes` to spawn the child processes. The parent process manages signal forwarding (SIGTERM/SIGINT) and waits for all children to finish.
 
 ### Torchrun
 
@@ -223,7 +237,7 @@ torchrun --nproc_per_node=4 scripts/tools/train.py \
 
 When launched via `torchrun`, the launcher creates the worker processes. AstrAI reads `RANK`, `WORLD_SIZE`, and `LOCAL_RANK` from the environment and uses `TorchrunStrategy`; the parallelism degrees do not control process creation in this mode.
 
-The parallelism degrees still drive scheduler `total_steps`. Set them so `dp_size × cp_size` equals the global `WORLD_SIZE` (including multi-node runs); a mismatched decomposition fails loudly at startup.
+The parallelism degrees still drive scheduler `total_steps`. Set them so `dp_size × cp_size × tp_size` equals the global `WORLD_SIZE` (including multi-node runs); a mismatched decomposition fails loudly at startup.
 
 Raw Slurm variables such as `SLURM_PROCID`, `SLURM_NTASKS`, and `SLURM_LOCALID` are not recognized automatically. Launch through `torchrun`, or map the scheduler's variables to `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `MASTER_ADDR`, and `MASTER_PORT` before starting AstrAI. The same requirement applies to launchers that expose only OpenMPI-specific variables.
 
@@ -240,19 +254,15 @@ Apply them only after confirming the relevant NCCL transport is the source of th
 
 ## Checkpoint Saving
 
-Checkpoints are saved by **rank-0 only**. The flow:
+All ranks participate in the executor checkpoint context and state collection;
+only rank 0 publishes files. FSDP materializes sharded tensors collectively, so
+non-writing ranks must remain alive until collection finishes.
 
-1. `executor.checkpoint_context(model)` — wraps with `dist.barrier()` before and after (distributed only).
-2. `executor.unwrap_model(model)` — gathers the full state dict:
-   - `none`: `model.state_dict()`
-   - `ddp`: `model.module.state_dict()`
-   - `fsdp`: `unshard()` → `full_tensor()` → `reshard()` (collective on all ranks, result kept only on rank-0)
-3. Non-rank-0 ranks get `None` — the save is skipped.
-4. Rank-0 writes metadata, weights, optional optimizer/scheduler state, and a
-   checksum manifest to a hidden sibling directory, then atomically renames the
-   complete checkpoint into place.
-
-> **FSDP note**: Even though only rank-0 saves, all ranks must participate in `unwrap_model` because `unshard()` and `full_tensor()` are collective operations. The barriers in `checkpoint_context` keep all ranks in lockstep.
+The writer stages weights, training state, metrics and metadata, then publishes
+the completed directory atomically. The current manifest records file sizes;
+it does not compute per-file checksums. See
+[checkpoint publication and resume](training.md#checkpoint) for completeness,
+failure and precision contracts.
 
 ## Total Steps Calculation
 
@@ -268,69 +278,6 @@ Synchronous online RL counts each window's replay passes and prompt minibatches
 as separate learner updates. The shared `step_plan.py` calculations use the
 resumed epoch offset and configured tail policy, keeping scheduler and progress
 counts aligned with the actual update plan.
-
-## Real Examples
-
-### Pretraining (seq, DDP, 4 GPUs)
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-python scripts/tools/train.py \
-    --train_type=seq \
-    --param_path ./params \
-    --data_root_path ./dataset/cached \
-    --dp_mode=ddp \
-    --dp_size=4 \
-    --n_epoch=1 \
-    --max_lr=2e-4 \
-    --schedule_type=wsd \
-    --warmup_ratio=0.02 \
-    --window_size=2048 \
-    --batch_per_device=4 \
-    --grad_accum_steps=32 \
-    --ckpt_interval=2000
-# Effective batch = 4 × 4 × 32 = 512
-```
-
-### SFT (DDP, 4 GPUs)
-
-```bash
-python scripts/tools/train.py \
-    --train_type=sft \
-    --param_path ./AstrAI-V1-base \
-    --data_root_path ./dataset/cached_sft \
-    --dp_mode=ddp \
-    --dp_size=4 \
-    --n_epoch=2 \
-    --max_lr=2e-5 \
-    --schedule_type=cosine \
-    --warmup_ratio=0.02 \
-    --min_rate=0.05 \
-    --window_size=2048 \
-    --batch_per_device=4 \
-    --grad_accum_steps=8
-# Effective batch = 4 × 4 × 8 = 128
-```
-
-### DPO (Single GPU)
-
-```bash
-python scripts/tools/train.py \
-    --train_type=dpo \
-    --param_path ./checkpoint/epoch_1_step_6000 \
-    --data_root_path ./alpaca_dpo.jsonl \
-    --dp_mode=none \
-    --dp_size=1 \
-    --max_lr=5e-6 \
-    --schedule_type=cosine \
-    --warmup_ratio=0.1 \
-    --min_rate=0.1 \
-    --window_size=1024 \
-    --batch_per_device=4 \
-    --grad_accum_steps=8 \
-    --dpo_beta=0.1 \
-    --max_grad_norm=50
-```
 
 ## CLI Parameters
 
@@ -348,5 +295,3 @@ python scripts/tools/train.py \
 
 
 Full parameter reference: [CLI Reference](params.md). Training loop and strategies: [Training Guide](training.md).
-
-> Document Update Time: 2026-09-05

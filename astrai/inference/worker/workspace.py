@@ -22,9 +22,6 @@ class InferenceWorkspace:
     Families of buffers, all sized to ``max_batch_size`` / ``max_seq_len``
     and sliced via views each step:
 
-    - ``decode_mask``: a ``[B, 1, total_len]`` validity mask, the RHS
-      ``arange`` pre-computed so only a single ``torch.ge(out=)`` runs per
-      step.
     - ``input_ids``: per-step token IDs filled from host — values are
       staged through a pinned buffer and bulk-copied into the stable
       device buffer (fixed address for CUDA-graph capture).
@@ -66,13 +63,6 @@ class InferenceWorkspace:
         # ``scripts/tools/generate.py``) would otherwise create inference
         # tensors that reject off-thread in-place updates.
         with torch.inference_mode(False):
-            # ``position_ids[:, None, None] >= arange`` RHS, reused every step.
-            self.arange = torch.arange(max_seq_len, device=device)
-            # Decode validity mask: [max_batch, 1, max_seq_len] bool.
-            self.input_mask = torch.empty(
-                (max_batch_size, 1, max_seq_len), dtype=torch.bool, device=device
-            )
-
             # Per-step token IDs.  Values come from host Python lists every
             # step, so the device buffer is pre-allocated (stable address for
             # CUDA-graph capture) and filled via a host staging buffer.
@@ -171,15 +161,3 @@ class InferenceWorkspace:
         b = tokens.size(0)
         self.input_ids[:b].copy_(tokens)
         return self.input_ids[:b]
-
-    def decode_mask(self, position_ids: Tensor, total_len: int) -> Tensor:
-        """Return the ``[B, 1, total_len]`` validity mask for this step.
-
-        Written into the pre-allocated buffer via ``torch.ge(out=)`` — no
-        new tensor is allocated.  ``position_ids`` is the current step's
-        ``[B]`` positions; ``total_len`` must not exceed ``max_seq_len``.
-        """
-        b = position_ids.size(0)
-        out = self.input_mask[:b, :, :total_len]
-        torch.ge(position_ids[:, None, None], self.arange[:total_len], out=out)
-        return out

@@ -64,8 +64,8 @@ class TrainSession:
                 lambda: self._call_callbacks("on_shutdown", context),
             ),
         ]
-        if context.async_rollout is not None:
-            steps.append(("close_rollout", context.async_rollout.close))
+        if context.rollout is not None:
+            steps.append(("close_rollout", context.rollout.close))
         steps.append(
             ("on_train_end", lambda: self._call_callbacks("on_train_end", context))
         )

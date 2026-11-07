@@ -1,0 +1,267 @@
+"""Update precision and restart continuity for BF16 compute parameters."""
+
+import copy
+import io
+import json
+from dataclasses import asdict
+
+import pytest
+import torch
+from torch import nn
+
+from astrai.config import ComponentSpec, PrecisionConfig, TrainConfig
+from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
+from astrai.trainer.components import (
+    build_optimizer_component,
+    load_optimizer_state_dict,
+)
+from tests.support.precision import check_precision_storage
+
+
+class PrecisionModel(nn.Module):
+    def __init__(self, dtype):
+        super().__init__()
+        self.matrix = nn.Parameter(torch.full((8, 8), 0.02, dtype=dtype))
+        self.norm = nn.Parameter(torch.ones(8, dtype=dtype))
+        self.embed = nn.Embedding(8, 8, dtype=dtype)
+        self.lm_head = nn.Linear(8, 8, bias=False, dtype=dtype)
+
+
+def test_sub_ulp_updates_and_decay_survive_restart():
+    model = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    optimizer = PrecisionOptimizer(torch.optim.SGD([model], lr=1e-5, weight_decay=0.1))
+    reference = nn.Parameter(model.float())
+    expected = torch.optim.SGD([reference], lr=1e-5, weight_decay=0.1)
+    direct = model.detach().clone()
+    for step in range(600):
+        model.grad = torch.ones_like(model)
+        reference.grad = torch.ones_like(reference)
+        optimizer.step()
+        expected.step()
+        direct.mul_(1 - 1e-6).add_(-1e-5)
+        if step == 299:
+            payload = io.BytesIO()
+            torch.save(optimizer.state_dict(), payload)
+            payload.seek(0)
+            saved = torch.load(payload, weights_only=True)
+            restored = nn.Parameter(model.clone())
+            optimizer = PrecisionOptimizer(
+                torch.optim.SGD([restored], lr=1e-5, weight_decay=0.1)
+            )
+            optimizer.load_state_dict(saved)
+            model = restored
+    torch.testing.assert_close(
+        optimizer.state_dict()["master_params"][0], reference, atol=0, rtol=0
+    )
+    torch.testing.assert_close(model, reference.bfloat16(), atol=0, rtol=0)
+    assert torch.all(direct == 1)
+    assert torch.all(model < 1)
+
+
+@pytest.mark.parametrize("reuse_buffers", [False, True])
+@pytest.mark.parametrize(
+    "device,cpu_offload",
+    [
+        ("cpu", False),
+        pytest.param(
+            "cuda",
+            True,
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="CUDA required"
+                ),
+            ],
+        ),
+    ],
+)
+def test_muon_and_adam_keep_fp32_state_and_resume(reuse_buffers, device, cpu_offload):
+    torch.manual_seed(9)
+    model = PrecisionModel(torch.bfloat16).to(device)
+    model.norm = nn.Parameter(model.norm.float())
+    reference = copy.deepcopy(model).float()
+    kwargs = dict(lr=2e-5, weight_decay=0.1, reuse_ns_buffers=reuse_buffers)
+    optimizer = PrecisionOptimizer(MuonAdamW(model, **kwargs), cpu_offload=cpu_offload)
+    expected = MuonAdamW(reference, **kwargs)
+    update_devices = set()
+
+    def observe_update(optimizer, args, kwargs):
+        update_devices.update(
+            p.device.type
+            for group in optimizer.param_groups
+            for p in group["params"]
+            if p.grad is not None
+        )
+
+    for child in optimizer._optimizers:
+        child.register_step_pre_hook(observe_update)
+    for step in range(120):
+        for p, q in zip(model.parameters(), reference.parameters()):
+            p.grad = torch.rand_like(p) * 0.25
+            q.grad = p.grad.float()
+        optimizer.step()
+        expected.step()
+        optimizer.zero_grad()
+        expected.zero_grad()
+        if step == 59:
+            saved = copy.deepcopy(optimizer.state_dict())
+            model = copy.deepcopy(model)
+            optimizer = PrecisionOptimizer(
+                MuonAdamW(model, **kwargs), cpu_offload=cpu_offload
+            )
+            optimizer.load_state_dict(saved)
+    for p, q in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(p, q.to(p.dtype), atol=0, rtol=0)
+    assert torch.all(model.norm < 1)
+    assert update_devices == {device}
+    for master in optimizer.state_dict()["master_params"]:
+        assert master.dtype == torch.float32
+        if cpu_offload:
+            assert master.device.type == "cpu"
+    for child in (optimizer.optimizer.muon, optimizer.optimizer.adamw):
+        for state in child.state.values():
+            for value in state.values():
+                if isinstance(value, torch.Tensor):
+                    assert value.dtype == torch.float32
+                    if cpu_offload:
+                        assert value.device.type == "cpu"
+    actual = optimizer.optimizer.state_dict()
+    wanted = expected.state_dict()
+    for child in ("muon", "adamw"):
+        for key, state in actual[child]["state"].items():
+            for name, value in state.items():
+                torch.testing.assert_close(
+                    value.cpu(), wanted[child]["state"][key][name].cpu(), atol=0, rtol=0
+                )
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_factory_closure_missing_gradient_and_scheduler_options(cpu_offload):
+    model = nn.Linear(2, 1, bias=False).bfloat16()
+    optimizer = build_optimizer_component(
+        ComponentSpec(
+            type="torch.optim:SGD", params={"lr": 1e-5, "cpu_offload": cpu_offload}
+        ),
+        model,
+    )
+    assert isinstance(optimizer, PrecisionOptimizer)
+    calls = []
+
+    def closure():
+        calls.append(True)
+        optimizer.zero_grad()
+        loss = model.weight.float().sum()
+        loss.backward()
+        return loss
+
+    assert optimizer.step(closure) is not None
+    before = copy.deepcopy(optimizer.state_dict())
+    optimizer.zero_grad()
+    optimizer.step()
+    assert len(calls) == 1
+    torch.testing.assert_close(
+        before["master_params"][0],
+        optimizer.state_dict()["master_params"][0],
+        atol=0,
+        rtol=0,
+    )
+    optimizer.param_groups[0]["lr"] = 3e-5
+    load_optimizer_state_dict(optimizer, before)
+    assert optimizer.param_groups[0]["lr"] == 3e-5
+    model.weight.grad = torch.ones(
+        model.weight.numel(), dtype=model.weight.dtype
+    ).view_as(model.weight)
+    optimizer.zero_grad(set_to_none=False)
+    assert torch.count_nonzero(model.weight.grad) == 0
+
+
+def test_unversioned_or_mismatched_master_state_is_rejected():
+    model = nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+    base = torch.optim.AdamW([model])
+    legacy = base.state_dict()
+    optimizer = PrecisionOptimizer(base)
+    with pytest.raises(ValueError, match="no master"):
+        optimizer.load_state_dict(legacy)
+    unversioned = optimizer.state_dict()
+    unversioned.pop("precision")
+    with pytest.raises(ValueError, match="explicit optimizer precision"):
+        optimizer.load_state_dict(unversioned)
+    saved = optimizer.state_dict()
+    saved["master_params"] = [model.detach()]
+    with pytest.raises(ValueError, match="do not match"):
+        optimizer.load_state_dict(saved)
+
+
+@pytest.mark.parametrize("kind", ["sgd", "adamw", "muon_adamw"])
+@pytest.mark.parametrize("compute_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("master_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_resident_storage_precision_and_restart(
+    kind, compute_dtype, master_dtype, state_dtype
+):
+    check_precision_storage(
+        kind, compute_dtype, master_dtype, state_dtype, "cpu", False
+    )
+
+
+def test_master_state_dict_preserves_aliases_and_filters_unmanaged_parameters():
+    model = nn.Linear(2, 2, bias=False).bfloat16()
+    model.register_parameter("tied", model.weight)
+    # Same storage is insufficient: this distinct Parameter is not managed.
+    model.register_parameter("unmanaged", nn.Parameter(model.weight.detach()))
+    optimizer = PrecisionOptimizer(torch.optim.SGD([model.weight], lr=1e-3))
+    state = optimizer.master_state_dict(model.named_parameters(remove_duplicate=False))
+    assert set(state) == {"weight", "tied"}
+    assert all(not value.requires_grad for value in state.values())
+    with torch.no_grad():
+        state["weight"].fill_(0.75)
+    torch.testing.assert_close(state["tied"], state["weight"], atol=0, rtol=0)
+    torch.testing.assert_close(
+        optimizer.state_dict()["master_params"][0], state["weight"], atol=0, rtol=0
+    )
+
+
+def test_native_fp32_factory_reuses_compute_parameters_and_keeps_state_protocol():
+    model = nn.Linear(2, 1)
+    reference = copy.deepcopy(model)
+    actual = build_optimizer_component(
+        ComponentSpec(type="torch.optim:SGD", params={"lr": 0.1, "momentum": 0.9}),
+        model,
+    )
+    expected = torch.optim.SGD(reference.parameters(), lr=0.1, momentum=0.9)
+    assert isinstance(actual, PrecisionOptimizer)
+    assert all(p is q for p, q in zip(model.parameters(), actual._master_params))
+    for _ in range(3):
+        model(torch.ones(2)).sum().backward()
+        reference(torch.ones(2)).sum().backward()
+        actual.step()
+        expected.step()
+        actual.zero_grad()
+        expected.zero_grad()
+    for p, q in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(p, q, atol=0, rtol=0)
+
+
+def test_precision_roundtrip():
+    policy = PrecisionConfig(
+        compute_dtype="bfloat16",
+        gradient_dtype="bfloat16",
+        master_dtype="bfloat16",
+        optimizer_state_dtype="float32",
+        export_dtype="float16",
+    )
+    config = TrainConfig(
+        strategy="sft",
+        model=ComponentSpec(
+            type="torch.nn:Linear", params={"in_features": 1, "out_features": 1}
+        ),
+        dataset=ComponentSpec(type="packed"),
+        optimizer=ComponentSpec(type="sgd", params={"lr": 0.01}),
+        scheduler=ComponentSpec(type="constant"),
+        precision=asdict(policy),
+    )
+    payload = json.loads(json.dumps(config.to_dict()))
+    assert payload["precision"] == asdict(policy)
+    assert "model_dtype" not in payload
+    assert TrainConfig(**payload).precision == policy

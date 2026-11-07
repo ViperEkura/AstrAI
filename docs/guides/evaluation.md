@@ -68,7 +68,7 @@ Generates completions for 164 programming problems, executes them against hidden
 
 Scoring uses `astrai.bench.execute_one`, shared with MBPP. It explicitly forks the worker function in `bench.py` and returns success through a shared boolean. Each sample gets a temporary working directory, a wall-clock timeout (`--test_timeout`, default 3 seconds), a CPU-time limit, and a 16 MiB per-file size limit. The address-space ceiling is the worker's inherited virtual size plus 512 MiB, capped by any existing hard limit. This permits up to 512 MiB of additional mappings; it is not an RSS/private-memory quota and does not account for copy-on-write growth within inherited mappings. Process groups are cleaned up after execution, and early exits do not count as passes.
 
-Code execution requires Linux (`fork`, `/proc`, and `resource`). Native Windows is rejected explicitly; use WSL2 for this path. Docker, `prlimit`, a separate worker file, and startup code strings are not used. These limits do not isolate the filesystem/network or cap total directory size. The suite launcher also uses Linux-style shell commands; native Windows suite execution has not been ported.
+Code execution requires Linux (`fork`, `/proc`, and `resource`). Native Windows is rejected explicitly; use WSL2 for this path. These limits do not isolate the filesystem/network or cap total directory size. The suite launcher also uses Linux-style shell commands; native Windows suite execution has not been ported.
 
 `--generate_only` skips execution; `--test_only` scores saved generations without loading a model. Every generation, including duplicates and empty answers, remains in the sample count.
 
@@ -95,7 +95,7 @@ python scripts/eval/evaluate_humaneval.py \
 | `--top_k` | 50 | Top-k sampling |
 | `--batch_size` | 64 | Generation batch size |
 | `--max_seq_len` | 4096 | KV cache sequence length |
-| `--test_workers` | 8 | ProcessPoolExecutor workers for test execution |
+| `--test_workers` | 8 | Concurrent test workers (threads launching forked children) |
 | `--test_timeout` | 3.0 | Per-subprocess timeout (seconds) |
 | `--problems` | None | Restrict to specific problem indices |
 
@@ -107,7 +107,8 @@ python scripts/eval/evaluate_humaneval.py \
 
 ## MBPP (Code Generation)
 
-Mostly Basic Python Problems, full test split (500 tasks, ids 11-510), chat zero-shot: task text + asserts + the canonical function signature go through the chat template. Raw few-shot completion transcripts derail SFT models, and without the signature ~65% of failures are invented function names — so absolute numbers are not comparable to published few-shot MBPP; cross-checkpoint comparisons are the payload.
+Mostly Basic Python Problems, full test split (500 tasks, ids 11-510), chat zero-shot: task text + asserts + the canonical function signature go through the chat template. This prompt protocol differs from few-shot MBPP; compare runs using the same
+protocol and report it with the score.
 
 ```bash
 python scripts/eval/evaluate_mbpp.py \
@@ -146,7 +147,9 @@ python scripts/eval/evaluate_mmlu.py \
 | `--split` | `test` | `test` or `val` |
 | `--device` | auto | Device (`cuda` / `cpu`) |
 | `--dtype` | auto | `bfloat16` on CUDA, `float32` on CPU |
-| `--seed` | 0 | Seed for option permutation (0 = enabled, -1 = disabled) |
+| `--seed` | -1 | Option permutation seed; -1 preserves the original order |
+| `--prompt_format` | `raw` | Raw few-shot prompt or chat template |
+| `--max_seq_len` | 2048 | Scoring context limit; demonstrations are reduced to fit |
 | `--batch_size` | 4 | Questions per batch; each question produces four choice rows |
 
 **How it works**: For each question, builds a prompt with n-shot examples, then scores each choice (A/B/C/D) by computing the summed log-likelihood of the choice token given the context. The choice with the highest log-prob is the prediction.
@@ -283,36 +286,33 @@ python scripts/eval/evaluate_ifd.py \
 
 ## IFEval (Instruction Following)
 
-Google's IFEval benchmark: generates responses and verifies 27 types of constraints (keywords, format, length, case, punctuation, etc.).
+Generates one response per prompt and uses Google's
+`instruction_following_eval.evaluation_lib` verifier. The verifier package and
+its dependencies must be installed or supplied through `--verifier_path`
+(the directory containing `instruction_following_eval/`).
 
 ```bash
 python scripts/eval/evaluate_ifeval.py \
     --param_path ./params \
-    --num_samples 1 \
-    --max_tokens 512 \
+    --verifier_path /path/to/verifier-parent \
     --output results/ifeval.json
 ```
 
 | Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--param_path` | `./params` | Model directory |
-| `--data_path` | `./ifeval/input_data.jsonl` | IFEval JSONL (auto-downloaded if missing) |
-| `--output` | None | Output JSON path |
-| `--max_tokens` | 512 | Max generation tokens |
-| `--temperature` | 0.1 | Sampling temperature (low for instruction-following) |
-| `--top_p` | 0.95 | Top-p sampling |
-| `--top_k` | 50 | Top-k sampling |
-| `--num_samples` | 1 | Samples per problem (best-of-n scoring) |
-| `--batch_size` | 64 | Inference batch size |
-| `--max_seq_len` | 4096 | KV cache sequence length |
-| `--limit` | None | Limit to first N problems (quick testing) |
-| `--dump_responses` | None | Path to dump raw responses as JSONL |
+| --- | --- | --- |
+| `--param_path`, `--output` | required | Checkpoint and result paths |
+| `--data_path` | `./ifeval/input_data.jsonl` | Prompts; downloads `google/IFEval` if missing |
+| `--max_tokens` | 1536 | Maximum generated tokens |
+| `--max_seq_len` | 2048 | Prompt plus output capacity |
+| `--batch_size` | 8 | Generation batch size |
+| `--temperature`, `--top_p`, `--top_k` | 0.0, 1.0, 0 | Greedy by default |
+| `--num_samples` | 1 | Must be 1; best-of-n is rejected |
+| `--seed` | 3407 | Generation seed |
+| `--limit` | None | Evaluate only the first N prompts |
+| `--dump_responses` | output stem + `.responses.jsonl` | Raw response file |
 
-**Output**: stdout prints overall accuracy + per-constraint-type accuracy table. With `--output`, writes per-problem results + `_summary`.
-
-**Data**: Auto-downloads `google/IFEval` from HuggingFace. Each problem has `key`, `prompt`, `instruction_id_list`, `kwargs`.
-
----
+Results contain strict and loose prompt-level and instruction-level accuracy,
+plus the per-prompt verifier records. Keep these four scores distinct.
 
 ## Weight Analysis
 
@@ -417,5 +417,3 @@ Metric names: `acc`; `pass@1`/`pass@10` plus `zero_pass`/`strong_pass` counts (c
 - **Auto-download**: After installing `datasets`, HumanEval, MBPP, MMLU, HellaSwag, and IFEval auto-download their datasets on first run (set `HF_ENDPOINT` if the default endpoint is unreachable). The other scripts expect user-provided data.
 - **Output formats**: `--output` writes a single JSON for most scripts. PPL and IFD write an `--output_dir` containing `summary.json` plus per-file artifacts.
 - **CPU mode**: MMLU, PPL, and IFD support `--device cpu --dtype float32`; weight analysis supports `--device cpu`. HumanEval generation and IFEval are CUDA-only.
-
-> Document Update Time: 2026-07-30

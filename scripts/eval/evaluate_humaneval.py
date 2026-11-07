@@ -118,6 +118,7 @@ def generate_all(
             stream=False,
             max_tokens=cfg.max_tokens,
             temperature=cfg.temperature,
+            do_sample=cfg.temperature > 0,
             top_p=cfg.top_p,
             top_k=cfg.top_k,
             frequency_penalty=0.0,

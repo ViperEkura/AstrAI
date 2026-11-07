@@ -72,13 +72,28 @@ class Trainer:
         if agree_stop:
             self._agree_stop(context)
 
-    def _commit_offline_update(self, context: TrainContext, new_data: bool) -> None:
-        """Apply one step; both counters roll back if the step itself fails.
+    @staticmethod
+    def _step_policy(context: TrainContext) -> None:
+        """Mutate actor weights and publish replicas under one version lock."""
+        if context.rollout is None:
+            context.optimizer.step()
+            return
+
+        def update(version: int):
+            context.optimizer.step()
+            context.rollout.publish_weights(version, context.model)
+
+        context.rollout.apply_weight_update(None, update)
+        context.rollout.step()
+
+    def _commit_global_update(self, context: TrainContext, new_data: bool) -> None:
+        """Commit a global update; failed runs retain the previous safe cursor.
 
         The step advances before the observers run, so the hooks that log or
         validate record the step they belong to; advancing it after would
         label every logged step with the previous one.
         """
+        context.checkpoint_safe = False
         context.metric_history.discard_pending()
         committed_samples = context.pending_samples if new_data else 0
         context.optimizer_steps_completed += 1
@@ -86,7 +101,8 @@ class Trainer:
             context.consumed_samples += committed_samples
         try:
             self._call_callbacks("before_optimizer_step", context)
-            context.strategy.optimizer_step(context.optimizer)
+            self._step_policy(context)
+            context.strategy.after_update()
             context.optimizer.zero_grad()
             if context.scheduler:
                 context.scheduler.step()
@@ -102,28 +118,31 @@ class Trainer:
     def _commit_online_update(
         self, context: TrainContext, batch, new_data: bool
     ) -> None:
-        """Publish one policy version; the cursor follows the version, not the call."""
+        """Account for published actor versions, even if later work fails."""
+        context.checkpoint_safe = False
         context.metric_history.discard_pending()
-        coordinator = context.async_rollout
-        version_before = coordinator.policy_version
+        version_before = context.rollout.policy_version
         try:
             self._call_callbacks("before_optimizer_step", context)
-            context.strategy.optimizer_step(context.optimizer)
+            self._step_policy(context)
         finally:
-            # A version advance marks a committed step, even if later
-            # publication fails and an error checkpoint is needed.
-            if coordinator.policy_version > version_before:
-                context.optimizer.zero_grad()
-                if context.scheduler:
-                    context.scheduler.step()
+            if context.rollout.policy_version > version_before:
                 context.optimizer_steps_completed += 1
                 if new_data:
                     count = batch.prompts.shape[0] * context.dp_size
                     context.consumed_samples += count
                     context.epoch_sample_offset += count
-                context.metric_history.commit(
-                    context.optimizer_step, context.consumed_samples
-                )
+                try:
+                    context.strategy.after_update()
+                    context.optimizer.zero_grad()
+                    if context.scheduler:
+                        context.scheduler.step()
+                    context.metric_history.commit(
+                        context.optimizer_step, context.consumed_samples
+                    )
+                except BaseException:
+                    context.metric_history.discard_pending()
+                    raise
                 context.checkpoint_safe = True
             else:
                 context.metric_history.discard_pending()
@@ -133,39 +152,37 @@ class Trainer:
         executor = context.executor
         with executor.accumulate_explicit(context.model, sync=True):
             self._call_callbacks("on_batch_begin", context)
-            for update in context.strategy.training_updates(
-                batch, context.config.async_train_microbatch_prompts
+            prepared = context.strategy.prepare_from_rollout(batch)
+            update_loss = None
+            update_metrics = {}
+            for output in context.strategy.loss_outputs(
+                prepared, context.config.async_train_microbatch_prompts
             ):
-                update_loss = None
-                update_metrics = {}
-                for output in update:
-                    loss = output["loss"]
-                    executor.backward(loss)
-                    detached = loss.detach()
-                    update_loss = (
-                        detached if update_loss is None else update_loss + detached
-                    )
-                    for name, value in output["metrics"].items():
-                        update_metrics[name] = update_metrics.get(name, 0.0) + float(
-                            value
-                        )
-                if update_loss is None:
-                    raise RuntimeError("training update has no valid loss")
-                context.loss = float(update_loss.item())
-                context.metrics = update_metrics
-                self._commit_online_update(context, batch, new_data=True)
-                self._after_commit(context, agree_stop=False)
+                loss = output["loss"]
+                executor.backward(loss)
+                detached = loss.detach()
+                update_loss = (
+                    detached if update_loss is None else update_loss + detached
+                )
+                for name, value in output["metrics"].items():
+                    update_metrics[name] = update_metrics.get(name, 0.0) + float(value)
+            if update_loss is None:
+                raise RuntimeError("training update has no valid loss")
+            context.loss = float(update_loss.item())
+            context.metrics = update_metrics
+            self._commit_online_update(context, batch, new_data=True)
+            self._after_commit(context, agree_stop=False)
             self._call_callbacks("on_batch_end", context)
 
     def _should_stop(self, context: TrainContext) -> bool:
         """Online training stops between rounds; sync training at an agreed step."""
-        if context.async_rollout is not None:
+        if context.config.rollout_mode == "async_round":
             return context.stop_requested
         return context.stop_agreed
 
     def _agree_stop(self, context: TrainContext) -> bool:
         """Agree on a stop with every rank, so none leaves a peer mid-collective."""
-        if context.async_rollout is not None:
+        if context.config.rollout_mode == "async_round":
             return context.stop_requested
         device = next(context.model.parameters()).device
         if agree_stop(context.stop_requested, device):
@@ -175,20 +192,8 @@ class Trainer:
 
     @staticmethod
     def _window_loss_output(strategy, batch, real_count: int):
-        """Use the offline strategy hook without letting it add hidden commits."""
-        if strategy.policy_version is not None:
-            # Online batches have already been collected and prepared for the
-            # current learner update by _train_global_epoch.
-            return strategy.compute_loss_output(batch)
-        updates = iter(strategy.training_updates(batch))
-        try:
-            outputs = list(next(updates))
-        except StopIteration as error:
-            raise RuntimeError("global window strategy produced no update") from error
-        if next(updates, None) is not None:
-            raise RuntimeError(
-                "global window strategy must yield one update per microbatch"
-            )
+        """Combine losses for one update without changing their normalization."""
+        outputs = list(strategy.loss_outputs(batch))
         if not outputs:
             raise RuntimeError("global window strategy update has no loss")
         count = float(outputs[0].get("normalizer", real_count))
@@ -267,7 +272,7 @@ class Trainer:
         context.metrics["loss"] = context.loss
         if final_update:
             context.pending_samples = window_samples
-        self._commit_offline_update(context, new_data=final_update)
+        self._commit_global_update(context, new_data=final_update)
         if final_update:
             context.epoch_sample_offset = window_end
             context.checkpoint_safe = True
@@ -295,17 +300,18 @@ class Trainer:
                 for slot in range(microbatches)
             ]
             context.checkpoint_safe = False
-            online = context.strategy.policy_version is not None
+            online = context.rollout is not None
             if online:
                 prepared = []
                 for batch, _real_count in batches:
+                    result, _ = context.rollout(batch)
                     prepared.append(
                         {
                             key: value.detach().cpu()
                             if isinstance(value, torch.Tensor)
                             else value
-                            for key, value in context.strategy.prepare_rollout_batch(
-                                batch
+                            for key, value in context.strategy.prepare_from_rollout(
+                                result
                             ).items()
                         }
                     )
@@ -333,7 +339,7 @@ class Trainer:
                         total = next(
                             value.shape[0]
                             for value in source.values()
-                            if isinstance(value, torch.Tensor)
+                            if isinstance(value, torch.Tensor) and value.ndim
                         )
                         chunk = slice_batch(source, indices or [0], total)
                         chunks.append((chunk, len(indices)))
@@ -360,7 +366,7 @@ class Trainer:
             context.epoch = epoch + 1
 
     def _train_epoch(self, context: TrainContext, epoch: int) -> None:
-        if context.async_rollout is None:
+        if context.config.rollout_mode != "async_round":
             self._train_global_epoch(context, epoch)
             return
         context.epoch = epoch
@@ -368,7 +374,7 @@ class Trainer:
         context.dataloader.sampler.iter = context.epoch_sample_offset // context.dp_size
         self._call_callbacks("on_epoch_begin", context)
         loader_iterator = iter(context.dataloader)
-        batches = context.async_rollout.iter_rounds(
+        batches = context.rollout.iter_rounds(
             loader_iterator, lambda: context.stop_requested
         )
         iterator = iter(batches)

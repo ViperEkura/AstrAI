@@ -14,19 +14,20 @@ colocated backend still shares the learner model in its existing process.
 
 ```mermaid
 flowchart LR
-    Trainer[Trainer: one learner] --> Strategy[GRPO: update and microbatch losses]
-    Trainer --> Coordinator[Rollout coordinator]
+    Trainer[Trainer: one learner] --> Strategy[GRPO: preparation and weighted losses]
+    Trainer --> Runner[Context-owned RolloutRunner]
+    Runner --> Coordinator[Rollout coordinator]
     Coordinator -->|versioned Pipe commands| Workers[Rollout workers]
     Workers -->|CPU tokens, masks and behavior logprobs| Coordinator
-    Coordinator -->|complete round and rewards| Strategy
-    Trainer --> Channel[Isolated NCCL weight channel]
+    Coordinator -->|complete round and rewards| Trainer
+    Coordinator --> Channel[Isolated NCCL weight channel]
     Channel -->|CUDA model state| Workers
 ```
 
 ### Ownership and version boundaries
 
-- Trainer uses the same batch/update loop for synchronous and asynchronous
-  strategies. It commits the optimizer, scheduler and checkpoint counters.
+- Trainer owns both global-window replay and asynchronous round updates. It
+  commits the optimizer, scheduler and checkpoint counters.
 - GRPO weights complete prompt microbatches by their valid-token or nonempty
   response counts. One collected round produces one optimizer update.
 - The coordinator partitions prompts, preserves response order, scores rewards
@@ -46,7 +47,9 @@ prompts in a short final round; an ACK is sent only after CUDA completion.
 
 A failed or stale collection performs no learner update. An optimizer update
 that advanced the policy version remains a committed step even if later
-publication fails. Resume restores the completed sample cursor and version,
+publication fails. A version advance alone does not permit a checkpoint:
+algorithm post-update work, gradient clearing, scheduler and metric commit must
+also succeed. Resume restores the completed sample cursor and version,
 rebuilds worker replicas, and discards pending prefetched results. Normal
 shutdown sends STOP and enters NCCL shutdown on the learner before joining
 workers; failure cleanup aborts the channel and terminates remaining workers.

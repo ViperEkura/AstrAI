@@ -15,7 +15,7 @@ hooks and makes a best-effort cleanup pass when startup or training fails.
 | callbacks/metric_util.py | Metric accessors, gradient norm and GradSNRTracker |
 | callbacks/optimization.py | Gradient clipping and activation checkpointing |
 | callbacks/progress.py | Epoch progress display |
-| optional_extras.py | Global RNG/FP8 and strategy-owned checkpoint extras |
+| optional_extras.py | Optimizer, scheduler, FP8 and strategy-owned checkpoint extras |
 
 ```mermaid
 classDiagram
@@ -79,9 +79,10 @@ JSONL is streamed from disk, followed by the snapshot's records. Historical
 records are not all loaded into memory. TrainContextBuilder restores history
 from the selected resume checkpoint before startup callbacks run; loading
 weights for a new run does not inherit the old run's metrics. Checkpoints
-without metric.jsonl start with empty history. The checkpoint format, metric
-record schema, validation cadence and GNS calculation remain unchanged.
+without metric.jsonl start with empty history. Metric history persistence does not persist the internal state of every metric estimator.
 
-optional_extras.py records enabled global RNG/FP8 state and strategy-owned
-state such as a critic or frozen reference. The builder restores each component
+optional_extras.py records optimizer, scheduler, enabled FP8 state and
+strategy-owned state such as a critic or frozen reference. Global RNG state is
+not currently persisted, so resume is not guaranteed to reproduce stochastic
+training bit for bit. The builder restores each component
 after its owner exists. Unknown optional keys are ignored on restore.

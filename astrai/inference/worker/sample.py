@@ -30,6 +30,7 @@ def sample(
     return_logprobs: bool = False,
     meta: Optional[SamplingMeta] = None,
     seeds: Optional[List[Optional[int]]] = None,
+    uniforms: Optional[Tensor] = None,
 ):
     """Apply frequency penalty, temperature, top-k and top-p, then sample.
 
@@ -37,7 +38,9 @@ def sample(
     penalties or filtering. Frequency counts are supplied by the caller and
     remain unchanged. Per-request seeds do not advance the global RNG.
     The worker supplies cached metadata; standalone callers may use scalars
-    or per-row tensors without it.
+    or per-row tensors without it. Optional ``uniforms`` supply one
+    independent draw in [0, 1) per row for inverse-CDF sampling; None keeps
+    multinomial sampling with ``seeds`` or the shared RNG.
     """
     if meta is None:
         meta = SamplingMeta(
@@ -109,24 +112,42 @@ def sample(
                 1, indices, remove
             )
             logits[mask] = filter_value
-        probabilities = torch.softmax(logits, dim=-1)
-        if seeds is None:
-            tokens = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
-        else:
-            if len(seeds) != logits.shape[0]:
-                raise ValueError("sampling seeds must match the batch size")
-            tokens = torch.cat(
-                [
-                    torch.multinomial(
-                        probabilities[i],
-                        num_samples=1,
-                        generator=None
-                        if seed is None
-                        else torch.Generator(device=logits.device).manual_seed(seed),
-                    )
-                    for i, seed in enumerate(seeds)
-                ]
+        if uniforms is not None:
+            if seeds is not None:
+                raise ValueError("uniforms and seeds are mutually exclusive")
+            if uniforms.shape != logits.shape[:-1]:
+                raise ValueError("one sampling uniform is required per logit row")
+            # FP32 CDF sampling keeps request-local draws independent of row
+            # order, variable EOS and speculative steps later discarded.
+            cdf = torch.softmax(logits.float(), dim=-1).cumsum(dim=-1)
+            cdf = cdf / cdf[..., -1:]
+            uniforms = uniforms.to(device=cdf.device, dtype=cdf.dtype).clamp(
+                min=0, max=1 - 2**-24
             )
+            tokens = torch.searchsorted(
+                cdf.contiguous(), uniforms.unsqueeze(-1).contiguous(), right=True
+            ).squeeze(-1)
+        else:
+            probabilities = torch.softmax(logits, dim=-1)
+            if seeds is None:
+                tokens = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+            else:
+                if len(seeds) != logits.shape[0]:
+                    raise ValueError("sampling seeds must match the batch size")
+                tokens = torch.cat(
+                    [
+                        torch.multinomial(
+                            probabilities[i],
+                            num_samples=1,
+                            generator=None
+                            if seed is None
+                            else torch.Generator(device=logits.device).manual_seed(
+                                seed
+                            ),
+                        )
+                        for i, seed in enumerate(seeds)
+                    ]
+                )
     if return_logprobs:
         return tokens, raw_log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     return tokens

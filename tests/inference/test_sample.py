@@ -8,6 +8,21 @@ import torch
 from astrai.inference.worker.sample import SamplingMeta, sample
 
 
+def test_request_uniform_inverse_cdf_retains_raw_logprobs():
+    logits = torch.log(torch.tensor([[0.1, 0.2, 0.7]] * 4))
+    uniforms = torch.tensor([0.0, 0.15, 0.5, 1.0])
+    tokens, logprobs = sample(logits.clone(), uniforms=uniforms, return_logprobs=True)
+    assert tokens.tolist() == [0, 1, 2, 2]
+    torch.testing.assert_close(logprobs, logits[torch.arange(4), tokens])
+    filtered, raw = sample(
+        logits.clone(), top_k=1, uniforms=uniforms, return_logprobs=True
+    )
+    assert filtered.tolist() == [2] * 4
+    torch.testing.assert_close(raw, logits[:, 2])
+    with pytest.raises(ValueError, match="per logit row"):
+        sample(logits, uniforms=torch.tensor([0.5]))
+
+
 def test_sample_return_logprobs_greedy_path():
     """Greedy decode (temperature 0) also returns logprobs."""
     logits = torch.tensor([[1.0, 5.0, 2.0]])

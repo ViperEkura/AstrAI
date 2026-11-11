@@ -70,6 +70,35 @@ def test_seeded_sampling_is_independent_of_global_rng_and_order():
     assert single.item() == tokens[2].item()
 
 
+def test_seeded_sampling_draws_the_batch_without_per_row_generators():
+    logits = torch.randn(8, 64)
+    with patch("torch.Generator", side_effect=AssertionError("per-row generator")):
+        tokens = sample(
+            logits.clone(), temperature=0.7, top_p=0.9, seeds=list(range(8))
+        )
+    assert tokens.shape == (8,)
+
+
+def test_seeded_sampling_matches_the_filtered_distribution():
+    row = torch.randn(1, 16) * 2
+    n = 50000
+    tokens = sample(
+        row.expand(n, -1).clone(), temperature=0.7, top_p=0.9, seeds=list(range(n))
+    )
+    filtered = []
+
+    def draw(probabilities, num_samples):
+        filtered.append(probabilities.double())
+        return probabilities.argmax(-1, keepdim=True)
+
+    with patch("torch.multinomial", side_effect=draw):
+        sample(row.clone(), temperature=0.7, top_p=0.9)
+    expected = filtered[0][0]
+    observed = torch.bincount(tokens, minlength=16).double() / n
+    assert observed[expected == 0].sum() == 0
+    assert 0.5 * (observed - expected).abs().sum() < 0.02
+
+
 @pytest.mark.parametrize("meta_cached", [False, True])
 def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
     logits = torch.tensor([[5.0, 4.0, 3.0, 2.0], [1.0, 2.0, 3.0, 4.0]])

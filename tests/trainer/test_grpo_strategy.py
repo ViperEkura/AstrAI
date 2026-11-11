@@ -132,15 +132,16 @@ def test_grpo_dapo_clip_higher_changes_positive_advantage_bound(
             ]
         )
 
-        def fake_get_logprobs(*_args, **_kwargs):
+        def fake_rollout_logprobs(*_args, **_kwargs):
             return {
-                "logprobs": next(outputs),
+                "logprobs": next(outputs).view(1, 2, 1),
                 "aux_loss": None,
                 "router_stats": None,
             }
 
         monkeypatch.setattr(
-            "astrai.trainer.strategy.ops.get_logprobs", fake_get_logprobs
+            "astrai.trainer.strategy.grpo.rollout_token_logprobs",
+            fake_rollout_logprobs,
         )
         metrics = strategy.compute_loss_output(batch)["metrics"]
         return metrics["policy_loss"], metrics

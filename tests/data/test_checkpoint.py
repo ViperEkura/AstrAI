@@ -12,6 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from astrai.parallel.setup import get_rank, spawn_parallel_fn
 from astrai.serialization import Checkpoint
 from astrai.serialization import checkpoint as checkpoint_module
+from tests.support.capabilities import requires_nccl
 
 
 def test_single_process():
@@ -192,13 +193,14 @@ def test_checkpoint_load_accepts_legacy_directory_without_manifest(tmp_path):
 
 
 def simple_training():
-    model = torch.nn.Linear(10, 5)
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = torch.nn.Linear(10, 5, device=device)
     optimizer = AdamW(model.parameters(), lr=1e-3)
     scheduler = CosineAnnealingLR(optimizer, T_max=10)
 
     for epoch in range(2):
         for iteration in range(5):
-            x = torch.randn(16, 10)
+            x = torch.randn(16, 10, device=device)
             loss = model(x).mean()
             loss.backward()
             optimizer.step()
@@ -228,8 +230,11 @@ def simple_training():
     assert loaded.epoch == 2
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_multi_process():
-    spawn_parallel_fn(simple_training, world_size=2, backend="gloo")
+    spawn_parallel_fn(simple_training, world_size=2, backend="nccl")
 
 
 def test_stale_staging_is_cleaned_before_the_next_save(tmp_path):

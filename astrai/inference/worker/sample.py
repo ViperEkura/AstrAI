@@ -18,6 +18,27 @@ class SamplingMeta:
     has_freq: bool
 
 
+_MASK64 = (1 << 64) - 1
+
+
+def _seed_uniforms(seeds: List[Optional[int]]) -> Tensor:
+    """Map each seed to a uniform in [0, 1) with splitmix64; None rows use the global RNG."""
+    values = []
+    for seed in seeds:
+        if seed is None:
+            values.append(float("nan"))
+            continue
+        z = (seed + 0x9E3779B97F4A7C15) & _MASK64
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+        values.append(((z ^ (z >> 31)) >> 11) * 2.0**-53)
+    uniforms = torch.tensor(values, dtype=torch.float64)
+    missing = torch.isnan(uniforms)
+    if missing.any():
+        uniforms[missing] = torch.rand(int(missing.sum()), dtype=torch.float64)
+    return uniforms
+
+
 @torch.inference_mode()
 def sample(
     logits: Tensor,
@@ -40,7 +61,7 @@ def sample(
     The worker supplies cached metadata; standalone callers may use scalars
     or per-row tensors without it. Optional ``uniforms`` supply one
     independent draw in [0, 1) per row for inverse-CDF sampling; None keeps
-    multinomial sampling with ``seeds`` or the shared RNG.
+    the ``seeds`` or shared-RNG sampling.
     """
     if meta is None:
         meta = SamplingMeta(
@@ -134,20 +155,13 @@ def sample(
             else:
                 if len(seeds) != logits.shape[0]:
                     raise ValueError("sampling seeds must match the batch size")
-                tokens = torch.cat(
-                    [
-                        torch.multinomial(
-                            probabilities[i],
-                            num_samples=1,
-                            generator=None
-                            if seed is None
-                            else torch.Generator(device=logits.device).manual_seed(
-                                seed
-                            ),
-                        )
-                        for i, seed in enumerate(seeds)
-                    ]
-                )
+                # One stateless uniform per row and a batched inverse-CDF draw, instead
+                # of a Generator plus multinomial launch per row on every decode step.
+                uniforms = _seed_uniforms(seeds).to(logits.device, non_blocking=True)
+                cdf = probabilities.double().cumsum(dim=-1)
+                target = (uniforms * cdf[:, -1]).unsqueeze(-1)
+                tokens = torch.searchsorted(cdf, target, right=True).squeeze(-1)
+                tokens = tokens.clamp_(max=probabilities.size(-1) - 1)
     if return_logprobs:
         return tokens, raw_log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     return tokens

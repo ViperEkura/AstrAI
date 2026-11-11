@@ -10,6 +10,7 @@ from typing import (
     TypedDict,
 )
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -310,6 +311,134 @@ def rollout_sequences(
     return full_sequences, attn_mask
 
 
+def _packed_rollout_token_logprobs(
+    model: nn.Module,
+    prompts: Tensor,
+    prompt_mask: Tensor,
+    responses: Tensor,
+    response_masks: Tensor,
+    grad_chunked: bool = False,
+) -> Optional[LogprobsOutput]:
+    """Score responses on unpadded (prompt, response) runs packed into rows.
+
+    Each run keeps positions from zero and attends only within itself through a
+    block-diagonal causal mask; lm_head projects only the predicting positions.
+    Returns None when the model cannot take packed 4-D masks.
+    """
+    # DDP keeps the model in ``.module``; the forward still goes through the
+    # wrapper, and the head is applied inside it via ``logits_positions``.
+    inner = getattr(model, "module", model)
+    layer_types = getattr(getattr(inner, "model", None), "layer_types", ())
+    if getattr(inner, "lm_head", None) is None or not layer_types:
+        return None
+    if not set(layer_types) <= {"gqa", "mla"}:
+        return None
+    batch_size, group_size, response_len = responses.shape
+    prompt_len = prompts.size(1)
+    width = prompt_len + response_len
+    device = prompts.device
+    prompt_valid = prompt_mask.bool()
+    response_valid = response_masks.reshape(-1, response_len).bool()
+    prompt_count = prompt_valid.sum(-1)
+    response_count = response_valid.sum(-1)
+    # Runs are left-padded prompts and right-padded responses; other layouts
+    # keep the padded path.
+    steps_p = torch.arange(prompt_len, device=device)
+    steps_r = torch.arange(response_len, device=device)
+    left = steps_p >= (prompt_len - prompt_count)[:, None]
+    right = steps_r < response_count[:, None]
+    if not (torch.equal(left, prompt_valid) and torch.equal(right, response_valid)):
+        return None
+    prompt_lens = prompt_count.tolist()
+    response_lens = response_count.tolist()
+    runs = sorted(
+        (
+            (prompt_lens[i // group_size] + n, i)
+            for i, n in enumerate(response_lens)
+            if n
+        ),
+        reverse=True,
+    )
+    if not runs:
+        return None
+    fill, place = [], {}
+    for length, i in runs:  # first-fit decreasing; every run fits in width
+        row = next((r for r, used in enumerate(fill) if used + length <= width), None)
+        if row is None:
+            row = len(fill)
+            fill.append(0)
+        place[i] = (row, fill[row])
+        fill[row] += length
+    rows = len(fill)
+    source = np.full((rows, width), -1, dtype=np.int64)
+    segment = -1 - np.arange(rows * width, dtype=np.int64).reshape(rows, width)
+    position = np.zeros((rows, width), dtype=np.int64)
+    gather_row, gather_col, scatter = [], [], []
+    for i, (row, start) in place.items():
+        p, n = prompt_lens[i // group_size], response_lens[i]
+        span = slice(start, start + p + n)
+        base = i * width
+        source[row, span] = np.concatenate(
+            [
+                base + np.arange(prompt_len - p, prompt_len),
+                base + prompt_len + np.arange(n),
+            ]
+        )
+        segment[row, span] = i
+        position[row, span] = np.arange(p + n)
+        gather_row.append(np.full(n, row))
+        gather_col.append(np.arange(start + p - 1, start + p - 1 + n))
+        scatter.append(i * response_len + np.arange(n))
+    flat = torch.cat(
+        [
+            prompts.repeat_interleave(group_size, dim=0),
+            responses.reshape(-1, response_len),
+        ],
+        dim=-1,
+    ).reshape(-1)
+    source = torch.from_numpy(source).to(device)
+    tokens = torch.where(source >= 0, flat[source.clamp(min=0)], 0)
+    segment = torch.from_numpy(segment).to(device)
+    causal = torch.ones(width, width, dtype=torch.bool, device=device).tril()
+    attn_mask = (segment[:, :, None] == segment[:, None, :]) & causal
+    gather_row = torch.from_numpy(np.concatenate(gather_row)).to(device)
+    gather_col = torch.from_numpy(np.concatenate(gather_col)).to(device)
+    targets = tokens[gather_row, gather_col + 1]
+    # Same choice as get_logprobs: full log-softmax for gradients unless
+    # grad_chunked, row-chunked otherwise.
+    chunked = grad_chunked or not torch.is_grad_enabled()
+    outputs = model(
+        tokens,
+        attn_mask[:, None],
+        position_ids=torch.from_numpy(position).to(device),
+        logits_positions=(gather_row, gather_col),
+        skip_lm_head=chunked,
+        return_lm_head_weight=chunked,
+    )
+    if not chunked:
+        log_probs = torch.log_softmax(outputs["logits"].float(), dim=-1)
+        picked = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    else:
+        chunk_fn = (
+            _chunked_token_logprobs_grad
+            if torch.is_grad_enabled()
+            else _chunked_token_logprobs
+        )
+        picked = chunk_fn(
+            outputs["hidden_states"].unsqueeze(0),
+            outputs["lm_head_weight"],
+            targets.unsqueeze(0),
+        ).squeeze(0)
+    scatter = torch.from_numpy(np.concatenate(scatter)).to(device)
+    logprobs = picked.new_zeros(batch_size * group_size * response_len)
+    logprobs = logprobs.index_put((scatter,), picked)
+    return {
+        "logprobs": logprobs.view(batch_size, group_size, response_len),
+        "aux_loss": outputs.get("aux_loss"),
+        "router_stats": outputs.get("router_stats"),
+    }
+
+
 def rollout_token_logprobs(
     model: nn.Module,
     prompts: Tensor,
@@ -325,10 +454,19 @@ def rollout_token_logprobs(
     the first response token's logprob (predicted from the last prompt
     token) is correctly included.
 
+    Full-attention models score unpadded (prompt, response) runs packed into
+    rows (see :func:`_packed_rollout_token_logprobs`); other models keep the
+    padded layout below.
+
     Returns:
         ``logprobs`` reshaped to [B, G, R]: position j is the log-probability
         of response token j under ``model``.
     """
+    packed = _packed_rollout_token_logprobs(
+        model, prompts, prompt_mask, responses, response_masks, grad_chunked
+    )
+    if packed is not None:
+        return packed
     batch_size, group_size, response_len = responses.shape
     prompt_len = prompts.size(1)
     full_sequences, attn_mask = rollout_sequences(

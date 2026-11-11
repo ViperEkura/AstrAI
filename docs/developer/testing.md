@@ -41,8 +41,9 @@ python -m pytest tests -m cuda -q
 ```
 
 The distributed marker selects multi-rank/worker scenarios independently of
-device type. CPU/Gloo scenarios remain part of the CPU suite. The slow marker
-identifies long-running tests. Unknown markers are errors.
+device type. Distributed communication tests use CUDA/NCCL and skip when
+NCCL or the required GPU count is unavailable. Single-process CPU tests remain
+part of the CPU suite. The slow marker identifies long-running tests. Unknown markers are errors.
 
 ## Skips and numerical checks
 

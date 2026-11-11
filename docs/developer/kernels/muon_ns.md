@@ -63,7 +63,7 @@ momentum do not take that writeback. Gather, NS scratch and distribution
 remain full-matrix costs; owner-only or pipelined collectives are separate
 work.
 
-CPU/Gloo tests compare parameters and exact momentum over five updates,
+CUDA/NCCL tests compare parameters and exact momentum over five updates,
 including zero/tiny gradients and state restore, at 2/4/8 ranks. They observe
 full-matrix shape and backend arguments, not actual CUDA launches. Native
 CUDA dispatch, peak memory and complete RL cost require the assigned GPU

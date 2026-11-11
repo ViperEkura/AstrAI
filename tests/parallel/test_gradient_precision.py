@@ -17,7 +17,7 @@ from astrai.parallel.executor import DDPExecutor, NoneExecutor
 from astrai.parallel.executor.gradients import parameter_gradient
 from astrai.trainer.callbacks.metric_util import GradSNRTracker, grad_norm
 from astrai.trainer.components import build_optimizer_component
-from tests.support.capabilities import skip_no_multi_device
+from tests.support.capabilities import requires_nccl
 from tests.support.precision import assert_precision_state
 
 
@@ -27,14 +27,13 @@ def _distributed_check(
     rendezvous,
     bucket_view,
     static_graph,
-    backend="gloo",
+    backend="nccl",
     compute_dtype=torch.bfloat16,
     gradient_dtype="float32",
 ):
     torch.set_num_threads(1)
-    device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
-    if backend == "nccl":
-        torch.cuda.set_device(device)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
     dist.init_process_group(
         backend, rank=rank, world_size=world_size, init_method=rendezvous
     )
@@ -199,8 +198,10 @@ def test_model_precision_opt_out_and_fp32_model_remain_native():
 @pytest.mark.parametrize(
     "bucket_view,static_graph", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.cuda
+@requires_nccl(2)
 def test_two_rank_accumulation_and_rebuilt_buckets(tmp_path, bucket_view, static_graph):
-    rendezvous = Path(tmp_path / "gloo").as_uri()
+    rendezvous = Path(tmp_path / "nccl").as_uri()
     mp.spawn(
         _distributed_check,
         args=(2, rendezvous, bucket_view, static_graph),
@@ -211,13 +212,17 @@ def test_two_rank_accumulation_and_rebuilt_buckets(tmp_path, bucket_view, static
 
 def _conditional_check(rank, rendezvous):
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=rendezvous)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", rank=rank, world_size=2, init_method=rendezvous)
     try:
         executor = DDPExecutor(find_unused_parameters=True, bucket_cap_mb=0.00001)
 
         def build():
-            model = nn.Linear(2, 1).bfloat16()
-            model.register_parameter("unused", nn.Parameter(torch.ones(1).bfloat16()))
+            model = nn.Linear(2, 1, device=device).bfloat16()
+            model.register_parameter(
+                "unused", nn.Parameter(torch.ones(1, device=device).bfloat16())
+            )
             return model
 
         model, optimizer, _ = executor.prepare(
@@ -230,7 +235,7 @@ def _conditional_check(rank, rendezvous):
         for window in range(3):
             # All ranks have the same graph output, but only rank zero uses bias.
             output = torch.nn.functional.linear(
-                torch.ones(1, 2).bfloat16(),
+                torch.ones(1, 2, device=device).bfloat16(),
                 raw.weight,
                 raw.bias if rank == 0 else None,
             )
@@ -254,6 +259,8 @@ def _conditional_check(rank, rendezvous):
 
 
 @pytest.mark.distributed
+@pytest.mark.cuda
+@requires_nccl(2)
 def test_unused_parameter_rank_agreement_and_no_spurious_decay(tmp_path):
     mp.spawn(
         _conditional_check,
@@ -316,13 +323,15 @@ def test_checkpoint_continuity_includes_accumulated_fp32_updates():
 
 def _buffer_sync_check(rank, rendezvous):
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", rank=rank, world_size=2, init_method=rendezvous)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl", rank=rank, world_size=2, init_method=rendezvous)
     try:
         for init_sync in (True, False):
             for forward_sync_buffers in (True, False):
-                raw = nn.Linear(2, 2, bias=False).bfloat16()
+                raw = nn.Linear(2, 2, bias=False, device=device).bfloat16()
                 raw.weight.data.fill_(1 + rank)
-                raw.register_buffer("counter", torch.tensor(float(rank)))
+                raw.register_buffer("counter", torch.tensor(float(rank), device=device))
                 executor = DDPExecutor(
                     init_sync=init_sync, forward_sync_buffers=forward_sync_buffers
                 )
@@ -330,7 +339,7 @@ def _buffer_sync_check(rank, rendezvous):
                 assert raw.counter.item() == (0 if init_sync else rank)
                 assert torch.all(raw.weight == (1 if init_sync else 1 + rank))
                 raw.counter.fill_(10 + rank)
-                model(torch.ones(1, 2).bfloat16())
+                model(torch.ones(1, 2, device=device).bfloat16())
                 assert raw.counter.item() == (10 if forward_sync_buffers else 10 + rank)
                 executor._grad_accumulator.close()
     finally:
@@ -338,6 +347,8 @@ def _buffer_sync_check(rank, rendezvous):
 
 
 @pytest.mark.distributed
+@pytest.mark.cuda
+@requires_nccl(2)
 def test_bf16_initial_buffer_sync_is_separate_from_forward_sync(tmp_path):
     mp.spawn(
         _buffer_sync_check,
@@ -348,6 +359,8 @@ def test_bf16_initial_buffer_sync_is_separate_from_forward_sync(tmp_path):
 
 
 @pytest.mark.distributed
+@pytest.mark.cuda
+@requires_nccl(2)
 def test_fp32_compute_bf16_main_gradients_reduce_across_ranks(tmp_path):
     mp.spawn(
         _distributed_check,
@@ -356,7 +369,7 @@ def test_fp32_compute_bf16_main_gradients_reduce_across_ranks(tmp_path):
             Path(tmp_path / "bf16_gradients").as_uri(),
             True,
             False,
-            "gloo",
+            "nccl",
             torch.float32,
             "bfloat16",
         ),
@@ -387,9 +400,8 @@ def _owner_optimizer(
 
 def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
     torch.set_num_threads(1)
-    device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
-    if backend == "nccl":
-        torch.cuda.set_device(device)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
     dist.init_process_group(backend, rank=rank, world_size=2, init_method=rendezvous)
     try:
         cases = [
@@ -517,36 +529,13 @@ def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
 
 
 @pytest.mark.distributed
-@pytest.mark.parametrize(
-    "backend,cpu_offload",
-    [
-        ("gloo", False),
-        pytest.param(
-            "nccl",
-            False,
-            marks=[
-                pytest.mark.cuda,
-                pytest.mark.skipif(
-                    torch.cuda.device_count() < 2, reason="Two GPUs required"
-                ),
-            ],
-        ),
-        pytest.param(
-            "nccl",
-            True,
-            marks=[
-                pytest.mark.cuda,
-                pytest.mark.skipif(
-                    torch.cuda.device_count() < 2, reason="Two GPUs required"
-                ),
-            ],
-        ),
-    ],
-)
-def test_complete_parameter_ownership_export_and_resume(tmp_path, backend, cpu_offload):
+@pytest.mark.cuda
+@requires_nccl(2)
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_complete_parameter_ownership_export_and_resume(tmp_path, cpu_offload):
     mp.spawn(
         _owner_state_check,
-        args=(Path(tmp_path / "owners").as_uri(), str(tmp_path), backend, cpu_offload),
+        args=(Path(tmp_path / "owners").as_uri(), str(tmp_path), "nccl", cpu_offload),
         nprocs=2,
         join=True,
     )
@@ -554,8 +543,10 @@ def test_complete_parameter_ownership_export_and_resume(tmp_path, backend, cpu_o
 
 def _subgroup_owner_check(rank, rendezvous):
     torch.set_num_threads(1)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
     dist.init_process_group(
-        "gloo",
+        "nccl",
         rank=rank,
         world_size=4,
         init_method=rendezvous,
@@ -565,7 +556,7 @@ def _subgroup_owner_check(rank, rendezvous):
         groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
         group = groups[rank // 2]
         executor = DDPExecutor(process_group=group, grad_accum_dtype="float32")
-        model = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+        model = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16, device=device)
         model.weight.data.fill_(1)
         model = executor._prepare_model(model)
         raw = executor.model_for_inference(model)
@@ -578,7 +569,9 @@ def _subgroup_owner_check(rank, rendezvous):
             process_group=group,
         )
         executor.backward(
-            model(torch.full((1, 2), rank // 2 + 1, dtype=torch.bfloat16)).sum()
+            model(
+                torch.full((1, 2), rank // 2 + 1, dtype=torch.bfloat16, device=device)
+            ).sum()
         )
         optimizer.step()
         expected = torch.full_like(raw.weight, 1 - 0.1 * (rank // 2 + 1))
@@ -612,22 +605,12 @@ def _subgroup_owner_check(rank, rendezvous):
 
 
 @pytest.mark.distributed
+@pytest.mark.cuda
+@requires_nccl(4)
 def test_optimizer_ownership_and_checkpoints_stay_inside_ddp_group(tmp_path):
     mp.spawn(
         _subgroup_owner_check,
         args=(Path(tmp_path / "subgroups").as_uri(),),
         nprocs=4,
-        join=True,
-    )
-
-
-@pytest.mark.distributed
-@pytest.mark.cuda
-@skip_no_multi_device
-def test_nccl_fp32_accumulation_and_update_parity(tmp_path):
-    mp.spawn(
-        _distributed_check,
-        args=(2, Path(tmp_path / "nccl").as_uri(), True, False, "nccl"),
-        nprocs=2,
         join=True,
     )

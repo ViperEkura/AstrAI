@@ -15,6 +15,7 @@ from astrai.serialization import Checkpoint
 from astrai.trainer.context import TrainContextBuilder
 from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.trainer import Trainer
+from tests.support.capabilities import requires_nccl
 from tests.support.precision import assert_precision_state
 from tests.support.rollout import LengthRewardModel
 from tests.support.tokenizers import CHAT_TEMPLATE
@@ -190,7 +191,8 @@ def _sharded_config(path, policy, shard_state=True):
         dp_mode="ddp",
         dp_size=2,
         batch_per_device=1,
-        backend="gloo",
+        backend="nccl",
+        device="cuda",
     )
     return replace(
         config,
@@ -209,6 +211,9 @@ def _sharded_config(path, policy, shard_state=True):
         ("float32", False, True),
     ],
 )
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_sharded_trainer_export_resume_matches_continuous_training(
     tmp_path, compute, source_sharded, target_sharded
 ):
@@ -258,6 +263,9 @@ def test_sharded_trainer_export_resume_matches_continuous_training(
     assert_precision_state(baseline.extra["optimizer"], resumed.extra["optimizer"])
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_sharded_ppo_critic_checkpoint_matches_continuous_training(base_test_env):
     root = Path(base_test_env["test_dir"])
     tokenizer = base_test_env["tokenizer"]
@@ -286,8 +294,8 @@ def test_sharded_ppo_critic_checkpoint_matches_continuous_training(base_test_env
         grad_accum_steps=1,
         ckpt_interval=1,
         random_seed=42,
-        device_type="cpu",
-        backend="gloo",
+        device_type="cuda",
+        backend="nccl",
         dp_mode="ddp",
         dp_size=2,
         strategy_kwargs={"group_size": 2, "kl_coef": 0.01},

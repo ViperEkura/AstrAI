@@ -301,6 +301,24 @@ class SingleOutputMaskBuilder(BaseMaskBuilder):
 
     def build(self, item: Dict, config, tokenizer) -> Optional[Dict]:
         sections = config.input.sections
+        if config.input.chat_template_mask:
+            field = sections[0]["field"]
+            messages = item.get(field)
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("Chat SFT requires a non-empty messages list")
+            rendered = tokenizer.apply_chat_template(
+                messages,
+                tools=item.get("tools") or [],
+                tokenize=True,
+                add_generation_prompt=False,
+                return_assistant_tokens_mask=True,
+            )
+            ids, mask = rendered["input_ids"], rendered["assistant_masks"]
+            if not any(mask):
+                raise ValueError(
+                    "Chat SFT has no supervised tokens; mark assistant output with generation blocks"
+                )
+            return self._assemble_outputs([item], [(ids, mask)], config)[0]
         if not sections:
             return None
         rendered = self.renderer.process_sections(
@@ -309,6 +327,8 @@ class SingleOutputMaskBuilder(BaseMaskBuilder):
         return self._assemble_outputs([item], [rendered], config)[0]
 
     def build_batch(self, items, config, tokenizer):
+        if config.input.chat_template_mask:
+            return [self.build(item, config, tokenizer) for item in items]
         sections = config.input.sections
         if not sections:
             return [None] * len(items)

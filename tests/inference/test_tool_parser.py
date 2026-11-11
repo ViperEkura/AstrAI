@@ -10,22 +10,22 @@ from astrai.inference.network.tool_parser import SimpleJsonToolParser
 @pytest.mark.parametrize(
     "source,expected",
     [
-        ('{"city": "Beijing"}', '"city": "Beijing"'),
-        ('{"a": {"b": {"c": {"d": 4}}}}', '"a": {"b": {"c": {"d": 4}}}'),
+        ('{"city": "Beijing"}', '{"city": "Beijing"}'),
+        ('{"a": {"b": {"c": {"d": 4}}}}', '{"a": {"b": {"c": {"d": 4}}}}'),
         (
             '{"active": true, "count": 0, "nick": null}',
-            '"active": true, "count": 0, "nick": null',
+            '{"active": true, "count": 0, "nick": null}',
         ),
-        ('{"items": [1, 2, 3]}', '"items": [1, 2, 3]'),
-        ('{"rows": [{"id": 1}, {"id": 2}]}', '"rows": [{"id": 1}, {"id": 2}]'),
-        ('{"text": "你好，世界"}', '"text": "你好，世界"'),
-        (r'{"text": "he said \"hello\""}', r'"text": "he said \"hello\""'),
+        ('{"items": [1, 2, 3]}', '{"items": [1, 2, 3]}'),
+        ('{"rows": [{"id": 1}, {"id": 2}]}', '{"rows": [{"id": 1}, {"id": 2}]}'),
+        ('{"text": "你好，世界"}', '{"text": "你好，世界"}'),
+        (r'{"text": "he said \"hello\""}', '{"text": "he said \\"hello\\""}'),
         (
             '{"code": "function(x) { return x + 1; }"}',
-            '"code": "function(x) { return x + 1; }"',
+            '{"code": "function(x) { return x + 1; }"}',
         ),
         ('"just a string"', "just a string"),
-        ("{}", ""),
+        ("{}", "{}"),
     ],
     ids=[
         "object",
@@ -54,7 +54,7 @@ def test_complete_multiple_calls_preserve_content_order_and_ids(prefix):
     result = SimpleJsonToolParser().parse_complete(body)
     assert result["content"] == (prefix.strip() or None)
     assert [call["function"] for call in result["tool_calls"]] == [
-        {"name": "f1", "arguments": '"a": 1'},
+        {"name": "f1", "arguments": '{"a": 1}'},
         {"name": "f2", "arguments": ""},
     ]
     identifiers = [call["id"] for call in result["tool_calls"]]
@@ -73,9 +73,9 @@ def test_complete_ignores_plain_or_unfinished_calls(body):
 @pytest.mark.parametrize(
     "body,arguments",
     [
-        ('{"name": "f", "arguments": {"city"', '"city"'),
-        ('{"name": "f", "arguments": {"a": {"b": ', '"a": {"b":'),
-        ('{"name": "f", "arguments": {"items": [1, 2, ', '"items": [1, 2,'),
+        ('{"name": "f", "arguments": {"city"', '{"city"'),
+        ('{"name": "f", "arguments": {"a": {"b": ', '{"a": {"b":'),
+        ('{"name": "f", "arguments": {"items": [1, 2, ', '{"items": [1, 2,'),
     ],
 )
 def test_partial_calls_emit_available_name_and_arguments(body, arguments):
@@ -91,21 +91,21 @@ def test_partial_calls_emit_available_name_and_arguments(body, arguments):
     [
         (
             '{"name": "deep", "arguments": {"a": {"b": {"c": 42}}}}',
-            '"a": {"b": {"c": 42}}',
+            '{"a": {"b": {"c": 42}}}',
         ),
         (
             '{"name": "translate", "arguments": {"text": "你好，世界"}}',
-            '"text": "你好，世界"',
+            '{"text": "你好，世界"}',
         ),
-        ('{"name": "add", "arguments": {"items": [1, 2, 3]}}', '"items": [1, 2, 3]'),
+        ('{"name": "add", "arguments": {"items": [1, 2, 3]}}', '{"items": [1, 2, 3]}'),
         (
             r'{"name":"echo","arguments":{"text":"a{b}c \"quoted\""}}',
-            r'"text":"a{b}c \"quoted\""',
+            '{"text":"a{b}c \\"quoted\\""}',
         ),
-        ('{"name":"ping","arguments":{}}', ""),
+        ('{"name":"ping","arguments":{}}', "{}"),
         (
             '{"name": "get_weather","arguments": {"city":"Beijing","unit":"c"}}',
-            '"city":"Beijing","unit":"c"',
+            '{"city":"Beijing","unit":"c"}',
         ),
     ],
 )
@@ -117,6 +117,7 @@ def test_streamed_arguments_match_complete_source(body, arguments):
     assert names == [expected_name]
     assert "".join(chunks) == arguments
     assert completed == {"name": expected_name, "arguments": arguments}
+    assert json.loads("".join(chunks)) == json.loads(body)["arguments"]
 
 
 def test_feed_incremental_text():
@@ -198,7 +199,7 @@ def test_streaming_args_diff_only_emits_new_bytes():
     joined = "".join(all_args)
     assert "city" in joined
     assert "Beijing" in joined
-    assert joined.startswith('"city":')
+    assert joined.startswith('{"city":')
     assert all_args[0] != all_args[1]
 
 
@@ -216,7 +217,7 @@ def test_streaming_distinct_tool_call_ids():
                     actual[field] += value
     assert list(calls) == [0, 1]
     assert [call["name"] for call in calls.values()] == ["f1", "f2"]
-    assert [call["arguments"] for call in calls.values()] == ['"a": 1', '"b": 2']
+    assert [call["arguments"] for call in calls.values()] == ['{"a": 1}', '{"b": 2}']
     identifiers = [call["id"] for call in calls.values()]
     assert len(set(identifiers)) == 2
     assert all(identifier.startswith("call_") for identifier in identifiers)

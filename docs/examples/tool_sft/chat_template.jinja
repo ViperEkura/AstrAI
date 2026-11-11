@@ -1,0 +1,37 @@
+{%- if bos_token is defined and bos_token %}{{ bos_token }}{% endif -%}
+{%- if tools is defined and tools -%}
+{{- '<｜im▁start｜>system\nAvailable tools: ' + (tools | tojson) + '\nCall a tool with a JSON object containing name and arguments.\n<｜im▁end｜>' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{{- '<｜im▁start｜>' + message['role'] + '\n' -}}
+{%- if message['role'] == 'assistant' -%}
+{%- generation -%}
+{{- message.get('content') or '' -}}
+{%- for call in message.get('tool_calls') or [] -%}
+{{- '\n' if message.get('content') or not loop.first else '' -}}
+{{- {'name': call['function']['name'], 'arguments': call['function']['arguments']} | tojson -}}
+{%- endfor -%}
+{{- '<｜im▁end｜>' -}}
+{%- endgeneration -%}
+{%- elif message['role'] == 'tool' -%}
+{# Resolve IDs in history; generated JSON does not need to invent call IDs. #}
+{%- set matched = namespace(function=none) -%}
+{%- for previous in messages[:loop.index0] -%}
+{%- for call in previous.get('tool_calls') or [] -%}
+{%- if call.get('id') and call['id'] == message.get('tool_call_id') -%}
+{%- set matched.function = call['function'] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- if matched.function is none -%}
+{{- raise_exception('Tool result must reference a preceding tool call ID') -}}
+{%- endif -%}
+{{- {'name': matched.function['name'], 'arguments': matched.function['arguments'], 'result': message.get('content') or ''} | tojson -}}
+{{- '<｜im▁end｜>' -}}
+{%- else -%}
+{{- message.get('content') or '' -}}{{- '<｜im▁end｜>' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<｜im▁start｜>assistant\n' -}}
+{%- endif -%}

@@ -52,7 +52,7 @@ class OpenAIResponseBuilder(ResponseBuilder):
     def prepare(
         self, request: BaseModel, engine: InferenceEngine
     ) -> Tuple[str, GenContext, List[str]]:
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        messages = [m.model_dump(exclude_none=True) for m in request.messages]
         tools = _resolve_tools(request)
         prompt = engine.tokenizer.apply_chat_template(
             messages, tokenize=False, tools=tools or []

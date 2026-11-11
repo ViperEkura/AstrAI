@@ -116,10 +116,11 @@ def _raw_arguments_span(json_str: str) -> Optional[str]:
         return None
     rest = json_str[m.end() :]
     if rest[:1] in ("{", "["):
-        end, ok = _scan_json(rest, 0)
-        if ok:
-            return rest[1 : end - 1]
-        return None
+        try:
+            _, end = json.JSONDecoder().raw_decode(rest)
+        except json.JSONDecodeError:
+            return None
+        return rest[:end]
     str_match = re.match(r'"(?:[^"\\]|\\.)*"', rest)
     if str_match:
         return str_match.group(0)
@@ -142,22 +143,10 @@ def _parse_tool_call_json(json_str: str, complete: bool):
             return None, "", False
         args = obj.get("arguments")
         raw = _raw_arguments_span(json_str)
-        if isinstance(args, dict):
-            if not args:
-                args = ""
-            else:
-                # Prefer the source span: it matches what streaming
-                # already emitted (prefix-consistent completion).
-                args = (
-                    raw
-                    if raw is not None
-                    else json.dumps(args, ensure_ascii=False)[1:-1].rstrip()
-                )
-        elif isinstance(args, list):
-            if not args:
-                args = ""
-            else:
-                args = raw if raw is not None else json.dumps(args, ensure_ascii=False)
+        if isinstance(args, (dict, list)):
+            # Keep the complete JSON value, including braces, so API arguments
+            # can be decoded and reused as structured tool-call history.
+            args = raw if raw is not None else json.dumps(args, ensure_ascii=False)
         elif isinstance(args, str):
             pass
         else:
@@ -174,11 +163,10 @@ def _parse_tool_call_json(json_str: str, complete: bool):
         return name, "", True
 
     raw = args_match.group(1).rstrip()
-    if raw.startswith("{"):
-        inner = raw[1:].rstrip()
-        if inner.endswith("}"):
-            inner = inner[:-1].rstrip()
-        raw = inner
+    if raw.startswith(("{", "[")):
+        # A complete value may arrive before the enclosing call closes.
+        # Never stream the enclosing object's delimiter as part of arguments.
+        raw = _raw_arguments_span(json_str) or raw
     return name, raw, True
 
 

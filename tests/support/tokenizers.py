@@ -80,6 +80,15 @@ class FakeTokenizer:
     ):
         if self._chat_template is None:
             raise RuntimeError("Chat template not configured")
+        if messages and isinstance(messages[0], list):
+            return [
+                self.apply_chat_template(
+                    conversation,
+                    tokenize=tokenize,
+                    add_generation_prompt=add_generation_prompt,
+                )
+                for conversation in messages
+            ]
         rendered = self._chat_template.render(
             messages=messages, add_generation_prompt=add_generation_prompt
         )

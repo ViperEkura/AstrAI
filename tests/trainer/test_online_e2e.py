@@ -19,6 +19,7 @@ from astrai.trainer.rollout.nccl_transport import NCCLWeightChannel
 from astrai.trainer.rollout.setup import configure_rollout
 from astrai.trainer.rollout.types import ResolvedAsyncRolloutConfig, SamplingParams
 from astrai.trainer.trainer import Trainer
+from tests.support.capabilities import requires_nccl
 from tests.support.rollout import (
     InstructionDataset,
     LengthRewardModel,
@@ -493,15 +494,19 @@ def test_online_accumulation_commits_complete_rollout_windows(online_env):
     assert steps == list(range(1, 9))
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_online_ddp_accumulation_keeps_policy_versions_aligned(online_env):
     """All ranks publish the same replay updates, including empty group slots."""
     test_dir = online_env["test_dir"]
 
     config = _online_config(
         online_env,
+        device_type="cuda",
         dp_size=2,
         dp_mode="ddp",
-        backend="gloo",
+        backend="nccl",
         master_port=find_free_port(),
         batch_per_device=1,
         grad_accum_steps=2,
@@ -515,10 +520,14 @@ def test_online_ddp_accumulation_keeps_policy_versions_aligned(online_env):
     assert checkpoint.meta["consumed_samples"] == 4
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_online_rollout_window_resumes_after_dp_resize(online_env):
     test_dir = online_env["test_dir"]
     old = _online_config(
         online_env,
+        device_type="cuda",
         dataset_length=8,
         batch_per_device=2,
         grad_accum_steps=2,
@@ -533,10 +542,11 @@ def test_online_rollout_window_resumes_after_dp_resize(online_env):
 
     new = _online_config(
         online_env,
+        device_type="cuda",
         dataset_length=8,
         dp_size=2,
         dp_mode="ddp",
-        backend="gloo",
+        backend="nccl",
         master_port=find_free_port(),
         batch_per_device=1,
         grad_accum_steps=2,
@@ -550,14 +560,18 @@ def test_online_rollout_window_resumes_after_dp_resize(online_env):
     assert final.consumed_samples == 8
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_online_ddp_flushes_tail_with_empty_rank(online_env):
     test_dir = online_env["test_dir"]
     config = _online_config(
         online_env,
+        device_type="cuda",
         dataset_length=5,
         dp_size=2,
         dp_mode="ddp",
-        backend="gloo",
+        backend="nccl",
         master_port=find_free_port(),
         batch_per_device=1,
         grad_accum_steps=2,

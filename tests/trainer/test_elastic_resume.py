@@ -12,6 +12,7 @@ from astrai.serialization import Checkpoint
 from astrai.trainer.callbacks import TrainCallback
 from astrai.trainer.context.resume import PreloadedState, ResumeLoader
 from astrai.trainer.trainer import Trainer
+from tests.support.capabilities import requires_nccl
 from tests.support.trainer import create_train_config
 
 
@@ -96,10 +97,10 @@ def _contract_config(tmp_path, dp, batch, accum, mode="ddp"):
     return create_train_config(
         _TokenDataset(),
         str(tmp_path),
-        device="cpu",
+        device="cuda",
         dp_size=dp,
         dp_mode=mode,
-        backend="gloo",
+        backend="nccl",
         master_port=find_free_port(),
         n_epoch=1,
         batch_per_device=batch,
@@ -166,8 +167,11 @@ def test_elastic_contract_and_rejections(tmp_path):
             take_contract(config, legacy)
 
 
-def test_cpu_ddp_short_tail_and_single_rank_resume(tmp_path):
-    """Gloo ranks including an empty tail rank finish the same collectives."""
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
+def test_nccl_ddp_short_tail_and_single_rank_resume(tmp_path):
+    """NCCL ranks including an empty tail rank finish the same collectives."""
     tail_dir = tmp_path / "tail"
     Trainer(_contract_config(tail_dir, 2, 1, 2)).train()
     tail = Checkpoint.load(str(tail_dir / "epoch_0_step_3"))
@@ -219,10 +223,10 @@ def test_cpu_ddp_short_tail_and_single_rank_resume(tmp_path):
     wrong_length = create_train_config(
         _TokenDataset(length=10),
         str(tmp_path / "wrong_length"),
-        device="cpu",
+        device="cuda",
         dp_size=1,
         dp_mode="none",
-        backend="gloo",
+        backend="nccl",
         n_epoch=1,
         batch_per_device=2,
         grad_accum_steps=2,
@@ -232,16 +236,19 @@ def test_cpu_ddp_short_tail_and_single_rank_resume(tmp_path):
         Trainer(wrong_length).train(param_path=str(first), resume=True)
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_sft_global_token_weighting_matches_single_rank(tmp_path):
     def config(directory, dp, batch, mode):
         return create_train_config(
             _MaskedTokenDataset(length=5),
             str(directory),
-            device="cpu",
+            device="cuda",
             strategy="sft",
             dp_size=dp,
             dp_mode=mode,
-            backend="gloo",
+            backend="nccl",
             master_port=find_free_port(),
             n_epoch=1,
             batch_per_device=batch,

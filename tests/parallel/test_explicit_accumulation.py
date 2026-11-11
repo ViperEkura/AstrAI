@@ -10,12 +10,15 @@ from torch import nn
 
 from astrai.parallel.executor import DDPExecutor, NoneExecutor
 from astrai.parallel.setup import find_free_port
+from tests.support.capabilities import requires_nccl
 
 
 def _compare_windows(rank, world_size, port):
+    device = torch.device("cuda", rank) if world_size > 1 else torch.device("cpu")
     if world_size > 1:
+        torch.cuda.set_device(device)
         dist.init_process_group(
-            "gloo",
+            "nccl",
             rank=rank,
             world_size=world_size,
             init_method=f"tcp://127.0.0.1:{port}",
@@ -23,13 +26,13 @@ def _compare_windows(rank, world_size, port):
         )
     try:
         torch.manual_seed(17)
-        reference = nn.Linear(3, 2)
+        reference = nn.Linear(3, 2, device=device)
         initial = {
             name: value.clone() for name, value in reference.state_dict().items()
         }
 
         def make_model():
-            model = nn.Linear(3, 2)
+            model = nn.Linear(3, 2, device=device)
             model.load_state_dict(initial)
             return model
 
@@ -45,7 +48,12 @@ def _compare_windows(rank, world_size, port):
         )
         reference_optimizer = make_optimizer(reference)
         reference_scheduler = make_scheduler(reference_optimizer)
-        inputs = torch.arange(world_size * 18, dtype=torch.float).reshape(-1, 3) / 50
+        inputs = (
+            torch.arange(world_size * 18, dtype=torch.float, device=device).reshape(
+                -1, 3
+            )
+            / 50
+        )
         targets = inputs[:, :2].cos()
         local_inputs, local_targets = (
             inputs.chunk(world_size)[rank],
@@ -83,7 +91,9 @@ def _compare_windows(rank, world_size, port):
 
 
 @pytest.mark.distributed
-@pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize(
+    "world_size", [1, pytest.param(2, marks=[pytest.mark.cuda, requires_nccl(2)])]
+)
 def test_explicit_windows_match_global_batch(world_size):
     if world_size == 1:
         _compare_windows(0, world_size, 0)

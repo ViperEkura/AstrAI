@@ -1,4 +1,4 @@
-"""Logical-matrix and multi-step DTensor optimizer state oracles on CPU."""
+"""Logical-matrix and multi-step DTensor optimizer state oracles on CUDA/NCCL."""
 
 from datetime import timedelta
 
@@ -12,19 +12,22 @@ from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
 from astrai.optimization.optimizer.muon import sharded_update as module
 from astrai.optimization.optimizer.muon.sharded_update import ShardedMuon
+from tests.support.capabilities import requires_nccl
 
 
 def _worker(rank, world, rendezvous, output, batched=False):
     torch.set_num_threads(1)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
     dist.init_process_group(
-        "gloo",
+        "nccl",
         init_method=rendezvous,
         rank=rank,
         world_size=world,
         timeout=timedelta(seconds=180),
     )
     try:
-        mesh = init_device_mesh("cpu", (world,))
+        mesh = init_device_mesh("cuda", (world,))
         original = module.newton_schulz
         calls = []
 
@@ -44,7 +47,7 @@ def _worker(rank, world, rendezvous, output, batched=False):
                     for placement in (Shard(0), Shard(1), Replicate()):
                         torch.manual_seed(3407)
                         expected = [
-                            nn.Parameter(torch.randn(shape, dtype=dtype))
+                            nn.Parameter(torch.randn(shape, dtype=dtype, device=device))
                             for shape in shapes
                         ]
                         actual = [
@@ -73,10 +76,15 @@ def _worker(rank, world, rendezvous, output, batched=False):
                         )
                         calls.clear()
                         for step, scale in enumerate((0.0, 1e-9, 1.0, 0.0, 0.2)):
-                            generator = torch.Generator().manual_seed(70 + step)
+                            generator = torch.Generator(device=device).manual_seed(
+                                70 + step
+                            )
                             for full, shard in zip(expected, actual):
                                 gradient = (
-                                    torch.randn(full.shape, generator=generator) * scale
+                                    torch.randn(
+                                        full.shape, generator=generator, device=device
+                                    )
+                                    * scale
                                 ).to(dtype)
                                 full.grad = gradient.clone()
                                 shard.grad = distribute_tensor(
@@ -129,8 +137,12 @@ def _worker(rank, world, rendezvous, output, batched=False):
                                 "auto" if mode == "auto" else "torch"
                             }
         # Unsupported logical rank must fail before momentum/parameter mutation.
-        param = nn.Parameter(distribute_tensor(torch.ones(2, 3, 4), mesh, [Shard(0)]))
-        param.grad = distribute_tensor(torch.ones(2, 3, 4), mesh, [Shard(0)])
+        param = nn.Parameter(
+            distribute_tensor(torch.ones(2, 3, 4, device=device), mesh, [Shard(0)])
+        )
+        param.grad = distribute_tensor(
+            torch.ones(2, 3, 4, device=device), mesh, [Shard(0)]
+        )
         before = param.full_tensor().clone()
         with pytest.raises(ValueError, match="2D"):
             ShardedMuon([param])
@@ -140,7 +152,10 @@ def _worker(rank, world, rendezvous, output, batched=False):
 
 
 @pytest.mark.distributed
-@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "world", [pytest.param(n, marks=requires_nccl(n)) for n in (2, 4, 8)]
+)
 def test_sharded_muon_parameters_momentum_dispatch_and_resume(tmp_path, world):
     mp.spawn(
         _worker,
@@ -151,6 +166,8 @@ def test_sharded_muon_parameters_momentum_dispatch_and_resume(tmp_path, world):
 
 
 @pytest.mark.distributed
+@pytest.mark.cuda
+@requires_nccl(2)
 def test_batched_sharded_muon_preserves_momentum_and_resume(tmp_path):
     mp.spawn(
         _worker,

@@ -1,11 +1,11 @@
 """Tests for :func:`broadcast_state_dict` and distributed ``create_ref_model``.
 
-Uses ``spawn_parallel_fn`` with the ``gloo`` backend to simulate a
-multi-rank environment without requiring multiple GPUs.
+Uses CUDA ranks and NCCL to check values, rank-local devices and storage reuse.
 """
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from astrai.model.autoregressive_lm import AutoRegressiveLM
@@ -13,14 +13,18 @@ from astrai.parallel import get_rank, spawn_parallel_fn
 from astrai.parallel.executor import broadcast_state_dict
 from astrai.trainer.components import create_ref_model
 from astrai.trainer.strategy import GRPOStrategy
+from tests.support.capabilities import requires_nccl
 from tests.support.models import make_rollout_config
 
 
 def _broadcast_worker():
+    device = torch.device("cuda", torch.cuda.current_device())
     for reuse_storage in (False, True):
         expected = {
-            "layer.weight": torch.arange(32, dtype=torch.float32).view(4, 8),
-            "layer.bias": torch.full((4,), -0.5),
+            "layer.weight": torch.arange(32, dtype=torch.float32, device=device).view(
+                4, 8
+            ),
+            "layer.bias": torch.full((4,), -0.5, device=device),
         }
         state = (
             {key: value.clone() for key, value in expected.items()}
@@ -34,13 +38,16 @@ def _broadcast_worker():
         assert set(received) == set(expected)
         for key, reference in expected.items():
             torch.testing.assert_close(received[key], reference, atol=0, rtol=0)
-            assert received[key].device.type == "cpu"
+            assert received[key].device == device
             if key in pointers:
                 assert received[key].data_ptr() == pointers[key]
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_broadcast_values_and_compatible_storage():
-    spawn_parallel_fn(_broadcast_worker, world_size=2, backend="gloo")
+    spawn_parallel_fn(_broadcast_worker, world_size=2, backend="nccl")
 
 
 def _rank_zero_state_dict(model):
@@ -51,8 +58,9 @@ def _create_ref_model_worker():
     """Verify create_ref_model works when model_state_dict returns None on non-rank-0."""
 
     rank = get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
     config = make_rollout_config()
-    model = AutoRegressiveLM(config).to("cpu")
+    model = AutoRegressiveLM(config).to(device)
     # Give each rank distinct weights so we can verify broadcast overwrites them
     with torch.no_grad():
         for p in model.parameters():
@@ -66,7 +74,7 @@ def _create_ref_model_worker():
         model_fn=lambda: AutoRegressiveLM(config),
         executor=executor,
         model=model,
-        device="cpu",
+        device=device,
     )
 
     assert ref is not None, f"rank {rank}: ref model is None"
@@ -86,17 +94,21 @@ def _create_ref_model_worker():
         assert not p.requires_grad
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_create_ref_model_distributed():
-    spawn_parallel_fn(_create_ref_model_worker, world_size=2, backend="gloo")
+    spawn_parallel_fn(_create_ref_model_worker, world_size=2, backend="nccl")
 
 
 def _sync_old_model_worker():
     """Verify that sync_old_model broadcasts weights to all ranks."""
     rank = get_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
     config = make_rollout_config()
-    model = AutoRegressiveLM(config).to("cpu")
-    old_model = AutoRegressiveLM(config).to("cpu")
-    ref_model = AutoRegressiveLM(config).to("cpu")
+    model = AutoRegressiveLM(config).to(device)
+    old_model = AutoRegressiveLM(config).to(device)
+    ref_model = AutoRegressiveLM(config).to(device)
 
     # Give model rank-distinct weights
     with torch.no_grad():
@@ -105,7 +117,7 @@ def _sync_old_model_worker():
 
     strategy = GRPOStrategy(
         model=model,
-        device="cpu",
+        device=device,
         old_model=old_model,
         ref_model=ref_model,
         executor=SimpleNamespace(
@@ -127,8 +139,11 @@ def _sync_old_model_worker():
         assert torch.equal(old_sd[k], expected[k]), f"rank {rank}: mismatch at {k}"
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_sync_old_model_distributed():
-    spawn_parallel_fn(_sync_old_model_worker, world_size=2, backend="gloo")
+    spawn_parallel_fn(_sync_old_model_worker, world_size=2, backend="nccl")
 
 
 def test_create_ref_model_single_process():

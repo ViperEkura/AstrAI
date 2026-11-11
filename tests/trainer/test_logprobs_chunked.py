@@ -9,6 +9,7 @@ agree numerically (up to bf16 GEMM tiling noise) for every reduction.
 
 from datetime import timedelta
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -17,6 +18,7 @@ from torch.nn.parallel import DistributedDataParallel
 from astrai.parallel.setup import find_free_port
 from astrai.trainer.strategy import get_logprobs, rollout_token_logprobs
 from astrai.trainer.strategy import ops as strategy_module
+from tests.support.capabilities import requires_nccl
 from tests.support.models import make_model
 
 
@@ -146,8 +148,10 @@ def test_packed_rollout_logprobs_keep_the_grad_chunked_choice(cpu_device, monkey
 
 
 def _ddp_packed_worker(rank, world_size, port):
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
     dist.init_process_group(
-        "gloo",
+        "nccl",
         rank=rank,
         world_size=world_size,
         init_method=f"tcp://127.0.0.1:{port}",
@@ -155,13 +159,13 @@ def _ddp_packed_worker(rank, world_size, port):
     )
     try:
         torch.manual_seed(0)
-        model, _ = make_model("cpu")
+        model, _ = make_model(device)
         wrapped = DistributedDataParallel(model)
-        prompts = torch.randint(3, 200, (1, 4))
-        prompt_mask = torch.tensor([[False, False, True, True]])
+        prompts = torch.randint(3, 200, (1, 4), device=device)
+        prompt_mask = torch.tensor([[False, False, True, True]], device=device)
         prompts[~prompt_mask] = 0
-        responses = torch.randint(3, 200, (1, 3, 5))
-        masks = torch.ones(1, 3, 5, dtype=torch.bool)
+        responses = torch.randint(3, 200, (1, 3, 5), device=device)
+        masks = torch.ones(1, 3, 5, dtype=torch.bool, device=device)
         masks[0, :2, 2:] = False
         responses[~masks] = 0
         ref = rollout_token_logprobs(model, prompts, prompt_mask, responses, masks)
@@ -185,6 +189,9 @@ def _ddp_packed_worker(rank, world_size, port):
         dist.destroy_process_group()
 
 
+@pytest.mark.cuda
+@pytest.mark.distributed
+@requires_nccl(2)
 def test_packed_rollout_logprobs_run_through_ddp():
     mp.spawn(_ddp_packed_worker, args=(2, find_free_port()), nprocs=2)
 

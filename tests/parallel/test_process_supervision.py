@@ -19,8 +19,9 @@ from astrai.parallel.setup import (
     spawn_parallel_fn,
 )
 from astrai.signal_handler import register_signal_handlers
+from tests.support.capabilities import requires_nccl
 
-pytestmark = pytest.mark.distributed
+pytestmark = [pytest.mark.distributed, pytest.mark.cuda, requires_nccl(2)]
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,10 +46,11 @@ def _loop_rank(pid_dir, shutdown_delay=0.0):
     """
     flag = _Flag()
     register_signal_handlers(flag)
+    device = torch.device("cuda", torch.cuda.current_device())
+    dist.all_reduce(torch.ones(1, device=device))
     Path(pid_dir, f"rank{dist.get_rank()}.pid").write_text(str(os.getpid()))
-    device = torch.device("cpu")
     while True:
-        dist.all_reduce(torch.ones(64))
+        dist.all_reduce(torch.ones(64, device=device))
         if agree_stop(flag.stopped, device):
             break
     if shutdown_delay:
@@ -85,21 +87,24 @@ def _signal_rank(directory, rank: int, signum: int) -> threading.Thread:
     return thread
 
 
-def test_killed_rank_stops_the_launcher(tmp_path):
+def test_killed_rank_stops_the_launcher(tmp_path, monkeypatch):
+    # Exercise both cleanup windows without waiting the production grace period.
+    grace = 1.0
+    monkeypatch.setattr(parallel_setup, "SHUTDOWN_GRACE_SECONDS", grace)
     killer = _signal_rank(tmp_path, 1, signal.SIGKILL)
     started = time.monotonic()
     with pytest.raises(Exception) as info:
         spawn_parallel_fn(
             _loop_rank,
             world_size=2,
-            backend="gloo",
-            device_type="cpu",
+            backend="nccl",
+            device_type="cuda",
             pid_dir=str(tmp_path),
         )
     elapsed = time.monotonic() - started
     killer.join(timeout=5)
 
-    assert elapsed < SHUTDOWN_GRACE_SECONDS + 30, f"launcher took {elapsed:.1f}s"
+    assert elapsed < 2 * grace + 30, f"launcher took {elapsed:.1f}s"
     assert "SIGKILL" in str(info.value) or "process 1" in str(info.value)
     assert not any(
         _alive(int((tmp_path / f"rank{rank}.pid").read_text())) for rank in (0, 1)
@@ -113,8 +118,8 @@ def test_rank_signal_stops_every_rank(tmp_path):
         spawn_parallel_fn(
             _loop_rank,
             world_size=2,
-            backend="gloo",
-            device_type="cpu",
+            backend="nccl",
+            device_type="cuda",
             pid_dir=str(tmp_path),
         )
     elapsed = time.monotonic() - started
@@ -134,8 +139,8 @@ def test_graceful_stop_waits_for_slow_rank_shutdown(tmp_path, monkeypatch):
         spawn_parallel_fn(
             _loop_rank,
             world_size=2,
-            backend="gloo",
-            device_type="cpu",
+            backend="nccl",
+            device_type="cuda",
             pid_dir=str(tmp_path),
             shutdown_delay=0.5,
         )
@@ -152,8 +157,8 @@ def test_ranks_exit_with_the_launcher(tmp_path):
         "from astrai.parallel.setup import spawn_parallel_fn\n"
         f"from {__name__} import _loop_rank\n"
         "if __name__ == '__main__':\n"
-        "    spawn_parallel_fn(_loop_rank, world_size=2, backend='gloo',\n"
-        "                      device_type='cpu', pid_dir=sys.argv[1])\n"
+        "    spawn_parallel_fn(_loop_rank, world_size=2, backend='nccl',\n"
+        "                      device_type='cuda', pid_dir=sys.argv[1])\n"
     )
     env = {**os.environ, "PYTHONPATH": str(ROOT)}
     proc = subprocess.Popen(

@@ -31,95 +31,40 @@ continues to use section/role masks.
 
 ## Tool-call SFT
 
-See the runnable [example configuration](../examples/tool_sft/pipeline.json),
-[JSONL data](../examples/tool_sft/data.jsonl), and
-[chat template](../examples/tool_sft/chat_template.jinja).
-Each JSONL row contains a complete dialogue:
+Enable `input.chat_template_mask: true` with exactly one messages section whose
+`template` is `true` and `action` is `$role`, and no `input.sources`. Each JSONL
+record supplies a complete `messages` dialogue and optional top-level `tools`.
+Assistant messages carry `tool_calls`; tool results reference their calls through
+`tool_call_id`. Serving preserves these historical fields.
 
-```json
-{
-  "tools": [{"type": "function", "function": {
-    "name": "get_weather",
-    "description": "Get weather for a city",
-    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-  }}],
-  "messages": [
-    {"role": "user", "content": "Weather in Beijing?"},
-    {"role": "assistant", "content": null, "tool_calls": [
-      {"id": "call_1", "type": "function", "function": {
-        "name": "get_weather", "arguments": {"city": "Beijing"}
-      }}
-    ]},
-    {"role": "tool", "tool_call_id": "call_1", "content": "18 C, sunny"},
-    {"role": "assistant", "content": "It is sunny and 18 C in Beijing."}
-  ]
-}
-```
+`function.arguments` accepts an object or a JSON string containing an object.
+Rendering normalizes it without modifying the input. Malformed JSON and
+non-object arguments raise an error; parameter-schema validation is not included.
+Tool results use string `content`.
 
-`function.arguments` accepts either an object or a JSON string containing an
-object. Rendering normalizes it to an object without modifying the input.
-Malformed JSON and non-object arguments raise an error. This is format
-validation, not validation against each function's parameter schema. Tool
-results use string `content`; multimodal messages are outside this example.
-
-Enable the new path with exactly one template section and no `input.sources`:
-
-```json
-"input": {
-  "chat_template_mask": true,
-  "sections": [{"field": "messages", "action": "$role", "template": true}]
-}
-```
-
-In this mode, generation blocks are authoritative: `mask`, `mask_default` and
-section `add_special_tokens` do not override them. The example marks **all**
-assistant turns, including call JSON and end-of-turn tokens; user text, tool
-definitions, tool results and assistant headers remain context-only. Ordinary
-chat rows without `tools` can be mixed into the same file. The causal label shift
+Supply a checkpoint-compatible chat template that renders tool definitions,
+calls and results. Mark every assistant output to train, including call JSON and
+end-of-turn tokens, with `{% generation %}` blocks. Leave user/system messages
+and tool results outside those blocks. Generation blocks are authoritative:
+`mask`, `mask_default` and section `add_special_tokens` do not override them.
+Ordinary chat rows can be mixed with tool dialogues. The causal label shift
 still happens in the SFT collator; do not shift the stored mask yourself.
 
-The example emits `{"name": "...", "arguments": {...}}` for each call, matching
-the server's `SimpleJsonToolParser`. Parallel calls are newline-separated JSON
-objects. IDs remain in structured messages; tool results resolve their
-`tool_call_id` against preceding calls and render the function name, arguments
-and result. The model does not need to generate arbitrary call IDs. Serving
-preserves the historical call fields and uses the same saved template.
+The server's `SimpleJsonToolParser` recognizes call objects containing `name`
+and `arguments`, including multiple separate objects. It returns complete JSON
+argument values for execution and replay. Use the same saved template during
+preprocessing and serving, with delimiters and stop tokens matching the model's
+vocabulary. BOS, if needed, belongs in the template; no extra BOS is prepended.
+Regenerate existing preprocessing caches when the template or mask changes.
 
-Install the template into a **new** tokenizer directory before preprocessing:
-
-```python
-from pathlib import Path
-from astrai.tokenize import AutoTokenizer
-
-tokenizer = AutoTokenizer("path/to/base-tokenizer")
-tokenizer.set_chat_template(Path("docs/examples/tool_sft/chat_template.jinja").read_text())
-tokenizer.save_pretrained("path/to/tool-tokenizer")
-```
-
-The example uses AstrAI's `<｜im▁start｜>` / `<｜im▁end｜>` delimiters. Adapt them
-to the model's existing vocabulary and configure the matching end-of-turn stop
-token for serving. Do not add vocabulary entries to an existing checkpoint
-without also resizing its embeddings. BOS, if needed, belongs in the template;
-this path does not prepend an extra BOS.
-
-```bash
-.venv/bin/python scripts/tools/preprocess.py docs/examples/tool_sft/data.jsonl \
-  --config docs/examples/tool_sft/pipeline.json \
-  --tokenizer_path path/to/tool-tokenizer --output_dir path/to/tool-sft-bin
-```
-
-Use the resulting binary dataset with the existing SFT trainer. Save/use the
-same tokenizer template with the trained checkpoint. Regenerate existing
-preprocessed datasets to change their template or supervision mask.
-
-Token IDs are identical to encoding the full rendered conversation, with masks
-derived from character offsets. A token spanning both context and generation
-is rejected rather than assigned ambiguous supervision; use token-aligned
-delimiters. Generation blocks can sit directly in the template or in ordinary
-`for`/`if` blocks, but cannot be nested or wrapped in buffered constructs such
-as macros, `set`, `filter`, or recursive loops. The builder rejects samples without any supervised
-tokens; the pipeline logs these failures and skips the invalid records. Existing truncation/packing settings still apply;
-choose a context length that retains the required tool exchanges.
+Token IDs match encoding the full rendered dialogue; character offsets define
+the mask. Tokens spanning context and generation are rejected. Use token-aligned
+delimiters. Generation blocks may appear directly or in ordinary `for`/`if`
+blocks, but not nested or inside buffered constructs such as macros, `set`,
+`filter`, or recursive loops. The builder rejects samples with no supervised
+tokens; the pipeline logs failures and skips those records. Existing
+truncation/packing settings apply, so retain the required tool exchanges within
+the configured context length.
 
 ## Config Structure
 

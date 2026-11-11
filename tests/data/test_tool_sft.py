@@ -3,7 +3,6 @@
 import json
 import pickle
 from copy import deepcopy
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -19,13 +18,113 @@ from astrai.preprocessing.pipeline import Pipeline
 from astrai.tokenize import AutoTokenizer, ChatTemplate
 from tests.support.tokenizers import build_test_tokenizer
 
-EXAMPLE = Path(__file__).resolve().parents[2] / "docs" / "examples" / "tool_sft"
+# Test-only conversation template; production templates belong to checkpoints.
+TOOL_TEMPLATE = r"""{%- if bos_token is defined and bos_token %}{{ bos_token }}{% endif -%}
+{%- if tools is defined and tools -%}
+{{- '<｜im▁start｜>system\nAvailable tools: ' + (tools | tojson) + '\nCall a tool with a JSON object containing name and arguments.\n<｜im▁end｜>' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{{- '<｜im▁start｜>' + message['role'] + '\n' -}}
+{%- if message['role'] == 'assistant' -%}
+{%- generation -%}
+{{- message.get('content') or '' -}}
+{%- for call in message.get('tool_calls') or [] -%}
+{{- '\n' if message.get('content') or not loop.first else '' -}}
+{{- {'name': call['function']['name'], 'arguments': call['function']['arguments']} | tojson -}}
+{%- endfor -%}
+{{- '<｜im▁end｜>' -}}
+{%- endgeneration -%}
+{%- elif message['role'] == 'tool' -%}
+{# Resolve IDs in history; generated JSON does not need to invent call IDs. #}
+{%- set matched = namespace(function=none) -%}
+{%- for previous in messages[:loop.index0] -%}
+{%- for call in previous.get('tool_calls') or [] -%}
+{%- if call.get('id') and call['id'] == message.get('tool_call_id') -%}
+{%- set matched.function = call['function'] -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- if matched.function is none -%}
+{{- raise_exception('Tool result must reference a preceding tool call ID') -}}
+{%- endif -%}
+{{- {'name': matched.function['name'], 'arguments': matched.function['arguments'], 'result': message.get('content') or ''} | tojson -}}
+{{- '<｜im▁end｜>' -}}
+{%- else -%}
+{{- message.get('content') or '' -}}{{- '<｜im▁end｜>' -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<｜im▁start｜>assistant\n' -}}
+{%- endif -%}
+"""
 START, END = "<｜im▁start｜>", "<｜im▁end｜>"
 
 
 @pytest.fixture
 def record():
-    return json.loads(EXAMPLE.joinpath("data.jsonl").read_text().splitlines()[0])
+    return {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ],
+        "messages": [
+            {"role": "user", "content": "北京现在天气怎么样？"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city":"北京"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": '{"temperature_c":18,"condition":"晴"}',
+            },
+            {"role": "assistant", "content": "北京现在晴，气温 18°C。"},
+        ],
+    }
+
+
+@pytest.fixture
+def config():
+    return PipelineConfig.from_dict(
+        {
+            "input": {
+                "chat_template_mask": True,
+                "sections": [
+                    {"field": "messages", "action": "$role", "template": True}
+                ],
+            },
+            "preprocessing": {
+                "max_seq_len": 8192,
+                "max_packed_len": 8192,
+                "overflow": "truncate",
+                "packing": "bfd",
+            },
+            "output": {
+                "record_keys": ["sequence", "loss_mask", "seq_lengths"],
+                "dtype": {"loss_mask": "bool"},
+            },
+        }
+    )
 
 
 @pytest.fixture
@@ -35,7 +134,7 @@ def tokenizer():
         add_prefix_space=False,
         train_data=[chr(i) for i in range(256)]
         + ["北京现在天气怎么样？晴，气温 18°C。上海下雨谢谢不客气你好"],
-        chat_template=EXAMPLE.joinpath("chat_template.jinja").read_text(),
+        chat_template=TOOL_TEMPLATE,
     )
     tokenizer._tokenizer.decoder = decoders.ByteLevel()
     return tokenizer
@@ -138,8 +237,7 @@ def test_batch_and_template_save_reload(tokenizer, record, tmp_path):
     )
 
 
-def test_pipeline_packing_preserves_supervision(tokenizer, record, tmp_path):
-    config = PipelineConfig.from_file(str(EXAMPLE / "pipeline.json"))
+def test_pipeline_packing_preserves_supervision(tokenizer, record, config, tmp_path):
     records = [
         record,
         {
@@ -232,9 +330,8 @@ def test_reject_token_crossing_mask_boundary():
     ] == [1]
 
 
-def test_no_generation_supervision_fails(tokenizer, record):
+def test_no_generation_supervision_fails(tokenizer, record, config):
     tokenizer.set_chat_template("{{ messages | tojson }}")
-    config = PipelineConfig.from_file(str(EXAMPLE / "pipeline.json"))
     with pytest.raises(ValueError, match="no supervised tokens"):
         SingleOutputMaskBuilder().build(record, config, tokenizer)
     with pytest.raises(ValueError, match="tokenize=True"):

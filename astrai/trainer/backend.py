@@ -72,6 +72,7 @@ def run_batch(
     ):
         raise ValueError("seeds must contain one integer in [0, 2**63) per request")
     requests, errors = [], []
+    batch_id = uuid.uuid4().hex
     for index, ids in enumerate(prompt_ids_list):
         error = None
         if not ids:
@@ -88,7 +89,7 @@ def run_batch(
         request = None
         if error is None:
             request = Request(
-                f"batch_{uuid.uuid4().hex}",
+                f"batch_{batch_id}_{index:08d}",
                 ids,
                 limit,
                 temperature,

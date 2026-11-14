@@ -29,6 +29,7 @@ from torch import nn
 from astrai.inference.core.engine_core import EngineCore
 from astrai.inference.core.events import FINISH_STOP_TOKEN
 from astrai.inference.core.request import GenerationResult, Request
+from astrai.inference.sampling_rng import validate_seed
 from astrai.parallel.executor import strip_compile_prefix
 
 T = TypeVar("T")
@@ -61,6 +62,7 @@ def run_batch(
     return_logprobs: bool = False,
     return_details: bool = False,
     seeds: Optional[List[int]] = None,
+    request_seeds: Optional[List[int]] = None,
 ) -> List[Any]:
     """Generate a rollout batch and restore its original request order."""
     if seeds is not None and (
@@ -71,7 +73,15 @@ def run_batch(
         )
     ):
         raise ValueError("seeds must contain one integer in [0, 2**63) per request")
+    if request_seeds is not None:
+        if seeds is not None:
+            raise ValueError("seeds and request_seeds are mutually exclusive")
+        if len(request_seeds) != len(prompt_ids_list):
+            raise ValueError("one sampling seed is required per request")
+        for seed in request_seeds:
+            validate_seed(seed)
     requests, errors = [], []
+    batch_id = uuid.uuid4().hex
     for index, ids in enumerate(prompt_ids_list):
         error = None
         if not ids:
@@ -88,7 +98,7 @@ def run_batch(
         request = None
         if error is None:
             request = Request(
-                f"batch_{uuid.uuid4().hex}",
+                f"batch_{batch_id}_{index:08d}",
                 ids,
                 limit,
                 temperature,
@@ -97,6 +107,7 @@ def run_batch(
                 frequency_penalty,
                 rep_window,
                 seed=None if seeds is None else seeds[index],
+                sampling_seed=None if request_seeds is None else request_seeds[index],
             )
         requests.append(request)
         errors.append(error)
@@ -218,6 +229,7 @@ class ReplicaBackend:
         max_seq_len: Optional[int] = None,
         policy_version: int = 0,
         enable_cuda_graph: bool = True,
+        enable_overlap: bool = False,
     ):
         model.eval()
         with _device_context(device):
@@ -228,6 +240,7 @@ class ReplicaBackend:
                 max_seq_len=max_seq_len,
                 device=str(device) if isinstance(device, torch.device) else device,
                 enable_cuda_graph=enable_cuda_graph,
+                enable_overlap=enable_overlap,
                 policy_version=policy_version,
             )
         self.model = model

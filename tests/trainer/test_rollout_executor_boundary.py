@@ -19,7 +19,7 @@ from astrai.trainer.context import TrainContextBuilder
 from astrai.trainer.context import builder as train_context_builder
 from astrai.trainer.rollout.setup import resolve_async_rollout
 from astrai.trainer.rollout.types import SamplingParams
-from tests.support.inference import make_cpu_scheduler
+from tests.support.inference import make_cpu_model, make_cpu_scheduler
 from tests.support.models import make_rollout_config
 from tests.support.tokenizers import FakeTokenizer
 
@@ -61,6 +61,40 @@ def _online_train_config(dp_mode):
         dp_mode=dp_mode,
         reward_model_fn=object,
     )
+
+
+@pytest.mark.parametrize("enable_overlap", [False, True])
+def test_rollout_enable_overlap_reaches_engine_core(monkeypatch, enable_overlap):
+    captured = {}
+
+    class _EngineCore:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(train_context_builder, "EngineCore", _EngineCore)
+    monkeypatch.setattr(
+        train_context_builder.AutoTokenizer,
+        "from_pretrained",
+        lambda _param_path: FakeTokenizer(),
+    )
+    context = SimpleNamespace(
+        model=make_cpu_model(),
+        executor=NoneExecutor(),
+        checkpoint=None,
+        optimizer_step=0,
+        strategy=SimpleNamespace(supports_online=lambda: True),
+    )
+    builder = TrainContextBuilder(
+        _config(
+            rollout_mode="sync",
+            rollout_devices=[],
+            rollout_enable_overlap=enable_overlap,
+        )
+    )
+
+    builder._configure_rollout(context, {"group_size": 2})
+
+    assert captured["enable_overlap"] is enable_overlap
 
 
 def test_online_rollout_rejects_torch_compile_before_scheduler(monkeypatch):

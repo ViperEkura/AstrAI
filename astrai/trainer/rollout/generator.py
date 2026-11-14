@@ -1,11 +1,13 @@
 """Generate grouped responses through the shared inference backend."""
 
 import threading
+from collections import Counter
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from astrai.inference.core.request import GenerationResult
+from astrai.inference.sampling_rng import request_seed
 from astrai.trainer.backend import RolloutBackend
 from astrai.trainer.rollout.types import _PAD, RawRollout, SamplingParams, T
 
@@ -120,6 +122,22 @@ class RolloutGenerator:
         for ids in flat_prompt_ids:
             expanded_prompt_ids.extend([list(ids)] * G)
 
+        sampling_options = {"seeds": seeds} if seeds is not None else {}
+        if params.seed is not None and seeds is None:
+            occurrences = Counter()
+            seeds = []
+            for ids in flat_prompt_ids:
+                key = tuple(ids)
+                occurrence = occurrences[key]
+                occurrences[key] += 1
+                seeds.extend(
+                    request_seed(
+                        params.seed, generation_version, ids, index, occurrence
+                    )
+                    for index in range(G)
+                )
+            sampling_options["request_seeds"] = seeds
+
         results = self.backend.generate(
             expanded_prompt_ids,
             max_tokens=params.max_tokens,
@@ -130,7 +148,7 @@ class RolloutGenerator:
             rep_window=params.rep_window,
             return_logprobs=True,
             return_details=True,
-            **({"seeds": seeds} if seeds is not None else {}),
+            **sampling_options,
         )
         if len(results) != B * G:
             raise RuntimeError(

@@ -1,9 +1,12 @@
 import json
+from contextvars import ContextVar
+from copy import deepcopy
 from datetime import datetime
 from functools import cached_property
 from typing import Any, Dict, List, Optional
 
-from jinja2 import Template, TemplateError
+from jinja2 import Template, TemplateError, nodes
+from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 MessageType = Dict[str, Any]
@@ -25,6 +28,94 @@ def _tojson(value, ensure_ascii=False, indent=None, separators=None, sort_keys=F
 
 def _strftime_now(format):
     return datetime.now().strftime(format)
+
+
+_generation_tracker = ContextVar("generation_tracker", default=None)
+
+
+class GenerationExtension(Extension):
+    """Record character spans without inserting markers into rendered text."""
+
+    tags = {"generation"}
+
+    def parse(self, parser):
+        lineno = next(parser.stream).lineno
+        body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+        return nodes.CallBlock(self.call_method("capture"), [], [], body).set_lineno(
+            lineno
+        )
+
+    def capture(self, caller):
+        tracker = _generation_tracker.get()
+        if tracker is None:
+            return caller()
+        if tracker["inside"]:
+            raise ValueError("Nested generation blocks are not supported")
+        tracker["inside"] = True
+        try:
+            text = caller()
+        finally:
+            tracker["inside"] = False
+        start = tracker["position"]
+        tracker["spans"].append((start, start + len(text)))
+        return text
+
+
+def _validate_generation_blocks(node, parents=()):
+    """Generation spans require blocks that stream directly to the root."""
+    is_generation = (
+        isinstance(node, nodes.CallBlock)
+        and isinstance(node.call.node, nodes.ExtensionAttribute)
+        and node.call.node.identifier == GenerationExtension.identifier
+    )
+    if is_generation and any(
+        not isinstance(parent, (nodes.Template, nodes.For, nodes.If, nodes.Scope))
+        or (isinstance(parent, nodes.For) and parent.recursive)
+        for parent in parents
+    ):
+        raise ValueError(
+            "Generation blocks cannot be nested or placed in buffered constructs "
+            "(macros, set/filter/call blocks, or recursive loops)"
+        )
+    for child in node.iter_child_nodes():
+        _validate_generation_blocks(child, parents + (node,))
+
+
+class ToolCallValidationError(ValueError):
+    """Invalid tool-call history supplied by the caller."""
+
+
+def normalize_tool_messages(messages):
+    """Accept API JSON-string arguments and template-native objects without mutation."""
+    result = deepcopy(messages)
+    for message in result:
+        calls = message.get("tool_calls")
+        if calls is None:
+            continue
+        if not isinstance(calls, list):
+            raise ToolCallValidationError("tool_calls must be a list")
+        for call in calls:
+            if not isinstance(call, dict) or call.get("type", "function") != "function":
+                raise ToolCallValidationError("Only function tool calls are supported")
+            function = call.get("function")
+            if (
+                not isinstance(function, dict)
+                or not isinstance(function.get("name"), str)
+                or not function["name"]
+            ):
+                raise ToolCallValidationError("Tool calls require a function name")
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as error:
+                    raise ToolCallValidationError(
+                        "Tool arguments must contain valid JSON"
+                    ) from error
+            if not isinstance(arguments, dict):
+                raise ToolCallValidationError("Tool arguments must be a JSON object")
+            function["arguments"] = arguments
+    return result
 
 
 class ChatTemplate:
@@ -64,13 +155,17 @@ class ChatTemplate:
         the cache on first render.
         """
         environment = ImmutableSandboxedEnvironment(
-            trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"]
+            trim_blocks=True,
+            lstrip_blocks=True,
+            extensions=["jinja2.ext.loopcontrols", GenerationExtension],
         )
         environment.filters["tojson"] = _tojson
         environment.globals.update(
             raise_exception=_raise_exception, strftime_now=_strftime_now
         )
-        return environment.from_string(self.template_str)
+        parsed = environment.parse(self.template_str)
+        _validate_generation_blocks(parsed)
+        return environment.from_string(parsed)
 
     def __getstate__(self) -> Dict[str, Any]:
         """Exclude the cached Jinja2 template from pickling.
@@ -123,8 +218,23 @@ class ChatTemplate:
         """
         # Merge default variables, special tokens, and extra variables
         variables = {**self.default_variables, **self.special_tokens, **extra_variables}
-        variables["messages"] = messages
+        variables["messages"] = normalize_tool_messages(messages)
         if system_prompt is not None:
             variables["system_prompt"] = system_prompt
 
         return self._compiled.render(**variables)
+
+    def render_with_spans(self, messages, **extra_variables):
+        """Render once and track template-declared generation regions."""
+        variables = {**self.default_variables, **self.special_tokens, **extra_variables}
+        variables["messages"] = normalize_tool_messages(messages)
+        tracker = {"position": 0, "spans": [], "inside": False}
+        token = _generation_tracker.set(tracker)
+        parts = []
+        try:
+            for part in self._compiled.generate(**variables):
+                parts.append(part)
+                tracker["position"] += len(part)
+        finally:
+            _generation_tracker.reset(token)
+        return "".join(parts), tracker["spans"]

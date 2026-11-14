@@ -4,13 +4,13 @@ Tokenizer module with implementation and auto-loading support.
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from tokenizers import AddedToken, Tokenizer
 
 from astrai.tokenize.chat_template import ChatTemplate
 
-Message = Dict[str, str]
+Message = Dict[str, Any]
 """Single chat message with ``role`` and ``content`` keys."""
 
 Messages = List[Message]
@@ -273,8 +273,9 @@ class AutoTokenizer:
         system_prompt: Optional[str] = None,
         tokenize: bool = True,
         add_generation_prompt: bool = True,
+        return_assistant_tokens_mask: bool = False,
         **kwargs,
-    ) -> Union[str, List[int], List[str], List[List[int]]]:
+    ) -> Union[str, List[int], List[str], List[List[int]], Dict[str, Any]]:
         """Apply the chat template and optionally tokenize.
 
         Accepts both single conversations and batches:
@@ -292,6 +293,8 @@ class AutoTokenizer:
             system_prompt: Optional system prompt prepended (single mode only).
             tokenize: Whether to return token IDs (True) or raw string (False).
             add_generation_prompt: Whether to add the generation prompt.
+            return_assistant_tokens_mask: Return input_ids and assistant_masks
+                from template generation blocks, using full-text token offsets.
             **kwargs: Additional template variables.
 
         Returns:
@@ -304,6 +307,49 @@ class AutoTokenizer:
             )
 
         is_batch = bool(messages) and isinstance(messages[0], list)
+        if return_assistant_tokens_mask:
+            if not tokenize:
+                raise ValueError("Assistant token masks require tokenize=True")
+            if self._tokenizer is None:
+                raise RuntimeError("Tokenizer not initialized")
+            conversations = messages if is_batch else [messages]
+            outputs = []
+            for conversation in conversations:
+                if system_prompt and not is_batch:
+                    conversation = [
+                        {"role": "system", "content": system_prompt}
+                    ] + list(conversation)
+                text, spans = self._chat_template.render_with_spans(
+                    conversation, add_generation_prompt=add_generation_prompt, **kwargs
+                )
+                merged_spans = []
+                for start, end in spans:
+                    if merged_spans and start == merged_spans[-1][1]:
+                        merged_spans[-1] = (merged_spans[-1][0], end)
+                    elif end > start:
+                        merged_spans.append((start, end))
+                encoded = self._tokenizer.encode(text, add_special_tokens=False)
+                mask = []
+                for start, end in encoded.offsets:
+                    overlaps = [
+                        (a, b)
+                        for a, b in merged_spans
+                        if start < b and end > a and end > start
+                    ]
+                    if overlaps and not any(
+                        a <= start and end <= b for a, b in overlaps
+                    ):
+                        raise ValueError(
+                            "A token crosses a generation boundary; use token-aligned delimiters"
+                        )
+                    mask.append(int(bool(overlaps)))
+                outputs.append({"input_ids": encoded.ids, "assistant_masks": mask})
+            if is_batch:
+                return {
+                    key: [output[key] for output in outputs]
+                    for key in ("input_ids", "assistant_masks")
+                }
+            return outputs[0]
 
         if is_batch:
             rendered = [

@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -216,6 +217,11 @@ def test_training_commits_small_epoch(
         grad_accum_steps=grad_accum_steps,
     )
     Trainer(config).train()
-    meta = load_checkpoint_meta(base_test_env["test_dir"])
+    expected_steps = 8 // (batch_per_device * grad_accum_steps)
+    # The periodic step-5 checkpoint may precede the final checkpoint in os.walk.
+    final_checkpoint = (
+        Path(base_test_env["test_dir"]) / f"epoch_0_step_{expected_steps}"
+    )
+    meta = load_checkpoint_meta(final_checkpoint)
     assert meta["consumed_samples"] == 8
-    assert meta["optimizer_step"] == 8 // (batch_per_device * grad_accum_steps)
+    assert meta["optimizer_step"] == expected_steps

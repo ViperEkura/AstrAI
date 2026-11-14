@@ -35,12 +35,26 @@ class InputConfig(BaseConfig):
         }}}
 
     Args:
+        chat_template_mask (bool): Render full conversations and supervise template generation blocks instead of role masks. Defaults to False.
         sections (Optional[List[Dict]]): Section list for single-output mode. Defaults to None.
         sources (Optional[Dict[str, Dict]]): Source map for multi-output mode, DPO/GRPO. Defaults to None.
     """
 
     sections: Optional[List[Dict]] = None
     sources: Optional[Dict[str, Dict]] = None
+    chat_template_mask: bool = False
+
+    def __post_init__(self):
+        if self.chat_template_mask and (
+            self.sources
+            or not self.sections
+            or len(self.sections) != 1
+            or self.sections[0].get("template") is not True
+            or self.sections[0].get("action") != "$role"
+        ):
+            raise ValueError(
+                "chat_template_mask requires one template section with action=$role and no sources"
+            )
 
 
 @dataclass(config=ConfigDict(extra="forbid"))

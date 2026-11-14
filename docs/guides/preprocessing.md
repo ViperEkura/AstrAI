@@ -9,6 +9,7 @@ Declarative JSON-driven data preprocessing. The built-in pipeline directly const
 - [Quick Start](#quick-start) — SFT Chat, SFT Instruction, Pretrain, DPO, GRPO examples
 - [Configuration Reference](#configuration-reference) — all fields
 - [Mask Algorithm](#mask-algorithm)
+- [Tool-call SFT](#tool-call-sft)
 - [Output Layout](#output-layout)
 - [Training Compatibility](#training-compatibility)
 - [CLI](#cli)
@@ -22,6 +23,48 @@ Declarative JSON-driven data preprocessing. The built-in pipeline directly const
 | `pipeline.json` (`mask`) | Masking -- which roles participate in training |
 
 A single config file captures the entire pipeline, reusable and version-controllable.
+
+With `input.chat_template_mask: true`, the chat template also defines supervision
+using `{% generation %}` blocks. This opt-in path renders each complete dialogue
+once, including its top-level `tools`, before tokenization. The default path
+continues to use section/role masks.
+
+## Tool-call SFT
+
+Enable `input.chat_template_mask: true` with exactly one messages section whose
+`template` is `true` and `action` is `$role`, and no `input.sources`. Each JSONL
+record supplies a complete `messages` dialogue and optional top-level `tools`.
+Assistant messages carry `tool_calls`; tool results reference their calls through
+`tool_call_id`. Serving preserves these historical fields.
+
+`function.arguments` accepts an object or a JSON string containing an object.
+Rendering normalizes it without modifying the input. Malformed JSON and
+non-object arguments raise an error; parameter-schema validation is not included.
+Tool results use string `content`.
+
+Supply a checkpoint-compatible chat template that renders tool definitions,
+calls and results. Mark every assistant output to train, including call JSON and
+end-of-turn tokens, with `{% generation %}` blocks. Leave user/system messages
+and tool results outside those blocks. Generation blocks are authoritative:
+`mask`, `mask_default` and section `add_special_tokens` do not override them.
+Ordinary chat rows can be mixed with tool dialogues. The causal label shift
+still happens in the SFT collator; do not shift the stored mask yourself.
+
+The server's `SimpleJsonToolParser` recognizes call objects containing `name`
+and `arguments`, including multiple separate objects. It returns complete JSON
+argument values for execution and replay. Use the same saved template during
+preprocessing and serving, with delimiters and stop tokens matching the model's
+vocabulary. BOS, if needed, belongs in the template; no extra BOS is prepended.
+Regenerate existing preprocessing caches when the template or mask changes.
+
+Token IDs match encoding the full rendered dialogue; character offsets define
+the mask. Tokens spanning context and generation are rejected. Use token-aligned
+delimiters. Generation blocks may appear directly or in ordinary `for`/`if`
+blocks, but not nested or inside buffered constructs such as macros, `set`,
+`filter`, or recursive loops. The builder rejects samples with no supervised
+tokens; the pipeline logs failures and skips those records. Existing
+truncation/packing settings apply, so retain the required tool exchanges within
+the configured context length.
 
 ## Config Structure
 

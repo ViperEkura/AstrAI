@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 from astrai.inference.frontend.engine import InferenceEngine
@@ -15,6 +16,7 @@ from astrai.inference.network.protocol import (
     sse_event,
 )
 from astrai.inference.network.tool_parser import BaseToolParser, SimpleJsonToolParser
+from astrai.tokenize.chat_template import ToolCallValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +54,14 @@ class OpenAIResponseBuilder(ResponseBuilder):
     def prepare(
         self, request: BaseModel, engine: InferenceEngine
     ) -> Tuple[str, GenContext, List[str]]:
-        messages = [{"role": m.role, "content": m.content} for m in request.messages]
+        messages = [m.model_dump(exclude_none=True) for m in request.messages]
         tools = _resolve_tools(request)
-        prompt = engine.tokenizer.apply_chat_template(
-            messages, tokenize=False, tools=tools or []
-        )
+        try:
+            prompt = engine.tokenizer.apply_chat_template(
+                messages, tokenize=False, tools=tools or []
+            )
+        except ToolCallValidationError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
         self._resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         self._model = request.model

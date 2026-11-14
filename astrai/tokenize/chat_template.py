@@ -81,6 +81,10 @@ def _validate_generation_blocks(node, parents=()):
         _validate_generation_blocks(child, parents + (node,))
 
 
+class ToolCallValidationError(ValueError):
+    """Invalid tool-call history supplied by the caller."""
+
+
 def normalize_tool_messages(messages):
     """Accept API JSON-string arguments and template-native objects without mutation."""
     result = deepcopy(messages)
@@ -89,27 +93,27 @@ def normalize_tool_messages(messages):
         if calls is None:
             continue
         if not isinstance(calls, list):
-            raise ValueError("tool_calls must be a list")
+            raise ToolCallValidationError("tool_calls must be a list")
         for call in calls:
             if not isinstance(call, dict) or call.get("type", "function") != "function":
-                raise ValueError("Only function tool calls are supported")
+                raise ToolCallValidationError("Only function tool calls are supported")
             function = call.get("function")
             if (
                 not isinstance(function, dict)
                 or not isinstance(function.get("name"), str)
                 or not function["name"]
             ):
-                raise ValueError("Tool calls require a function name")
+                raise ToolCallValidationError("Tool calls require a function name")
             arguments = function.get("arguments")
             if isinstance(arguments, str):
                 try:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError as error:
-                    raise ValueError(
+                    raise ToolCallValidationError(
                         "Tool arguments must contain valid JSON"
                     ) from error
             if not isinstance(arguments, dict):
-                raise ValueError("Tool arguments must be a JSON object")
+                raise ToolCallValidationError("Tool arguments must be a JSON object")
             function["arguments"] = arguments
     return result
 

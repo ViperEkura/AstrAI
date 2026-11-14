@@ -107,6 +107,53 @@ def test_http_protocol_preserves_text_usage_and_terminal_sequence(
     assert usage == expected_usage
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "arguments,detail",
+    [
+        ("{bad", "Tool arguments must contain valid JSON"),
+        ("[]", "Tool arguments must be a JSON object"),
+    ],
+)
+def test_chat_rejects_invalid_tool_arguments(
+    client, loaded_model, stream, arguments, detail
+):
+    loaded_model.tokenizer = build_test_tokenizer(chat_template=CHAT_TEMPLATE)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "stream": stream,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": arguments},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": detail}
+    loaded_model.generate_events.assert_not_called()
+
+
+def test_chat_does_not_relabel_internal_value_errors(client, loaded_model):
+    loaded_model.tokenizer.apply_chat_template.side_effect = ValueError(
+        "internal failure"
+    )
+    with pytest.raises(ValueError, match="internal failure"):
+        client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "Hi"}]},
+        )
+    loaded_model.generate_events.assert_not_called()
+
+
 def test_chat_completions_real_engine(tmp_path, client):
     """POST /v1/chat/completions with a real tiny model and tokenizer."""
     cfg = make_tiny_config(vocab_size=256)

@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 find_package(CUDAToolkit REQUIRED)
 include(cmake/arch.cmake)
+include(cmake/parallel.cmake)
 
 if(NOT DEFINED TORCH_HOME)
     set(TORCH_HOME "$ENV{TORCH_HOME}")
@@ -27,6 +28,11 @@ endif()
 
 function(astrai_compile_target target)
     set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # The pool caps concurrent TUs; --threads caps the threads inside one
+    # nvcc. Both come from cmake/parallel.cmake and multiply into the load.
+    if(ASTRAI_JOB_POOL)
+        set_target_properties(${target} PROPERTIES JOB_POOL_COMPILE ${ASTRAI_JOB_POOL})
+    endif()
     target_include_directories(${target} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
         "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -43,7 +49,7 @@ function(astrai_compile_target target)
         "$<$<COMPILE_LANGUAGE:CUDA>:--extra-device-vectorization>"
         "$<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin>"
         "$<$<COMPILE_LANGUAGE:CUDA>:--compress-all>"
-        "$<$<COMPILE_LANGUAGE:CUDA>:--threads=4>")
+        "$<$<COMPILE_LANGUAGE:CUDA>:--threads=${ASTRAI_NVCC_THREADS}>")
 endfunction()
 
 if(NOT ASTRAI_CUDA_ARCH_LIST)

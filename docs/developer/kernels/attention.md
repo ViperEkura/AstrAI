@@ -6,12 +6,15 @@
 ## Attention dispatch
 
 `AttentionDispatcher` builds an `AttentionSpec` for each call and selects a
-function from the `cuda`, `flash`, or `torch` modules in
+function from the `cuda`, `flash`, `varlen`, or `torch` modules in
 `astrai.extension.backend.attention`. There are no attention backend classes.
 
-Automatic selection tries CUDA, FlashAttention, then torch SDPA. CUDA handles
-supported inference calls with a KV cache; training calls requiring backward
-use FlashAttention or torch autograd. The compiled-kernel wrappers in
+Automatic selection tries CUDA, FlashAttention, PyTorch varlen attention,
+then torch SDPA. CUDA handles supported inference calls with a KV cache;
+document-packed training batches carry explicit offsets and valid-token
+indices for the varlen path. The 4D adapter removes padding and restores
+the padded output shape. The 3D adapter uses the KV cache's request offsets.
+Other training calls use FlashAttention or torch autograd. The compiled-kernel wrappers in
 `astrai.extension.kernel.attention` execute one exact kernel and do not fall
 back.
 

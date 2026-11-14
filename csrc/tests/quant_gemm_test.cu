@@ -445,6 +445,11 @@ static bool test_dtype_combos() {
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0, "w16a16 big 128x128", 0.02f);
         all &= check_pinned<__nv_bfloat16, __nv_bfloat16, Bf16Small>(
             ha.data(), hb.data(), 256, 256, k, k, k, 1, 0, "w16a16 small 64x64", 0.02f);
+        /*
+         * Decode row: m == 1 takes the row GEMV on the congruous routes and
+         * the tile route everywhere else; both must match the reference.
+         */
+        all &= check_all_layouts<__nv_bfloat16>(ha, hb, 1, 256, k, "w16a16 m1", 0.02f);
     }
 
     /*
@@ -490,6 +495,9 @@ static bool test_dtype_combos() {
         all &= check_pinned<__nv_bfloat16, int8_t, MixedTall>(ha.data(), hb.data(), 256, 256, k, k,
                                                               k, 1, 0, "w8a16 tall 64x128 kk32 s3",
                                                               0.02f, scale);
+        // Decode row through the same four layouts (per-channel scale on B).
+        all &= check_all_layouts<__nv_bfloat16, int8_t>(ha, hb, 1, 256, k, "w8a16 m1", 0.02f,
+                                                        scale);
         if (k == 320) {
             /*
              * Crosswise/dual-row-major big CTA pinned (the planner routes
@@ -694,6 +702,8 @@ static void bench_dtype_combos() {
         {4096, 4096, 4096},  // square
         {2048, 4096, 4096},  // batched linear
         {4096, 14336, 4096}, // llama up_gate
+        {1, 4096, 4096},     // decode: square linear
+        {1, 14336, 4096},    // decode: llama up_gate
     };
     for (const Shape& s : shapes) {
         bench_combo<bf16_, bf16_>(s.m, s.n, s.k, "W16A16", 0, 0);

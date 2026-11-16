@@ -2,9 +2,12 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from astrai.optimization.optimizer.precision import PrecisionOptimizer
+from astrai.parallel.executor import NoneExecutor
 from astrai.parallel.topology import ParallelTopology
-from astrai.trainer.callbacks import MetricCallback
+from astrai.trainer.callbacks import GradientClippingCallback, MetricCallback
 from astrai.trainer.callbacks.checkpoint import _write_metric_snapshot
 from astrai.trainer.context import PreloadedState, TrainContext, TrainContextBuilder
 from astrai.trainer.context.metric import MetricHistory
@@ -146,3 +149,72 @@ def test_async_validation_cadence_uses_pre_update_step(step, expected):
     callback.on_train_begin(_context(step=step, checkpoint=object(), rollout=object()))
 
     assert callback._next_val_step == expected
+
+
+@pytest.mark.parametrize("main_grad", [False, True], ids=["native", "fp32-main"])
+def test_grad_norm_logs_current_pre_clipping_gradient(tmp_path, monkeypatch, main_grad):
+    config = create_train_config(
+        RandomTokenDataset(), str(tmp_path), "cpu", metrics=["grad_norm"]
+    )
+    trainer = Trainer(config)
+    trainer.callbacks = [
+        callback
+        for callback in trainer.callbacks
+        if isinstance(callback, (MetricCallback, GradientClippingCallback))
+    ]
+    context = _context()
+    context.model = torch.nn.Linear(
+        2, 1, bias=False, dtype=torch.bfloat16 if main_grad else torch.float32
+    )
+    context.model.weight.data.zero_()
+    context.executor = NoneExecutor()
+    context.optimizer = PrecisionOptimizer(
+        torch.optim.SGD(context.model.parameters(), lr=0.1)
+    )
+    context.strategy = SimpleNamespace(after_update=lambda: None)
+    expected = torch.zeros(1, 2)
+
+    for index, gradient in enumerate(((3.0, 4.0), (5.0, 12.0), (7.0, 24.0)), 1):
+        raw = torch.tensor([gradient])
+        parameter = context.model.weight
+        if main_grad:
+            parameter.main_grad = raw.clone()
+            parameter.grad = torch.full_like(parameter, 100)
+        else:
+            parameter.grad = raw.clone()
+        context.pending_samples = 2
+        if index == 2:
+
+            def fail_update():
+                raise RuntimeError("optimizer failed")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(context.optimizer, "step", fail_update)
+                with pytest.raises(RuntimeError, match="optimizer failed"):
+                    trainer._commit_global_update(context, new_data=True)
+            assert context.optimizer_step == 1
+            assert context.consumed_samples == 2
+            assert len(context.metric_history.snapshot().records) == 1
+            # Clipping changed the failed attempt's buffer; retry the raw gradient.
+            if main_grad:
+                parameter.main_grad.copy_(raw)
+            else:
+                parameter.grad.copy_(raw)
+        trainer._commit_global_update(context, new_data=True)
+        expected.add_(raw * (1 / (raw.norm() + 1e-6)).clamp(max=1), alpha=-0.1)
+        torch.testing.assert_close(
+            context.optimizer.master_state_dict(context.model.named_parameters())[
+                "weight"
+            ],
+            expected,
+        )
+
+    records = [
+        json.loads(record) for record in context.metric_history.snapshot().records
+    ]
+    assert [(record["step"], record["consumed_samples"]) for record in records] == [
+        (1, 2),
+        (2, 4),
+        (3, 6),
+    ]
+    assert [record["grad_norm"] for record in records] == pytest.approx([5, 13, 25])

@@ -51,6 +51,7 @@ class Trainer:
         cfg = self.train_config
         return [
             GradientCheckpointingCallback(modules=cfg.gradient_checkpointing_modules),
+            GradientClippingCallback(cfg.max_grad_norm),
             MetricCallback(
                 metrics=cfg.metrics,
                 val_step=cfg.val_step,
@@ -58,7 +59,6 @@ class Trainer:
             ),
             CheckpointCallback(cfg.ckpt_dir, cfg.ckpt_interval),
             ProgressBarCallback(cfg.n_epoch),
-            GradientClippingCallback(cfg.max_grad_norm),
         ]
 
     def _call_callbacks(self, method_name: str, context: TrainContext):

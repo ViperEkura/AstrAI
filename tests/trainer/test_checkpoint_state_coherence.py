@@ -149,9 +149,12 @@ def test_resume_reproduces_the_uninterrupted_run(
     split_dir = tmp_path / "split"
     per_step_total = 2 * 2  # batch_per_device * grad_accum_steps, dp_size == 1
 
-    _train(resume_config(baseline_dir))
+    _train(resume_config(baseline_dir, metrics=["loss", "grad_norm"]))
 
-    _train(resume_config(split_dir), callbacks=[stop_callback])
+    _train(
+        resume_config(split_dir, metrics=["loss", "grad_norm"]),
+        callbacks=[stop_callback],
+    )
     first_leg = _checkpoints(split_dir)
     assert len(first_leg) == 1, (
         f"expected a single emergency checkpoint, got {first_leg}"
@@ -167,7 +170,11 @@ def test_resume_reproduces_the_uninterrupted_run(
     if mid_window is not None:
         assert mid_window is False, "the stop must land mid-window"
 
-    _train(resume_config(split_dir), param_path=str(checkpoint), resume=True)
+    _train(
+        resume_config(split_dir, metrics=["loss", "grad_norm"]),
+        param_path=str(checkpoint),
+        resume=True,
+    )
 
     baseline = _last_checkpoint(baseline_dir).state_dict
     resumed = _last_checkpoint(split_dir).state_dict
@@ -176,7 +183,12 @@ def test_resume_reproduces_the_uninterrupted_run(
     def metric_coordinates(directory):
         path = _checkpoints(directory)[-1] / "metric.jsonl"
         return [
-            (entry["type"], entry["step"], entry["consumed_samples"])
+            (
+                entry["type"],
+                entry["step"],
+                entry["consumed_samples"],
+                entry["grad_norm"],
+            )
             for entry in map(json.loads, path.read_text().splitlines())
         ]
 

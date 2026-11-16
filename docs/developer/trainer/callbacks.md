@@ -54,7 +54,14 @@ MetricCallback stages pre-update measurements in before_optimizer_step. Trainer
 commits them with the final optimizer step and sample cursor only after a
 successful update, before dispatching any after_optimizer_step callbacks.
 Reordering the metric and checkpoint callbacks cannot change which records a
-checkpoint captures. Gradient clipping still acts before the optimizer step.
+checkpoint captures. The default GradientClippingCallback precedes MetricCallback
+and ProgressBarCallback: its returned pre-clipping norm belongs to the current
+update, including the first one. Reuse this value rather than scanning the
+gradients again. Custom callback orders must preserve that dependency.
+
+The opt-in temporal `grad_snr` currently observes the clipped update gradients.
+It remains a temporal EMA diagnostic, not a fixed-weight Gradient Noise Scale;
+its estimator commit/resume semantics are tracked separately in issue #115.
 
 A failed offline update discards pending records and rolls back the counters;
 the existing checkpoint-safe guard prevents publication of partially updated

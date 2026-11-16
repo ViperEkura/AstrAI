@@ -71,7 +71,7 @@ class CPUStateOffload:
     Persistent masters/state are pinned CPU tensors. Each call drains its
     completion events before returning, so checkpoints can read CPU state
     immediately. Device allocations remain alive through their consumer
-    streams; no model parameter is split and Muon still sees full matrices.
+    streams. Inputs are local compute views; Muon still sees full matrices.
     """
 
     def __init__(

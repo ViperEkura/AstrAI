@@ -20,20 +20,66 @@ from astrai.optimization.optimizer.offload import (
 from astrai.parallel.executor.gradients import parameter_gradient
 
 
-def _parameter_owners(optimizers, world_size):
-    costs = {}
+def _parameter_owners(optimizers, world_size, master_dtype, state_dtype):
+    master_bytes = torch.empty((), dtype=master_dtype).element_size()
+    state_bytes = torch.empty((), dtype=state_dtype).element_size()
+    costs, splittable = {}, set()
     for child in optimizers:
-        factor = 3 if isinstance(child, AdamW) else 2
         for group in child.param_groups:
+            moments = (
+                2 + int(group.get("amsgrad", False))
+                if isinstance(child, AdamW)
+                else int(bool(group["momentum"]))
+                if isinstance(child, SGD)
+                else 1
+            )
             for parameter in group["params"]:
-                costs[parameter] = parameter.numel() * 4 * factor
-    loads = [0] * world_size
-    owners = {}
+                costs[parameter] = parameter.numel() * (
+                    master_bytes + moments * state_bytes
+                )
+                if (
+                    isinstance(child, AdamW)
+                    and parameter.is_contiguous()
+                    and parameter.numel() >= world_size
+                ):
+                    splittable.add(parameter)
+    target = sum(costs.values()) / world_size
+    owners = {p: None for p in splittable if costs[p] > target}
+    # Oversized AdamW tensors use equal element ranges; other tensors stay whole.
+    loads = [
+        sum(
+            costs[p]
+            * (
+                _shard_range(p, rank, world_size)[1]
+                - _shard_range(p, rank, world_size)[0]
+            )
+            // p.numel()
+            for p in owners
+        )
+        for rank in range(world_size)
+    ]
     for parameter in sorted(costs, key=costs.__getitem__, reverse=True):
+        if parameter in owners:
+            continue
         owner = min(range(world_size), key=loads.__getitem__)
         owners[parameter] = owner
         loads[owner] += costs[parameter]
     return owners
+
+
+def _shard_range(parameter, rank, world_size):
+    size = parameter.numel()
+    return size * rank // world_size, size * (rank + 1) // world_size
+
+
+def _merge_parameter_tensor(destination, key, value, parameter, ranges):
+    if parameter not in ranges:
+        destination[key] = value
+        return
+    start, end = ranges[parameter]
+    if key not in destination:
+        destination[key] = value.new_empty(parameter.shape)
+    destination[key].view(-1)[start:end].copy_(value.view(-1))
 
 
 def _gather_tensor_tree(value, source, device, group):
@@ -78,12 +124,19 @@ def _gather_tensor_tree(value, source, device, group):
     return tree_unflatten(result, spec) if rank == 0 else None
 
 
-def _merge_optimizer_state(destination, source):
-    if "state" in destination and "param_groups" in destination:
-        destination["state"].update(source["state"])
-    else:
-        for name in destination:
-            _merge_optimizer_state(destination[name], source[name])
+def _merge_optimizer_state(destination, source, model_groups, ranges):
+    if "state" not in source:
+        for name, groups in zip(source, model_groups):
+            _merge_optimizer_state(destination[name], source[name], groups, ranges)
+        return
+    parameters = [p for group in model_groups for p in group]
+    for index, state in source["state"].items():
+        current = destination["state"].setdefault(index, {})
+        for name, value in state.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and name != "step":
+                _merge_parameter_tensor(current, name, value, parameters[index], ranges)
+            else:
+                current[name] = value
 
 
 def _global_optimizer_state(optimizer, model_groups, masters):
@@ -115,7 +168,7 @@ def _global_optimizer_state(optimizer, model_groups, masters):
     }
 
 
-def _local_optimizer_state(saved, model_groups, owners, rank):
+def _local_optimizer_state(saved, model_groups, owners, rank, ranges):
     groups = []
     selected = set()
     if len(saved["param_groups"]) != len(model_groups):
@@ -126,17 +179,26 @@ def _local_optimizer_state(saved, model_groups, owners, rank):
         indices = [
             index
             for index, parameter in zip(group["params"], models)
-            if owners[parameter] == rank
+            if owners[parameter] in (None, rank)
         ]
         selected.update(indices)
         groups.append({**group, "params": indices})
-    return {
-        **saved,
-        "state": {
-            index: state for index, state in saved["state"].items() if index in selected
-        },
-        "param_groups": groups,
-    }
+    parameters = [p for models in model_groups for p in models]
+    states = {}
+    for index, state in saved["state"].items():
+        if index not in selected:
+            continue
+        parameter = parameters[index]
+        states[index] = {
+            name: value.detach().view(-1)[slice(*ranges[parameter])].clone()
+            if parameter in ranges
+            and isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and name != "step"
+            else value
+            for name, value in state.items()
+        }
+    return {**saved, "state": states, "param_groups": groups}
 
 
 class PrecisionOptimizer(Optimizer):
@@ -147,8 +209,8 @@ class PrecisionOptimizer(Optimizer):
     CPU offload stores masters and optimizer state in host memory between
     steps. Pinned host state uses a bounded upload/compute/return pipeline.
     Each step completes host copies before returning; forward/backward do
-    not overlap with optimizer mutation. Optional state sharding assigns
-    complete parameters to ranks and broadcasts updated compute weights.
+    not overlap with optimizer mutation. State sharding slices oversized AdamW
+    parameters and assigns whole Muon matrices, then synchronizes compute weights.
     """
 
     supports_main_grad = True
@@ -206,6 +268,7 @@ class PrecisionOptimizer(Optimizer):
             for child in self._optimizers
         ]
         self._owners = None
+        self._model_shards = {}
         self._checkpoint_state = None
         self.process_group = process_group
         if shard_state and dist.is_initialized():
@@ -227,26 +290,40 @@ class PrecisionOptimizer(Optimizer):
             if len({parameter.device for parameter in parameters}) != 1:
                 raise ValueError("Sharded optimizer parameters must share one device")
             self._owners = _parameter_owners(
-                self._optimizers, dist.get_world_size(self.process_group)
+                self._optimizers,
+                dist.get_world_size(self.process_group),
+                master_dtype,
+                state_dtype,
             )
             rank = dist.get_rank(self.process_group)
+            world_size = dist.get_world_size(self.process_group)
+            for parameter, owner in self._owners.items():
+                if owner is None:
+                    start, end = _shard_range(parameter, rank, world_size)
+                    self._model_shards[parameter] = nn.Parameter(
+                        parameter.detach().view(-1)[start:end],
+                        requires_grad=parameter.requires_grad,
+                    )
             parameters = [
-                parameter for parameter in parameters if self._owners[parameter] == rank
+                parameter
+                for parameter in parameters
+                if self._owners[parameter] in (None, rank)
             ]
             for group in groups:
                 group["params"] = [
                     parameter
                     for parameter in group["params"]
-                    if self._owners[parameter] == rank
+                    if self._owners[parameter] in (None, rank)
                 ]
         super().__init__(groups, optimizer.defaults)
         self.optimizer = optimizer
         self._model_params = parameters
+        self._model_views = [self._model_shards.get(p, p) for p in parameters]
         stage_on_gpu = cpu_offload and any(p.is_cuda for p in parameters)
         if stage_on_gpu and len({p.device for p in parameters}) != 1:
             raise ValueError("CPU state offload requires one CUDA model device")
         self._master_params = []
-        for model in self._model_params:
+        for model in self._model_views:
             if not cpu_offload and model.dtype == master_dtype == torch.float32:
                 self._master_params.append(model)
                 continue
@@ -272,7 +349,7 @@ class PrecisionOptimizer(Optimizer):
 
         self._offload = (
             CPUStateOffload(
-                self._model_params, self._master_params, self._optimizers, state_dtype
+                self._model_views, self._master_params, self._optimizers, state_dtype
             )
             if stage_on_gpu
             else None
@@ -316,6 +393,17 @@ class PrecisionOptimizer(Optimizer):
             with torch.enable_grad():
                 loss = closure()
         self._checkpoint_state = None
+        for model, view in self._model_shards.items():
+            gradient = parameter_gradient(model)
+            view.grad = None
+            start, end = _shard_range(
+                model,
+                dist.get_rank(self.process_group),
+                dist.get_world_size(self.process_group),
+            )
+            view.main_grad = (
+                None if gradient is None else gradient.reshape(-1)[start:end]
+            )
         result = (
             self._offload.step() if self._offload is not None else self._step_resident()
         )
@@ -325,11 +413,11 @@ class PrecisionOptimizer(Optimizer):
     @torch.no_grad()
     def _step_resident(self):
         if not self._convert_state:
-            for model, master in zip(self._model_params, self._master_params):
+            for model, master in zip(self._model_views, self._master_params):
                 gradient = parameter_gradient(model)
                 master.grad = None if gradient is None else gradient.detach().float()
             result = self.optimizer.step()
-            for model, master in zip(self._model_params, self._master_params):
+            for model, master in zip(self._model_views, self._master_params):
                 if model is not master:
                     model.copy_(master)
             return result
@@ -337,7 +425,7 @@ class PrecisionOptimizer(Optimizer):
         stored = [master.data for master in self._master_params]
         try:
             for model, master, value in zip(
-                self._model_params, self._master_params, stored
+                self._model_views, self._master_params, stored
             ):
                 gradient = parameter_gradient(model)
                 master.data = value.float()
@@ -350,7 +438,7 @@ class PrecisionOptimizer(Optimizer):
                         )
             result = self.optimizer.step()
             for model, master, value in zip(
-                self._model_params, self._master_params, stored
+                self._model_views, self._master_params, stored
             ):
                 if value.data_ptr() != master.data_ptr():
                     value.copy_(master)
@@ -366,6 +454,8 @@ class PrecisionOptimizer(Optimizer):
 
     def zero_grad(self, set_to_none: bool = True):
         self.optimizer.zero_grad(set_to_none=set_to_none)
+        for view in self._model_shards.values():
+            view.main_grad = None
         for parameter in self._all_model_params:
             if getattr(parameter, "main_grad", None) is not None:
                 if set_to_none:
@@ -382,18 +472,47 @@ class PrecisionOptimizer(Optimizer):
                         parameter.grad.requires_grad_(False)
                     parameter.grad.zero_()
 
+    @torch.no_grad()
     def _publish_models(self):
         if self._owners is None:
             return
-        pending = [
-            dist.broadcast(
-                parameter.detach(),
-                src=dist.get_global_rank(self.process_group, self._owners[parameter]),
-                group=self.process_group,
-                async_op=True,
-            )
-            for parameter in self._all_model_params
-        ]
+        pending = []
+        world_size = dist.get_world_size(self.process_group)
+        for parameter in self._all_model_params:
+            owner = self._owners[parameter]
+            if owner is not None:
+                pending.append(
+                    dist.broadcast(
+                        parameter.detach(),
+                        src=dist.get_global_rank(self.process_group, owner),
+                        group=self.process_group,
+                        async_op=True,
+                    )
+                )
+                continue
+            flat = parameter.detach().view(-1)
+            if parameter.numel() % world_size:
+                # Uneven tails use in-place slices rather than a full padded buffer.
+                for source in range(world_size):
+                    start, end = _shard_range(parameter, source, world_size)
+                    if start < end:
+                        pending.append(
+                            dist.broadcast(
+                                flat[start:end],
+                                src=dist.get_global_rank(self.process_group, source),
+                                group=self.process_group,
+                                async_op=True,
+                            )
+                        )
+            else:
+                pending.append(
+                    dist.all_gather_single(
+                        flat,
+                        self._model_shards[parameter].detach(),
+                        group=self.process_group,
+                        async_op=True,
+                    )
+                )
         for work in pending:
             work.wait()
 
@@ -423,16 +542,37 @@ class PrecisionOptimizer(Optimizer):
             },
         }
         full = None
-        for source in range(dist.get_world_size(self.process_group)):
+        composite = isinstance(self.optimizer, MuonAdamW)
+        groups = self._model_groups if composite else self._model_groups[0]
+        world_size = dist.get_world_size(self.process_group)
+        for source in range(world_size):
             part = _gather_tensor_tree(
                 local, source, self._all_model_params[0].device, self.process_group
             )
-            if dist.get_rank(self.process_group) == 0:
-                if full is None:
-                    full = part
-                else:
-                    full["master_params"].update(part["master_params"])
-                    _merge_optimizer_state(full["optimizer"], part["optimizer"])
+            if dist.get_rank(self.process_group) != 0:
+                continue
+            if full is None:
+                empty = (
+                    {
+                        name: {**state, "state": {}}
+                        for name, state in part["optimizer"].items()
+                    }
+                    if composite
+                    else {**part["optimizer"], "state": {}}
+                )
+                full = {**part, "optimizer": empty, "master_params": {}}
+            ranges = {
+                p: _shard_range(p, source, world_size) for p in self._model_shards
+            }
+            for index, value in part["master_params"].items():
+                _merge_parameter_tensor(
+                    full["master_params"],
+                    index,
+                    value,
+                    self._all_model_params[index],
+                    ranges,
+                )
+            _merge_optimizer_state(full["optimizer"], part["optimizer"], groups, ranges)
         if full is not None:
             full["master_params"] = [
                 full["master_params"][index]
@@ -485,21 +625,25 @@ class PrecisionOptimizer(Optimizer):
         optimizer_state = state_dict["optimizer"]
         if self._owners is not None:
             rank = dist.get_rank(self.process_group)
+            ranges = {
+                p: _shard_range(p, rank, dist.get_world_size(self.process_group))
+                for p in self._model_shards
+            }
             if isinstance(self.optimizer, MuonAdamW):
                 optimizer_state = {
                     name: _local_optimizer_state(
-                        optimizer_state[name], groups, self._owners, rank
+                        optimizer_state[name], groups, self._owners, rank, ranges
                     )
                     for name, groups in zip(("muon", "adamw"), self._model_groups)
                 }
             else:
                 optimizer_state = _local_optimizer_state(
-                    optimizer_state, self._model_groups[0], self._owners, rank
+                    optimizer_state, self._model_groups[0], self._owners, rank, ranges
                 )
             saved = [
-                value
+                value.view(-1)[slice(*ranges[model])] if model in ranges else value
                 for model, value in zip(self._all_model_params, saved)
-                if self._owners[model] == rank
+                if self._owners[model] in (None, rank)
             ]
         self._checkpoint_state = None
         # Native loaders cast moments to parameter dtype. Present FP32 update
@@ -517,7 +661,7 @@ class PrecisionOptimizer(Optimizer):
             self._offload.pin_state()
         self.param_groups = self.optimizer.param_groups
         self.state = self.optimizer.state
-        for model, master, value in zip(self._model_params, self._master_params, saved):
+        for model, master, value in zip(self._model_views, self._master_params, saved):
             master.copy_(value)
             model.copy_(master)
         self._publish_models()

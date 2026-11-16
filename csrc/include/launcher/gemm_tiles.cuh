@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include <launcher/gemm_launch.cuh>
+#include <launcher/gemv.cuh>
 #include <launcher/kernel_resources.cuh>
 
 namespace astrai {
@@ -143,6 +144,10 @@ struct GemmTileDispatch {
                        const DeviceFacts& dev) {
         const PlanDecision& decision = selected.decision;
         p.raster = decision.raster;
+        // A single decode row skips the tile pipeline: its M padding is the
+        // whole cost and the route keeps the same weight stream (gemv.cuh).
+        if (try_launch_gemv<ElemA, ElemB, LayoutA, LayoutB, LayoutOut, OutT>(p, stream))
+            return;
         // Descriptor rejection falls through to the cp.async policy.
         if constexpr (tma_eligible_v<Schedule, ElemA, ElemB, LayoutA, LayoutB>) {
             if (selected.tma &&

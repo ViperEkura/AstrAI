@@ -20,7 +20,7 @@ maps to one family of translation units under `csrc/` (headers live in the `csrc
 | `swiglu` | `swiglu.cu` | Fused SwiGLU forward and both input gradients |
 | `cross_entropy` | `cross_entropy.cu` | Fused cross-entropy and chunked linear cross-entropy |
 | `quantize` | `quantize/bindings.cu` + `quantize/entry.cu` | Shared FP8/int8 quantization kernels (sm_80+) |
-| `gemm` | `gemm/entry.cu` + `gemm/instantiations/*.cu` | dtype-generic tensor-core GEMM binding + one explicit `gemm_dispatch` instantiation per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+) |
+| `gemm` | `gemm/entry.cu` + `gemm/instantiations/*.cu` | dtype-generic tensor-core GEMM binding + one explicit `gemm_dispatch` instantiation per dtype pair (fp8 / W8A16 / W8A8 / W16A16, sm_89+); single-row (decode) problems take the row GEMV instead of a tile |
 
 Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Accumulate) exist:
 
@@ -123,12 +123,34 @@ package and `loader.py` simply finds no `.so` files. When the env is unset,
 ```
 NVCC_FLAGS = -O3 --expt-relaxed-constexpr --use_fast_math
              --ptxas-options=-O3,-v --extra-device-vectorization
-             -Xfatbin --compress-all --threads=4
+             -Xfatbin --compress-all --threads=${ASTRAI_NVCC_THREADS}
 ```
 
 `--compress-all` stores every fatbin entry (SASS and PTX) compressed; the
 driver decompresses at module load, so the executed code is unchanged and the
 `.so` is ~4x smaller (measured per gemm TU: 8.03 MB -> 1.89 MB).
+
+`--threads` is derived per machine by `csrc/cmake/parallel.cmake`, which also
+caps how many translation units compile at once. Two knobs multiply into the
+build's CPU load — concurrent TUs and threads *inside* one nvcc — so a fixed
+`--threads=4` under an unbounded `-j` asks for several times the core count and
+the box throttles. The defaults leave a quarter of the box alone, split the
+remaining budget between the two knobs, bound the jobs by resident memory
+(~2GB per nvcc) and cap each at 8:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `ASTRAI_BUILD_CPU` | `3/4` of logical cores | logical cores the build may use |
+| `ASTRAI_BUILD_JOBS` | `budget/2`, `<= 8`, `<= RAM/4GB` | concurrent compile TUs |
+| `ASTRAI_NVCC_THREADS` | `budget/jobs`, `<= 8` | threads inside one nvcc |
+
+Each reads the same-named environment variable; `-D` wins over the environment
+and the environment wins over the derived default. On Ninja the job count is a
+compile job pool, so it holds even when the caller passes a larger `-j`;
+configure prints the resolved pair (`AstrAI build concurrency: 7 compile jobs x
+2 nvcc threads (budget 18 of 24 cores)`). Other generators have no pool, so the
+message reports the `--parallel` value to pass instead.
+
 
 Each kernel in `astrai/extension` is compiled as an independent pybind11 module (one `.so` per kernel, named `_C_<kernel>.cpython-*-x86_64-linux-gnu.so`). CMake builds all registered kernel targets in parallel via `cmake --build -j N`. The target list is the **single source of truth**: the `KERNEL_TARGETS` registry in `csrc/CMakeLists.txt`, one entry per target as `name|OBJECT/MODULE|sources...` (a module may span several TUs — gemm is split into per-dtype-pair instantiation units so the heavy template work parallelizes). The module registry is built for the selected architectures; GEMM schedules have separate architecture gates, and an unset `ASTRAI_CUDA_ARCH` builds no targets. The same creation loop handles objects and modules. Both `quantize` and `gemm` declare `$<TARGET_OBJECTS:quantize_entry>` in their source entries, so the shared Torch entry is compiled once. `astrai/extension/runtime/loader.py` auto-discovers the compiled `.so` files, so adding a kernel means one registry entry and nothing else.
 
@@ -340,6 +362,7 @@ csrc/
 │   │   │   └── kernel.cuh            # mainloop/epilogue composition
 │   │   ├── gemm/
 │   │   │   ├── sm80.cuh              # staged mma.sync mainloop
+│   │   │   ├── gemv.cuh              # m == 1 row GEMV (decode route)
 │   │   │   └── kernel.cuh            # cp.async and TMA entry kernels
 │   │   └── quantize/
 │   │       └── kernel.cuh            # vectorized and transpose kernels

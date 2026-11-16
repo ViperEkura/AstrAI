@@ -35,6 +35,51 @@ Host planning is a fixed sequence of ordinary functions: override rows,
 injected rows, measured builtin rows, then heuristic,
 subject to the selected planner mode. No virtual planner hierarchy is needed.
 
+## Decode row (`m == 1`)
+
+A decode step presents one row per linear. Every tile pads M up to the CTA
+height (64 or 128 rows), so at `m == 1` the mainloop issues 63/64 or 127/128
+of its MMA work for rows that do not exist while still streaming the whole
+weight: the tile route is bound by padding work, not by the weight stream
+that actually limits decode. `launcher/gemv.cuh` routes that shape to
+`kernel/gemm/gemv.cuh` — one warp per output row, 16B weight chunks per lane,
+warp-shuffle reduction, epilogue factors folded in lane 0 — and leaves every
+other shape on the manifest dispatch.
+
+The route is a strict subset of the tile contract, gated at compile time by
+`gemv_eligible_v` (a pair without a dot product instantiates no kernel):
+
+- `m == 1` and `batch == 1` — a batched decode keeps the tile pipeline;
+- `crosswise_of<LayoutA, LayoutB>() == 0`, i.e. both operands
+  contract-contiguous, so a weight row is `b + n * b_ld` (the NT linear route);
+- row-major output — the symmetric-NN swap lowering keeps the tile path;
+- bf16/fp16 activation with a bf16/fp16/int8 weight and a bf16/fp32 output.
+
+The epilogue is the tile epilogue's, on the one live row:
+`y[n] = (sum_k a[k] * b[n,k]) * a_scale(0) * b_scale(n) + bias[n]`, per-tensor
+scalars folded first, bias added in fp32, one rounding to the output dtype.
+`quant_gemm_test.cu` runs `m == 1` through all four layouts for W16A16 and
+W8A16 (NT takes the GEMV, the crosswise layouts keep the tile route); both
+agree with the reference at the same tolerance as the `m == 256` cells.
+
+Kernel-only A/B through the production dispatch, 200 launches per cell after
+20 warmups, mean over the whole event window, RTX 5060 Ti (sm_120), CUDA 13.4:
+
+| Shape (m×n×k) | dtype | tile route | GEMV route | speedup | GEMV bandwidth |
+|---|---|---|---|---|---|
+| 1×4096×4096 | W16A16 | 0.0675 ms | **0.0193 ms** | 3.5× | 1739 GB/s¹ |
+| 1×4096×4096 | W8A16 | 0.0674 ms | **0.0147 ms** | 4.6× | 1145 GB/s¹ |
+| 1×11008×4096 | W16A16 | 0.3427 ms | **0.2123 ms** | 1.6× | 425 GB/s |
+| 1×11008×4096 | W8A16 | 0.3364 ms | **0.1080 ms** | 3.1× | 418 GB/s |
+| 4×4096×4096 | W16A16 | 0.0632 ms | 0.0620 ms | 1.02× | — |
+| 4×4096×4096 | W8A16 | 0.0674 ms | 0.0676 ms | 1.00× | — |
+
+¹ The 4096-wide weight fits the 32MB L2, so that row measures L2 limits. The
+11008-wide row is DRAM-bound and lands at the card's measured streaming read
+ceiling (437 GB/s), i.e. the GEMV route has no headroom left to recover; the
+tile route leaves 2-3x on the table by computing padding. `m == 4` confirms the
+route is decode-only: same kernel path, same latency.
+
 ## Geometry heuristic (`geom_cta`)
 
 `plan.configure(planner="heuristic")` uses the same `geom_cta` rule as the
@@ -152,6 +197,8 @@ Headers under `csrc/include` contain declarations and device templates;
 | `kernel/gemm/mainloop.cuh` | `GemmCollectiveMainloop`: stage rings, stage loads, fragment addressing (ldmatrix + dequantized scalar paths), pipelined mma.sync loop |
 | `epilogue/writer.cuh` | `GemmCollectiveEpilogue`: fused bias + per-row/per-channel scale folding + bf16/fp32 smem scatter + coalesced copy-out |
 | `kernel/gemm/kernel.cuh` | Device entry kernels for cp.async and TMA staging; they compose the mainloop and epilogue |
+| `kernel/gemm/gemv.cuh` | Single-row (decode) row GEMV: one warp per output row, 16B weight chunks, scale/bias folded in lane 0 |
+| `launcher/gemv.cuh` | `m == 1` capability gate and launch; the tile dispatch calls it first and keeps its path when it declines |
 | `launcher/gemm_launch.cuh` | Typed CUDA launch and TMA descriptor setup |
 | `launcher/gemm_tiles.cuh` | Manifest tile selection, output-reclaim fallback, and launch from the resolved staging decision |
 | `launcher/gemm_dispatch.cuh` | Heavy definitions: typed query construction, layout canonicalization and routing shared by launch and probe |

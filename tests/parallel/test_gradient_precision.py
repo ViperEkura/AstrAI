@@ -400,8 +400,9 @@ def _owner_optimizer(
 
 def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
     torch.set_num_threads(1)
-    device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     dist.init_process_group(backend, rank=rank, world_size=2, init_method=rendezvous)
     try:
         cases = [
@@ -430,9 +431,12 @@ def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
                         for _ in range(4)
                     ]
                 )
-                model.embed = nn.Embedding(32, 16, device=device, dtype=compute_dtype)
+                vocab_size = 128 + case % 2
+                model.embed = nn.Embedding(
+                    vocab_size, 33, device=device, dtype=compute_dtype
+                )
                 model.lm_head = nn.Linear(
-                    16, 32, bias=False, device=device, dtype=compute_dtype
+                    33, vocab_size, bias=False, device=device, dtype=compute_dtype
                 )
                 model.lm_head.weight = model.embed.weight
                 model.norm = nn.Parameter(
@@ -446,19 +450,32 @@ def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
             expected = _owner_optimizer(
                 reference, kind, False, False, state_dtype, master_dtype
             )
-            counts = torch.tensor(len(actual._model_params), device=device)
+            counts = torch.tensor(
+                sum(p.numel() for p in actual._master_params), device=device
+            )
             dist.all_reduce(counts)
-            assert counts.item() == len(list(model.parameters()))
+            assert counts.item() == sum(p.numel() for p in model.parameters())
             for step in range(6):
                 torch.manual_seed(130 + step)
                 for index, (param, target) in enumerate(
                     zip(model.parameters(), reference.parameters())
                 ):
                     gradient = torch.randn_like(param, dtype=torch.float32) * 0.1
-                    if index == 0 and step % 3 == 0:
+                    embedding = getattr(getattr(model, "embed", None), "weight", None)
+                    if (index == 0 or param is embedding) and step % 3 == 0:
                         gradient = None
-                    param.main_grad = gradient
-                    target.main_grad = None if gradient is None else gradient.clone()
+                    if step % 2:
+                        param.main_grad = target.main_grad = None
+                        param.grad = (
+                            None if gradient is None else gradient.to(param.dtype)
+                        )
+                        target.grad = None if gradient is None else param.grad.clone()
+                    else:
+                        param.grad = target.grad = None
+                        param.main_grad = gradient
+                        target.main_grad = (
+                            None if gradient is None else gradient.clone()
+                        )
                 actual.step()
                 expected.step()
                 for param, target in zip(model.parameters(), reference.parameters()):
@@ -529,24 +546,30 @@ def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
 
 
 @pytest.mark.distributed
-@pytest.mark.cuda
-@requires_nccl(2)
-@pytest.mark.parametrize("cpu_offload", [False, True])
-def test_complete_parameter_ownership_export_and_resume(tmp_path, cpu_offload):
+@pytest.mark.parametrize(
+    "backend,cpu_offload",
+    [
+        ("gloo", False),
+        pytest.param("nccl", False, marks=[pytest.mark.cuda, requires_nccl(2)]),
+        pytest.param("nccl", True, marks=[pytest.mark.cuda, requires_nccl(2)]),
+    ],
+)
+def test_optimizer_shards_export_and_resume(tmp_path, backend, cpu_offload):
     mp.spawn(
         _owner_state_check,
-        args=(Path(tmp_path / "owners").as_uri(), str(tmp_path), "nccl", cpu_offload),
+        args=(Path(tmp_path / "owners").as_uri(), str(tmp_path), backend, cpu_offload),
         nprocs=2,
         join=True,
     )
 
 
-def _subgroup_owner_check(rank, rendezvous):
+def _subgroup_owner_check(rank, rendezvous, backend):
     torch.set_num_threads(1)
-    device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     dist.init_process_group(
-        "nccl",
+        backend,
         rank=rank,
         world_size=4,
         init_method=rendezvous,
@@ -556,13 +579,14 @@ def _subgroup_owner_check(rank, rendezvous):
         groups = [dist.new_group(ranks) for ranks in ([0, 1], [2, 3])]
         group = groups[rank // 2]
         executor = DDPExecutor(process_group=group, grad_accum_dtype="float32")
-        model = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16, device=device)
-        model.weight.data.fill_(1)
+        model = nn.Linear(1, 5, bias=False, dtype=torch.bfloat16, device=device)
+        model.weight.data.fill_(rank // 2 + 1)
         model = executor._prepare_model(model)
         raw = executor.model_for_inference(model)
         optimizer = build_optimizer_component(
             ComponentSpec(
-                type="torch.optim:SGD", params={"lr": 0.1, "shard_state": True}
+                type="torch.optim:AdamW",
+                params={"lr": 0.1, "weight_decay": 0.0, "shard_state": True},
             ),
             raw,
             PrecisionConfig(compute_dtype="bfloat16"),
@@ -570,19 +594,21 @@ def _subgroup_owner_check(rank, rendezvous):
         )
         executor.backward(
             model(
-                torch.full((1, 2), rank // 2 + 1, dtype=torch.bfloat16, device=device)
+                torch.full((1, 1), rank // 2 + 1, dtype=torch.bfloat16, device=device)
             ).sum()
         )
+        reference = nn.Parameter(raw.weight.detach().float().clone())
+        expected_optimizer = torch.optim.AdamW([reference], lr=0.1, weight_decay=0.0)
+        reference.grad = parameter_gradient(raw.weight).clone()
+        expected_optimizer.step()
         optimizer.step()
-        expected = torch.full_like(raw.weight, 1 - 0.1 * (rank // 2 + 1))
+        expected = reference.bfloat16()
         torch.testing.assert_close(raw.weight, expected, atol=0, rtol=0)
         with executor.checkpoint_context(
             model, optimizer=optimizer, export_dtype="float32"
         ) as (state, extra):
             if rank % 2 == 0:
-                torch.testing.assert_close(
-                    state["weight"], torch.full((2, 2), 1 - 0.1 * (rank // 2 + 1))
-                )
+                torch.testing.assert_close(state["weight"], reference.cpu())
                 saved = copy.deepcopy(optimizer.state_dict())
                 assert extra["training_model"]["weight"].dtype == torch.bfloat16
             else:
@@ -605,12 +631,14 @@ def _subgroup_owner_check(rank, rendezvous):
 
 
 @pytest.mark.distributed
-@pytest.mark.cuda
-@requires_nccl(4)
-def test_optimizer_ownership_and_checkpoints_stay_inside_ddp_group(tmp_path):
+@pytest.mark.parametrize(
+    "backend",
+    ["gloo", pytest.param("nccl", marks=[pytest.mark.cuda, requires_nccl(4)])],
+)
+def test_optimizer_ownership_and_checkpoints_stay_inside_ddp_group(tmp_path, backend):
     mp.spawn(
         _subgroup_owner_check,
-        args=(Path(tmp_path / "subgroups").as_uri(),),
+        args=(Path(tmp_path / "subgroups").as_uri(), backend),
         nprocs=4,
         join=True,
     )

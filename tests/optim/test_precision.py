@@ -11,7 +11,10 @@ from torch import nn
 
 from astrai.config import ComponentSpec, PrecisionConfig, TrainConfig
 from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
-from astrai.optimization.optimizer.precision import PrecisionOptimizer
+from astrai.optimization.optimizer.precision import (
+    PrecisionOptimizer,
+    _parameter_owners,
+)
 from astrai.trainer.components import (
     build_optimizer_component,
     load_optimizer_state_dict,
@@ -265,3 +268,25 @@ def test_precision_roundtrip():
     assert payload["precision"] == asdict(policy)
     assert "model_dtype" not in payload
     assert TrainConfig(**payload).precision == policy
+
+
+def test_oversized_adam_states_balance_without_splitting_muon_matrices():
+    model = nn.Module()
+    model.matrix = nn.ParameterList(
+        [nn.Parameter(torch.empty(128, 128, device="meta")) for _ in range(8)]
+    )
+    model.embed = nn.Embedding(512, 128, device="meta")
+    model.lm_head = nn.Linear(128, 512, bias=False, device="meta")
+    optimizer = MuonAdamW(model)
+    owners = _parameter_owners(
+        (optimizer.muon, optimizer.adamw), 8, torch.float32, torch.float32
+    )
+    assert owners[model.embed.weight] is None and owners[model.lm_head.weight] is None
+    loads = [0] * 8
+    for p in model.parameters():
+        if owners[p] is None:
+            for rank in range(8):
+                loads[rank] += p.numel() // 8 * 12
+        else:
+            loads[owners[p]] += p.numel() * 8
+    assert loads == [327680] * 8

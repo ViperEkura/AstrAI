@@ -135,14 +135,16 @@ still apply.
 
 ### Distributed optimizer state
 
-Set optimizer.params.shard_state to true with cpu_offload false to keep FP32
-masters and moments on their owning GPUs. Assignment is deterministic and
-balances estimated state bytes; each Muon matrix stays intact. Every rank
-still accumulates and reduces full FP32 gradients. Only the owner updates a
-parameter, then broadcasts its compute-format weights within the supplied
-data-parallel process group. Ownership, state gathering and the checkpoint
-writer use that same group; independent groups never exchange weights. This
-avoids replicated updates and repeated CPU state transfers.
+Set optimizer.params.shard_state to true with cpu_offload false to keep
+masters and moments on their owning GPUs. Assignment balances state bytes
+using the configured master and moment dtypes. Contiguous AdamW parameters
+larger than the per-rank target are split into element ranges; smaller
+parameters and complete Muon matrices are assigned to individual ranks.
+Every rank still accumulates and reduces full FP32 gradients. Each owner
+updates its local master/state and compute-weight slice. Equal slices are
+all-gathered in place; uneven tails use slice broadcasts without a full
+padding buffer. Ownership, synchronization and checkpoint gathering use the
+supplied data-parallel group; independent groups never exchange weights.
 
 ```yaml
 optimizer:
@@ -165,8 +167,9 @@ declared strategy optimizers, including the PPO critic, collectively before
 the writer snapshots extras. The optimizer
 gathers masters and moments to group rank zero as CPU tensors, streaming tensor
 payloads without staging the complete checkpoint on one GPU. The writer then
-uses the existing full optimizer checkpoint format. Temporary consolidated
-state is released on context exit. Direct distributed optimizer callers must
+uses the existing full optimizer checkpoint format. Split masters and moments
+are reassembled under their original parameter IDs; loading slices them for
+the current layout. Temporary consolidated state is released on context exit. Direct distributed optimizer callers must
 enter that context on every rank before calling state_dict or exporting named
 masters on rank zero. An unsharded optimizer can load the resulting checkpoint;
 a sharded optimizer selects the state for its current owners when loading.

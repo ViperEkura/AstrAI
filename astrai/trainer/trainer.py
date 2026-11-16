@@ -51,6 +51,7 @@ class Trainer:
         cfg = self.train_config
         return [
             GradientCheckpointingCallback(modules=cfg.gradient_checkpointing_modules),
+            GradientClippingCallback(cfg.max_grad_norm),
             MetricCallback(
                 metrics=cfg.metrics,
                 val_step=cfg.val_step,
@@ -58,7 +59,6 @@ class Trainer:
             ),
             CheckpointCallback(cfg.ckpt_dir, cfg.ckpt_interval),
             ProgressBarCallback(cfg.n_epoch),
-            GradientClippingCallback(cfg.max_grad_norm),
         ]
 
     def _call_callbacks(self, method_name: str, context: TrainContext):
@@ -95,6 +95,8 @@ class Trainer:
         """
         context.checkpoint_safe = False
         context.metric_history.discard_pending()
+        if context.grad_snr_tracker is not None:
+            context.grad_snr_tracker.discard()
         committed_samples = context.pending_samples if new_data else 0
         context.optimizer_steps_completed += 1
         if new_data:
@@ -109,10 +111,15 @@ class Trainer:
             context.pending_samples = 0
         except BaseException:
             context.metric_history.discard_pending()
+            if context.grad_snr_tracker is not None:
+                context.grad_snr_tracker.discard()
+                context.grad_snr_value = None
             context.optimizer_steps_completed -= 1
             if new_data:
                 context.consumed_samples -= committed_samples
             raise
+        if context.grad_snr_tracker is not None:
+            context.grad_snr_tracker.commit(context.optimizer_step)
         context.metric_history.commit(context.optimizer_step, context.consumed_samples)
 
     def _commit_online_update(

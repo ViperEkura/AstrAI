@@ -74,6 +74,16 @@ def _scheduler_restore(context: Any, state: Dict) -> None:
         group["lr"] = lr
 
 
+def _grad_snr_snapshot(context: Any) -> Optional[Dict]:
+    tracker = getattr(context, "grad_snr_tracker", None)
+    return tracker.state_dict() if tracker is not None else None
+
+
+def _grad_snr_restore(context: Any, state: Dict) -> None:
+    if context.checkpoint is not None and context.grad_snr_tracker is not None:
+        context.grad_snr_tracker.load_state_dict(state)
+
+
 @dataclass(frozen=True)
 class Extra:
     """One run-owned state that must survive a resume.
@@ -112,6 +122,7 @@ EXTRAS: Tuple[Extra, ...] = (
         purpose="the LR schedule position",
     ),
     Extra(key="fp8_state", snapshot=_fp8_snapshot, restore=_fp8_restore),
+    Extra(key="grad_snr", snapshot=_grad_snr_snapshot, restore=_grad_snr_restore),
 )
 
 EXTRA_KEYS: Tuple[str, ...] = tuple(entry.key for entry in EXTRAS)

@@ -60,7 +60,7 @@ class TrainContext:
     metrics: Dict[str, float] = field(default_factory=dict)
     metric_history: MetricHistory = field(default_factory=MetricHistory)
     grad_norm: Optional[float] = field(default=None)
-    grad_snr_tracker: GradSNRTracker = field(default_factory=GradSNRTracker)
+    grad_snr_tracker: Optional[GradSNRTracker] = field(default=None)
     grad_snr_value: Optional[float] = field(default=None)
     val_dataloader: Optional[DataLoader] = field(default=None)
     val_loss: Optional[float] = field(default=None)

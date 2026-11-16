@@ -54,7 +54,18 @@ MetricCallback stages pre-update measurements in before_optimizer_step. Trainer
 commits them with the final optimizer step and sample cursor only after a
 successful update, before dispatching any after_optimizer_step callbacks.
 Reordering the metric and checkpoint callbacks cannot change which records a
-checkpoint captures. Gradient clipping still acts before the optimizer step.
+checkpoint captures. The default GradientClippingCallback precedes MetricCallback
+and ProgressBarCallback: its returned pre-clipping norm belongs to the current
+update, including the first one. Reuse this value rather than scanning the
+gradients again. Custom callback orders must preserve that dependency.
+
+The opt-in temporal `grad_snr` samples at most 65,536 fixed gradient coordinates
+from the reduced and clipped update, independent of model size. MetricCallback
+stages a proposed EMA and value; Trainer commits that state together with metric
+history only after a successful update. Failure or shutdown discards the proposal.
+Unsampled, non-finite, first and unresolved observations omit the metric. GradSNR
+is a sampled temporal diagnostic, not a fixed-weight Gradient Noise Scale or an
+optimal-batch-size estimate.
 
 A failed offline update discards pending records and rolls back the counters;
 the existing checkpoint-safe guard prevents publication of partially updated
@@ -79,7 +90,9 @@ JSONL is streamed from disk, followed by the snapshot's records. Historical
 records are not all loaded into memory. TrainContextBuilder restores history
 from the selected resume checkpoint before startup callbacks run; loading
 weights for a new run does not inherit the old run's metrics. Checkpoints
-without metric.jsonl start with empty history. Metric history persistence does not persist the internal state of every metric estimator.
+without metric.jsonl start with empty history. The optional `grad_snr` extra saves only committed EMA moments, sampled coordinates, parameter layout,
+observation count, optimizer step and sampling interval. Full resume validates
+these against the current run; warm starts create fresh estimator state.
 
 optional_extras.py records optimizer, scheduler, enabled FP8 state and
 strategy-owned state such as a critic or frozen reference. Global RNG state is

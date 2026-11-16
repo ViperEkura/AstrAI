@@ -426,7 +426,7 @@ _SPECS = [
     OptSpec(
         "metrics",
         "Validation",
-        help="Metrics to log (repeatable). grad_snr is opt-in and keeps model-sized state.",
+        help="Metrics to log (repeatable). grad_snr is an opt-in sampled temporal diagnostic.",
     ),
     OptSpec("ckpt_interval", "Checkpoint", help="Steps between checkpoints."),
     OptSpec(

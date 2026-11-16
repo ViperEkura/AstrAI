@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from functools import partial
 from typing import TYPE_CHECKING, Dict, List
@@ -138,6 +139,28 @@ class MetricCallback(TrainCallback):
         return {name: total / num_batches for name, total in totals.items()}
 
     def on_train_begin(self, context: TrainContext):
+        if "grad_snr" in self.metrics:
+            was_safe = context.checkpoint_safe
+            context.checkpoint_safe = False
+            tracker = context.grad_snr_tracker
+            if (
+                context.checkpoint is not None
+                and "grad_snr" not in context.checkpoint.extra
+            ):
+                raise ValueError(
+                    "resume with grad_snr requires checkpointed estimator state; use a warm start to reset it"
+                )
+            if tracker is None or tracker.last_step != context.optimizer_step:
+                raise ValueError(
+                    "gradient SNR state does not match the committed optimizer step"
+                )
+            if (
+                context.checkpoint is not None
+                and tracker.interval != self.grad_snr_interval
+            ):
+                raise ValueError("gradient SNR sampling interval changed on resume")
+            tracker.interval = self.grad_snr_interval
+            context.checkpoint_safe = was_safe
         if self.val_step > 0:
             next_slot = (
                 (context.optimizer_step + self.val_step - 1) // self.val_step
@@ -149,17 +172,21 @@ class MetricCallback(TrainCallback):
             )
 
     def before_optimizer_step(self, context):
-        # GradSNR keeps model-sized first-moment state. Only update it when
-        # requested and at the configured sampling interval.
+        context.grad_snr_value = None
+        # Observe the globally reduced, clipped gradient before optimizer mutation.
+        # Only the trainer may commit the bounded pending estimator state.
         if (
             "grad_snr" in self.metrics
             and context.grad_snr_tracker is not None
             and context.optimizer_step % self.grad_snr_interval == 0
         ):
-            context.grad_snr_tracker.update(
-                context.model, step_span=self.grad_snr_interval
-            )
-            context.grad_snr_value = context.grad_snr_tracker.snr
+            norm = getattr(context, "grad_norm", None)
+            if norm is None or math.isfinite(norm):
+                context.grad_snr_value = context.grad_snr_tracker.stage(
+                    context.model,
+                    step_span=context.optimizer_step
+                    - context.grad_snr_tracker.last_observation_step,
+                )
 
         if (
             context.val_dataloader is not None
@@ -178,3 +205,7 @@ class MetricCallback(TrainCallback):
 
         step_metrics = [m for m in self.metrics if m != "val_loss"]
         self._append("step", context, **self._metrics(context, step_metrics))
+
+    def on_shutdown(self, context: TrainContext):
+        if context.grad_snr_tracker is not None:
+            context.grad_snr_tracker.discard()

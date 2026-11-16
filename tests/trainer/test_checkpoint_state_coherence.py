@@ -149,9 +149,18 @@ def test_resume_reproduces_the_uninterrupted_run(
     split_dir = tmp_path / "split"
     per_step_total = 2 * 2  # batch_per_device * grad_accum_steps, dp_size == 1
 
-    _train(resume_config(baseline_dir))
+    _train(
+        resume_config(
+            baseline_dir, metrics=["loss", "grad_norm", "grad_snr"], grad_snr_interval=2
+        )
+    )
 
-    _train(resume_config(split_dir), callbacks=[stop_callback])
+    _train(
+        resume_config(
+            split_dir, metrics=["loss", "grad_norm", "grad_snr"], grad_snr_interval=2
+        ),
+        callbacks=[stop_callback],
+    )
     first_leg = _checkpoints(split_dir)
     assert len(first_leg) == 1, (
         f"expected a single emergency checkpoint, got {first_leg}"
@@ -167,16 +176,38 @@ def test_resume_reproduces_the_uninterrupted_run(
     if mid_window is not None:
         assert mid_window is False, "the stop must land mid-window"
 
-    _train(resume_config(split_dir), param_path=str(checkpoint), resume=True)
+    _train(
+        resume_config(
+            split_dir, metrics=["loss", "grad_norm", "grad_snr"], grad_snr_interval=2
+        ),
+        param_path=str(checkpoint),
+        resume=True,
+    )
 
     baseline = _last_checkpoint(baseline_dir).state_dict
     resumed = _last_checkpoint(split_dir).state_dict
     torch.testing.assert_close(baseline, resumed, rtol=0, atol=0)
+    baseline_snr = _last_checkpoint(baseline_dir).extra["grad_snr"]
+    resumed_snr = _last_checkpoint(split_dir).extra["grad_snr"]
+    assert baseline_snr.keys() == resumed_snr.keys()
+    for key in baseline_snr:
+        if isinstance(baseline_snr[key], torch.Tensor):
+            torch.testing.assert_close(
+                baseline_snr[key], resumed_snr[key], rtol=0, atol=0
+            )
+        else:
+            assert baseline_snr[key] == resumed_snr[key]
 
     def metric_coordinates(directory):
         path = _checkpoints(directory)[-1] / "metric.jsonl"
         return [
-            (entry["type"], entry["step"], entry["consumed_samples"])
+            (
+                entry["type"],
+                entry["step"],
+                entry["consumed_samples"],
+                entry["grad_norm"],
+                entry.get("grad_snr"),
+            )
             for entry in map(json.loads, path.read_text().splitlines())
         ]
 

@@ -1,8 +1,10 @@
 """Accumulation precision, DDP parity and main-gradient consumers."""
 
 import copy
+import json
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,10 +17,17 @@ from astrai.optimization.optimizer.muon.optimizer import MuonAdamW
 from astrai.optimization.optimizer.precision import PrecisionOptimizer
 from astrai.parallel.executor import DDPExecutor, NoneExecutor
 from astrai.parallel.executor.gradients import parameter_gradient
+from astrai.parallel.setup import setup_parallel
+from astrai.parallel.topology import ParallelTopology
+from astrai.trainer.callbacks import GradientClippingCallback, MetricCallback
 from astrai.trainer.callbacks.metric_util import GradSNRTracker, grad_norm
 from astrai.trainer.components import build_optimizer_component
+from astrai.trainer.context import TrainContext
+from astrai.trainer.trainer import Trainer
 from tests.support.capabilities import requires_nccl
 from tests.support.precision import assert_precision_state
+from tests.support.rollout import RandomTokenDataset
+from tests.support.trainer import create_train_config
 
 
 def _distributed_check(
@@ -158,7 +167,7 @@ def test_fp32_accumulation_preserves_cancellation_and_drives_update(executor_typ
     assert abs(grad_norm(model) - 0.001) < 2e-7
     tracker = GradSNRTracker()
     tracker.update(model)
-    assert tracker._first[id(model.weight)].dtype == torch.float32
+    assert tracker._first.dtype == torch.float32
     wanted = before - gradient * 0.1
     optimizer.step()
     torch.testing.assert_close(
@@ -640,5 +649,157 @@ def test_optimizer_ownership_and_checkpoints_stay_inside_ddp_group(tmp_path, bac
         _subgroup_owner_check,
         args=(Path(tmp_path / "subgroups").as_uri(), backend),
         nprocs=4,
+        join=True,
+    )
+
+
+def _weighted_diagnostic_check(
+    rank, world_size, rendezvous, backend, output, gradient_dtype
+):
+    torch.set_num_threads(1)
+    device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
+    with setup_parallel(
+        rank,
+        world_size,
+        rank,
+        backend=backend,
+        device_type=device.type,
+        master_port=rendezvous,
+    ):
+        baseline = None
+        for enabled in (False, True):
+            config = create_train_config(
+                RandomTokenDataset(),
+                output,
+                device.type,
+                dp_mode="ddp",
+                dp_size=world_size,
+                metrics=["grad_norm", "grad_snr"] if enabled else ["grad_norm"],
+            )
+            executor = DDPExecutor(grad_accum_dtype=gradient_dtype)
+            dtype = torch.float32 if gradient_dtype == "model" else torch.bfloat16
+            model, optimizer, _ = executor.prepare(
+                lambda: nn.Linear(2, 1, bias=False, device=device, dtype=dtype),
+                lambda module: PrecisionOptimizer(
+                    torch.optim.SGD(module.parameters(), lr=0.1)
+                ),
+            )
+            with torch.no_grad():
+                model.module.weight.zero_()
+                for master in optimizer.master_state_dict(
+                    model.module.named_parameters()
+                ).values():
+                    master.zero_()
+
+            def loss_outputs(batch):
+                yield {
+                    "loss": model(batch).float().mean(),
+                    "metrics": {},
+                    "normalizer": len(batch),
+                }
+
+            context = TrainContext(
+                model=model,
+                optimizer=optimizer,
+                executor=executor,
+                config=config,
+                topology=ParallelTopology(world_size),
+                rank=rank,
+                world_size=world_size,
+                strategy=SimpleNamespace(
+                    loss_outputs=loss_outputs, after_update=lambda: None
+                ),
+                grad_snr_tracker=GradSNRTracker(beta=0.5) if enabled else None,
+            )
+            trainer = Trainer(config)
+            trainer.callbacks = [
+                callback
+                for callback in trainer.callbacks
+                if isinstance(callback, (MetricCallback, GradientClippingCallback))
+            ]
+            trainer._call_callbacks("on_train_begin", context)
+            expected = torch.zeros(1, 2, device=device)
+            mean = None
+            power = None
+            for step in range(1, 5):
+                count = 1 if rank == 0 else 3
+                inputs = (
+                    torch.arange(count * 2, device=device).reshape(count, 2)
+                    + rank * 4
+                    + step
+                )
+                inputs = inputs.to(dtype)
+                # Analytic global mean, with the ranks contributing 1 and 3 rows.
+                all_inputs = torch.cat(
+                    [
+                        torch.arange(rows * 2, device=device).reshape(rows, 2)
+                        + owner * 4
+                        + step
+                        for owner, rows in enumerate((1, 3))
+                    ]
+                ).float()
+                gradient = all_inputs.mean(dim=0, keepdim=True)
+                norm = gradient.norm()
+                clipped = gradient * (1 / (norm + 1e-6)).clamp(max=1)
+                trainer._run_global_update(
+                    context, [(inputs, count)], 4, step * 4, True
+                )
+                expected.add_(clipped, alpha=-0.1)
+                master = optimizer.master_state_dict(model.module.named_parameters())[
+                    "weight"
+                ]
+                torch.testing.assert_close(master, expected, rtol=0, atol=2e-7)
+                assert context.grad_norm == pytest.approx(norm.item(), abs=1e-6)
+                if enabled:
+                    mean = clipped if mean is None else 0.5 * mean + 0.5 * clipped
+                    square = clipped.double().square().sum()
+                    power = square if power is None else 0.5 * power + 0.5 * square
+                    if step > 1:
+                        signal = mean.double().square().sum()
+                        expected_snr = (
+                            10 * torch.log10(signal / (power - signal)).item()
+                        )
+                        assert context.grad_snr_tracker.snr == pytest.approx(
+                            expected_snr, abs=1e-4
+                        )
+                if enabled and step == 2:
+                    restored = GradSNRTracker(beta=0.5)
+                    restored.load_state_dict(context.grad_snr_tracker.state_dict())
+                    context.grad_snr_tracker = restored
+                    trainer._call_callbacks("on_train_begin", context)
+            if enabled:
+                torch.testing.assert_close(master, baseline, rtol=0, atol=0)
+                assert context.grad_snr_tracker.last_step == 4
+                assert context.grad_snr_tracker.observations == 4
+                if rank == 0:
+                    records = [
+                        json.loads(record)
+                        for record in context.metric_history.snapshot().records
+                    ]
+                    assert records[-1]["grad_snr"] == pytest.approx(
+                        context.grad_snr_tracker.snr, abs=2e-6
+                    )
+                    assert "grad_snr" not in records[0]
+            else:
+                baseline = master.detach().clone()
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize(
+    "backend",
+    ["gloo", pytest.param("nccl", marks=[pytest.mark.cuda, requires_nccl(2)])],
+)
+@pytest.mark.parametrize(
+    "gradient_dtype", ["model", "float32"], ids=["native-fp32", "bf16-fp32-main"]
+)
+def test_weighted_gradient_diagnostics_preserve_ddp_updates(
+    tmp_path, backend, gradient_dtype
+):
+    from astrai.parallel.setup import find_free_port
+
+    mp.spawn(
+        _weighted_diagnostic_check,
+        args=(2, find_free_port(), backend, str(tmp_path), gradient_dtype),
+        nprocs=2,
         join=True,
     )

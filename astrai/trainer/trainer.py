@@ -95,6 +95,8 @@ class Trainer:
         """
         context.checkpoint_safe = False
         context.metric_history.discard_pending()
+        if context.grad_snr_tracker is not None:
+            context.grad_snr_tracker.discard()
         committed_samples = context.pending_samples if new_data else 0
         context.optimizer_steps_completed += 1
         if new_data:
@@ -109,10 +111,15 @@ class Trainer:
             context.pending_samples = 0
         except BaseException:
             context.metric_history.discard_pending()
+            if context.grad_snr_tracker is not None:
+                context.grad_snr_tracker.discard()
+                context.grad_snr_value = None
             context.optimizer_steps_completed -= 1
             if new_data:
                 context.consumed_samples -= committed_samples
             raise
+        if context.grad_snr_tracker is not None:
+            context.grad_snr_tracker.commit(context.optimizer_step)
         context.metric_history.commit(context.optimizer_step, context.consumed_samples)
 
     def _commit_online_update(

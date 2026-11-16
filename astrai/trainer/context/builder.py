@@ -26,6 +26,7 @@ from astrai.parallel.setup import get_current_device, get_rank, get_world_size
 from astrai.parallel.topology import ParallelTopology, build_topology
 from astrai.parallel.tp import TPState
 from astrai.tokenize import AutoTokenizer
+from astrai.trainer.callbacks.metric_util import GradSNRTracker
 from astrai.trainer.components import (
     build_dataloader,
     build_dataset_component,
@@ -204,6 +205,9 @@ class TrainContextBuilder:
             optimizer_steps_completed=state.optimizer_steps_completed,
             checkpoint=state.checkpoint,
             metric_history=MetricHistory(resume_path),
+            grad_snr_tracker=GradSNRTracker()
+            if "grad_snr" in self.config.metrics
+            else None,
             param_path=self._param_path,
         )
 

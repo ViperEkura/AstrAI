@@ -33,6 +33,7 @@ from astrai.optimization.optimizer.muon import MuonAdamW
 from astrai.parallel.executor import FSDPExecutor
 from astrai.trainer.callbacks.metric_util import GradSNRTracker
 from astrai.trainer.callbacks.metrics import MetricCallback
+from astrai.trainer.context.metric import MetricHistory
 from astrai.trainer.strategy.ops import _collect_moe_diagnostics
 
 SMOKE_CASES = [
@@ -375,7 +376,7 @@ def _run_stats(args, torch):
             for key, values in samples.items()
         }
 
-    # 8.4 million trainable weights, ~32 MiB per full-size FP32 moment.
+    # 8.4 million trainable weights; sampled diagnostic state stays bounded.
     layers = []
     for _ in range(8):
         layers.extend((nn.Linear(1024, 1024), nn.GELU()))
@@ -387,6 +388,7 @@ def _run_stats(args, torch):
     ctx = SimpleNamespace(
         model=model,
         grad_snr_tracker=tracker,
+        metric_history=MetricHistory(),
         val_dataloader=None,
         optimizer_step=0,
         epoch=0,
@@ -407,6 +409,7 @@ def _run_stats(args, torch):
         elif track == "default_metric":
             default_metric.before_optimizer_step(ctx)
         opt.step()
+        ctx.metric_history.discard_pending()
 
     result["train_params"] = params
     result["train_without_snr"] = timed(lambda: train_step(None), repeats=20)
@@ -421,7 +424,7 @@ def _run_stats(args, torch):
     result["snr_extra_allocated_mib"] = round(
         (torch.cuda.memory_allocated() - allocated_before) / 2**20, 2
     )
-    result["snr_db"] = round(tracker.snr, 4)
+    result["snr_db"] = None if tracker.snr is None else round(tracker.snr, 4)
     result["snr_read_wall_ms"] = timed_wall(lambda: tracker.snr)
 
     def sampled_metric_step(callback, sampled_ctx):
@@ -431,6 +434,8 @@ def _run_stats(args, torch):
         sampled_ctx.optimizer_step += 1
         callback.before_optimizer_step(sampled_ctx)
         opt.step()
+        sampled_ctx.grad_snr_tracker.commit(sampled_ctx.optimizer_step)
+        sampled_ctx.metric_history.discard_pending()
 
     for interval in (1, 10):
         sample_ctx = SimpleNamespace(**vars(ctx))
@@ -443,7 +448,7 @@ def _run_stats(args, torch):
         result[f"train_snr_interval_{interval}"] = timed(
             lambda: sampled_metric_step(callback, sample_ctx), repeats=20
         )
-        assert sample_ctx.grad_snr_value is not None
+        assert sample_ctx.grad_snr_tracker.observations > 0
     del model, opt, x, tracker, ctx, sample_ctx, callback, default_metric
     del train_step, sampled_metric_step
     gc.collect()

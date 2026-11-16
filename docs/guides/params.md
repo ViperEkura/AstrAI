@@ -110,7 +110,19 @@ with `--optimizer=muon_adamw`.
 |-----------|-------------|---------|
 | `--metrics` | Repeatable metric option (for example, `--metrics loss --metrics lr --metrics val_loss`) | `loss`, `lr`, `grad_norm` |
 
-`grad_snr` is opt-in. To enable it, include `--metrics grad_snr` alongside the other desired metrics. Its persistent gradient EMA uses one model-sized tensor set per GPU, with storage proportional to the number of parameters.
+`grad_snr` is opt-in. To enable it, include `--metrics grad_snr` alongside the other desired metrics. It tracks the temporal EMA of at most 65,536 fixed, stratified gradient coordinates
+per rank after global objective normalization, DDP reduction and clipping.
+First moments use FP32; sampled squared norms accumulate in FP64. State and sampling
+cadence survive a full resume and advance only with committed optimizer updates.
+The first observation, non-finite observations, zero signal and unresolved variance
+omit the value rather than report a misleading finite SNR. Unsampled steps also omit it.
+
+This is a sampled stability diagnostic along changing model weights, not a fixed-weight
+Gradient Noise Scale or a guaranteed optimal batch size. Coordinate sampling and token
+correlations limit interpretation. It supports eager offline SEQ/SFT/DPO with none/DDP;
+CP/TP/FSDP, online training and compiled training are rejected when enabled.
+Old checkpoints without estimator state require a warm start to enable the diagnostic;
+changing its sampling interval during a full resume is rejected.
 
 ### Gradient Checkpointing
 

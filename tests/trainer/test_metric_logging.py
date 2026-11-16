@@ -9,6 +9,7 @@ from astrai.parallel.executor import NoneExecutor
 from astrai.parallel.topology import ParallelTopology
 from astrai.trainer.callbacks import GradientClippingCallback, MetricCallback
 from astrai.trainer.callbacks.checkpoint import _write_metric_snapshot
+from astrai.trainer.callbacks.metric_util import GradSNRTracker
 from astrai.trainer.context import PreloadedState, TrainContext, TrainContextBuilder
 from astrai.trainer.context.metric import MetricHistory
 from astrai.trainer.trainer import Trainer
@@ -154,7 +155,7 @@ def test_async_validation_cadence_uses_pre_update_step(step, expected):
 @pytest.mark.parametrize("main_grad", [False, True], ids=["native", "fp32-main"])
 def test_grad_norm_logs_current_pre_clipping_gradient(tmp_path, monkeypatch, main_grad):
     config = create_train_config(
-        RandomTokenDataset(), str(tmp_path), "cpu", metrics=["grad_norm"]
+        RandomTokenDataset(), str(tmp_path), "cpu", metrics=["grad_norm", "grad_snr"]
     )
     trainer = Trainer(config)
     trainer.callbacks = [
@@ -172,6 +173,7 @@ def test_grad_norm_logs_current_pre_clipping_gradient(tmp_path, monkeypatch, mai
         torch.optim.SGD(context.model.parameters(), lr=0.1)
     )
     context.strategy = SimpleNamespace(after_update=lambda: None)
+    context.grad_snr_tracker = GradSNRTracker(beta=0.5)
     expected = torch.zeros(1, 2)
 
     for index, gradient in enumerate(((3.0, 4.0), (5.0, 12.0), (7.0, 24.0)), 1):
@@ -192,6 +194,9 @@ def test_grad_norm_logs_current_pre_clipping_gradient(tmp_path, monkeypatch, mai
                 patch.setattr(context.optimizer, "step", fail_update)
                 with pytest.raises(RuntimeError, match="optimizer failed"):
                     trainer._commit_global_update(context, new_data=True)
+            assert context.grad_snr_tracker.observations == 1
+            assert context.grad_snr_tracker.last_step == 1
+            assert context.grad_snr_tracker._pending is None
             assert context.optimizer_step == 1
             assert context.consumed_samples == 2
             assert len(context.metric_history.snapshot().records) == 1
@@ -218,3 +223,25 @@ def test_grad_norm_logs_current_pre_clipping_gradient(tmp_path, monkeypatch, mai
         (3, 6),
     ]
     assert [record["grad_norm"] for record in records] == pytest.approx([5, 13, 25])
+    assert context.grad_snr_tracker.observations == 3
+    assert context.grad_snr_tracker.last_step == 3
+    assert "grad_snr" not in records[0]
+    assert records[-1]["grad_snr"] == context.grad_snr_tracker.snr
+
+
+@pytest.mark.parametrize("mismatch", ["missing", "step", "interval"])
+def test_grad_snr_resume_rejects_inconsistent_estimator(mismatch):
+    context = _context(step=4, checkpoint=SimpleNamespace(extra={"grad_snr": {}}))
+    context.grad_snr_tracker = GradSNRTracker()
+    context.grad_snr_tracker.last_step = 4
+    context.grad_snr_tracker.interval = 2
+    if mismatch == "missing":
+        context.checkpoint.extra.clear()
+    elif mismatch == "step":
+        context.grad_snr_tracker.last_step = 3
+    else:
+        context.grad_snr_tracker.interval = 1
+    callback = MetricCallback(metrics=["grad_snr"], grad_snr_interval=2)
+    with pytest.raises(ValueError, match="grad_snr requires|SNR state|SNR sampling"):
+        callback.on_train_begin(context)
+    assert context.checkpoint_safe is False

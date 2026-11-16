@@ -434,6 +434,21 @@ class TrainConfig(BaseConfig):
             raise ValueError(f"must be non-negative, got {v}")
         return v
 
+    @model_validator(mode="after")
+    def _validate_grad_snr(self):
+        if "grad_snr" in self.metrics and (
+            self.cp_size != 1
+            or self.tp_size != 1
+            or self.dp_mode not in ("none", "ddp")
+            or self.compile_mode is not None
+            or self.strategy not in ("seq", "sft", "dpo")
+            or self.rollout_mode != "sync"
+        ):
+            raise ValueError(
+                "grad_snr supports eager offline SEQ/SFT/DPO with none/DDP only; CP/TP/FSDP/online/compiled paths are unsupported"
+            )
+        return self
+
     @field_validator("rollout_max_policy_lag")
     def _validate_optional_non_negative_int(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v < 0:

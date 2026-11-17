@@ -1,105 +1,65 @@
 # Frontend Layer
 
-`astrai/inference/frontend/` — everything that faces the user. The vLLM
-analogue is the API process (`AsyncLLM` / `LLMEngine` +
-`InputProcessor` / `OutputProcessor`); here it is an in-process layer so
-colocated RL rollout keeps sharing the model object with the trainer.
+The frontend is a **facade** for text generation and scoring. Network adapters
+translate HTTP protocols around it; the frontend itself handles inputs and
+output consumers. Keeping text work here lets tokenized training rollout use
+the core directly, without duplicating the scheduling loop.
 
 Frontend code must not touch engine locks, hold `Request` objects beyond
 submission, or read KV state.
 
-## Classes
+## Collaborators
 
 ```mermaid
 classDiagram
     direction TB
-    class InferenceEngine {
-        <<FACADE>>
-        +nn.Module model
-        +AutoTokenizer tokenizer
-        -EngineCore _core
-        -RequestTracker _tracker
-        -InputProcessor _input_processor
-        +generate(prompt, stream, max_tokens, ...) Union~Generator, str, List~str~~
-        +generate_async(prompt, ...) AsyncGenerator~str~
-        +generate_events(prompt, ..., stop_sequences) AsyncGenerator~StreamChunk~
-        +score(prompt, continuation, per_token)
-        +get_stats() Dict
-        +shutdown()
+    namespace Frontend {
+        class InferenceEngine {
+            <<Facade>>
+            generate()
+            generate_events()
+            score()
+        }
+        class InputProcessor
+        class ProcessedInput
+        class OutputProcessor
+        class StopSequenceChecker
+        class RequestTracker {
+            register(request_id, event_capacity)
+            drain(request_id)
+            subscribe_async(request_id, loop)
+        }
+        class TrackedRequest
+        class StreamChunk
     }
-    class EngineCore {
-        +set_event_sink(sink)
-        +start() / stop()
-        +add_requests(prompts, **kwargs) List~str~
-        +cancel_request(request_id) bool
-        +score_ids(prompts, continuations, per_token)
-        +get_stats() Dict
-    }
-    class InputProcessor {
-        +AutoTokenizer _tokenizer
-        +int _max_seq_len
-        +new_request_id() str
-        +process(prompt) ProcessedInput
-        +process_batch(prompts) List~ProcessedInput~
-    }
-    class ProcessedInput {
-        <<frozen>>
-        +str request_id
-        +List~int~ prompt_ids
-    }
-    class OutputProcessor {
-        +ProcessedOutput state
-        +push(event) Tuple
-        +usage() Tuple~int, int~
-        +finished bool
-    }
-    class StopSequenceChecker {
-        +Optional~str~ matched
-        +push(text) Tuple~str, bool~
-        incremental windowed matching
-    }
-    class RequestTracker {
-        +__call__(events)
-        +register(request_id, maxlen) Event
-        +drain(request_id) List
-        +wait(request_id, timeout) bool
-        +is_finished(request_id) bool
-    }
-    class TrackedRequest {
-        events
-        finished
-        subscriber
-    }
-    class OutputEvent {
-        <<frozen · core/events.py>>
-        TokenDelta(request_id, token_id, sequence_no)
-        RequestFinished(request_id, finish_reason, usage)
-        RequestError(request_id, code, message, retryable)
-    }
-    class StreamChunk {
-        +text
-        +delta_token_ids
-        +finish_reason / prompt_tokens / completion_tokens
+    namespace Core {
+        class EngineCore
+        class OutputEventSink
     }
 
     InferenceEngine --> EngineCore
     InferenceEngine --> InputProcessor : uses
     InferenceEngine --> OutputProcessor : folds events
     InferenceEngine *-- RequestTracker
+    EngineCore --> OutputEventSink : installs sink on scheduler
+    OutputEventSink <|-- RequestTracker
     InputProcessor ..> ProcessedInput : produces
     OutputProcessor *-- StopSequenceChecker
     RequestTracker *-- TrackedRequest
-    RequestTracker ..> OutputEvent : consumes
     OutputProcessor ..> StreamChunk : frontend maps
 ```
+
+The sink contract reverses event delivery without reversing source imports:
+the core calls `OutputEventSink`, and the frontend supplies `RequestTracker`.
+This is a single consumer outlet. Blocking and asynchronous consumption share
+the same registration and terminal-state bookkeeping.
 
 ## Responsibilities
 
 - **`InputProcessor`** tokenizes on the caller's thread (single or one
   batched `encode` call) and **mints the request id before submission**.
   Because the id exists before the scheduler knows about the request, an
-  event can never precede its consumer — this is what allowed the old
-  `_ResultSink` replay buffer to be deleted.
+  event cannot precede its consumer.
   Single and batch inputs then share one prepared-request submission path:
   register every consumer, submit the IDs and tokens through EngineCore,
   and release the registered requests if submission fails. Scalar tokenization
@@ -119,7 +79,7 @@ classDiagram
   limit, including when `core=` is supplied with different constructor options.
   The frontend attaches its event sink, starts the core and stops it on
   shutdown in either case. Locking and scheduler/KV ownership remain in the
-  core. The deprecated frontend `scheduler` property has been removed.
+  core.
 - **`RequestTracker`** is also the core's event sink. One lock protects its
   event queues, completion events and async subscriptions. Terminal delivery
   sets the same completion event used to suppress duplicate/late output;
@@ -137,12 +97,11 @@ Terminal protocol events carry finish metadata without replaying output text.
 
 Non-streaming `generate` runs **no helper thread**. It submits, parks the
 caller on the per-request finished events, and when every request has
-terminated folds all events at once on the caller's thread
-(`_collect_blocking`). Per-step fold wake-ups were a measured host
-overhead: each wake is a GIL handoff with the scheduler loop at exactly
-the worst time (between commit and the next submit). Folding once, after
-the batch is done, moves the same work off the decode loop entirely; the
-event queues for blocking generate are sized to `max_seq_len + 1` so
+terminated collects output on the caller's thread (`_collect_blocking`).
+The normal path decodes the collected token IDs once; tokenizers without the
+bulk path, errors and decode failures use incremental event folding.
+This avoids per-step caller wakeups competing with the engine thread.
+The event queues are sized to `max_seq_len + 1` so
 accumulating until completion never drops tokens. Streaming entry points
 keep incremental folding — their consumers want text as it is produced.
 

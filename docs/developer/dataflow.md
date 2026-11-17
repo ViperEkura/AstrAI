@@ -31,7 +31,7 @@ JSON / JSONL Records → Pipeline (mask builder) → Tokenized Tensors
 
 The offline `Pipeline` accepts `.jsonl` records and `.json` files containing one
 object or a list of objects. It tokenizes them and writes binary shards (`.bin`
-plus `meta.json`) with keyed tensor groups. Binary is the only registered output
+plus `meta.json`) with keyed tensor groups. Binary is the only supported output
 writer; the pipeline cannot emit JSONL.
 
 ### Tokenization
@@ -93,13 +93,16 @@ access methods.
 **MmapStore**: Memory-maps `.bin` files. OS page cache sharing is native — no explicit `share_memory_()` needed. Uses `torch.from_numpy(np.memmap(...))`. `segments_are_records=False` — bin segments are contiguous streams; record access is driven by `_offsets` (written when `save_bin(..., record_keys=...)` was used at preprocessing time).
 
 **JsonlStore**: Reads a `.jsonl` file or the sorted top-level `*.jsonl` files in
-a directory. Eager transform selection is owned by
-`DatasetFactory._build_jsonl_transform()` (called from `DatasetFactory.load()`) —
-the factory picks the first available route:
+a directory. `DatasetFactory.load()` calls the module-level
+`_build_jsonl_transform()` in `dataset/dataset.py`, selecting:
 
-1. An explicit `transform=` argument passed through `store.load()`.
-2. `dataset_config.json` in the JSONL directory. It follows `PipelineConfig` and may add `tokenizer_path`; when omitted, the config directory is used.
-3. The built-in `messages` transform when `tokenizer_path=` is supplied. It masks system/user turns, trains assistant turns, and emits document-reset position IDs.
+1. `dataset_config.json` in the JSONL directory. It follows `PipelineConfig` and may add `tokenizer_path`; when omitted, the config directory is used.
+2. The built-in `messages` transform when `tokenizer_path=` is supplied. It masks system/user turns, trains assistant turns, and emits document-reset position IDs.
+
+For a custom transform, call `JsonlStore.load(path, transform=...)` directly,
+then pass the loaded `store=` to `DatasetFactory.load()`. The factory's eager
+path supplies its own transform; it does not accept a transform override through
+`**kwargs`.
 
 `JsonlStore.load()` requires `transform=` to be passed explicitly for eager mode
 (raises `ValueError` if missing).
@@ -129,7 +132,8 @@ records and processes them in `fetch_record`.
 | Type | Storage Keys | Access Mode |
 |------|-------------|-------------|
 | `seq` | `sequence`, `position_ids` by default (`SEQDataset` consumes only `sequence`) | stream (`fetch`) |
-| `sft` | `sequence`, `loss_mask`, `position_ids` | stream (`fetch`) |
+| `sft` stream | `sequence`, `loss_mask`, `position_ids` | stream (`fetch`) |
+| `sft` packed records | `sequence`, `loss_mask`, `seq_lengths` | record (`fetch_record`), then `sft_collate_fn` |
 | `dpo` | `chosen`, `rejected`, `chosen_mask`, `rejected_mask` | record (`fetch_record`) |
 | `grpo` | `prompts`, `responses`, `masks`, `rewards` | record (`fetch_record`) |
 
@@ -166,8 +170,8 @@ Class hierarchy: `BaseDataset` is the direct base of `SEQDataset`, `SFTDataset`,
 uses `window_size` to reject oversized packs rather than re-slicing them. `storage_type` defaults to `None` (auto-detect via `detect_format`).
 
 For raw JSONL, `tokenizer_path` builds the lazy processor only for DPO. For
-SEQ/SFT it is forwarded to `JsonlStore` so the built-in eager `messages`
-transform can be selected when no `dataset_config.json` exists. GRPO receives no
+SEQ/SFT the factory uses it to construct the built-in eager `messages`
+transform when no `dataset_config.json` exists. GRPO receives no
 automatic processor. A pre-built `store` bypasses path, format, tokenizer,
 window, and stride setup entirely.
 

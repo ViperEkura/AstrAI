@@ -32,14 +32,41 @@ and greedy decoding when it is zero. Their defaults differ from direct engine ca
 ## Cache and backend selection
 
 The default contiguous cache reserves `max_batch_size × max_seq_len` slots.
-Pass a finite `kv_tokens` to select paged allocation; `page_size > 1` also
-enables prefix reuse. Sequence limits apply to prompt plus output.
-Chunked prefill is disabled by default.
+`build_engine()` defaults to batch capacity 1; the server CLI defaults to 16.
+Sequence limits apply to prompt plus output. Chunked prefill is disabled by
+default.
+
+`kv_tokens`, `page_size` and `token_budget` are `EngineCore` constructor
+options, not direct `build_engine()` or server CLI flags. With an already
+loaded and placed model/tokenizer, inject a configured core:
+
+```python
+from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.frontend.engine import InferenceEngine
+
+core = EngineCore(
+    model,
+    tokenizer,
+    max_batch_size=1,
+    max_seq_len=4096,
+    kv_tokens=16384,
+    page_size=16,
+)
+engine = InferenceEngine(model, tokenizer, core=core)
+try:
+    print(engine.generate("Hello", max_new_tokens=128))
+finally:
+    engine.shutdown()
+```
+
+A finite `kv_tokens` selects paged allocation; `page_size > 1` enables prefix
+reuse. `token_budget` limits each prefill start-offset group, not all work in
+one scheduler step. The frontend uses the injected core's sequence limit.
 
 Automatic attention dispatch tries compatible CUDA, FlashAttention and Torch
 implementations. Use `set_op("attention", "cuda")` for a soft default or
 `op_backend(attention="cuda")` for a strict scope around engine construction.
-The worker snapshots that selection when created.
+The core captures that selection at construction and installs it in the worker.
 
 For cache layout, scheduling, CUDA graphs and ownership, see
 [inference internals](../developer/inference/README.md). Cache views are

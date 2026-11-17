@@ -67,12 +67,18 @@ Unsampled, non-finite, first and unresolved observations omit the metric. GradSN
 is a sampled temporal diagnostic, not a fixed-weight Gradient Noise Scale or an
 optimal-batch-size estimate.
 
-A failed offline update discards pending records and rolls back the counters;
-the existing checkpoint-safe guard prevents publication of partially updated
-weights. An online policy version advance marks a committed update even if
-subsequent publication raises: its metric records follow the committed counters.
-Without a version advance, pending records are discarded. TrainSession also
-discards pending records before shutdown callbacks attempt an emergency save.
+The global-window path covers offline and synchronous online training. If an
+update fails, it discards pending records and restores that update's counters;
+this does not restore mutated weights or undo an already advanced policy
+version. `checkpoint_safe` remains false, and the run must stop.
+
+The asynchronous-round path retains step/sample counters when the actor version
+has advanced, even if later work fails. It commits metric records and marks the
+checkpoint safe only after algorithm post-update work, gradient clearing and
+scheduler advancement succeed. A failure in that local work discards pending
+records and leaves the checkpoint unsafe. Without a version advance, the round
+does not advance counters. TrainSession discards any remaining pending records
+before shutdown callbacks attempt an emergency save.
 
 ## Persistence and resume
 

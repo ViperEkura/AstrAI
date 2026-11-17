@@ -25,8 +25,8 @@ with op_backend(attention="torch"):
 `attention(..., implementation="cuda")` overrides the context for one call.
 An explicit argument or context choice raises when unsupported.
 `set_op("attention", "cuda")` and `ASTR_OPS=attention=cuda` are soft process
-defaults with automatic fallback. An inference scheduler captures the context
-choice when it is created and installs it in its worker; requests do not carry
+defaults with automatic fallback. `EngineCore` captures the context choice
+when it is constructed and installs it in its worker; requests do not carry
 an implementation choice.
 
 ## Native dtype dispatch

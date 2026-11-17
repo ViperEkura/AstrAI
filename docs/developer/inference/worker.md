@@ -4,6 +4,10 @@
 assembly, device buffers, sampling, CUDA graphs and result materialization.
 It does not own request lifecycle or retain core `Request` objects.
 
+The runner composes device resources directly. Graph replay, workspace reuse
+and result copying have different lifetimes; they are not interchangeable
+execution strategies and do not need a common manager base class.
+
 ## Data boundary
 
 The neutral `contracts.py` defines immutable execution-request descriptions,
@@ -11,6 +15,11 @@ The neutral `contracts.py` defines immutable execution-request descriptions,
 version and request windows. It contains execution data, not a reference to a
 live scheduler request. The returned results identify the requests to which
 rows belong; the core must not infer that correspondence from a mutable batch.
+
+Plans isolate request execution data, but not all cache access: the runner
+still calls the shared `KVCacheManager.bind()` and checks `bind_was_steady`.
+This [remaining boundary](core.md#cache-binding-boundary) must be visible in
+architecture diagrams even though the corresponding imports are type-only.
 
 The core applies results to requests. Worker-side result materialization does
 not append output tokens, decide a request's final service state, emit terminal
@@ -44,12 +53,14 @@ classDiagram
         pinned input staging
     }
     class CUDAGraphRunner
+    class KVCacheManager
 
     GPUModelRunner *-- InferenceWorkspace
     GPUModelRunner *-- CUDAGraphRunner
     GPUModelRunner *-- ResultRing
     GPUModelRunner *-- DecodeSteadyState
     GPUModelRunner --> PendingExecution
+    GPUModelRunner --> KVCacheManager : bind allocated slots to workspace
     ResultRing --> PendingExecution : output copy
 ```
 
@@ -58,6 +69,11 @@ classDiagram
 AstrAI's submit/commit boundary separates **forward plus sampling submission**
 from **host result materialization**. It is not the same split as vLLM's
 `execute_model`/`sample_tokens`, which separates forward from sampling.
+
+`PendingExecution` acts as a deferred result with resource ownership. Its
+`commit()` resolves a host payload; only `Scheduler.update_from_output()`
+commits that payload to live request state. This is not a model-weight or
+checkpoint commit.
 
 - Submission produces device-resident sampled tokens and optional raw-model
   logprobs without resolving their values on the host.
@@ -94,11 +110,11 @@ CUDA decode path, not every fallback and sampling combination.
 addresses owned by `InferenceWorkspace`, and capture must not race outstanding
 work on those buffers. Sampling remains outside the captured forward. An
 in-place weight update does not by itself change parameter addresses.
-Each runner captures on an explicit stream bound to its input device. Async
-rollout constructs replicas sequentially and freezes new captures before
-generator threads start; an unseen batch size runs eager. PyTorch allows only
-one capture at a time per process, and its implicit graph stream may produce
-an empty graph on later GPUs in a single-process multi-GPU setup.
+Each runner captures on an explicit stream bound to its input device.
+`freeze_captures()` makes unseen shapes use eager execution, but currently only
+the graph regression test calls it; production rollout does not automatically
+freeze capture. Do not treat this helper as an installed multi-runner capture
+coordination mechanism.
 
 ## Prefill and future mixed execution
 

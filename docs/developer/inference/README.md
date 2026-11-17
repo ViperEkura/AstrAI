@@ -1,110 +1,178 @@
-# Inference Engine Internals
+# Inference Architecture
 
-Inference uses three one-way **in-process** layers. The colocated rollout
-backend shares the trainer's model object, so `EngineCore` is a driver,
-not a process or an RPC server.
+Inference separates user-facing text processing, request scheduling and device
+execution. The layers run **in one process**: colocated rollout shares the
+trainer's model, while a serving instance uses a background engine thread.
+Separate rollout replicas are placed by the training backend.
 
-```text
-astrai/inference/
-  contracts.py  immutable scheduling and execution data
-  frontend/     engine facade, input/output processing, tracking, direct core calls
-  core/         EngineCore driver, Scheduler, request lifecycle, KV accounting
-  worker/       model runner, pending execution, CUDA graphs, sampling, workspace
-  network/      OpenAI/Anthropic protocol adapters
-```
+## Three-layer class relationships
 
-The dependency direction is **frontend → core → worker → model/KV ABI**.
-All layers may use the neutral data contracts. Worker code must not import
-core request-lifecycle types at runtime or retain mutable `Request` objects.
-`tests/inference/test_layering.py` checks the runtime import direction.
+The inference engine has three layers: **Frontend → Core → Runner**.
+Scheduling and KV management belong to Core; workspace and graph execution
+belong to Runner. Runner is implemented in the `worker/` package.
 
-## Documents
-
-| Document | Scope |
-|----------|-------|
-| [frontend.md](frontend.md) | Engine facade, input/output processing, request tracking and event consumption |
-| [core.md](core.md) | Driver, scheduling, result application, KV ownership and policy versioning |
-| [worker.md](worker.md) | Execution contracts, pending results, sampling, workspace and CUDA graphs |
-| [events.md](events.md) | Event order, terminal states, cancellation and shutdown |
-
-## Ownership
+Network adapters are entrypoints around Frontend. Model/cache tensor layouts
+are dependencies used by Runner, and `contracts.py` carries shared data.
+These are not additional inference-engine layers.
 
 ```mermaid
 classDiagram
-    direction LR
-    class InferenceEngine
-    class EngineCore {
-        driver and operation lock
-        in-flight execution and draining
+    direction TB
+    namespace Frontend {
+        class InferenceEngine
+        class InputProcessor
+        class OutputProcessor
+        class RequestTracker
     }
-    class Scheduler {
-        request state and KV accounting
-        schedule / update_from_output
+    namespace Core {
+        class EngineCore
+        class Scheduler
+        class StepPlanner
+        class KVCacheManager
+        class PolicyVersionGuard
     }
-    class GPUModelRunner {
-        execute immutable plans
-        device buffers and sampling
+    namespace Runner {
+        class GPUModelRunner
+        class InferenceWorkspace
+        class CUDAGraphRunner
+        class PendingExecution
     }
-    class SchedulerOutput
-    class ModelRunnerOutput
-    class PendingExecution
 
-    InferenceEngine --> EngineCore : public operations
-    EngineCore *-- Scheduler : plan and apply results
-    EngineCore --> GPUModelRunner : execute
-    Scheduler --> SchedulerOutput
-    GPUModelRunner --> PendingExecution
-    PendingExecution --> ModelRunnerOutput
-    ModelRunnerOutput --> Scheduler
+    InferenceEngine --> InputProcessor : prepare inputs
+    InferenceEngine --> OutputProcessor : decode events
+    InferenceEngine *-- RequestTracker : track consumers
+    InferenceEngine --> EngineCore : submit and cancel
+    EngineCore *-- Scheduler : schedule and apply results
+    EngineCore *-- PolicyVersionGuard : serialize operations
+    Scheduler *-- StepPlanner : plan windows
+    Scheduler *-- KVCacheManager : allocate and release KV
+    EngineCore *-- GPUModelRunner : execute plans
+    EngineCore --> PendingExecution : materialize results
+    GPUModelRunner --> PendingExecution : return handles
+    GPUModelRunner *-- InferenceWorkspace : device buffers
+    GPUModelRunner *-- CUDAGraphRunner : capture and replay
+    GPUModelRunner ..> KVCacheManager : shared cache binding
 ```
 
-`EngineCore` provides `start`/`stop`, `execute_requests`, `score_ids`,
-request submission and policy-version operations. `Scheduler` owns mutable
-request and KV state and applies results. `StepPlanner` generates execution
-entries without a back-reference to the driver. Training rollout formats
-tokenized batches in `astrai.trainer.backend.run_batch` and passes requests
-to `EngineCore.execute_requests`, using the same scheduling and result path
-as serving.
+Composition arrows mark owned collaborators; other arrows mark calls or
+dependencies. The dotted Runner-to-Core edge records the existing shared KV
+binding dependency. It does not introduce another layer.
 
-## Stages 0 and 1
+| Layer | Owns | Why it is separate |
+| --- | --- | --- |
+| Frontend | Input processing, consumer tracking, output decoding and text stops | Text APIs can change without altering scheduling; tokenized rollout can enter core directly |
+| Core | Execution loop, request queues, planning, KV allocation and policy versions | Scheduling, accepted output and resource lifetime need coordinated state ownership |
+| Runner | Input tensors, model execution, sampling, workspace, graphs and deferred results | Device optimizations do not decide request completion or logical KV release |
 
-These stages establish correctness and ownership without changing the
-scheduling policy into a global token scheduler:
+The source import direction is **frontend → core → worker → model/cache ABI**;
+all layers can use `contracts.py`. `tests/inference/test_layering.py` rejects
+reverse runtime imports. This is an import rule, not complete object isolation:
+the runner receives a shared `KVCacheManager` and calls `bind()` to create model
+cache views. That method still combines request lookup with device metadata
+assembly. See [the cache boundary](core.md#cache-binding-boundary).
 
-- Terminal events are emitted once, after every accepted token event.
-  Cancellation, rejection, zero-output requests and errors must also
-  terminate their consumers.
-- Every submitted execution is accounted for, including backend sub-batches,
-  drains at a batch change, and shutdown. Discarding a cancelled result does
-  not permit releasing its still-in-flight KV resources.
-- Plans and worker results carry execution identity and the real policy
-  version. Worker outputs are matched by request identity, not by assuming
-  that a batch's mutable request list remains unchanged.
-- Paged cache mapping is updated even when a decode token fits in an already
-  allocated page. Prefix publication requires an explicit materialized
-  token boundary; allocated but uncomputed pages are not reusable prefixes.
-- Shared-model generation, scoring and weight updates use the same policy
-  operation boundary. Colocated model-mode changes and replica weight
-  copies are included in that boundary.
+## Design patterns in use
 
-## Preserved fast paths and remaining work
+These names describe existing responsibilities; they do not require additional
+base classes, registries or forwarding layers.
 
-Fixed-address workspace, pure-decode CUDA graphs, GPU token relay, pinned
-result copying, controlled decode overlap, and completion-driven blocking
-output collection remain in place.
+| Pattern | Current implementation | Benefit and constraint |
+| --- | --- | --- |
+| Facade | `InferenceEngine.generate`, `generate_events` and `score` | One text API hides registration and cleanup; scheduling stays in core |
+| Adapter | OpenAI/Anthropic network modules | Translate protocols around the same frontend; no per-protocol scheduler |
+| Strategy | `AllocationStrategy`: contiguous or paged | Real alternative allocation policies share one interface; they need not share prefix-cache behavior |
+| Event sink | `OutputEventSink` implemented by `RequestTracker` | Core emits token/terminal events without importing consumers; this is one sink, not a general event bus |
+| Immutable execution messages | `SchedulerOutput` and `ModelRunnerOutput` | Identity and version travel with delayed work; the worker cannot mutate a live `Request` through a plan |
+| Deferred result | `PendingExecution` | Submission and host materialization are separate; `commit()` resolves data, while the scheduler applies request state |
+| Resource reuse | `InferenceWorkspace`, `ResultRing`, `CUDAGraphRunner` | Stable buffers reduce allocation and copying; their reuse must wait for the relevant execution to retire |
 
-Chunked prefill already exists, but its current budget is a **local prefill
-forward budget**, not a global scheduling-step budget. Chunking remains off
-by default. Decode-first global budget scheduling and a single packed
-prefill/decode forward are later stages, not part of stages 0 and 1.
+`EngineCore` coordinates these collaborators directly. There is no need for a
+second executor facade while execution remains local. `StepPlanner` is a small
+planning collaborator, not a scheduler plugin hierarchy. Sampling is a function,
+and is not represented as a class in the diagrams.
 
-Paged allocation is selectable but is not the default. `kv_tokens=None`
-selects contiguous allocation; a finite `kv_tokens` selects paged allocation,
-and `page_size > 1` additionally enables the radix prefix index. Both modes
-preallocate their GPU storage arena. The paged path currently reserves the
-prompt's pages at admission; progressive prompt-page allocation and
-recompute preemption are subsequent resource-policy work.
+## Cooperation across one execution
 
-The workspace-root design documents contain historical diagrams. This
-folder describes the current implementation and deliberately does not
-prescribe EngineCore/Worker processes, ZMQ, or the full vLLM feature matrix.
+```mermaid
+sequenceDiagram
+    participant F as Frontend
+    participant T as RequestTracker
+    participant C as EngineCore
+    participant S as Scheduler
+    participant W as GPUModelRunner
+    participant P as PendingExecution
+    F->>F: Tokenize and assign request IDs
+    F->>T: Register consumers
+    F->>C: Submit prepared inputs
+    C->>S: Admit and enqueue
+    loop Until completion or cancellation
+        C->>S: schedule()
+        S-->>C: SchedulerOutput (identity, version, windows)
+        C->>W: execute_model(plan)
+        W-->>C: Handle for each submitted group
+        C->>P: commit() during drain
+        P-->>C: ModelRunnerOutput
+        C->>S: update_from_output(result)
+        S-->>T: Accepted tokens, then terminal event
+    end
+    T-->>F: Events for decoding and usage
+```
+
+This shows logical order. Supported decode overlap may submit the next forward
+before materializing the previous result. The distinction between **planned**,
+**materialized** and **accepted** progress is therefore necessary:
+
+- A planned window reserves resources but does not prove its KV has been written.
+- Materialization waits for execution/copy completion. Even a prefill chunk
+  without a sampled token needs this boundary.
+- The scheduler validates identity, order and policy version before accepting
+  output. Cancellation can discard a result without making its resources safe
+  to reuse early.
+
+## State ownership and lifetime
+
+| State | Owner | Release or reuse boundary |
+| --- | --- | --- |
+| Consumer queues and completion notifications | RequestTracker | Unregister after collection or early exit |
+| Live requests and accepted tokens | Scheduler | Terminal state plus retirement of in-flight executions |
+| Request-to-KV allocation and prefix index | KVCacheManager / BlockPool | Free after retirement; publish only completed prefix pages |
+| Outstanding execution queue | EngineCore | Drain or safely retire every submitted handle |
+| Latest decode relay and sampling state | GPUModelRunner | Reuse only for the same ordered request identities and valid KV binding |
+| Host copy slots and device buffers | ResultRing / InferenceWorkspace | Completion and consumption before overwrite |
+| Model version and mutation lock | PolicyVersionGuard | Stopped/drained engine, successful mutation and KV invalidation |
+
+The core's pending queue accounts for all submitted groups. The runner's latest
+decode handle supports relay and overlap checks; it is not a second request
+queue. Likewise, consumer completion and GPU resource retirement are different
+milestones. Merging these states solely because their names look similar would
+erase required lifetime boundaries.
+
+## Current scope and tradeoffs
+
+The useful vLLM-style separation is scheduling versus execution, with explicit
+plan/result messages. AstrAI keeps direct in-process calls for shared-model
+training; it has no EngineCore/worker RPC or process executor.
+
+Chunked prefill uses a budget **per start-offset group**, reset for each group.
+Decode is planned separately, and the runner submits separate forwards by phase
+and prefill start offset. This is not a global token budget or a single mixed
+prefill/decode forward. Chunking remains off by default.
+
+Both allocation policies preallocate GPU storage. `kv_tokens=None` selects
+contiguous allocation; a finite value selects paged allocation, with radix
+prefix reuse when `page_size > 1`. Paged admission currently reserves the
+prompt's pages. Progressive admission and recompute preemption are not present.
+
+The main remaining ownership issue is shared KV binding. A future change can
+make request-slot/length data explicit at that boundary and keep device metadata
+assembly with the worker, while preserving fixed addresses and overlap ordering.
+Adding an abstract manager alone would leave the same dependency in place.
+
+## Layer details
+
+| Document | Scope |
+| --- | --- |
+| [Frontend](frontend.md) | Facade, input/output processing and consumer tracking |
+| [Core](core.md) | Driver, scheduling, KV ownership and policy versioning |
+| [Runner](worker.md) | Execution messages, deferred results and device resources |
+| [Events](events.md) | Cancellation, terminal delivery and shutdown |

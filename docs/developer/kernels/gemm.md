@@ -503,18 +503,13 @@ mainloop/staging/epilogue layers are untouched: `MxMmaOp` (mma/mma.cuh)
 swaps only the cell, carrying a constant unit scale (every ue8m0 scale byte
 0x7f = 2^0, selectors inert — the scale-factored product IS the plain
 product; quant_gemm_test output stays byte-identical). Warp-level
-block_scale is an sm_120-FAMILY instruction (CUDA 13.0 ptxas: 120a/121a/
-120f accepted, 100a/103a/110a rejected — datacenter Blackwell does MX
-through tcgen05, which needs 13.1+), so the cell gates on the family pass
-(`ASTRAI_ARCH_FAMILY >= 1200`, mma/mma.cuh's value-macro twin of
-`ASTRAI_DEVICE_ARCH`) and the gemm fatbin carries the sm_120a image (the
-arch token names it — `ASTRAI_CUDA_ARCH=120a`; CMake's native `a` grammar
-emits one image per token, and a plain `120` list warns at configure time)
-which the driver picks on sm_120; every other pass/device falls back to the
-plain cell inside the same tree, so routing can only trade speed, never
-correctness. `launch_plan` routes the symmetric-fp8 pair through the mx
-tree on sm_120 unless `set_staging(mx=False)` knocks it out (the A/B knob;
-read once per process — separate processes to compare).
+block_scale is implemented in `mma/sm120.cuh`. The header checks CUDA's
+SM120 architecture/family feature macros, and CMake builds the MX schedule
+only for explicit `120a` or `120f` targets accepted by NVCC. Plain `120`
+does not include that schedule. Runtime selection requires both a compatible
+device and a matching compiled image, as recorded in `gemm_build.h`.
+`set_staging(mx=False)` disables MX selection for comparisons; baseline
+schedules remain subject to their own build and device capabilities.
 
 **Crosswise loads.** Crosswise operands (A `[K][M]` / B `[N][K]` storage)
 cannot cp.async into the canonical tile; they take the direct LDG.128×4 +

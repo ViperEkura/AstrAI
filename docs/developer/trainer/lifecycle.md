@@ -68,7 +68,7 @@ TrainContext is the mutable state shared by Trainer, strategies, callbacks,
 and rollout. It records the model, optimizer, scheduler, executor, data
 loaders, step counters and stop request. TrainContextBuilder constructs those
 objects in dependency order, restores checkpoint state, and closes an
-assigned asynchronous rollout if construction fails.
+assigned rollout if construction fails, in either synchronous or asynchronous mode.
 
 create_ref_model() creates the frozen reference policy for strategies that
 declare that capability. The builder uses StrategyCapabilities for auxiliary

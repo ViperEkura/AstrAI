@@ -44,9 +44,7 @@ BLAS-style formulas, not a complete BLAS interface with side/uplo/trans flags.
 
 ```mermaid
 flowchart LR
-    Optimizer --> NS[backend.newton_schulz]
-    NS --> Ops[backend.newton_schulz]
-    Ops --> Dispatch[backend.newton_schulz dispatcher]
+    Optimizer --> Dispatch[backend.newton_schulz: recurrence and operator dispatch]
     Dispatch --> Policy[policy.newton_schulz]
     Dispatch --> Torch[Torch fallback]
     Dispatch --> Adapter[kernel.newton_schulz]
@@ -56,10 +54,10 @@ flowchart LR
     CUDA --> Scheduler[GemmTileScheduler]
 ```
 
-The C++ module has three translation units: \`bindings.cu\` owns the pybind
-surface, \`entry.cu\` validates tensors and packs GEMM parameters, and
-\`kernels.cu\` owns the typed kernels, launch dispatch and their resource
-planner. Their declarations are private to \`newton_schulz/entry.h\`.
+The C++ module has three translation units: `bindings.cu` owns the pybind
+surface, `entry.cu` validates tensors and packs GEMM parameters, and
+`kernels.cu` owns the typed kernels, launch dispatch and their resource
+planner. Their declarations are private to `newton_schulz/entry.h`.
 
 The kernel adapter forwards execution arguments and exposes candidate and plan
 metadata. The operator dispatcher owns validation and fallback. The

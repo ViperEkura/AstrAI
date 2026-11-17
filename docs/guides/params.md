@@ -279,7 +279,7 @@ See [Inference Guide](inference.md) for HTTP API documentation.
 | `--num_samples` | int | `1` | Responses per prompt |
 | `--max_seq_len` | int | `2048` | KV cache sequence length |
 | `--frequency_penalty` | float | `0.0` | Frequency penalty |
-| `--rep_window` | int | `64` | Window size for frequency penalty |
+| `--rep_window` | int | `64` | Recent prompt tokens included in the frequency penalty; all generated tokens are also counted |
 
 Usage:
 ```bash

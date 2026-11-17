@@ -4,7 +4,7 @@ This page describes module boundaries, ownership and execution flow.
 Boxes group classes by responsibility; arrows show calls, ownership or data
 contracts. Detailed fields and signatures remain in source.
 
-## Entrypoints and layers
+## System overview
 
 CLI tools resolve configuration and call the same Python components used by
 applications. Training owns updates; inference owns request execution. They share
@@ -12,30 +12,68 @@ model, tokenizer, serialization and kernel infrastructure.
 
 ```mermaid
 flowchart TB
-    Prep["preprocess.py"] --> Pipeline["Preprocessing pipeline"]
-    Pipeline --> Data["Binary records and metadata"]
-    TrainCLI["train.py / Python"] --> Trainer["Trainer"]
-    Data --> Loader["Dataset and DataLoader"]
+    subgraph Entrypoints["Entrypoints"]
+        Prep["preprocess.py"]
+        TrainCLI["train.py / Python"]
+        HTTP["server.py / HTTP"]
+        Python["Python / demos"]
+    end
+    subgraph DataPreparation["Data preparation"]
+        Pipeline["Preprocessing pipeline"]
+        Data["Binary records and metadata"]
+        Loader["Dataset and DataLoader"]
+    end
+    subgraph Training["Training"]
+        Trainer["Trainer"]
+        Rollout["Rollout backend"]
+    end
+    subgraph Inference["Inference"]
+        Protocol["Protocol adapters"]
+        Frontend["Frontend"]
+        Core["Core"]
+        Runner["Runner"]
+    end
+    subgraph Shared["Shared infrastructure"]
+        Model["Model execution"]
+        Tokenizer["Tokenizer"]
+        Extension["Backend dispatch and kernels"]
+        Checkpoint["Checkpoint serialization"]
+    end
+
+    Prep --> Pipeline
+    Pipeline --> Data
+    TrainCLI --> Trainer
+    Data --> Loader
     Loader --> Trainer
-    HTTP["server.py / HTTP"] --> Protocol["Protocol adapters"]
-    Python["Python / demos"] --> Frontend["Inference frontend"]
+    HTTP --> Protocol
+    Python --> Frontend
     Protocol --> Frontend
-    Frontend --> Core["EngineCore and Scheduler"]
-    Core --> Worker["GPUModelRunner"]
-    Trainer --> Model["Model execution"]
-    Worker --> Model
-    Trainer --> Rollout["Rollout backend"]
+    Frontend --> Core
+    Core --> Runner
+    Trainer --> Model
+    Runner --> Model
+    Trainer --> Rollout
     Rollout --> Core
-    Model --> Extension["Backend dispatch and kernels"]
-    Trainer --> Checkpoint["Checkpoint publication"]
+    Pipeline --> Tokenizer
+    Frontend --> Tokenizer
+    Model --> Extension
+    Trainer --> Checkpoint
 ```
 
 The arrows show calls or data flow, not separate processes. A local training
 launcher creates one process per configured distributed rank. Within an
-inference instance, frontend, core and worker are in-process layers. Async rollout
+inference instance, Frontend, Core and Runner are in-process layers. Async rollout
 creates separate replica processes, each with its own inference instance.
 
-## Configuration and construction
+Entrypoints translate user settings into calls. Data preparation produces the
+records consumed by training; training owns updates and inference owns request
+execution. Shared infrastructure provides computation, tokenization and
+serialization without owning either execution loop. The protocol adapter is an
+entrypoint around the three-layer inference engine.
+
+## Training
+
+### Construction and lifetime
 
 The CLI merges defaults, YAML and explicit flags into validated configuration.
 `ComponentSpec(type, params)` selects training components; construction occurs
@@ -48,40 +86,32 @@ process groups and rollout workers. A builder failure cleans up partially create
 rollout resources; a session failure follows the normal shutdown plan.
 See [construction lifecycle](trainer/lifecycle.md) for the exact order.
 
-## Training ownership
+### Module relationships
 
 ```mermaid
 classDiagram
     direction TB
-    namespace Construction {
+    namespace Lifecycle {
         class TrainSession
         class TrainContextBuilder
-    }
-    namespace TrainingLoop {
         class Trainer
         class TrainContext
     }
-    namespace Strategy {
+    namespace UpdateExecution {
         class BaseStrategy
+        class BaseExecutor
+        class Optimizer
+        class LRScheduler
     }
     namespace Rollout {
         class RolloutRunner
         class RolloutEvaluator
         class WeightPublisher
     }
-    namespace Parallel {
-        class BaseExecutor
-    }
-    namespace Optimization {
-        class Optimizer
-        class LRScheduler
-    }
-    namespace Callbacks {
+    namespace CallbacksAndPersistence {
         class MetricCallback
         class CheckpointCallback
         class GradientClippingCallback
-    }
-    namespace Persistence {
         class MetricHistory
         class Checkpoint
     }
@@ -107,6 +137,12 @@ classDiagram
     CheckpointCallback --> MetricHistory : snapshot and acknowledge
     CheckpointCallback --> Checkpoint : publish
 ```
+
+The four groups describe collaborators, not four sequential training stages.
+Lifecycle owns the run, UpdateExecution performs requested algorithm and gradient
+operations, Rollout supplies generated data, and CallbacksAndPersistence
+contains callback hooks and committed history. `Trainer` coordinates them;
+the other groups do not create independent update loops.
 
 - `Trainer` owns global data windows, optimizer updates and committed counters.
 - `TrainContextBuilder` resolves components inside each rank; `TrainSession`
@@ -144,8 +180,8 @@ sequenceDiagram
     T->>E: Backward and synchronize selected boundary
     T->>E: Normalize accumulated gradients
     T->>B: Dispatch pre-update hooks
-    B->>H: MetricCallback stages measurements
     B->>E: GradientClippingCallback clips gradients
+    B->>H: MetricCallback stages measurements
     T->>O: Update actor (inside rollout lock when online)
     opt Online training
         T->>R: Publish replicas, advance version and update count
@@ -170,7 +206,15 @@ the same committed prefix. The callbacks communicate through that state, so
 neither callback controls the other. Full-resume state and exported inference
 weights serve different purposes; see the [checkpoint contract](../guides/training.md#checkpoint).
 
-## Inference ownership
+## Inference
+
+The inference engine has three layers: **Frontend → Core → Runner**.
+Scheduling and KV management belong to Core; workspace and graph execution
+belong to Runner. Runner is implemented in the `worker/` package.
+
+Network adapters are entrypoints around Frontend. Model/cache tensor layouts
+are dependencies used by Runner, and `contracts.py` carries shared data.
+These are not additional inference-engine layers.
 
 ```mermaid
 classDiagram
@@ -183,105 +227,70 @@ classDiagram
     }
     namespace Core {
         class EngineCore
-        class PolicyVersionGuard
-    }
-    namespace Scheduling {
         class Scheduler
         class StepPlanner
         class KVCacheManager
+        class PolicyVersionGuard
     }
     namespace Runner {
         class GPUModelRunner
         class InferenceWorkspace
         class CUDAGraphRunner
-    }
-    namespace Contracts {
-        class SchedulerOutput
-        class ModelRunnerOutput
-    }
-    namespace ModelExecution {
-        class Module
-        class BaseKVCache
+        class PendingExecution
     }
 
-    InferenceEngine --> InputProcessor : tokenize
+    InferenceEngine --> InputProcessor : prepare inputs
     InferenceEngine --> OutputProcessor : decode events
     InferenceEngine *-- RequestTracker : track consumers
     InferenceEngine --> EngineCore : submit and cancel
+    EngineCore *-- Scheduler : schedule and apply results
     EngineCore *-- PolicyVersionGuard : serialize operations
-    EngineCore *-- Scheduler : plan and apply results
-    Scheduler *-- StepPlanner : execution planning
-    Scheduler *-- KVCacheManager : allocation and reuse
-    Scheduler ..> SchedulerOutput : produce plan
-    EngineCore --> GPUModelRunner : submit execution
-    GPUModelRunner ..> SchedulerOutput : consume plan
-    GPUModelRunner ..> ModelRunnerOutput : produce result
-    Scheduler ..> ModelRunnerOutput : apply result
+    Scheduler *-- StepPlanner : plan windows
+    Scheduler *-- KVCacheManager : allocate and release KV
+    EngineCore *-- GPUModelRunner : execute plans
+    EngineCore --> PendingExecution : materialize results
+    GPUModelRunner --> PendingExecution : return handles
     GPUModelRunner *-- InferenceWorkspace : device buffers
     GPUModelRunner *-- CUDAGraphRunner : capture and replay
-    GPUModelRunner --> Module : forward
-    Module --> BaseKVCache : read and write cache
+    GPUModelRunner ..> KVCacheManager : shared cache binding
 ```
 
-**Frontend** owns inputs and output consumers. **Core** drives execution and
-serializes policy operations. **Scheduling** owns requests, plans and KV
-allocation; it lives in the core package but has no model runner dependency.
-**Runner** owns GPU execution, workspace and graph replay.
-**Contracts** carries immutable plans and results between scheduling and execution.
-The model execution layer consumes tensors and cache views without knowing
-about request queues.
+| Layer | Owns | Why it is separate |
+| --- | --- | --- |
+| Frontend | Input processing, consumer tracking, output decoding and text stops | Text APIs can change without altering scheduling; tokenized rollout can enter core directly |
+| Core | Execution loop, request queues, planning, KV allocation and policy versions | Scheduling, accepted output and resource lifetime need coordinated state ownership |
+| Runner | Input tensors, model execution, sampling, workspace, graphs and deferred results | Device optimizations do not decide request completion or logical KV release |
 
-
-Runtime dependencies point **frontend → core → worker → model/cache layout**.
-The worker consumes immutable execution contracts and does not retain mutable
-scheduler requests. The model-side cache types describe tensors; the inference
-core owns allocation and prefix reuse.
+Source imports point **frontend → core → worker → model/cache layout**.
+The worker does not retain mutable scheduler requests, but it still calls
+`KVCacheManager.bind()` to turn core allocation state into device cache views.
+This shared object is a remaining coupling, not eliminated by type-only imports.
+The model itself consumes tensors and cache layouts without request queues.
 
 The engine is an in-process driver. Colocated rollout shares the learner's model
 and serializes generation with policy updates. Async rollout uses separate frozen
 replicas; that placement is owned by the rollout backend, not the frontend.
 
-For cancellation, terminal events and resource lifetime, see
-[inference events](inference/events.md). For allocation and scheduling limits,
-see [inference core](inference/core.md).
+The request path is **register → admit → plan → execute → materialize → apply
+→ deliver**. Materializing a `PendingExecution` only resolves its result; the
+scheduler validates identity and policy version before accepting it. A terminal
+event ends consumption, but in-flight GPU work must retire before KV reuse.
 
-### Request execution flow
+The [inference architecture](inference/README.md) expands the layer diagram,
+design patterns and execution sequence. [Events](inference/events.md) defines
+cancellation and shutdown; [core](inference/core.md) explains allocation and
+the remaining cache-binding dependency.
 
-```mermaid
-sequenceDiagram
-    participant F as Frontend
-    participant C as EngineCore
-    participant S as Scheduler
-    participant W as GPUModelRunner
-    participant P as PendingExecution
-    F->>F: Tokenize and register consumer
-    F->>C: Submit request IDs and tokens
-    C->>S: Admit requests
-    loop Until terminal state
-        C->>S: Schedule execution
-        S-->>C: Immutable SchedulerOutput
-        C->>W: Execute plan
-        W-->>C: PendingExecution
-        C->>P: Commit completed execution
-        P-->>C: ModelRunnerOutput
-        C->>S: Validate and apply result
-        S-->>F: Token and terminal events through event sink
-    end
-    F->>F: Detokenize, match text stops and report usage
-```
+Global token-budget scheduling, progressive prompt-page admission and recompute
+preemption remain outside the current inference implementation.
 
-The diagram shows one logical iteration. Decode overlap can leave multiple
-executions in flight. Their identity and policy version travel with the results,
-so request mutation or cancellation cannot silently attach output to another
-request. Cancellation does not free resources still used by an execution;
-retirement and result application own that boundary.
+## Shared infrastructure and contracts
 
-The frontend owns text processing and consumers. The scheduler owns mutable
-requests and logical KV accounting. The runner owns device workspace, CUDA graph
-capture and model execution. Immutable plans separate those responsibilities
-without giving the worker access to live scheduler state.
+Model execution, tokenization, serialization and backend dispatch are shared by
+the data, training and inference paths. They provide reusable operations while
+their callers retain ownership of request and training progress.
 
-## State and lifetime
+### State ownership
 
 | State | Owner | Lifetime / boundary |
 | --- | --- | --- |
@@ -293,30 +302,10 @@ without giving the worker access to live scheduler state.
 | Weight version and mutation lock | PolicyVersionGuard | Serializes shared-model generation, scoring and updates |
 | Published checkpoint files | Checkpoint | Immutable step directory after atomic publication |
 
-Colocated rollout shares the learner model, so generation and weight mutation
-must use the same version boundary. Replica rollout owns a separate model and
-publishes weights through its backend. Async replicas use control messages and
-NCCL weight transfer; the [rollout guide](trainer/rollout.md) describes placement
-without changing frontend ownership.
-
-## Design choices
-
-| Choice | Reason |
-| --- | --- |
-| One trainer-owned update boundary | Counters, gradients and persistence agree on which update committed |
-| Separate construction and session lifetime | Partial initialization and normal shutdown need different cleanup owners |
-| Context-owned metric history | Measurements and checkpoint publication share state without callback coupling |
-| Immutable execution contracts | Overlapped work remains attributable after requests change or are cancelled |
-| Model-owned cache tensor layouts | Model and kernel code do not depend on inference scheduling policies |
-| Backend-owned rollout placement | Objective code consumes scored results independently of where generation runs |
-
-These are the current boundaries. Global token-budget scheduling, progressive
-prompt-page admission and recompute preemption remain outside the current
-inference implementation; see [inference internals](inference/README.md).
 Changing a boundary should update its focused contract rather than adding an
 independent state owner.
 
-## Extension boundaries
+### Extension points
 
 Use `Factory.create(name, ...)` for registered components and
 `create_from_config()` when selecting constructor fields from a broad config.

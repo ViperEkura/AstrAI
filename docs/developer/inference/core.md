@@ -13,6 +13,11 @@ and result application. It never holds or invokes `EngineCore` or the model
 runner. `StepPlanner` only builds execution entries and reports KV extension
 failures; `EngineCore` submits plans and drains results.
 
+This separates orchestration from scheduling policy: changing admission or
+prefill windows should not change GPU submission and shutdown. `StepPlanner`
+works with scheduler-owned requests and KV reservations; it is not a second
+training or inference loop.
+
 ```mermaid
 classDiagram
     direction TB
@@ -50,6 +55,7 @@ classDiagram
     EngineCore *-- PolicyVersionGuard
     Scheduler *-- StepPlanner
     Scheduler *-- KVCacheManager
+    GPUModelRunner --> KVCacheManager : shared bind dependency
 ```
 
 The scheduler owns one request registry, waiting/running queues and terminal
@@ -98,7 +104,7 @@ Stopping similarly drains or safely retires in-flight work before clearing
 request/KV state. A timed-out join retains the live thread and its state;
 a second loop must not be started over it.
 
-## KV accounting
+## KV allocation strategy
 
 `KVCacheManager` owns request allocation state. `BlockPool` owns the physical
 storage, token mapping and allocation strategy:
@@ -106,6 +112,28 @@ storage, token mapping and allocation strategy:
 - **ContiguousStrategy:** static request partitions, no prefix reuse.
 - **PagedStrategy:** logical pages from a bitmap/LRU allocator; radix prefix
   indexing is enabled for page sizes greater than one.
+
+This is the Strategy pattern with two real implementations. The scheduler
+uses the same allocation operations; `BlockPool` selects the policy at
+construction. Contiguous allocation has simpler fixed partitions; paging adds
+reuse and flexible capacity at the cost of page/index bookkeeping.
+
+```mermaid
+classDiagram
+    class KVCacheManager
+    class BlockPool
+    class AllocationStrategy
+    class ContiguousStrategy
+    class PagedStrategy
+    class Allocator
+    class RadixCache
+    KVCacheManager --> BlockPool
+    BlockPool *-- AllocationStrategy
+    AllocationStrategy <|-- ContiguousStrategy
+    AllocationStrategy <|-- PagedStrategy
+    PagedStrategy --> Allocator : page references
+    PagedStrategy --> RadixCache : optional prefix index
+```
 
 A decode token requires an updated token-to-slot mapping even if it needs no
 new page. Page allocation and slot-map updates are separate operations.
@@ -125,6 +153,21 @@ Both cache strategies preallocate a GPU arena. Paged allocation currently
 reserves prompt pages at admission; chunking limits computation, not that
 initial reservation. Global token budgets, progressive prompt allocation and
 recompute preemption are not introduced by this ownership refactor.
+
+### Cache binding boundary
+
+Logical ownership is separate from the current object dependencies.
+`GPUModelRunner` receives the scheduler's `KVCacheManager` and calls `bind()`
+for prefill, decode and scoring. Binding reads request allocation state,
+flushes slot mappings and delegates device-view assembly to
+`BlockPool.bind_tasks()`, which uses `InferenceWorkspace`.
+
+Consequently, `TYPE_CHECKING` imports prevent a reverse runtime import but
+do not make the worker independent of core-owned cache state. The current
+operation lock and drain rules protect this shared access. A cleaner future
+boundary would pass the allocated request slots, lengths and mapping data to
+worker-side binding, without moving admission/free decisions out of core or
+copying full page tables every decode step.
 
 ## Policy versioning
 

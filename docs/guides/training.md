@@ -9,7 +9,10 @@ precision, rollout and checkpoint behavior.
 Trainer groups the epoch permutation into global optimizer windows. The default
 `epoch_tail_policy: drop` records and skips an incomplete tail; `flush` updates
 using the real sample and target counts. CP and TP ranks do not multiply the
-data count. Online replay publishes only after the complete data window.
+data count. Synchronous online replay commits the data cursor and permits
+checkpoint publication only after the complete window; actor versions and
+replica weights advance at each successful update within it. Async GRPO uses
+one update per collected round.
 
 See [lifecycle](../developer/trainer/lifecycle.md) for startup and cleanup,
 [callbacks](../developer/trainer/callbacks.md) for metric commit boundaries,
@@ -277,9 +280,11 @@ RNG state, so stochastic training is not guaranteed to replay bit for bit. The D
 worker base seed from the global generator on every iterator creation — including
 the single-process one — and a resumed run creates one extra iterator.
 
-Signals are taken after an optimizer commit: a request that arrives inside an
-accumulation window finishes that window first (at most `grad_accum_steps - 1` more
-batches). At epoch end, a shorter window follows `epoch_tail_policy`.
+Signals are observed at a safe data boundary. Offline training finishes the
+current accumulation window; synchronous online training also completes that
+window's replay/minibatch updates. Async GRPO stops between rounds. A signal
+therefore does not imply a fixed number of remaining forwards. At epoch end,
+a shorter window follows `epoch_tail_policy`.
 The checkpoint records the committed or discarded data cursor. If an optimizer
 or scheduler update fails after mutating state, `checkpoint_safe` remains false:
 shutdown leaves the previous published checkpoint intact rather than labeling
@@ -302,10 +307,11 @@ the local launcher waits for every rank to finish its current update and checkpo
 even if that takes longer than the 30-second failure-cleanup grace period. A rank
 blocked outside a collective may still require an external forced stop.
 
-The DataLoader is dropped before anything is written. Its workers usually take the
-same signal that stopped training, and PyTorch turns a dead worker into a
-`RuntimeError` from its SIGCHLD handler — one that can land in the middle of the
-save and cost the checkpoint.
+During session shutdown, DataLoader workers are stopped before the final or
+emergency checkpoint; periodic checkpoints do not tear down the loader.
+Workers may receive the same signal that stopped training, and PyTorch turns a
+dead worker into a `RuntimeError` from its SIGCHLD handler — one that can land
+in the middle of the save and cost the checkpoint.
 
 The shutdown is an ordered plan owned by `TrainSession`: run the registered
 cleanup hooks (the DataLoader workers), call `on_shutdown` once on every observer,

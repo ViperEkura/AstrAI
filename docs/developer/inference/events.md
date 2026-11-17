@@ -20,7 +20,8 @@ sequenceDiagram
     C->>E: generate_events(prompt, stop_sequences)
     E->>E: tokenize and mint request_id
     E->>T: register before submission
-    E->>S: add_requests via EngineCore
+    E->>D: add_requests
+    D->>S: add_requests
     loop execution steps
         D->>S: schedule
         S-->>D: SchedulerOutput
@@ -33,7 +34,8 @@ sequenceDiagram
     T-->>O: consume events
     O-->>C: text and token-ID chunks
     alt frontend text stop or early consumer exit
-        E->>S: abort unfinished core request
+        E->>D: cancel unfinished core request
+        D->>S: cancel_request
         D->>D: retire in-flight work before KV release
     else core terminal received
         O-->>C: final chunk and usage

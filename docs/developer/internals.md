@@ -6,7 +6,9 @@ For training component ownership, startup and failure cleanup, see [Trainer inte
 
 ## Autoregression & Causal Masking
 
-Given a token sequence, the model predicts the probability of the next token. Each generated token is appended to the input and fed back, repeating until an end-of-sequence token or max length.
+Given a token sequence, the model predicts the probability of the next token.
+Cached inference processes the prompt once, then feeds each generated token
+back with the prior KV state until a stop token or length limit is reached.
 
 ```
 sequence : [[1, 2, 3, 4, 5, 6]]
@@ -34,10 +36,12 @@ $$ q_i = R_i W_q x_i, \quad k_j = R_j W_k x_j, \quad q_i^T k_j = x_i^T W_q^T R_{
 
 `RotaryEmbedding` pre-computes a cos/sin table `freqs_cis` of shape
 `[max_len, dim/2, 2]` (f32 — `[cos, sin]` pairs). `forward()` returns
-a `[batch, seq_len, dim/2, 2]` slice indexed by `position_ids`.
-`apply_rotary_emb` applies the rotation: during training it uses torch
-complex multiply (autograd-compatible); during inference it auto-dispatches
-to a fused CUDA kernel when available. The key property is that the dot
+a `[batch, seq_len, dim/2, 2]` slice indexed by `position_ids`, or
+`[total_tokens, dim/2, 2]` for packed positions. `apply_rotary_emb` selects
+the fused CUDA path for supported BF16 inputs in both training and inference;
+that path supplies gradients for the input tensor, not the frequency table.
+Other supported calls, including trainable frequencies, use Torch complex
+multiplication with autograd. The key property is that the dot
 product $q_i^T k_j$ depends only on the relative position $i - j$, not the
 absolute positions.
 
@@ -96,7 +100,8 @@ $$ L = L_{\text{task}} + \lambda_{\text{MoE}} L_{\text{aux}} $$
 ## Lifecycle, cache and preprocessing contracts
 
 - [Trainer lifecycle](trainer/lifecycle.md) owns startup, updates and cleanup.
-- [Callbacks](trainer/callbacks.md) owns committed metric history and publication.
+- [Callbacks](trainer/callbacks.md) stage measurements and publish checkpoints;
+  `TrainContext` owns metric history and Trainer commits it.
 - [Inference core](inference/core.md) owns KV allocation and prefix reuse;
   the [worker](inference/worker.md) executes immutable plans.
 - [Preprocessing](../guides/preprocessing.md) defines masks and position IDs.

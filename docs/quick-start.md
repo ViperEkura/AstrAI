@@ -55,6 +55,10 @@ python scripts/demo/stream_chat.py
 
 This starts a single-turn interactive prompt loop with streaming output. Each prompt is independent; conversation history is not retained.
 
+The demo defaults to a 4096-token total context and at most 2048 generated
+tokens. Its frequency penalty is 0.5 for chat and 0 for `--raw`; pass
+`--frequency_penalty 0` explicitly to disable it in chat mode.
+
 ### Start an HTTP Server
 
 ```bash

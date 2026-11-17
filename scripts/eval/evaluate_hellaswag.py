@@ -18,12 +18,22 @@ import argparse
 import json
 import os
 import re
+from pathlib import Path
 from typing import Dict
 
 import tqdm
 from datasets import load_dataset
 
-from astrai.bench import load_jsonl, load_score_model, loglikelihood_batched, save_json
+from astrai.evaluation import (
+    EvaluationResult,
+    Metric,
+    check_output,
+    load_jsonl,
+    load_score_model,
+    loglikelihood_batched,
+    save_json,
+    save_result,
+)
 
 HELLASWAG_HF_DATASET = "Rowan/hellaswag"
 
@@ -58,7 +68,7 @@ def build_item(row: Dict):
     return {"query": query, "endings": endings, "gold": gold}
 
 
-def evaluate(model, tokenizer, items, device, batch_size):
+def evaluate(model, tokenizer, items, device, batch_size, details=None):
     max_model_len = model.config.max_position_embeddings
     encoded = []
     for it in items:
@@ -84,9 +94,7 @@ def evaluate(model, tokenizer, items, device, batch_size):
         for ctx_ids, cont_ids_list in batch:
             for cont_ids in cont_ids_list:
                 requests.append((ctx_ids, cont_ids))
-        scores = loglikelihood_batched(
-            model, tokenizer, requests, device, max_model_len
-        )
+        scores = loglikelihood_batched(model, requests, device, max_model_len)
         for bi, (ctx_ids, cont_ids_list) in enumerate(batch):
             it = items[start + bi]
             lls = scores[bi * 4 : bi * 4 + 4]
@@ -95,8 +103,37 @@ def evaluate(model, tokenizer, items, device, batch_size):
                 correct += 1
             if max(range(4), key=lambda i: lls[i] / lens[i]) == it["gold"]:
                 correct_norm += 1
+            if details is not None:
+                details.append({"scores": lls, "lengths": lens, "gold": it["gold"]})
             total += 1
     return correct, correct_norm, total
+
+
+def summarize(details, metadata):
+    total = len(details)
+    if not total:
+        raise ValueError("No HellaSwag responses")
+    correct = sum(
+        max(range(4), key=lambda i: row["scores"][i]) == row["gold"] for row in details
+    )
+    correct_norm = sum(
+        max(range(4), key=lambda i: row["scores"][i] / row["lengths"][i]) == row["gold"]
+        for row in details
+    )
+    return EvaluationResult(
+        "hellaswag",
+        total,
+        {
+            "acc": Metric(round(correct / total, 4), "ratio"),
+            "acc_norm": Metric(round(correct_norm / total, 4), "ratio"),
+        },
+        {
+            **metadata,
+            "correct": correct,
+            "correct_norm": correct_norm,
+            "effective_counts": {"acc": total, "acc_norm": total},
+        },
+    )
 
 
 def main():
@@ -114,7 +151,18 @@ def main():
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument(
+        "--score_only", help="Rescore saved details JSON without loading a model"
+    )
     args = parser.parse_args()
+    check_output(args.output)
+    if args.score_only:
+        details = json.loads(Path(args.score_only).read_text())
+        result = summarize(details, {"source": args.score_only})
+        if args.output:
+            save_result(args.output, result)
+        print(result)
+        return
 
     download(os.path.dirname(args.data_path) or ".")
 
@@ -124,8 +172,9 @@ def main():
         items = items[: args.limit]
 
     model, tokenizer = load_score_model(args.param_path, args.device, args.dtype)
+    details = []
     correct, correct_norm, total = evaluate(
-        model, tokenizer, items, args.device, args.batch_size
+        model, tokenizer, items, args.device, args.batch_size, details
     )
 
     print(f"\n{'=' * 60}")
@@ -134,18 +183,8 @@ def main():
     print(f"{'=' * 60}")
 
     if args.output:
-        save_json(
-            args.output,
-            {
-                "_summary": {
-                    "acc": round(correct / total, 4),
-                    "acc_norm": round(correct_norm / total, 4),
-                    "correct": correct,
-                    "correct_norm": correct_norm,
-                    "total": total,
-                }
-            },
-        )
+        save_json(str(Path(args.output).with_suffix(".details.json")), details)
+        save_result(args.output, summarize(details, vars(args)))
         print(f"Results saved to {args.output}")
 
 

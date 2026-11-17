@@ -10,7 +10,15 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
-from astrai.bench import causal_sequence_logits
+from astrai.evaluation import (
+    EvaluationResult,
+    Metric,
+    causal_sequence_logits,
+    check_output,
+    perplexity,
+    save_json,
+    save_result,
+)
 from astrai.model import AutoModel
 from astrai.tokenize import AutoTokenizer
 
@@ -44,7 +52,7 @@ def _encode_rows(
     """Tokenize *texts*, truncating each to *max_length* tokens.
 
     Rows stay ragged: padding and the attention mask belong to the shared
-    scorer (``astrai.bench.causal_sequence_logits``), which is the only
+    scorer (``scripts.eval.model_utils.causal_sequence_logits``), which is the only
     place that is allowed to build one.
     """
     return [tokenizer.encode(t)[:max_length] for t in texts]
@@ -170,7 +178,7 @@ class LossAccumulator:
         result["overall"] = {
             "num_tokens": self.count,
             "mean_loss": mean_loss,
-            "ppl": float(torch.exp(torch.tensor(mean_loss))),
+            "ppl": perplexity(self.total, self.count),
         }
         if self.stream:
             result["overall"].update(self._hist_percentiles())
@@ -186,7 +194,7 @@ class LossAccumulator:
                 entry: Dict = {
                     "num_tokens": cnt,
                     "mean_loss": tmean,
-                    "ppl": float(torch.exp(torch.tensor(tmean))),
+                    "ppl": perplexity(self.type_total[ttype], cnt),
                 }
                 if not self.stream and ttype in self.by_type:
                     entry["median_loss"] = statistics.median(self.by_type[ttype])
@@ -281,6 +289,7 @@ def process_file(
                     acc.add_typed(ttype, tl)
 
     stats = acc.stats()
+    stats["num_samples"] = len(texts)
 
     if token_level and output_file:
         with open(output_file, "w", encoding="utf-8") as f:
@@ -346,6 +355,7 @@ def main(
     print(f"Found {len(input_files)} file(s) to evaluate")
     os.makedirs(output_dir, exist_ok=True)
 
+    check_output(os.path.join(output_dir, "summary.json"))
     all_stats = {}
     for filepath in input_files:
         label = os.path.splitext(os.path.basename(filepath))[0]
@@ -378,8 +388,33 @@ def main(
             print(f"  token-level output: {token_output}")
 
     summary_path = os.path.join(output_dir, "summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(all_stats, f, ensure_ascii=False, indent=2)
+    save_json(os.path.join(output_dir, "summary.details.json"), all_stats)
+    metrics, counts = {}, {}
+    for label, stats in all_stats.items():
+        groups = {"overall": stats.get("overall", {}), **stats.get("by_token_type", {})}
+        for group, scores in groups.items():
+            for key, value in scores.items():
+                name = f"{label}/{group}/{key}"
+                metrics[name] = Metric(
+                    value, "count" if key == "num_tokens" else "number"
+                )
+                counts[name] = scores["num_tokens"]
+    save_result(
+        summary_path,
+        EvaluationResult(
+            "ppl",
+            sum(s["num_samples"] for s in all_stats.values()),
+            metrics,
+            {
+                "model": param_path,
+                "input": input_path,
+                "max_length": max_length,
+                "text_key": text_key,
+                "aggregation": "token-weighted NLL",
+                "effective_counts": counts,
+            },
+        ),
+    )
     print(f"\nSummary saved to {summary_path}")
 
 

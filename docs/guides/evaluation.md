@@ -1,419 +1,212 @@
 # Evaluation
 
-AstrAI provides 9 evaluation scripts in `scripts/eval/` covering code generation, knowledge QA, commonsense QA, perplexity, summarization, data quality, instruction following, and weight analysis, plus suite tooling (`run_suite.py`, `collect.py`) built on the shared `astrai.bench` module.
+Run each task manually from the repository root. Scripts own data loading,
+prompt construction, answer extraction and task-specific denominators.
+`astrai.evaluation` provides reusable scoring, result storage and model/execution
+helpers. There is no task registry, job scheduler or checkpoint watcher.
 
-## Contents
+## Responsibilities
 
-- [Prerequisites](#prerequisites)
-- [Overview](#overview)
-- [HumanEval](#humaneval-code-generation)
-- [MBPP](#mbpp-code-generation)
-- [MMLU](#mmlu-knowledge-qa)
-- [HellaSwag](#hellaswag-commonsense-qa)
-- [Perplexity](#perplexity-ppl)
-- [ROUGE](#rouge)
-- [IFD](#ifd-instruction-following-difficulty)
-- [IFEval](#ifeval-instruction-following)
-- [Weight Analysis](#weight-analysis)
-- [Suite runner](#suite-runner)
-- [Online evaluation](#online-evaluation-checkpoint-watcher)
-- [Collecting results](#collecting-results)
-- [Tips](#tips)
-
-## Prerequisites
-
-HumanEval, MMLU, and IFEval import HuggingFace `datasets` to download their benchmark data. This package is not installed by AstrAI's base dependencies, so install it before running those scripts:
-
-```bash
-pip install datasets
+```text
+astrai/evaluation/
+├── __init__.py   # Explicit public exports
+├── scoring.py   # Exact match, means, pass@k, perplexity and code-score aggregation
+├── results.py   # Result types, JSON I/O and Markdown comparison tables
+└── utils.py     # Model loading, causal log-probs, sampling and code execution
 ```
 
-The generation-based scripts require CUDA because they load the model on `cuda` with `bfloat16`. Direct-scoring and metric scripts support the devices shown below.
+The helpers live inside the package so scripts can be run directly with
+`python scripts/eval/evaluate_*.py`. They do not own a training process or
+choose GPUs. Scripts pass prepared values to scoring functions and construct
+results with explicit metric units. Adding a task requires no registration.
 
-## Overview
+Only results need data classes; functions are not represented as classes:
 
-| Script | Metric | Model Invocation | External Dataset |
-|--------|--------|-------------------|-------------------|
-| `evaluate_humaneval.py` | Code-gen pass@1/10/100 | `InferenceEngine.generate` | HF `openai/openai_humaneval` (auto-download) |
-| `evaluate_mbpp.py` | Code-gen pass@1/10 (chat zero-shot) | `InferenceEngine.generate` | HF `google-research-datasets/mbpp` (auto-download) |
-| `evaluate_mmlu.py` | MCQ accuracy (log-likelihood) | Direct `model()` forward | HF `cais/mmlu` (auto-download) |
-| `evaluate_hellaswag.py` | Commonsense acc / acc_norm (log-likelihood) | Direct `model()` forward | HF `Rowan/hellaswag` (auto-download) |
-| `evaluate_ppl.py` | Perplexity / token loss | Direct `model()` forward | User JSONL |
-| `evaluate_rouge.py` | ROUGE-1/2/L | None (pure metric) | User JSONL |
-| `evaluate_ifd.py` | Instruction-Following Difficulty | Direct `model()` forward | User JSONL |
-| `evaluate_ifeval.py` | Instruction-following constraints | `InferenceEngine.generate` | HF `google/IFEval` (auto-download) |
-| `analyze_weights.py` | SVD effective rank / weight stats | None (loads safetensors) | Checkpoint dir |
-| `run_suite.py` | Standard suite per checkpoint, with retries | Launches the above | Local data caches |
-| `collect.py` | Markdown comparison table from results JSONs | None | `results/` directory |
-
-Two invocation patterns exist:
-- **Generation benchmarks** (HumanEval, IFEval): use `InferenceEngine` to generate responses, then score them.
-- **Scoring benchmarks** (MMLU, PPL, IFD): call `model()` directly under `torch.inference_mode()` for log-likelihood computation.
-
-| Script | Device support |
-|--------|----------------|
-| HumanEval | CUDA for generation; `--test_only` can score existing completions without loading a model |
-| IFEval | CUDA only |
-| MMLU | CUDA or CPU via `--device`; auto-selects CUDA when available |
-| PPL | CUDA or CPU via `--device`; auto-selects CUDA when available |
-| IFD | CUDA or CPU via `--device`; auto-selects CUDA when available |
-| ROUGE | CPU-only metric computation; no model is loaded |
-| Weight analysis | CUDA by default; CPU supported via `--device cpu` |
-
----
-
-## HumanEval (Code Generation)
-
-Generates completions for 164 programming problems, executes them against hidden tests, and reports pass@k.
-
-Scoring uses `astrai.bench.execute_one`, shared with MBPP. It explicitly forks the worker function in `bench.py` and returns success through a shared boolean. Each sample gets a temporary working directory, a wall-clock timeout (`--test_timeout`, default 3 seconds), a CPU-time limit, and a 16 MiB per-file size limit. The address-space ceiling is the worker's inherited virtual size plus 512 MiB, capped by any existing hard limit. This permits up to 512 MiB of additional mappings; it is not an RSS/private-memory quota and does not account for copy-on-write growth within inherited mappings. Process groups are cleaned up after execution, and early exits do not count as passes.
-
-Code execution requires Linux (`fork`, `/proc`, and `resource`). Native Windows is rejected explicitly; use WSL2 for this path. These limits do not isolate the filesystem/network or cap total directory size. The suite launcher also uses Linux-style shell commands; native Windows suite execution has not been ported.
-
-`--generate_only` skips execution; `--test_only` scores saved generations without loading a model. Every generation, including duplicates and empty answers, remains in the sample count.
-
-```bash
-python scripts/eval/evaluate_humaneval.py \
-    --param_path ./params \
-    --num_samples 20 \
-    --batch_size 64 \
-    --max_tokens 512 \
-    --output results/humaneval.json
+```mermaid
+classDiagram
+    class Metric {
+        +Optional[float] value
+        +str unit
+    }
+    class EvaluationResult {
+        +str task
+        +int num_samples
+        +Dict[str, Metric] metrics
+        +Dict[str, Any] metadata
+    }
+    EvaluationResult "1" *-- "*" Metric : metrics
 ```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--param_path` | `./params` | Model directory |
-| `--data_path` | `./humaneval/HumanEval.jsonl` | HumanEval JSONL (auto-downloaded if missing) |
-| `--output` | None | Save results JSON (also writes `_completions.json`) |
-| `--test_only` | None | Test an existing completions JSON (skip generation) |
-| `--generate_only` | False | Only generate, skip execution/testing |
-| `--num_samples` | 200 | Completions per problem (pass@k needs >= k) |
-| `--max_tokens` | 512 | Max generation length |
-| `--temperature` | 0.8 | Sampling temperature |
-| `--top_p` | 0.95 | Nucleus sampling threshold |
-| `--top_k` | 50 | Top-k sampling |
-| `--batch_size` | 64 | Generation batch size |
-| `--max_seq_len` | 4096 | KV cache sequence length |
-| `--test_workers` | 8 | Concurrent test workers (threads launching forked children) |
-| `--test_timeout` | 3.0 | Per-subprocess timeout (seconds) |
-| `--problems` | None | Restrict to specific problem indices |
-
-**Output**: stdout prints `pass@1`, `pass@10`, `pass@100`. With `--output`, writes per-problem results + `_summary` aggregate and a `_completions.json` file.
-
-**Data**: Auto-downloads `openai/openai_humaneval` from HuggingFace on first run. Each problem has `task_id`, `entry_point`, `prompt`, `test`.
-
----
-
-## MBPP (Code Generation)
-
-Mostly Basic Python Problems, full test split (500 tasks, ids 11-510), chat zero-shot: task text + asserts + the canonical function signature go through the chat template. This prompt protocol differs from few-shot MBPP; compare runs using the same
-protocol and report it with the score.
-
-```bash
-python scripts/eval/evaluate_mbpp.py \
-    --param_path ./params \
-    --num_samples 20 \
-    --batch_size 64 \
-    --output results/mbpp.json
+```mermaid
+flowchart TD
+    CLI[Manual task script] --> DATA[Load questions and references]
+    DATA --> INPUT[Build prompts or token sequences]
+    INPUT --> MODEL[Existing model interface]
+    MODEL --> RAW[Save responses or candidate log-probs]
+    RAW --> EXTRACT[Task-specific extraction and normalization]
+    STORED[Saved outputs] --> EXTRACT
+    EXTRACT --> SCORE[Scoring functions or official verifier]
+    SCORE --> AGG[Task-specific aggregation and effective counts]
+    AGG --> RESULT[EvaluationResult]
+    RESULT --> SAVE[save_result]
+    SAVE --> COLLECT[collect_results]
+    COLLECT --> TABLE[render_table]
 ```
 
-Key parameters mirror HumanEval (`--num_samples`, `--temperature`, `--batch_size`, `--test_only`, `--problems`); data auto-downloads to `mbpp/mbpp_test.jsonl` on first run. Execution = completion + `test_list` asserts (challenge tests excluded).
+| Function | Contract |
+|---|---|
+| `exact_match(prediction, reference)` | Compare already-normalized values; no task regex or case conversion |
+| `mean(values)` | Mean of a nonempty finite sequence |
+| `pass_at_k(n, correct, k)` | Unbiased estimator; requires `0 <= correct <= n` and `1 <= k <= n` |
+| `perplexity(nll_sum, token_count)` | `exp(total NLL / valid token count)`; positive token count required |
+| `save_result(path, result)` | Validate and atomically replace a new-format summary |
+| `load_result(path)` | Read only the explicit result schema |
+| `collect_results(paths, benchmarks=None, tags=None)` | Collect summaries by their stored task; filenames supply run tags |
+| `render_table(collected)` | Format units; missing values become `—` |
 
-**Output**: stdout prints `pass@1`/`pass@10`; with `--output`, per-problem results + `_summary` and a `_completions.json` file.
+`loglikelihood_batched(model, requests, device, max_model_len)` takes token-ID
+pairs `(context, continuation)`. Tokenization belongs to the caller, so there
+is no tokenizer argument. `causal_sequence_logits` constructs causal masks,
+padding masks and optional packed-document boundaries. The model backend and
+FP32 log-softmax calculation are unchanged.
 
----
+## Results and reproducibility
 
-## MMLU (Knowledge QA)
+Summary files contain no raw generations:
 
-57-subject multiple-choice accuracy via log-likelihood comparison. Supports n-shot few-shot prompting and option permutation.
-
-```bash
-python scripts/eval/evaluate_mmlu.py \
-    --param_path ./params \
-    --n_shot 5 \
-    --subjects abstract_algebra high_school_us_history \
-    --output results/mmlu.json
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--param_path` | `./params` | Model directory |
-| `--data_dir` | `./mmlu_data` | MMLU data directory (per-subject CSVs) |
-| `--download` | False | Force re-download |
-| `--n_shot` | 5 | Few-shot examples (0 = zero-shot) |
-| `--subjects` | all 57 | Specific subjects to evaluate |
-| `--output` | None | Output JSON path |
-| `--split` | `test` | `test` or `val` |
-| `--device` | auto | Device (`cuda` / `cpu`) |
-| `--dtype` | auto | `bfloat16` on CUDA, `float32` on CPU |
-| `--seed` | -1 | Option permutation seed; -1 preserves the original order |
-| `--prompt_format` | `raw` | Raw few-shot prompt or chat template |
-| `--max_seq_len` | 2048 | Scoring context limit; demonstrations are reduced to fit |
-| `--batch_size` | 4 | Questions per batch; each question produces four choice rows |
-
-**How it works**: For each question, builds a prompt with n-shot examples, then scores each choice (A/B/C/D) by computing the summed log-likelihood of the choice token given the context. The choice with the highest log-prob is the prediction.
-
-**Output**: stdout prints per-subject accuracy and overall. With `--output`, writes per-subject `{accuracy, correct, total}` + `_overall` aggregate.
-
-**Data**: Auto-downloads `cais/mmlu` from HuggingFace. Stored as per-subject CSVs in `<data_dir>/<split>/` and `<data_dir>/dev/` (for few-shot). `--subjects` accepts canonical MMLU names such as `abstract_algebra`, `college_computer_science`, `high_school_us_history`, and `world_religions`.
-
----
-
-## HellaSwag (Commonsense QA)
-
-Sentence-completion MCQ over the full validation split (10,042 questions), zero-shot, following the lm-evaluation-harness protocol (same text normalization; each ending scored as a continuation). Reports raw accuracy and length-normalized `acc_norm`.
-
-```bash
-python scripts/eval/evaluate_hellaswag.py \
-    --param_path ./params \
-    --batch_size 16 \
-    --output results/hellaswag.json
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--param_path` | `./params` | Model directory |
-| `--data_path` | `./hellaswag/val.jsonl` | HellaSwag validation JSONL (auto-downloaded if missing) |
-| `--limit` | 0 | Score only the first N questions (0 = all) |
-| `--batch_size` | 8 | Questions per batch (4 continuation rows each) |
-| `--device` / `--dtype` | cuda / bfloat16 | Device and dtype |
-| `--output` | None | Save `_summary` JSON |
-
-**Output**: stdout prints `acc` and `acc_norm`; with `--output`, a `_summary` JSON. A full run takes ~2.5 minutes per arm on one RTX 5090 — short-sequence forward passes are cheap; prefer full runs over sampling.
-
-**Data**: Auto-downloads `Rowan/hellaswag` (validation split) on first run.
-
----
-
-## Perplexity (PPL)
-
-Token-level negative-log-likelihood and perplexity on arbitrary text data. Supports streaming mode (memory-efficient) and non-streaming mode (exact per-token stats).
-
-```bash
-python scripts/eval/evaluate_ppl.py \
-    --param_path ./params \
-    --input_path data.jsonl \
-    --output_dir ppl_results/ \
-    --batch_size 64 \
-    --max_length 2048
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--param_path` | required | Model directory |
-| `--input_path` | required | Input file, glob, or directory |
-| `--output_dir` | required | Output directory for `summary.json` + token JSONL |
-| `--text_key` | `text` | Key for the text field in input data |
-| `--batch_size` | 64 | Batch size |
-| `--max_length` | 2048 | Max sequence length (tokens) |
-| `--token_level` | False | Store per-token log_probs + token-type analysis |
-| `--max_samples` | None | Random subsample per file |
-| `--device` | auto | Device |
-| `--dtype` | auto | Torch dtype |
-
-**Input**: JSONL or JSON files. Each item must have a field named by `--text_key` (default `text`). If `--input_path` is a directory, recursively collects `*.jsonl` and `*.json`.
-
-**Output**: `summary.json` with per-file token count, mean loss, perplexity, and p50/p90/p95/p99 loss. Median loss is included only with `--token_level`; that mode also writes per-token JSONL with token IDs and log-probs.
-
----
-
-## ROUGE
-
-ROUGE-1/2/L (precision, recall, F1) for summarization. Self-contained implementation with no external dependencies.
-
-```bash
-python scripts/eval/evaluate_rouge.py \
-    --data_path predictions.jsonl \
-    --output results/rouge.json
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--data_path` | required | JSONL with `reference`/`candidate` per line |
-| `--output` | None | Output JSON path |
-
-**Input**: JSONL, one object per line:
 ```json
-{"reference": "Ground truth text", "candidate": "Model output text"}
+{
+  "task": "gsm8k",
+  "num_samples": 1319,
+  "metrics": {
+    "strict_match": {"value": 0.25, "unit": "ratio"},
+    "flexible_extract": {"value": 0.25, "unit": "ratio"}
+  },
+  "metadata": {"prompt_format": "raw", "n_shot": 5}
+}
 ```
 
-**Output**: stdout prints `rouge-1`, `rouge-2`, `rouge-l` each as P/R/F1. With `--output`, writes JSON with `aggregate` and `per_item` scores.
+The numbers above illustrate the schema, not a measured model score.
+`num_samples` counts included questions/documents (weight analysis explicitly
+uses tensors). Units are `ratio`, `count` and `number`. Unavailable metrics use
+`null`, never NaN. Metadata records configuration and effective counts; it is
+task-specific rather than a common configuration object.
 
-Can also be imported as a library:
+Responses, candidate scores and verification details use separate
+`.responses.jsonl`, `_details.jsonl`, `.details.json`, `_details.json`,
+`_completions.json` or `_tested.json` files. Summary filenames and existing
+single-task arguments are retained. Use a fresh output directory for new runs:
+legacy summaries are neither converted nor overwritten. The collector reports
+the filename of an unsupported JSON candidate, including when task filters are
+specified. Detail sidecars are excluded.
+
+For an optional comparison table, use the functions directly:
+
 ```python
-from scripts.eval.evaluate_rouge import compute_rouge
-scores = compute_rouge(reference, candidate)
+from astrai.evaluation import collect_results, render_table
+
+print(render_table(collect_results("results/new-run")))
 ```
 
----
+Use names such as `mmlu_mid.json` and `gsm8k_mid.json` to align the `mid` tag.
+There is no separate collection CLI.
 
-## IFD (Instruction-Following Difficulty)
+## Task commands
 
-Data quality metric: `IFD = L_conditional / L_unconditional`. Measures how much harder it is to predict a response given its instruction vs. without it. Useful for filtering instruction-tuning data.
+Install the project's evaluation dependencies and select a GPU explicitly
+when needed, for example `CUDA_VISIBLE_DEVICES=0`. `--param_path` accepts a
+local AstrAI checkpoint directory. All commands below run from the repository
+root; output paths are examples.
+
+| Task | Entry point | Aggregation |
+|---|---|---|
+| HumanEval | `evaluate_humaneval.py` | Mean pass@k over problems with at least k samples |
+| MBPP | `evaluate_mbpp.py` | Same estimator, retaining existing deduplication |
+| MMLU | `evaluate_mmlu.py` | Question-weighted accuracy across subjects |
+| HellaSwag | `evaluate_hellaswag.py` | Raw and character-normalized candidate log-prob ranking |
+| GSM8K | `evaluate_gsm8k.py` | Strict and flexible numeric answer match |
+| IFEval | `evaluate_ifeval.py` | Official strict/loose prompt/instruction accuracy |
+| PPL | `evaluate_ppl.py` | Token-weighted NLL and perplexity |
+| ROUGE | `evaluate_rouge.py` | Existing per-pair precision/recall/F1 means |
+| IFD | `evaluate_ifd.py` | Existing valid-record statistics |
+| Weights | `analyze_weights.py` | Tensor counts and component statistics |
 
 ```bash
-python scripts/eval/evaluate_ifd.py \
-    --param_path ./params \
-    --input_path sft_data.jsonl \
-    --output_dir ifd_results/ \
-    --format messages \
-    --batch_size 8
+python scripts/eval/evaluate_gsm8k.py --param_path ./params \
+  --data_dir ./gsm8k --output results/new-run/gsm8k_mid.json
+python scripts/eval/evaluate_mmlu.py --param_path ./params \
+  --output results/new-run/mmlu_mid.json
+python scripts/eval/evaluate_hellaswag.py --param_path ./params \
+  --output results/new-run/hellaswag_mid.json
+python scripts/eval/evaluate_humaneval.py --param_path ./params \
+  --output results/new-run/humaneval_mid.json
+python scripts/eval/evaluate_mbpp.py --param_path ./params \
+  --output results/new-run/mbpp_mid.json
+python scripts/eval/evaluate_ifeval.py --param_path ./params \
+  --output results/new-run/ifeval_mid.json
 ```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--param_path` | required | Model directory |
-| `--input_path` | required | Input file, glob, or directory |
-| `--output_dir` | required | Output directory |
-| `--max_len` | 2048 | Max token length |
-| `--format` | `plain` | `plain` (instruction/response fields) or `messages` (chat format) |
-| `--instr_key` | `instruction` | Instruction field key (plain format) |
-| `--resp_key` | `response` | Response field key (plain format) |
-| `--batch_size` | 8 | Items per model-forward flush |
-| `--device` | auto | Device |
-| `--dtype` | auto | Torch dtype |
-| `--sentinel_text` | `\n` | Prefix for unconditional pass (`""` → bos/pad fallback) |
-| `--per_token` | False | Include per-token IFD breakdown |
-| `--max_samples` | None | Random subsample per file |
-| `--append_eos` / `--no-append_eos` | `True` | Append (or skip) EOS token to instruction/response |
+GSM8K defaults to five seeded raw demonstrations and greedy generation.
+`--prompt_format chat` is an explicit alternative. This is not an exact
+lm-evaluation-harness protocol reproduction. MMLU defaults to raw five-shot
+prompts; HellaSwag uses zero-shot continuation ranking. Do not compare scores
+across differing prompt, context, normalization or sampling settings as if
+they were the same evaluation.
 
-**How it works**: Two forward passes per batch — (1) conditional: packed BFD sequence with context + response, (2) unconditional: response prefixed with a sentinel. IFD = mean_conditional_loss / mean_unconditional_loss. IFD > 1 means the instruction makes the response harder to predict (higher quality data).
+HumanEval keeps every generated sample; MBPP keeps its existing deduplication
+policy. Per-problem pass@k is rounded to four decimals before eligible-problem
+averaging, as before. A task with fewer than k samples contributes no value to
+that k's denominator; the summary records effective counts. Insufficient
+samples produce `null`, not zero.
 
-**Output**: Per-file `<label>_ifd.jsonl` with IFD scores per item. `summary.json` aggregates per-file stats.
+Code execution uses a Linux fork worker with a temporary directory, wall-clock
+and CPU limits, 16 MiB per-file limit and 512 MiB additional virtual-address
+space above the inherited baseline. This is not a private-RSS limit or a
+security sandbox. The parent cleans up the process group, and early exits do
+not count as passing. Windows can run non-execution tasks; this execution path
+requires Linux/WSL.
 
----
-
-## IFEval (Instruction Following)
-
-Generates one response per prompt and uses Google's
-`instruction_following_eval.evaluation_lib` verifier. The verifier package and
-its dependencies must be installed or supplied through `--verifier_path`
-(the directory containing `instruction_following_eval/`).
+IFEval requires the official `instruction_following_eval` package and its
+dependencies. Use `--verifier_path` for its parent directory when it is not on
+the import path. The verifier supplies constraint outcomes; strict/loose
+prompt and instruction denominators remain separate.
 
 ```bash
-python scripts/eval/evaluate_ifeval.py \
-    --param_path ./params \
-    --verifier_path /path/to/verifier-parent \
-    --output results/ifeval.json
+python scripts/eval/evaluate_ppl.py --param_path ./params \
+  --input_path ./data.jsonl --output_dir results/new-ppl
+python scripts/eval/evaluate_ifd.py --param_path ./params \
+  --input_path ./sft.jsonl --output_dir results/new-ifd
+python scripts/eval/evaluate_rouge.py --data_path ./pairs.jsonl \
+  --output results/new-run/rouge_mid.json
+python scripts/eval/analyze_weights.py --ckpt_dir ./params \
+  --output results/new-run/weights_mid.json
 ```
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `--param_path`, `--output` | required | Checkpoint and result paths |
-| `--data_path` | `./ifeval/input_data.jsonl` | Prompts; downloads `google/IFEval` if missing |
-| `--max_tokens` | 1536 | Maximum generated tokens |
-| `--max_seq_len` | 2048 | Prompt plus output capacity |
-| `--batch_size` | 8 | Generation batch size |
-| `--temperature`, `--top_p`, `--top_k` | 0.0, 1.0, 0 | Greedy by default |
-| `--num_samples` | 1 | Must be 1; best-of-n is rejected |
-| `--seed` | 3407 | Generation seed |
-| `--limit` | None | Evaluate only the first N prompts |
-| `--dump_responses` | output stem + `.responses.jsonl` | Raw response file |
+ROUGE input rows contain `reference` and `candidate`. PPL defaults to the
+`text` field; use `--token_level` to retain per-token details. PPL uses Python
+floating-point exponentiation of the same token-weighted NLL; older summaries
+rounded the exponentiation through a float32 tensor. This can change trailing
+digits without changing the evaluated tokens or model log-probabilities.
 
-Results contain strict and loose prompt-level and instruction-level accuracy,
-plus the per-prompt verifier records. Keep these four scores distinct.
+## Rescoring saved outputs
 
-## Weight Analysis
-
-SVD-based effective rank and weight statistics for checkpoint diagnostics. Does not load the model graph or run any forward pass.
+GSM8K, MMLU, HellaSwag and IFEval accept `--score_only PATH`. This skips model
+loading. MMLU reads its `_details.jsonl`; HellaSwag reads `.details.json`;
+GSM8K and IFEval read response JSONL. IFEval also needs the selected dataset and
+official verifier. GSM8K and IFEval retain their required `--param_path` CLI
+argument, but do not open that model in score-only mode.
 
 ```bash
-python scripts/eval/analyze_weights.py \
-    --ckpt_dir ./checkpoint/epoch_1_step_6000 \
-    --output results/weights.json
+python scripts/eval/evaluate_gsm8k.py --param_path ./params \
+  --score_only results/new-run/gsm8k_mid.responses.jsonl \
+  --output results/replayed/gsm8k_mid.json
+python scripts/eval/evaluate_humaneval.py \
+  --test_only results/new-run/humaneval_mid_completions.json \
+  --output results/replayed/humaneval_mid.json
 ```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--ckpt_dir` | required | Checkpoint directory containing `model.safetensors` |
-| `--compare` | None | Additional checkpoint dirs to compare |
-| `--no_svd` | False | Skip SVD; show only weight stats (faster) |
-| `--output` | None | Save results as JSON |
-| `--device` | `cuda` | Device for SVD |
-
-**Output**: SVD effective rank by component (ER@90/95/99%, entropic rank, condition number), per-layer effective rank grid, and weight value statistics (mean/std/min/max). Provides a utilization verdict (HIGH >0.85 / MODERATE >0.5 / LOW).
-
----
-
-## Suite runner
-
-`run_suite.py` runs the standard benchmark set for one checkpoint, one benchmark per free GPU, with per-job retries (a job is retried when its process dies without writing the output file — idempotent, so rerunning skips completed benchmarks).
-
-```bash
-nohup python -u scripts/eval/run_suite.py \
-    --ckpt checkpoints/sft-mix3/epoch_1_step_4385 \
-    --tag mix3 \
-    --benchmarks mmlu,ifeval,humaneval,mbpp,hellaswag \
-    > logs/suite_mix3.log 2>&1 &
-```
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--ckpt` | required | Checkpoint path, passed through as `--param_path` |
-| `--tag` | required | Output naming: `results/<bench>_<tag>.json` |
-| `--benchmarks` | `mmlu,ifeval,humaneval` | Comma-separated subset (`mbpp`, `mbpp2`, `hellaswag` available) |
-| `--gpus` | auto | Preferred GPU indices (free GPUs below 100 MiB; otherwise 4-7 first) |
-| `--attempts` | 3 | Retries per benchmark |
-| `--smoke` | False | Cheap per-benchmark invocations for a plumbing test (IFEval has no cheap mode and is skipped) |
-| `--dry-run` | False | Print the job plan and exit |
-
-Standard per-benchmark parameters are baked in (MMLU 5-shot bs4; IFEval ns1 bs64 temp 0.1; HumanEval/MBPP ns20 bs64; HellaSwag bs16) and match the eval reports. Wrap in `nohup`: if the runner itself dies, rerunning the same command skips finished benchmarks. A summary table prints at the end.
-
-## Online evaluation (checkpoint watcher)
-
-`watch_ckpts.py` polls a training `ckpt_dir` and evaluates each new checkpoint as soon as it lands, on GPUs that training is **not** using — the training run itself is never touched. Results land under `results/` while training continues, so the score curve across checkpoints is visible without waiting for the run to finish.
-
-```bash
-# terminal 1: training on GPUs 4-7
-# terminal 2 (from the repo root): watcher on the spare GPUs
-nohup python -u scripts/eval/watch_ckpts.py \
-    --ckpt_dir checkpoints/sft-run1 \
-    --tag run1 \
-    --gpus 0,1,2 \
-    > logs/watch_run1.log 2>&1 &
-```
-
-Each checkpoint produces `<bench>_<tag>_epoch_<e>_step_<n>.json` (bare `epoch_<e>_step_<n>` tag without `--tag`), directly readable by `collect.py`. A summary table prints after each checkpoint's suite finishes.
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--ckpt_dir` | required | Training checkpoint directory to watch |
-| `--gpus` | required | Comma-separated spare GPU ids — must not overlap the training GPUs (the watcher never auto-picks, to avoid OOMing a training card) |
-| `--benchmarks` | `ifeval,humaneval,mbpp2` | Comma-separated subset of `mmlu,ifeval,humaneval,mbpp,mbpp2,hellaswag` |
-| `--tag` | none | Prefix for result tags |
-| `--every` | 1 | Only evaluate checkpoints whose step is a multiple of N (align with `--ckpt_interval`) |
-| `--once` | False | Evaluate existing checkpoints and exit instead of polling |
-| `--poll` | 30 | Poll interval in seconds |
-| `--attempts` | 3 | Retries per benchmark |
-| `--smoke` | False | Cheap per-benchmark invocations for a plumbing test |
-
-Behavior notes:
-
-- **Default benchmark set is the generation trio** (`ifeval`, `humaneval`, `mbpp2`). MMLU and HellaSwag score through the log-likelihood path, which sits at chance for every current checkpoint (a pretraining-side context pathology — see those sections), so they carry no online signal; pass them explicitly in `--benchmarks` if wanted anyway.
-- **Idempotent**: benchmarks whose output file already exists are skipped, so restarting the watcher (or rerunning `--once`) resumes where it left off, including after a crash.
-- **GPU contention is retried, not fatal**: if the spare GPUs are busy when a checkpoint lands, the watcher logs it and retries on the next poll.
-- More benchmarks than GPUs is fine: they run in waves of `len(--gpus)` per checkpoint, one checkpoint's suite at a time (oldest first).
-- **One watcher per `ckpt_dir`, one run per `ckpt_dir`**: checkpoint dir names (`epoch_<e>_step_<n>`) are reused across runs, and a second training into the same dir overwrites the old one — pointing two runs at one dir mixes their results.
-- Stop with Ctrl-C (or kill): benchmarks already in flight run to completion; the watcher itself needs no cleanup.
-
-## Collecting results
-
-`collect.py` walks `results/` for `<bench>_<benchmark>.json` files (skipping `*_completions.json`) and renders a markdown comparison table — rows are standardized metrics per benchmark, columns are tags.
-
-```bash
-python scripts/eval/collect.py \
-    --results-dir results \
-    --benchmarks mmlu,ifeval,humaneval,mbpp2,hellaswag \
-    --tags mix3,mix3_lr5e5,mix3_lr2e5 \
-    --output results/compare.md
-```
-
-Metric names: `acc`; `pass@1`/`pass@10` plus `zero_pass`/`strong_pass` counts (code benchmarks); `acc`/`acc_norm` (HellaSwag); IFEval `json_format`/`num_bullet_lists` sub-items. `mbpp2` denotes the signature-protocol MBPP (see the MBPP section). Omitting `--output` prints to stdout.
-
-## Tips
-
-- **Quick test**: Use `--limit` (IFEval, HellaSwag) or `--problems` (HumanEval, MBPP) to run on a small subset first — or `run_suite.py --smoke`.
-- **Auto-download**: After installing `datasets`, HumanEval, MBPP, MMLU, HellaSwag, and IFEval auto-download their datasets on first run (set `HF_ENDPOINT` if the default endpoint is unreachable). The other scripts expect user-provided data.
-- **Output formats**: `--output` writes a single JSON for most scripts. PPL and IFD write an `--output_dir` containing `summary.json` plus per-file artifacts.
-- **CPU mode**: MMLU, PPL, and IFD support `--device cpu --dtype float32`; weight analysis supports `--device cpu`. HumanEval generation and IFEval are CUDA-only.
+HumanEval and MBPP retain `--test_only` and `--generate_only`. ROUGE already
+scores saved text. Historical raw files can be explicitly rescored into a
+new path when they contain the fields the current script requires; no
+automatic old-summary inference is performed. Existing external waiting
+processes and fixed-version training directories are not migrated.

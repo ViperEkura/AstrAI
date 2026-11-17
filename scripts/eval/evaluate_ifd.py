@@ -33,7 +33,14 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
-from astrai.bench import causal_sequence_logits
+from astrai.evaluation import (
+    EvaluationResult,
+    Metric,
+    causal_sequence_logits,
+    check_output,
+    save_json,
+    save_result,
+)
 from astrai.model import AutoModel
 from astrai.preprocessing.packing import plan_bfd
 from astrai.tokenize import AutoTokenizer
@@ -464,6 +471,7 @@ def main():
         help="Append EOS token at the end of response in both passes (default: enabled).",
     )
     args = parser.parse_args()
+    check_output(os.path.join(args.output_dir, "summary.json"))
 
     if args.device is None:
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -519,8 +527,28 @@ def main():
         all_stats[label] = stats
 
     summary_path = os.path.join(args.output_dir, "summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(all_stats, f, ensure_ascii=False, indent=2)
+    save_json(os.path.join(args.output_dir, "summary.details.json"), all_stats)
+    save_result(
+        summary_path,
+        EvaluationResult(
+            "ifd",
+            sum(s["samples"] for s in all_stats.values()),
+            {
+                f"{label}/{key}": Metric(
+                    value,
+                    "count" if key in ("samples", "valid_ifd", "skipped") else "number",
+                )
+                for label, stats in all_stats.items()
+                for key, value in stats.items()
+            },
+            {
+                **vars(args),
+                "effective_counts": {
+                    label: stats["valid_ifd"] for label, stats in all_stats.items()
+                },
+            },
+        ),
+    )
     print(f"\nSummary saved to {summary_path}")
 
 

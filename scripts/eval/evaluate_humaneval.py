@@ -12,18 +12,21 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import tqdm
 from datasets import load_dataset
 
-from astrai.bench import (
+from astrai.evaluation import (
+    check_output,
     execute_one,
     load_jsonl,
-    report,
+    render_table,
     save_json,
+    save_result,
     score_results,
+    summarize_code,
 )
 from astrai.inference import InferenceEngine, build_engine
 
@@ -157,6 +160,7 @@ def evaluate_completions(generated: Sequence[Dict], cfg: EvalConfig):
 
 
 def run_pipeline(cfg: EvalConfig) -> Dict:
+    check_output(cfg.output)
     if cfg.test_only:
         with open(cfg.test_only, encoding="utf-8") as f:
             generated = json.load(f)
@@ -246,9 +250,13 @@ def parse_args(argv: Optional[List[str]] = None) -> EvalConfig:
 def main():
     cfg = parse_args()
     scored = run_pipeline(cfg)
-    report(scored)
+    if not scored:
+        return
+    result = summarize_code("humaneval", scored, asdict(cfg))
+    print(render_table({"run": {result.task: result}}))
     if cfg.output:
-        save_json(cfg.output, scored)
+        save_json(cfg.output.replace(".json", "_details.json"), scored)
+        save_result(cfg.output, result)
         print(f"Results saved to {cfg.output}")
 
 

@@ -11,6 +11,14 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
+from astrai.evaluation import (
+    EvaluationResult,
+    Metric,
+    check_output,
+    load_jsonl,
+    save_json,
+    save_result,
+)
 from astrai.inference import build_engine
 
 
@@ -33,6 +41,27 @@ def score_responses(problems, responses, verifier):
     return {"_summary": summary, "results": results}
 
 
+def summarize(scored, metadata):
+    summary = scored["_summary"]
+    return EvaluationResult(
+        "ifeval",
+        summary["strict"]["prompt_total"],
+        {
+            f"{mode}_{level}_acc": Metric(summary[mode][f"{level}_accuracy"], "ratio")
+            for mode in ("strict", "loose")
+            for level in ("prompt", "instruction")
+        },
+        {
+            **metadata,
+            "effective_counts": {
+                f"{mode}_{level}_acc": summary[mode][f"{level}_total"]
+                for mode in ("strict", "loose")
+                for level in ("prompt", "instruction")
+            },
+        },
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--param_path", required=True)
@@ -52,7 +81,12 @@ def main():
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument(
+        "--score_only", help="Run the official verifier on saved responses JSONL"
+    )
     args = parser.parse_args()
+    check_output(args.output)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     if args.num_samples != 1:
         parser.error("IFEval reports one response per prompt; num_samples must be 1")
     if args.verifier_path:
@@ -72,56 +106,69 @@ def main():
     verifier.test_instruction_following_strict(
         problems[0], {problems[0].prompt: "test"}
     )
-    torch.manual_seed(args.seed)
-    engine = build_engine(
-        args.param_path, max_batch_size=args.batch_size, max_seq_len=args.max_seq_len
-    )
-    engine.model.eval()
-    responses = {}
-    dump = args.dump_responses or str(Path(args.output).with_suffix(".responses.jsonl"))
-    try:
-        with open(dump, "w", encoding="utf-8") as out:
-            for start in tqdm(
-                range(0, len(problems), args.batch_size), desc="IFEval batches"
-            ):
-                batch = problems[start : start + args.batch_size]
-                prompts = [
-                    engine.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": problem.prompt}],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    for problem in batch
-                ]
-                texts = engine.generate(
-                    prompts,
-                    stream=False,
-                    max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                    do_sample=args.temperature > 0,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    frequency_penalty=0.0,
-                )
-                for problem, text in zip(batch, texts):
-                    responses[problem.prompt] = text
-                    out.write(
-                        json.dumps(
-                            {
-                                "key": problem.key,
-                                "prompt": problem.prompt,
-                                "response": text,
-                            },
-                            ensure_ascii=False,
+    if args.score_only:
+        rows = load_jsonl(args.score_only)
+        responses = {row["prompt"]: row["response"] for row in rows}
+        if len(responses) != len(rows):
+            raise ValueError("Duplicate saved IFEval prompts")
+        problems = [p for p in problems if p.prompt in responses]
+        if len(problems) != len(responses) or not problems:
+            raise ValueError("Saved responses do not match the selected IFEval prompts")
+    else:
+        torch.manual_seed(args.seed)
+        engine = build_engine(
+            args.param_path,
+            max_batch_size=args.batch_size,
+            max_seq_len=args.max_seq_len,
+        )
+        engine.model.eval()
+        responses = {}
+        dump = args.dump_responses or str(
+            Path(args.output).with_suffix(".responses.jsonl")
+        )
+        try:
+            with open(dump, "w", encoding="utf-8") as out:
+                for start in tqdm(
+                    range(0, len(problems), args.batch_size), desc="IFEval batches"
+                ):
+                    batch = problems[start : start + args.batch_size]
+                    prompts = [
+                        engine.tokenizer.apply_chat_template(
+                            [{"role": "user", "content": problem.prompt}],
+                            tokenize=False,
+                            add_generation_prompt=True,
                         )
-                        + "\n"
+                        for problem in batch
+                    ]
+                    texts = engine.generate(
+                        prompts,
+                        stream=False,
+                        max_tokens=args.max_tokens,
+                        temperature=args.temperature,
+                        do_sample=args.temperature > 0,
+                        top_p=args.top_p,
+                        top_k=args.top_k,
+                        frequency_penalty=0.0,
                     )
-                out.flush()
-    finally:
-        engine.shutdown()
+                    for problem, text in zip(batch, texts):
+                        responses[problem.prompt] = text
+                        out.write(
+                            json.dumps(
+                                {
+                                    "key": problem.key,
+                                    "prompt": problem.prompt,
+                                    "response": text,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                    out.flush()
+        finally:
+            engine.shutdown()
     results = score_responses(problems, responses, verifier)
-    results["_config"] = vars(args)
-    Path(args.output).write_text(json.dumps(results, ensure_ascii=False, indent=2))
+    save_json(str(Path(args.output).with_suffix(".details.json")), results["results"])
+    save_result(args.output, summarize(results, vars(args)))
     print(json.dumps(results["_summary"], indent=2))
 
 

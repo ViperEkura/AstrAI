@@ -8,14 +8,23 @@ Usage::
     python scripts/eval/evaluate_rouge.py --data_path preds.jsonl --output results.json
 
     # As a library
-    from scripts.eval.evaluate_rouge import compute_rouge
+    from evaluate_rouge import compute_rouge
     scores = compute_rouge("the cat sat on the mat", "the cat sat")
 """
 
 import argparse
 import json
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List
+
+from astrai.evaluation import (
+    EvaluationResult,
+    Metric,
+    check_output,
+    save_json,
+    save_result,
+)
 
 
 def _tokenize(text: str) -> List[str]:
@@ -131,6 +140,7 @@ def main():
     )
     parser.add_argument("--output", type=str, default=None, help="Output JSON path")
     args = parser.parse_args()
+    check_output(args.output)
 
     results = evaluate_file(args.data_path)
     agg = results["aggregate"]
@@ -144,8 +154,27 @@ def main():
         )
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        save_json(str(Path(args.output).with_suffix(".details.json")), results)
+        save_result(
+            args.output,
+            EvaluationResult(
+                "rouge",
+                results["num_samples"],
+                {
+                    f"{name}/{key}": Metric(value, "ratio")
+                    for name, scores in agg.items()
+                    for key, value in scores.items()
+                },
+                {
+                    "input": args.data_path,
+                    "effective_counts": {
+                        f"{name}/{key}": results["num_samples"]
+                        for name, scores in agg.items()
+                        for key in scores
+                    },
+                },
+            ),
+        )
         print(f"\nSaved to {args.output}")
 
 

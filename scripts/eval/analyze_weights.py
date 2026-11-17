@@ -2,11 +2,21 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Dict, List
 
 import safetensors.torch
 import torch
+
+from astrai.evaluation import (
+    EvaluationResult,
+    Metric,
+    check_output,
+    mean,
+    save_json,
+    save_result,
+)
 
 
 def effective_rank_metrics(w: torch.Tensor, device: str = "cpu") -> Dict:
@@ -246,6 +256,7 @@ def main():
         help="Device for SVD computation (e.g., 'cuda:0', 'cpu').",
     )
     args = parser.parse_args()
+    check_output(args.output)
 
     all_results = {}
 
@@ -322,8 +333,38 @@ def main():
             analyze_one(cdir, f"Compare_{cdir}")
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(all_results, f, indent=2)
+        save_json(str(Path(args.output).with_suffix(".details.json")), all_results)
+        metrics, counts = {}, {}
+        for label, weights in all_results.items():
+            metrics[f"{label}/parameters"] = Metric(
+                sum(math.prod(row["shape"]) for row in weights.values()), "count"
+            )
+            metrics[f"{label}/tensors"] = Metric(len(weights), "count")
+            for component, rows in group_by_component(weights).items():
+                for key in sorted(
+                    {key for row in rows for key in row} - {"shape", "is_1d"}
+                ):
+                    values = [
+                        row[key]
+                        for row in rows
+                        if key in row and math.isfinite(row[key])
+                    ]
+                    name = f"{label}/{component}/{key}"
+                    metrics[name] = Metric(mean(values) if values else None, "number")
+                    counts[name] = len(values)
+        save_result(
+            args.output,
+            EvaluationResult(
+                "weights",
+                sum(len(w) for w in all_results.values()),
+                metrics,
+                {
+                    **vars(args),
+                    "sample_unit": "weight tensor",
+                    "effective_counts": counts,
+                },
+            ),
+        )
         print(f"\nResults saved to {args.output}")
 
 

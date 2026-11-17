@@ -6,13 +6,22 @@ import json
 import os
 import random
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import tqdm
 from datasets import load_dataset
 
-from astrai.bench import load_score_model, loglikelihood_batched
+from astrai.evaluation import (
+    EvaluationResult,
+    Metric,
+    check_output,
+    load_jsonl,
+    load_score_model,
+    loglikelihood_batched,
+    save_result,
+)
 
 MMLU_HF_DATASET = "cais/mmlu"
 MMLU_SUBJECTS = [
@@ -236,7 +245,7 @@ def choice_logprobs_batched(
     for ctx_ids in context_ids_list:
         for cid in choice_ids_list:
             requests.append((ctx_ids, cid))
-    scores = loglikelihood_batched(model, tokenizer, requests, device, max_model_len)
+    scores = loglikelihood_batched(model, requests, device, max_model_len)
     return [
         {letters[ci]: scores[qi * 4 + ci] for ci in range(4)}
         for qi in range(len(context_ids_list))
@@ -357,6 +366,29 @@ def evaluate_subject(
     return correct / total, correct, total
 
 
+def summarize(details, metadata):
+    subjects = {}
+    for row in details:
+        counts = subjects.setdefault(row["subject"], {"correct": 0, "total": 0})
+        counts["total"] += 1
+        counts["correct"] += max(row["scores"], key=row["scores"].get) == row["answer"]
+    total = len(details)
+    accuracy = (
+        sum(counts["correct"] for counts in subjects.values()) / total if total else 0
+    )
+    return EvaluationResult(
+        "mmlu",
+        total,
+        {"acc": Metric(round(accuracy, 4), "ratio")},
+        {
+            **metadata,
+            "subjects": subjects,
+            "effective_counts": {"acc": total},
+            "aggregation": "question-weighted",
+        },
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="MMLU evaluation")
     parser.add_argument(
@@ -400,7 +432,17 @@ def main():
         default=4,
         help="Number of questions per batch (4 choices each = 4*B rows)",
     )
+    parser.add_argument(
+        "--score_only", help="Rescore saved details JSONL without loading a model"
+    )
     args = parser.parse_args()
+    check_output(args.output)
+    if args.score_only:
+        result = summarize(load_jsonl(args.score_only), {"source": args.score_only})
+        if args.output:
+            save_result(args.output, result)
+        print(result)
+        return
 
     if args.download or not os.path.exists(args.data_dir):
         download_mmlu(args.data_dir)
@@ -409,7 +451,6 @@ def main():
     model, tokenizer = load_score_model(args.param_path, device, args.dtype)
 
     subjects = args.subjects or MMLU_SUBJECTS
-    results = {}
     total_correct = 0
     total_questions = 0
     details = []
@@ -440,7 +481,6 @@ def main():
             prompt_format=args.prompt_format,
             max_seq_len=args.max_seq_len,
         )
-        results[subject] = {"accuracy": round(acc, 4), "correct": corr, "total": tot}
         total_correct += corr
         total_questions += tot
         print(f"  {subject:40s}  {acc:.2%}  ({corr}/{tot})")
@@ -448,21 +488,14 @@ def main():
     overall = total_correct / total_questions if total_questions else 0
     print(f"\n{'=' * 70}")
     print(f"  Overall: {overall:.2%}  ({total_correct}/{total_questions})")
-    results["_overall"] = {
-        "accuracy": round(overall, 4),
-        "correct": total_correct,
-        "total": total_questions,
-    }
-    results["_config"] = vars(args)
-
     if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         with open(
             args.output.replace(".json", "_details.jsonl"), "w", encoding="utf-8"
         ) as f:
             for row in details:
                 f.write(json.dumps(row) + "\n")
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
+        save_result(args.output, summarize(details, vars(args)))
         print(f"Results saved to {args.output}")
 
 

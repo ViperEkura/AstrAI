@@ -101,7 +101,7 @@ def test_ids_are_stable_across_reassign_and_replacements():
     assert len(set(ids)) == len(ids)
 
 
-def test_rebind_follows_a_replaced_weight():
+def test_reassign_follows_a_replaced_weight():
     model = _model()
     table = assign_slots(model)
     linear = model.layers[0].attention.q_proj
@@ -113,7 +113,7 @@ def test_rebind_follows_a_replaced_weight():
     # is not yet.
     assert table.slot_of(replacement) == -1
 
-    table.rebind(model)
+    table.assign(model)
     assert table.slot_of(replacement) == old_slot
     assert table.name_of(replacement) == "layers.0.attention.q_proj"
 

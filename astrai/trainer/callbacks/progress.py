@@ -20,11 +20,8 @@ class ProgressBarCallback(TrainCallback):
     Progress bar callback for trainer.
     """
 
-    def __init__(
-        self, num_epoch: int, log_interval: int = 100, file: Optional[IO[str]] = None
-    ):
+    def __init__(self, num_epoch: int, file: Optional[IO[str]] = None):
         self.num_epoch = num_epoch
-        self.log_interval = log_interval
         self.file = file
         self.progress_bar: tqdm = None
 

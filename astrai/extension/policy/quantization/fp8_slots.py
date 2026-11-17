@@ -1,26 +1,21 @@
-"""Stable module-path identities for FP8 linear state.
-
-Module paths survive weight replacement and wrapper prefixes, keeping C++
-delayed-scaling history and checkpoint state bound to the right layer.
-"""
+"""Stable module-path identities for FP8 scaling and checkpoint state."""
 
 import weakref
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Tuple, Type
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 
 from astrai.extension.runtime.loader import get_module, is_available
+from astrai.model.components.linear import Linear
+from astrai.model.components.lora import LoRALinear
 
-# Module path prefixes that wrappers add. ``torch.compile`` prefixes
-# ``_orig_mod.`` (see ``astrai/parallel/executor.py``); DDP wraps in
-# ``module.``. Stripping them keeps one model's slots identical whether or not
-# it is compiled or wrapped.
+# Normalize torch.compile and DDP module paths.
 _PATH_PREFIXES = ("_orig_mod.", "module.")
 
 
 def _canonical_path(name: str) -> str:
-    """Drop wrapper prefixes so a path is the same before and after wrapping."""
+    """Strip compile/DDP wrapper prefixes from module paths."""
     changed = True
     while changed:
         changed = False
@@ -32,35 +27,9 @@ def _canonical_path(name: str) -> str:
     return name
 
 
-_linear_types_cache: Optional[Tuple] = None
-
-
-def _linear_types() -> Tuple:
-    """Model classes whose forward is an ``aten::linear`` call.
-
-    Imported lazily: the extension package must stay importable on a box with
-    no model package (and importing it must not pull the model stack).
-    ``LoRALinear`` wraps a base ``Linear`` and re-registers the *same* weight
-    parameter, so a slot assigned before injection stays valid after it.
-    """
-    global _linear_types_cache
-    if _linear_types_cache is None:
-        from astrai.model.components.linear import Linear
-
-        types: List[Type] = [Linear]
-        try:
-            from astrai.model.components.lora import LoRALinear
-
-            types.append(LoRALinear)
-        except ImportError:  # pragma: no cover - model package always present
-            pass
-        _linear_types_cache = tuple(types)
-    return _linear_types_cache
-
-
 def _linear_weight(module: torch.nn.Module) -> Optional[torch.Tensor]:
     """The 2-D weight of a module that dispatches through ``aten::linear``."""
-    if not isinstance(module, _linear_types()):
+    if not isinstance(module, (Linear, LoRALinear)):
         return None
     weight = getattr(module, "weight", None)
     if not isinstance(weight, torch.nn.Parameter) or weight.dim() != 2:
@@ -70,18 +39,7 @@ def _linear_weight(module: torch.nn.Module) -> Optional[torch.Tensor]:
 
 @dataclass(frozen=True)
 class Fp8Slot:
-    """One quantized slot: a module path plus its parsed role.
-
-    ``name`` is the module path (e.g. ``layers.3.attention.q_proj``) and is the
-    *stable identity* — the snapshot binds on it. ``slot_id`` is a compact
-    index handed to C++ for per-call lookup; it follows ``named_modules()``
-    order and carries no meaning of its own.
-
-    ``module_type``/``tensor_type`` mirror TE's ``QuantizerRole``: the kind of
-    parent the linear hangs under (``attention``/``mlp``/``""``) and the child
-    name (``q_proj``/``up``/``lm_head``). ``pattern`` is the TE-plan-style
-    glob (``layers.*.attention.q_proj``) a per-role policy would match on.
-    """
+    """Module path for checkpoint identity, numeric slot ID for C++ lookup."""
 
     slot_id: int
     name: str
@@ -97,12 +55,7 @@ class Fp8Slot:
 
 
 def _parse_role(name: str) -> Tuple:
-    """``layers.3.attention.q_proj`` -> ``("attention", "q_proj")``.
-
-    The module type is the last non-numeric segment of the parent path, so MoE
-    experts (``...routed_experts.2.up``) report ``routed_experts`` rather than
-    the expert index. A top-level projection (``lm_head``) has no parent.
-    """
+    """Return the last nonnumeric parent component and child name."""
     parent, _, child = name.rpartition(".")
     module_type = ""
     for segment in reversed(parent.split(".")):
@@ -113,16 +66,9 @@ def _parse_role(name: str) -> Tuple:
 
 
 class SlotTable:
-    """Weight-identity -> slot map for one model.
+    """Map weight identities to module slots.
 
-    ``by_weight`` is keyed by ``id(weight)`` rather than by the tensor itself:
-    ``Tensor.__eq__`` is elementwise, so a dict keyed on tensors would compare
-    values on a hash collision. Identity hashing needs the address to stay
-    unique, which is what ``_keepalive`` is for — it holds a strong reference
-    to every registered weight, so no address can be recycled into a false hit.
-    ``rebind()`` is the release valve: it drops references to weights the model
-    no longer owns.
-    """
+    _keepalive prevents Python ID reuse; assign() releases replaced weights."""
 
     def __init__(self) -> None:
         self._slots: List[Fp8Slot] = []
@@ -130,8 +76,7 @@ class SlotTable:
         self._by_slot: Dict[int, Fp8Slot] = {}
         self._by_weight: Dict[int, Fp8Slot] = {}
         self._keepalive: List[torch.Tensor] = []
-        # slot id -> (module, weight attribute), weakly held so a dead model
-        # does not keep itself alive through the table.
+        # Weak owners avoid retaining the model through the table.
         self._owners: Dict[int, Tuple] = {}
         self._model_ref = None
 
@@ -144,25 +89,14 @@ class SlotTable:
     def __contains__(self, name: str) -> bool:
         return name in self._by_name
 
-    # -- construction -------------------------------------------------------
-
     def assign(self, model: torch.nn.Module) -> "SlotTable":
-        """Walk ``model`` and (re)build the table.
-
-        Re-assigning an unchanged model reuses the existing ``slot_id`` for
-        each path, so ids stay put across a rebuild; a genuinely new path gets
-        the next free id. One weight shared by two modules (tied LM head) is
-        one slot, named after the first module that reaches it.
-        """
+        """Reuse IDs for existing paths; shared weights use the first binding."""
         slots: List[Fp8Slot] = []
         by_name: Dict[str, Fp8Slot] = {}
         by_weight: Dict[int, Fp8Slot] = {}
         keepalive: List[torch.Tensor] = []
         owners: Dict[int, Tuple] = {}
-        # Ids are handed out monotonically and never reused, so a path that
-        # disappears and a new one that appears cannot collide on an id. The
-        # floor is the previous table's maximum: a pass only sees the slots it
-        # has reached so far, which lags behind ids assigned by an earlier pass.
+        # New paths must not collide with IDs from the previous table.
         next_id = max((slot.slot_id for slot in self._slots), default=-1) + 1
 
         for raw_name, module in model.named_modules():
@@ -177,13 +111,12 @@ class SlotTable:
             next_id = max(next_id, slot.slot_id + 1)
             slots.append(slot)
             by_name[name] = slot
-            # Tied weights: one state, so the second module must not overwrite
-            # the first binding with a different slot.
+            # Shared weights keep the first binding.
             if id(weight) not in by_weight:
                 by_weight[id(weight)] = slot
                 keepalive.append(weight)
             owners[slot.slot_id] = (weakref.ref(module), "weight")
-            module._fp8_slot = slot.slot_id  # external attach (TP-style)
+            module._fp8_slot = slot.slot_id
 
         self._slots = slots
         self._by_name = by_name
@@ -194,23 +127,8 @@ class SlotTable:
         self._model_ref = weakref.ref(model)
         return self
 
-    def rebind(self, model: torch.nn.Module) -> None:
-        """Re-point weight identities after parameters were replaced.
-
-        TP sharding, FSDP and graph-capture buffers swap the ``Parameter``
-        object, which changes ``id(weight)`` while the module path stays put.
-        Re-assigning restores the mapping and releases the stale references.
-        """
-        self.assign(model)
-
     def stale(self) -> int:
-        """How many slots no longer hold the weight tensor they registered.
-
-        A stale table is not a correctness problem — an unmatched weight falls
-        back to the address-keyed path — but the module loses its history, so
-        :func:`refresh_slots` repairs it at the next fp8 region entry. Reads one
-        attribute per slot: ~10us on a 1B model, once per region.
-        """
+        """Count replaced weights whose identity mappings need refreshing."""
         count = 0
         for slot_id, (module_ref, attr) in self._owners.items():
             module = module_ref()
@@ -223,12 +141,7 @@ class SlotTable:
         return count
 
     def refresh(self) -> bool:
-        """Re-assign from the model when a weight was swapped under it.
-
-        True when something had changed. A no-op when the model is gone (the
-        table outlives a throwaway model) or nothing moved, which keeps the
-        common path free.
-        """
+        """Reassign after a weight replacement; report whether the table changed."""
         model = self._model_ref() if self._model_ref is not None else None
         if model is None or not self.stale():
             return False
@@ -236,7 +149,7 @@ class SlotTable:
         return True
 
     def clear(self) -> None:
-        """Drop every slot and reference (tests, teardown)."""
+        """Drop slots and retained references."""
         self._slots = []
         self._by_name = {}
         self._by_slot = {}
@@ -245,8 +158,6 @@ class SlotTable:
         self._owners = {}
         self._model_ref = None
 
-    # -- lookup -------------------------------------------------------------
-
     def by_name(self, name: str) -> Optional[Fp8Slot]:
         return self._by_name.get(_canonical_path(name))
 
@@ -254,12 +165,7 @@ class SlotTable:
         return self._by_weight.get(id(weight))
 
     def slot_of(self, weight: torch.Tensor) -> int:
-        """Compact id for ``weight``, or ``-1`` when it was never assigned.
-
-        ``-1`` is the C++ side's "no slot" sentinel: an unassigned weight (a
-        bare call, a bench, a model that never went through :func:`assign_slots`)
-        keeps the original address-keyed behavior.
-        """
+        """Return the slot ID, or -1 for C++ address-based fallback."""
         slot = self._by_weight.get(id(weight))
         return -1 if slot is None else slot.slot_id
 
@@ -267,24 +173,13 @@ class SlotTable:
         slot = self._by_weight.get(id(weight))
         return "" if slot is None else slot.name
 
-    def describe(self) -> List[str]:
-        """One ``slot_id name`` line per slot (debug/tests)."""
-        return [f"{slot.slot_id} {slot.name}" for slot in self._slots]
 
-
-# The process-wide table the dispatcher consults. One model per process is the
-# training assumption; re-assigning a different model replaces the contents.
+# Assigning another model replaces the process-wide table.
 _slots = SlotTable()
 
 
 def sync_slots(table: Optional[SlotTable] = None) -> None:
-    """Publish ``table`` (the active one by default) to the C++ state.
-
-    C++ needs slot id -> module path to name its snapshot entries; keeping that
-    map there means only an ``int64`` crosses the per-call boundary. A no-op on
-    a box without the extension — the table itself is a pure name map, so slot
-    assignment never requires CUDA.
-    """
+    """Publish slot names and patterns to C++; no-op without the extension."""
     if not is_available("gemm"):
         return
     target = _slots if table is None else table
@@ -293,31 +188,21 @@ def sync_slots(table: Optional[SlotTable] = None) -> None:
     )
 
 
-def slot_table() -> SlotTable:
-    """The active table (queried by the ``aten::linear`` override)."""
-    return _slots
-
-
 def assign_slots(model: torch.nn.Module) -> SlotTable:
-    """Assign slots for ``model``, install them as the active table, publish."""
+    """Assign and publish the process-wide slot table."""
     table = _slots.assign(model)
     sync_slots(table)
     return table
 
 
 def clear_slots() -> None:
-    """Forget every slot (tests / reconfiguration)."""
+    """Clear the table and its C++ bindings."""
     _slots.clear()
     sync_slots()
 
 
 def refresh_slots() -> bool:
-    """Repair a stale table after a parameter swap; True when it changed.
-
-    Called on fp8 region entry: the C++ rebind path only fires when the same
-    slot id arrives with a different weight tensor, which is exactly what a
-    stale Python mapping cannot produce.
-    """
+    """Repair replaced-weight mappings and publish changes on FP8 region entry."""
     if _slots.refresh():
         sync_slots(_slots)
         return True
@@ -325,10 +210,5 @@ def refresh_slots() -> bool:
 
 
 def fp8_slot_of(weight: torch.Tensor) -> int:
-    """Slot id of a linear weight, ``-1`` when unassigned.
-
-    The seam a future producer (norm/activation epilogue writing fp8 directly)
-    uses to find the consuming linear's state without a tensor-identity
-    registry of its own.
-    """
+    """Return the weight slot ID, or -1 when unassigned."""
     return _slots.slot_of(weight)

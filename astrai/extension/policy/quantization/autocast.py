@@ -1,8 +1,4 @@
-"""FP8 autocast region, linear routing, and checkpoint state bridge.
-
-The region is thread-local and installs the aten::linear override lazily.
-Stable module identities live in fp8_slots; compiled bindings remain in kernel.
-"""
+"""Thread-local FP8 routing and checkpoint state access."""
 
 import functools
 import threading
@@ -20,7 +16,6 @@ from astrai.extension.policy.quantization.fp8_slots import (
     clear_slots,
     fp8_slot_of,
     refresh_slots,
-    slot_table,
     sync_slots,
 )
 from astrai.extension.runtime.loader import get_module, is_available
@@ -40,31 +35,12 @@ __all__ = [
     "fp8_slot_of",
     "fp8_state_dict",
     "refresh_slots",
-    "slot_table",
     "sync_slots",
 ]
 
-# ===========================================================================
-# Region management: formats, recipes, the autocast context, aten routing
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# FP8: formats, recipes, region config
-# ---------------------------------------------------------------------------
-
-# FP8 format vocabulary: the canonical key is the fp8 dtype itself
-# (torch.float8_e4m3fn / torch.float8_e5m2 — what the quantize binding
-# dispatches and validates on). The only policy-level notion beyond a
-# dtype is the hybrid per-direction pair, carried as a plain (fwd, bwd)
-# tuple; dtype validation stays in the C++ binding.
-
 
 def fp8_format_pair(fmt: Union[str, torch.dtype]) -> Tuple[torch.dtype, torch.dtype]:
-    """Format spec -> (fwd, bwd) fp8 dtype pair.
-
-    A dtype is symmetric; ``'hybrid'`` is E4M3 forward / E5M2 backward
-    (the training default).
-    """
+    """Return forward/backward dtypes; hybrid uses E4M3/E5M2."""
     if fmt == "hybrid":
         return (torch.float8_e4m3fn, torch.float8_e5m2)
     return (fmt, fmt)
@@ -72,15 +48,7 @@ def fp8_format_pair(fmt: Union[str, torch.dtype]) -> Tuple[torch.dtype, torch.dt
 
 @dataclass
 class FP8Recipe:
-    """Scale-from-amax policy knobs: ``scale = (amax / finfo(fmt).max) / 2^margin``.
-
-    ``dynamic=False`` (default) is TE-style delayed scaling: max over the
-    amax history window (amax from *previous* steps; the window trades
-    responsiveness against stability). ``dynamic=True`` is current-amax
-    scaling (torchao DYNAMIC): measure, then quantize — no history, at an
-    extra pass. The formula itself lives in the C++ op (the single home;
-    the seed and in-kernel fold both apply it there).
-    """
+    """Delayed scaling uses prior amax history; dynamic scaling uses current amax."""
 
     history_len: int = 16
     margin: int = 0
@@ -89,49 +57,31 @@ class FP8Recipe:
 
 @dataclass
 class _ActiveConfig:
-    """The immutable (enabled, recipe, format-pair) triple of one open
-    region; ``fp8_format`` is the (fwd, bwd) fp8 dtype pair."""
-
     enabled: bool
     recipe: FP8Recipe
     fp8_format: Tuple[torch.dtype, torch.dtype]
 
 
-# Thread-local active configuration (torch's autocast TLS analog): set by
-# fp8_autocast on __enter__, absent outside any region. Autograd engine
-# threads run backwards with their own empty context — fine, since backward
-# only reads state captured on ctx at forward time.
+# Backward reads state captured during forward, not the current context.
 _active_config: ContextVar[Optional[_ActiveConfig]] = ContextVar(
     "astrai_fp8_active_config", default=None
 )
 
-# Persistent out-of-region defaults. Everything else the old Python state
-# machine owned — the per-weight meta registry (delayed-scaling rings, the
-# version-keyed weight-cast cache, the checkpoint pending queue, the
-# generation counter invalidating that cache) — lives in the C++ op's
-# translation unit (``csrc/gemm/fp8/linear.cu``). A meta is addressed
-# by its module's *slot* when the dispatcher knows one (see the slot
-# stable module path, so a replaced weight parameter keeps its history) and by
-# ``(data_ptr, shape, dtype)`` otherwise; the snapshot binds slotted entries by
-# name and falls back to registration order for the rest.
+# Defaults used outside an explicit FP8 region.
 _default_enabled = False
 _default_recipe = FP8Recipe()
 _default_format = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 def fp8_state_dict() -> Dict:
-    """Checkpoint snapshot of the delayed-scaling rings (A1): save it beside
-    the optimizer state. Empty under dynamic scaling (no rings exist) and on
-    a box without the extension (bf16 training never allocated any)."""
+    """Export delayed-scaling state; return empty state without the extension."""
     if not is_available("gemm"):
         return {"version": 1, "entries": []}
     return get_module("gemm").fp8_state_dict()
 
 
 def fp8_load_state_dict(sd: Dict) -> None:
-    """Restore a :func:`fp8_state_dict` snapshot. Unmatched entries (a model
-    shape/topology change across the checkpoint) re-seed on next use — the
-    same resume transient a ring-less restart would pay on every step."""
+    """Restore scaling history; unmatched entries initialize on next use."""
     if not sd.get("entries"):
         return
     get_module("gemm").fp8_load_state_dict(sd)
@@ -144,12 +94,7 @@ def fp8_reset() -> None:
 
 
 def _active() -> Optional[_ActiveConfig]:
-    """The active config when fp8 dispatch is on, else ``None`` (fast guard).
-
-    A region config wins (honoring nested ``enabled=False`` regions); with no
-    region open this falls back to the persistent global switch
-    (``fp8_linear_enable``), so that flag still routes aten::linear to fp8.
-    """
+    """An active region overrides the global default, including enabled=False."""
     cfg = _active_config.get()
     if cfg is not None:
         return cfg if cfg.enabled else None
@@ -159,19 +104,7 @@ def _active() -> Optional[_ActiveConfig]:
 
 
 class fp8_autocast:
-    """Autocast-style context: fp8 linear dispatch on this thread.
-
-    Mirrors ``torch.autocast`` — a class-based, reentrant, nestable context
-    over thread-local state::
-
-        with fp8_autocast(enabled=True, fp8_format="hybrid"):
-            logits = model(input_ids)   # aten::linear -> fp8 path
-        loss.backward()  # fp8 backward; state was captured at forward time
-
-    Nesting follows torch: each ``__enter__`` pushes the new active config, each
-    ``__exit__`` restores the previous one, and a nested ``enabled=False`` region
-    simply disables dispatch inside it. The instance doubles as a decorator.
-    """
+    """Nestable FP8 context and decorator. Backward uses state saved by forward."""
 
     def __init__(
         self,
@@ -189,10 +122,7 @@ class fp8_autocast:
     def __enter__(self) -> "fp8_autocast":
         if self._config.enabled:
             _install_linear_override()
-            # A parameter swapped since the slots were assigned (TP sharding,
-            # FSDP, a graph buffer) would silently fall back to the
-            # address-keyed path and lose its amax history. One attribute read
-            # per slot repairs it here, once per region.
+            # Refresh identities after parameter replacement to retain scaling history.
             refresh_slots()
         self._tokens.append(_active_config.set(self._config))
         return self
@@ -214,8 +144,7 @@ class fp8_autocast:
 
 
 def fp8_linear_enable(enabled: bool = True) -> None:
-    """Toggle fp8 dispatch for aten::linear globally (the out-of-region default;
-    ``fp8_autocast`` regions override it thread-locally)."""
+    """Set the global default; active regions override it locally."""
     global _default_enabled
     if enabled:
         _install_linear_override()
@@ -223,15 +152,12 @@ def fp8_linear_enable(enabled: bool = True) -> None:
 
 
 def fp8_linear_enabled() -> bool:
-    """Whether fp8 dispatch is active right now (region config or global)."""
+    """Whether FP8 dispatch is active in this context."""
     return _active() is not None
 
 
 def _fp8_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
-    """Shape guard for the fp8 path. Unlike a strict 16-alignment requirement,
-    the kernels handle unaligned M/N via boundary checks (slower but correct) —
-    so no whole-call bf16 fallback for small decode batches. Only the K-dimension
-    contraction must match and the weight must be 2D."""
+    """K must match; kernels handle unaligned M/N dimensions."""
     return x.dim() >= 2 and w.dim() == 2 and x.size(-1) == w.size(1)
 
 
@@ -243,20 +169,8 @@ def _linear_cuda_impl(x: torch.Tensor, w: torch.Tensor, bias=None):
         and w.dtype is torch.bfloat16
         and _fp8_supported(x, w)
     ):
-        # One Python->C++ crossing per linear: quantize, the ring
-        # fold/advance, the weight-cast cache and all three GEMMs run inside
-        # gemm.fp8_linear. The caller's grad mode gates the delayed-scaling
-        # bookkeeping, and it must be read HERE: inside a Function forward
-        # grad is always disabled, so the mode would be invisible one frame
-        # deeper. A no-grad linear (checkpointing recompute, inference) reads
-        # the rings without folding or advancing them. This host bool is also
-        # the seam a CUDA-graph device flag replaces (TE's
-        # skip_fp8_weight_update).
-        #
-        # ``slot`` names the module the weight belongs to (slot addressing
-        # the C++ state attaches to the module rather than to whatever tensor
-        # holds its weight; -1 (no slot table, a bare call, the benches) keeps
-        # the original address-keyed lookup.
+        # Read grad mode before entering the C++ autograd node.
+        # No-grad forwards must not advance delayed-scaling history.
         recipe = cfg.recipe
         return get_module("gemm").fp8_linear(
             x,
@@ -284,27 +198,14 @@ _install_lock = threading.Lock()
 
 
 def _install_linear_override() -> None:
-    """Register the fp8 aten::linear impls once, on first activation.
-
-    Importing this module must stay dispatcher-neutral: the override routes
-    every CUDA ``aten::linear`` call through ``_linear_cuda_impl``'s guard,
-    so it is installed exactly when fp8 dispatch is first switched on (an
-    autocast enter or the global enable) — never at import. The ``Library``
-    handles live in a module global for the process lifetime (dropping them
-    would unregister the impls).
-    """
+    """Install on first activation, not import; retain Library handles to keep registrations alive."""
     global _linear_libs
     if _linear_libs is None:
         with _install_lock:
             if _linear_libs is None:
                 lib = Library("aten", "IMPL", "CUDA")
                 lib.impl("linear", _linear_cuda_impl)
-                # Also replace torch's generated linear autograd formula
-                # (which would call aten::linear_backward after the
-                # fp8_autocast region exits). The fp8 backward is owned by
-                # the C++ node with state captured at forward time, so
-                # loss.backward() works wherever it is called; the CUDA
-                # registration still covers inference_mode.
+                # Let the C++ node own backward after the FP8 context exits.
                 lib_autograd = Library("aten", "IMPL", "AutogradCUDA")
                 lib_autograd.impl("linear", _linear_cuda_impl)
                 _linear_libs = [lib, lib_autograd]

@@ -117,15 +117,16 @@ def prepare_sequences(keys: Dict, config: PipelineConfig) -> Dict:
     pp = config.preprocessing
     record_mode = "seq_lengths" in config.output.record_keys
     if record_mode:
-        required = {"sequence", "loss_mask", "seq_lengths"}
+        required = {"sequence", "seq_lengths"}
         if not required.issubset(config.output.record_keys):
-            raise ValueError(
-                "SFT records require sequence, loss_mask, seq_lengths offsets"
-            )
+            raise ValueError("segment records require sequence and seq_lengths offsets")
         if config.output.position_ids_mode != "doc_reset":
-            raise ValueError("SFT records require position_ids_mode=doc_reset")
+            raise ValueError("segment records require position_ids_mode=doc_reset")
         keys = dict(keys)
-        keys.setdefault("loss_mask", [[1] * len(seq) for seq in keys["sequence"]])
+        if "loss_mask" in config.output.record_keys:
+            keys.setdefault("loss_mask", [[1] * len(seq) for seq in keys["sequence"]])
+        elif "loss_mask" in keys:
+            raise ValueError("SEQ segment records cannot contain a loss mask")
     packed = pack_sequences(
         keys,
         pp.max_seq_len,

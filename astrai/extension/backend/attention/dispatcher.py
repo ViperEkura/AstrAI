@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 from torch import Tensor
 
-from astrai.extension.backend.attention import cuda, flash
+from astrai.extension.backend.attention import cuda, flash, varlen
 from astrai.extension.backend.attention import torch as native
 from astrai.extension.backend.attention.common import AttentionSpec, _attention_spec
 from astrai.extension.runtime.operation import ExplicitSelectionError, OpDispatcher
@@ -58,6 +58,9 @@ class AttentionDispatcher(OpDispatcher[AttentionSpec]):
         elif choice == "flash":
             if flash.supports(spec):
                 return flash.forward
+        elif choice == "varlen":
+            if varlen.supports(spec):
+                return varlen.forward
         elif choice is not None and origin in ("explicit", "context"):
             raise ValueError(f"Unknown attention implementation: {choice!r}")
         if choice is not None and origin in ("explicit", "context"):
@@ -68,6 +71,8 @@ class AttentionDispatcher(OpDispatcher[AttentionSpec]):
             return cuda.forward
         if flash.supports(spec):
             return flash.forward
+        if varlen.supports(spec):
+            return varlen.forward
         return native.forward
 
 

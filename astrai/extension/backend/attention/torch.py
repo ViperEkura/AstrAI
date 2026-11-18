@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.attention_layout import VarlenAttentionLayout
 from astrai.extension.backend.attention.common import _check_fwd, repeat_kv
 
 if TYPE_CHECKING:
@@ -62,13 +63,15 @@ def forward(
     v: Tensor,
     kv_cache: Optional["KVCache"],
     layer_id: int,
-    attn_mask: Optional[Tensor] = None,
+    attn_mask: Optional[Tensor | VarlenAttentionLayout] = None,
     is_causal: bool = False,
     fwd: Optional[str] = None,
     *,
     scale: Optional[float] = None,
 ) -> Tensor:
     _check_fwd(fwd)
+    if isinstance(attn_mask, VarlenAttentionLayout):
+        attn_mask = attn_mask.dense
     if q.ndim == 4:
         n_rep = q.size(2) // k.size(2)
         if n_rep > 1:

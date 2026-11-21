@@ -8,6 +8,9 @@
 !astrai/**/*.py
 !scripts/**/*.py
 !tests/**/*.py
+!examples/rl_reward/*.py
+!examples/rl_reward/README.md
+!examples/rl_reward/*.yaml
 !csrc/**/*.py
 !csrc/CMakeLists.txt
 

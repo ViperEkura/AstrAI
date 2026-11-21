@@ -77,6 +77,11 @@ inline void finish_pack(c10::optional<double> scale, AttentionParams& p) {
     p.ml_part = nullptr;
 }
 
+inline void set_kv_split_size(AttentionParams& p, int64_t size) {
+    p.kv_split_size = checked_int(size, "KV split size");
+    TORCH_CHECK(p.kv_split_size % 16 == 0, "KV split size must be a multiple of 16");
+}
+
 /* Tensor owners are retained by the entry until both kernels are launched. */
 struct SplitWorkspace {
     torch::Tensor o_part;
@@ -92,9 +97,12 @@ inline SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
     const bool has_ml = ml_part_buf.has_value() && ml_part_buf->defined();
     TORCH_CHECK(has_o == has_ml, "split buffers must be provided together");
     SplitWorkspace workspace;
-    const int64_t o_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * p.head_dim;
-    const int64_t ml_needed = (int64_t)p.batch * p.q_head * MAX_SPLITS * 2;
-    if (has_o) {
+    p.split_stride = std::max(MAX_SPLITS, static_cast<int>(plan.grid.z));
+    const int64_t o_needed = (int64_t)p.batch * p.q_head * p.split_stride * p.head_dim;
+    const int64_t ml_needed = (int64_t)p.batch * p.q_head * p.split_stride * 2;
+    // The standard reusable workspace has MAX_SPLITS slots. Longer fixed
+    // contexts use a larger stream-local allocation.
+    if (has_o && p.split_stride == MAX_SPLITS) {
         for (const auto* buffer_ptr : {&*o_part_buf, &*ml_part_buf}) {
             const auto& buffer = *buffer_ptr;
             TORCH_CHECK(buffer.device() == q.device(), "split buffers must be on Q's device");
@@ -108,8 +116,8 @@ inline SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
         p.ml_part = ml_part_buf->data_ptr<float>();
     } else if (!plan.direct_output) {
         const auto options = q.options().dtype(torch::kFloat32);
-        workspace.o_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, p.head_dim}, options);
-        workspace.ml_part = torch::empty({p.batch, p.q_head, MAX_SPLITS, 2}, options);
+        workspace.o_part = torch::empty({p.batch, p.q_head, p.split_stride, p.head_dim}, options);
+        workspace.ml_part = torch::empty({p.batch, p.q_head, p.split_stride, 2}, options);
     }
     if (workspace.o_part.defined()) {
         p.o_part = workspace.o_part.data_ptr<float>();
@@ -124,10 +132,9 @@ inline void launch_decode(AttentionParams& p,
                           const torch::Tensor& q,
                           const c10::optional<torch::Tensor>& o_part,
                           const c10::optional<torch::Tensor>& ml_part,
-                          cudaStream_t stream,
-                          bool consistent = false) {
+                          cudaStream_t stream) {
     with_decode_kernel<KV>(p, [&](auto kernel) {
-        const auto plan = kernel.plan(p, consistent);
+        const auto plan = kernel.plan(p);
         auto workspace = resolve_split_buffers(o_part, ml_part, p, plan, q);
         kernel.launch(p, plan, stream);
     });

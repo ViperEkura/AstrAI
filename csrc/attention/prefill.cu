@@ -19,7 +19,7 @@ torch::Tensor attn_prefill(torch::Tensor q,
                            c10::optional<double> scale,
                            int64_t layout,
                            bool is_causal,
-                           bool consistent) {
+                           int64_t kv_split_size) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -29,12 +29,13 @@ torch::Tensor attn_prefill(torch::Tensor q,
     auto O = torch::empty_strided(q.sizes(), q.strides(), q.options());
     auto O_view = (layout == BLHD) ? O.transpose(1, 2) : O;
     p.o_ptr = O_view.data_ptr();
+    set_kv_split_size(p, kv_split_size);
 
     visit_dtype<AttentionTypes>(
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream, consistent);
+            launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

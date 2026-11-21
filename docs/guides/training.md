@@ -77,17 +77,20 @@ Build the native attention and GEMM extensions first.
 export ASTR_OPS=attention=cuda_consistent,linear=cuda
 ```
 
-Both selections are needed. The attention mode uses 16-key tiles in prefill
-and replay, aligns the start of each packed run to a tile boundary, and uses
-single-split paged decode. Attention operands and KV storage remain BF16.
+Both selections are needed. Prefill, decode and replay use 16-key tiles in
+fixed 256-token segments. Packed replay aligns each run to a segment boundary.
+Decode calculates segments in parallel and merges their FP32 partials in
+sequence order. Prefill and replay use the same merge directly in their query
+tiles. Attention operands and KV storage remain BF16.
 Replay backward recomputes the masked SDPA derivative with Torch. The linear
 mode uses native BF16 GEMM for the model projections and both LM-head scoring
 paths. This applies to BF16 full-attention models with supported native head
 dimensions and boolean masks. Raw model logprobs still precede temperature
 and sampling filters.
 
-This mode is opt-in because single-split decode can be slower for long
-prefixes at low concurrency.
+This mode is opt-in. The fixed segment size favors matching the rollout and
+replay numerics across layouts. The default scheduler tunes splits for each
+decode workload.
 
 ### Online Rollout
 

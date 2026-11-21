@@ -86,6 +86,8 @@ struct AttentionParams {
     // Launch metadata and attention behavior; the boolean stays last to avoid padding.
     int num_q_tiles;
     int max_context_len; // req_to_token stride (dim 1)
+    int kv_split_size = 0; // Fixed logical KV segment size, in tokens. Zero selects adaptive.
+    int split_stride = MAX_SPLITS; // Partial workspace slots per output row.
     int num_splits = 0;
     float scale;
     bool is_causal = false;

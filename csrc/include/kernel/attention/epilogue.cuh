@@ -53,7 +53,7 @@ template <typename Traits> struct SplitEpilogue {
                 continue;
             const int head = row == 0 ? tile.rows.head0 : tile.rows.head1;
             const size_t slot =
-                (size_t(tile.rows.batch) * p.q_head + head) * MAX_SPLITS + blockIdx.z;
+                (size_t(tile.rows.batch) * p.q_head + head) * p.split_stride + blockIdx.z;
             float* output = p.o_part + slot * Traits::HEAD_DIM;
 #pragma unroll
             for (int i = 0; i < Traits::DN8; ++i) {
@@ -72,7 +72,7 @@ template <typename Traits> struct SplitEpilogue {
  * Split-combine: merges the per-split partials (o_part/ml_part) into the
  * final normalised O (KV selects the O addressing and element type).
  */
-template <typename KV, int TileK, bool SkipEmptySplits = false>
+template <typename KV, int TileK, bool SkipEmptySplits = false, bool FixedSplits = false>
 __global__ void split_kv_combine(const AttentionParams p) {
     using T = typename KV::Elem;
 
@@ -81,10 +81,28 @@ __global__ void split_kv_combine(const AttentionParams p) {
     const int batch = bh / p.q_head;
     const int q_head = bh % p.q_head;
 
-    const size_t split_base = (size_t)bh * MAX_SPLITS;
+    const size_t split_base = (size_t)bh * p.split_stride;
     const float* mlp = p.ml_part + split_base * 2;
     const float* op = p.o_part + split_base * p.head_dim;
     const float scale_log2 = p.scale * LOG2E;
+    if constexpr (FixedSplits) {
+        const int length = KV::kv_len(p, batch);
+        const int splits = length > 0 ? (length - 1) / p.kv_split_size + 1 : 0;
+        SoftmaxState total;
+        float acc = 0.0f;
+        for (int s = 0; s < splits; ++s) {
+            const SoftmaxState part{mlp[2 * s], mlp[2 * s + 1]};
+            if (part.l == 0.0f)
+                continue;
+            float alpha, beta;
+            merge_softmax(total, part, alpha, beta, scale_log2);
+            acc = merge_output(acc, op[s * p.head_dim + d], alpha, beta);
+        }
+        const float inv = total.l > 1e-20f ? 1.0f / total.l : 0.0f;
+        const int o_off = KV::q_base(p, batch, q_head) + d * p.q_d_stride;
+        static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
+        return;
+    }
     int active_splits = p.num_splits;
     if constexpr (SkipEmptySplits && KV::kPaged) {
         const int seq_len = KV::kv_len(p, batch);

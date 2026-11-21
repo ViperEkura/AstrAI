@@ -14,6 +14,7 @@ import torch
 
 from astrai.extension import attention, op_backend
 from astrai.extension.kernel.attention import (
+    ROLLOUT_KV_SPLIT_SIZE,
     attn_decode,
     attn_paged_decode,
     attn_paged_prefill,
@@ -707,10 +708,17 @@ def test_paged_prefill_short_mask_bounds(dtype, mask_rows, expand_rows, mask_col
 
 @pytest.mark.cuda
 @skip_no_kernel
-@pytest.mark.parametrize("head_dim,groups", [(32, 1), (64, 2), (128, 4), (256, 8)])
-def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups):
+@pytest.mark.parametrize(
+    "head_dim,groups,split_size",
+    [(32, 1, 16)]
+    + [
+        (dim, groups, ROLLOUT_KV_SPLIT_SIZE)
+        for dim, groups in ((32, 1), (64, 2), (128, 4), (256, 8))
+    ],
+)
+def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups, split_size):
     torch.manual_seed(3407)
-    batch, length, kv_heads = 2, 65, 2
+    batch, length, kv_heads = 2, 513, 2
     q_heads = kv_heads * groups
     q = torch.randn(
         batch, length, q_heads, head_dim, dtype=torch.bfloat16, device="cuda"
@@ -724,10 +732,14 @@ def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups):
     mask = torch.ones(batch, length, dtype=torch.bool, device=q.device)
     mask[0, 2::5] = False
     mask[1] = False
-    dense = attn_prefill(q, k, v, mask, is_causal=True, consistent=True)
+    dense = attn_prefill(q, k, v, mask, is_causal=True, kv_split_size=split_size)
     assert torch.count_nonzero(dense[1]) == 0
 
-    for end in (1, 15, 16, 17, 31, 32, 33, 64, 65):
+    # Test the usual preallocated workspace, including expansion when the
+    # 16-token case needs 33 logical splits.
+    o_part = torch.empty(batch, q_heads, 32, head_dim, device=q.device)
+    ml_part = torch.empty(batch, q_heads, 32, 2, device=q.device)
+    for end in (1, 15, 16, 17, 255, 256, 257, 511, 512, 513):
         indptr = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * end
         actual = attn_paged_decode(
             q[:, end - 1].contiguous(),
@@ -737,7 +749,9 @@ def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups):
             requests,
             indptr,
             mask=mask,
-            consistent=True,
+            o_part_buf=o_part,
+            ml_part_buf=ml_part,
+            kv_split_size=split_size,
         )
         torch.testing.assert_close(actual, dense[:, end - 1], rtol=0, atol=0)
 

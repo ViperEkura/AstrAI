@@ -250,16 +250,16 @@ def test_bf16_rollout_matches_differentiable_replay(cuda_graph):
         pytest.skip("Native BF16 attention and GEMM are required")
 
     model = make_seeded_gqa_model(
-        "cuda", dtype=torch.bfloat16, max_position_embeddings=96
+        "cuda", dtype=torch.bfloat16, max_position_embeddings=384
     )
     model.eval()
-    prompts = [list(range(8, 25)), list(range(26, 91))]
+    prompts = [list(range(8, 25)), list(range(26, 315))]
     with op_backend(attention="cuda_consistent", linear="cuda"):
         core = EngineCore(
             model,
             FakeTokenizer(),
             max_batch_size=4,
-            max_seq_len=96,
+            max_seq_len=384,
             enable_cuda_graph=cuda_graph,
             generation_config={"eos_token_id": []},
         )
@@ -281,7 +281,10 @@ def test_bf16_rollout_matches_differentiable_replay(cuda_graph):
     assert all(
         not result.error_reason and len(result.token_ids) == 17 for result in results
     )
-    prompt_ids = torch.tensor([[0] * 48 + prompts[0], prompts[1]], device="cuda")
+    prompt_ids = torch.tensor(
+        [[0] * (len(prompts[1]) - len(prompts[0])) + prompts[0], prompts[1]],
+        device="cuda",
+    )
     response_ids = torch.tensor(
         [result.token_ids for result in results], device="cuda"
     ).view(2, 2, 17)

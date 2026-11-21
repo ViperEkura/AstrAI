@@ -7,7 +7,9 @@ responsibility of the attention backend, not this module.
 Layout convention: all q/k/v are ``[batch, seq_len, n_heads, head_dim]``
 (blhd). ``scale=None`` selects ``1/sqrt(head_dim)``; native kernels require
 a finite positive scale. Causal queries align to the end of the KV sequence,
-including when the resulting first-query position is negative.
+including when the resulting first-query position is negative. A nonzero
+kv_split_size selects fixed KV segments, in multiples of 16 tokens,
+for prefill and paged decode.
 
 Interface (all functions):
     is_causal: True = causal mask; False = non-causal
@@ -21,6 +23,8 @@ from typing import Optional
 import torch
 
 from astrai.extension.runtime.loader import get_module
+
+ROLLOUT_KV_SPLIT_SIZE = 256
 
 
 class TensorLayout(enum.IntEnum):
@@ -74,7 +78,7 @@ def attn_prefill(
     is_causal: bool = False,
     *,
     scale: Optional[float] = None,
-    consistent: bool = False,
+    kv_split_size: int = 0,
 ) -> torch.Tensor:
     """GQA prefill attention (q_len > 1).
 
@@ -98,7 +102,7 @@ def attn_prefill(
         layout=TensorLayout.BLHD,
         scale=scale,
         is_causal=is_causal,
-        **({"consistent": True} if consistent else {}),
+        **({"kv_split_size": kv_split_size} if kv_split_size else {}),
     )
 
 
@@ -118,7 +122,7 @@ def attn_paged_decode(
     out_buf: Optional[torch.Tensor] = None,
     *,
     scale: Optional[float] = None,
-    consistent: bool = False,
+    kv_split_size: int = 0,
 ) -> torch.Tensor:
     """SGLang-style paged decode (q_len == 1, flat KV pool).
 
@@ -160,7 +164,7 @@ def attn_paged_decode(
         out_buf=out_buf,
         scale=scale,
         is_causal=is_causal,
-        **({"consistent": True} if consistent else {}),
+        **({"kv_split_size": kv_split_size} if kv_split_size else {}),
     )
 
 
@@ -178,7 +182,7 @@ def attn_paged_prefill(
     is_causal: bool = False,
     *,
     scale: Optional[float] = None,
-    consistent: bool = False,
+    kv_split_size: int = 0,
 ) -> torch.Tensor:
     """SGLang-style paged prefill (ragged batch, flat KV pool).
 
@@ -219,7 +223,7 @@ def attn_paged_prefill(
         mask,
         scale=scale,
         is_causal=is_causal,
-        **({"consistent": True} if consistent else {}),
+        **({"kv_split_size": kv_split_size} if kv_split_size else {}),
     )
 
 

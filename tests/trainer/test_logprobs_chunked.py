@@ -15,11 +15,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 
+from astrai.extension import is_available, op_backend
+from astrai.inference.core.engine_core import EngineCore
 from astrai.parallel.setup import find_free_port
+from astrai.trainer.backend import ColocatedBackend
+from astrai.trainer.callbacks.optimization import GradientCheckpointingCallback
+from astrai.trainer.context import TrainContext
 from astrai.trainer.strategy import get_logprobs, rollout_token_logprobs
 from astrai.trainer.strategy import ops as strategy_module
-from tests.support.capabilities import requires_nccl
-from tests.support.models import make_model
+from tests.support.capabilities import requires_nccl, skip_no_cuda
+from tests.support.models import make_model, make_seeded_gqa_model
+from tests.support.tokenizers import FakeTokenizer
 
 
 def _make_batch(device, seq_len=24, vocab_floor=3):
@@ -230,3 +236,82 @@ def test_kwarg_rejecting_wrapper_falls_back(cpu_device):
         out = get_logprobs(wrapped, *batch, "none")
     ref = _full_reference(model, batch, "none")
     torch.testing.assert_close(out["logprobs"], ref["logprobs"], rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.cuda
+@skip_no_cuda
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_bf16_rollout_matches_differentiable_replay(cuda_graph):
+    if not (
+        is_available("attention")
+        and is_available("gemm")
+        and torch.cuda.is_bf16_supported()
+    ):
+        pytest.skip("Native BF16 attention and GEMM are required")
+
+    model = make_seeded_gqa_model(
+        "cuda", dtype=torch.bfloat16, max_position_embeddings=384
+    )
+    model.eval()
+    prompts = [list(range(8, 25)), list(range(26, 315))]
+    with op_backend(attention="cuda_consistent", linear="cuda"):
+        core = EngineCore(
+            model,
+            FakeTokenizer(),
+            max_batch_size=4,
+            max_seq_len=384,
+            enable_cuda_graph=cuda_graph,
+            generation_config={"eos_token_id": []},
+        )
+    try:
+        assert core.cuda_graph_enabled is cuda_graph
+        results = ColocatedBackend(core).generate(
+            [prompt for prompt in prompts for _ in range(2)],
+            max_tokens=17,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0,
+            return_details=True,
+            return_logprobs=True,
+            seeds=[1, 2, 3, 4],
+        )
+    finally:
+        core.stop()
+
+    assert all(
+        not result.error_reason and len(result.token_ids) == 17 for result in results
+    )
+    prompt_ids = torch.tensor(
+        [[0] * (len(prompts[1]) - len(prompts[0])) + prompts[0], prompts[1]],
+        device="cuda",
+    )
+    response_ids = torch.tensor(
+        [result.token_ids for result in results], device="cuda"
+    ).view(2, 2, 17)
+    collected = torch.tensor(
+        [result.logprobs for result in results], device="cuda"
+    ).view_as(response_ids)
+    mask = torch.ones_like(response_ids, dtype=torch.bool)
+    # Replay also supports a trimmed response from the same rollout.
+    mask[0, 1, 7:] = False
+    args = (model, prompt_ids, prompt_ids.ne(0), response_ids, mask)
+
+    with op_backend(attention="cuda_consistent", linear="cuda"):
+        with torch.no_grad():
+            expected = rollout_token_logprobs(*args)["logprobs"]
+        full = rollout_token_logprobs(*args)["logprobs"]
+        checkpointing = GradientCheckpointingCallback([type(model.model.layers[0])])
+        context = TrainContext(model=model)
+        checkpointing.on_train_begin(context)
+        chunked = rollout_token_logprobs(*args, grad_chunked=True)["logprobs"]
+
+    for replayed in (expected, full, chunked):
+        torch.testing.assert_close(replayed[mask], collected[mask], atol=1e-5, rtol=0)
+        assert torch.count_nonzero(replayed[~mask]) == 0
+
+    # Backward runs outside the original selection scope.
+    full_grads = torch.autograd.grad(full[mask].mean(), tuple(model.parameters()))
+    chunked[mask].mean().backward()
+    for parameter, reference in zip(model.parameters(), full_grads):
+        assert torch.isfinite(parameter.grad).all()
+        torch.testing.assert_close(parameter.grad, reference, atol=2e-3, rtol=2e-2)

@@ -36,6 +36,29 @@ softmax_step(SoftmaxState& s, float score, float w, float& alpha, float& beta, f
     s.m = nm;
 }
 
+// Share the same rounding in the register and workspace combine paths.
+DEVICE_FORCEINLINE void merge_softmax(SoftmaxState& total,
+                                      const SoftmaxState& part,
+                                      float& alpha,
+                                      float& beta,
+                                      float scale_log2) {
+    if (total.l == 0.0f) {
+        total = part;
+        alpha = 0.0f;
+        beta = 1.0f;
+        return;
+    }
+    const float m = fmaxf(total.m, part.m);
+    alpha = exp2f(__fmul_rn(__fsub_rn(total.m, m), scale_log2));
+    beta = exp2f(__fmul_rn(__fsub_rn(part.m, m), scale_log2));
+    total.l = __fmaf_rn(total.l, alpha, __fmul_rn(part.l, beta));
+    total.m = m;
+}
+
+DEVICE_FORCEINLINE float merge_output(float total, float part, float alpha, float beta) {
+    return __fmaf_rn(total, alpha, __fmul_rn(part, beta));
+}
+
 /* Subtract-first keeps corr=1 exactly when the raw max is unchanged. */
 DEVICE_FORCEINLINE float softmax_remax(float& m, float cand, float& corr, float s2) {
     float nm = fmaxf(m, cand);

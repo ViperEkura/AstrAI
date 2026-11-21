@@ -25,7 +25,8 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
                                 c10::optional<torch::Tensor> o_part_buf,
                                 c10::optional<torch::Tensor> ml_part_buf,
                                 c10::optional<torch::Tensor> out_buf,
-                                bool is_causal) {
+                                bool is_causal,
+                                int64_t kv_split_size) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -47,6 +48,7 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
         O = torch::empty_strided(q.sizes(), q.strides(), q.options());
     }
     p.o_ptr = O.data_ptr();
+    set_kv_split_size(p, kv_split_size);
 
     visit_dtype<AttentionTypes>(
         q.scalar_type(),

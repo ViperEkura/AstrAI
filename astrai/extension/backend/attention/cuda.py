@@ -1,12 +1,20 @@
-"""Native CUDA attention backend for packed KV-cache inference."""
+"""Native CUDA attention for paged inference and consistent BF16 replay."""
 
+from functools import partial
 from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import Tensor
+from torch.autograd.function import once_differentiable
 
+from astrai.extension.backend.attention import torch as torch_attention
 from astrai.extension.backend.attention.common import AttentionSpec, _check_fwd
-from astrai.extension.kernel.attention import attn_paged_decode, attn_paged_prefill
+from astrai.extension.kernel.attention import (
+    ROLLOUT_KV_SPLIT_SIZE,
+    attn_paged_decode,
+    attn_paged_prefill,
+    attn_prefill,
+)
 from astrai.extension.runtime.loader import is_available
 
 if TYPE_CHECKING:
@@ -60,7 +68,73 @@ def supports(spec: AttentionSpec) -> bool:
     )
 
 
-def forward(
+def supports_consistent(spec: AttentionSpec) -> bool:
+    if spec.dtype != torch.bfloat16:
+        return False
+    if spec.kv_cache_kind != "none":
+        return supports(spec)
+    return (
+        spec.device.type == "cuda"
+        and spec.ndim == 4
+        and spec.head_dim in HEAD_DIMS
+        and (spec.scale is None or spec.scale > 0)
+        and (
+            spec.mask_kind == "none"
+            or (spec.mask_kind == str(torch.bool) and spec.mask_last_stride == 1)
+        )
+        and is_available("attention")
+    )
+
+
+_fixed_prefill = partial(attn_prefill, kv_split_size=ROLLOUT_KV_SPLIT_SIZE)
+
+
+class _ConsistentPrefill(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, mask, is_causal, scale):
+        ctx.save_for_backward(q, k, v, mask)
+        ctx.is_causal = is_causal
+        ctx.scale = scale
+        return _fixed_prefill(q, k, v, mask, is_causal, scale=scale)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        q, k, v, mask = ctx.saved_tensors
+        # Differentiate scaled dot-product attention with the same mask and
+        # scale. The reference backward is independent of the tile schedule
+        # and does not differentiate intermediate BF16 rounding.
+        with torch.enable_grad():
+            inputs = tuple(t.detach().requires_grad_(True) for t in (q, k, v))
+            result = torch_attention.forward(
+                *inputs, None, 0, mask, ctx.is_causal, scale=ctx.scale
+            )
+            grads = torch.autograd.grad(result, inputs, grad_output)
+        return *grads, None, None, None
+
+
+def forward_consistent(
+    q,
+    k,
+    v,
+    kv_cache,
+    layer_id,
+    attn_mask=None,
+    is_causal=False,
+    fwd=None,
+    *,
+    scale=None,
+):
+    if kv_cache is not None:
+        return _fixed_paged_attention(
+            q, k, v, kv_cache, layer_id, attn_mask, is_causal, fwd, scale=scale
+        )
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        return _ConsistentPrefill.apply(q, k, v, attn_mask, is_causal, scale)
+    return _fixed_prefill(q, k, v, attn_mask, is_causal, scale=scale)
+
+
+def _paged_attention(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -71,69 +145,40 @@ def forward(
     fwd: Optional[str] = None,
     *,
     scale: Optional[float] = None,
+    prefill,
+    decode,
 ) -> Tensor:
     _check_fwd(fwd)
     if kv_cache is None:
-        raise RuntimeError("CUDA attention does not support training (kv_cache=None)")
+        raise RuntimeError("Paged CUDA attention requires a KV cache")
     if attn_mask is not None:
         _validate_paged_mask(q, kv_cache, attn_mask, fwd)
-    if fwd == "decode":
-        return _decode(q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale)
-    return _prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale)
-
-
-def _decode(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    kv_cache: "KVCache",
-    layer_id: int,
-    attn_mask: Optional[Tensor],
-    is_causal: bool,
-    scale: Optional[float],
-) -> Tensor:
-    kv_indptr = kv_cache.kv_indptr
-
-    out = attn_paged_decode(
-        q,
-        kv_cache.k_buffer[layer_id],
-        kv_cache.v_buffer[layer_id],
-        kv_cache.req_to_token,
-        kv_cache.req_pool_indices,
-        kv_indptr,
-        new_k=k,
-        new_v=v,
-        mask=attn_mask,
-        is_causal=is_causal,
-        scale=scale,
-        o_part_buf=kv_cache.decode_o_part,
-        ml_part_buf=kv_cache.decode_ml_part,
-        out_buf=kv_cache.decode_out,
-    )
-    return out
-
-
-def _prefill(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    kv_cache: "KVCache",
-    layer_id: int,
-    attn_mask: Optional[Tensor] = None,
-    is_causal: bool = False,
-    scale: Optional[float] = None,
-) -> Tensor:
-    loc = kv_cache.out_cache_loc
-    kv_cache.k_buffer[layer_id, loc] = k
-    kv_cache.v_buffer[layer_id, loc] = v
-
-    out = attn_paged_prefill(
+    paged = (
         q,
         kv_cache.k_buffer[layer_id],
         kv_cache.v_buffer[layer_id],
         kv_cache.req_to_token,
         kv_cache.req_pool_indices,
         kv_cache.kv_indptr,
+    )
+    if fwd == "decode":
+        return decode(
+            *paged,
+            new_k=k,
+            new_v=v,
+            mask=attn_mask,
+            is_causal=is_causal,
+            scale=scale,
+            o_part_buf=kv_cache.decode_o_part,
+            ml_part_buf=kv_cache.decode_ml_part,
+            out_buf=kv_cache.decode_out,
+        )
+
+    loc = kv_cache.out_cache_loc
+    kv_cache.k_buffer[layer_id, loc] = k
+    kv_cache.v_buffer[layer_id, loc] = v
+    return prefill(
+        *paged,
         kv_cache.qo_indptr,
         kv_cache.q_tile_to_batch,
         kv_cache.q_tile_to_index,
@@ -141,4 +186,13 @@ def _prefill(
         is_causal=is_causal,
         scale=scale,
     )
-    return out
+
+
+forward = partial(
+    _paged_attention, prefill=attn_paged_prefill, decode=attn_paged_decode
+)
+_fixed_paged_attention = partial(
+    _paged_attention,
+    prefill=partial(attn_paged_prefill, kv_split_size=ROLLOUT_KV_SPLIT_SIZE),
+    decode=partial(attn_paged_decode, kv_split_size=ROLLOUT_KV_SPLIT_SIZE),
+)

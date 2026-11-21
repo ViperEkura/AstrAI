@@ -16,6 +16,13 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from astrai.extension.kernel.attention import ROLLOUT_KV_SPLIT_SIZE
+from astrai.extension.runtime.context import (
+    op_context,
+    snapshot_op_selection,
+    use_op_selection,
+)
+from astrai.model.components.linear import linear
 from astrai.model.components.mlp import RouterStats
 
 
@@ -65,6 +72,13 @@ def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
 _CHUNK_LOGIT_BYTES = 64 * 1024 * 1024
 
 
+def _replay_projection(hidden: Tensor, weight: Tensor) -> Tensor:
+    if op_context.choice("linear")[0] == "cuda":
+        return linear(hidden, weight)
+    # Preserve the default deferred projection outside FP8 linear autocast.
+    return hidden @ weight.t()
+
+
 def _chunked_token_logprobs(hidden_states: Tensor, weight: Tensor, targets: Tensor):
     """Per-token log-probs without materializing the full ``[N, S, V]`` tensor.
 
@@ -82,11 +96,10 @@ def _chunked_token_logprobs(hidden_states: Tensor, weight: Tensor, targets: Tens
     flat_targets = targets.reshape(n * s)
     vocab, dtype_bytes = weight.shape[0], weight.element_size()
     rows_per_chunk = max(1, _CHUNK_LOGIT_BYTES // (vocab * dtype_bytes))
-    weight_t = weight.t()
     out = torch.empty(n * s, dtype=torch.float32, device=hidden_states.device)
     for start in range(0, n * s, rows_per_chunk):
         end = min(start + rows_per_chunk, n * s)
-        logits = flat_hidden[start:end] @ weight_t
+        logits = _replay_projection(flat_hidden[start:end], weight)
         logits = logits.float()
         picked = logits.gather(-1, flat_targets[start:end].unsqueeze(-1)).squeeze(-1)
         out[start:end] = picked - torch.logsumexp(logits, dim=-1)
@@ -114,8 +127,12 @@ def _chunked_token_logprobs_grad(
     vocab, dtype_bytes = weight.shape[0], weight.element_size()
     rows_per_chunk = max(1, _CHUNK_LOGIT_BYTES // (vocab * dtype_bytes))
 
+    selection = snapshot_op_selection()
+
     def chunk_logprobs(chunk_hidden: Tensor, chunk_targets: Tensor) -> Tensor:
-        logits = (chunk_hidden @ weight.t()).float()
+        # Checkpoint backward can run after the caller has left its selection scope.
+        with use_op_selection(selection):
+            logits = _replay_projection(chunk_hidden, weight).float()
         picked = logits.gather(-1, chunk_targets.unsqueeze(-1)).squeeze(-1)
         return picked - torch.logsumexp(logits, dim=-1)
 
@@ -361,6 +378,12 @@ def _packed_rollout_token_logprobs(
     )
     if not runs:
         return None
+    # Align packed run starts to the same logical KV segments as generation.
+    alignment = (
+        ROLLOUT_KV_SPLIT_SIZE
+        if op_context.choice("attention")[0] == "cuda_consistent"
+        else 1
+    )
     fill, place = [], {}
     for length, i in runs:  # first-fit decreasing; every run fits in width
         row = next((r for r, used in enumerate(fill) if used + length <= width), None)
@@ -368,7 +391,7 @@ def _packed_rollout_token_logprobs(
             row = len(fill)
             fill.append(0)
         place[i] = (row, fill[row])
-        fill[row] += length
+        fill[row] += (length + alignment - 1) // alignment * alignment
     rows = len(fill)
     source = np.full((rows, width), -1, dtype=np.int64)
     segment = -1 - np.arange(rows * width, dtype=np.int64).reshape(rows, width)

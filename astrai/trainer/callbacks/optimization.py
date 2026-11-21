@@ -10,7 +10,6 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from astrai.extension.runtime.context import (
-    op_context,
     snapshot_op_selection,
     use_op_selection,
 )
@@ -54,12 +53,9 @@ class GradientCheckpointingCallback(TrainCallback):
             module._original_forward = fn
 
             def checkpointed_forward(*args, **kwargs):
-                if (
-                    op_context.choice("attention")[0] != "cuda_consistent"
-                    and op_context.choice("linear")[0] != "cuda"
-                ):
-                    return torch_checkpoint(fn, *args, use_reentrant=False, **kwargs)
                 selection = snapshot_op_selection()
+                if selection.choice("attention")[0] != "cuda_consistent":
+                    return torch_checkpoint(fn, *args, use_reentrant=False, **kwargs)
                 return torch_checkpoint(
                     fn,
                     *args,

@@ -69,28 +69,25 @@ clipping interval. Optional `overlong_max_len`, `overlong_buffer_len` and
 `overlong_penalty_scale` apply a linear length penalty before group normalization.
 See [CLI options](params.md#strategy-specific) for defaults.
 
-For BF16 CUDA policies, enable matched rollout and replay forward paths by
-exporting the following before starting the trainer and any rollout workers.
-Build the native attention and GEMM extensions first.
+For BF16 CUDA policies, enable matched attention for rollout and replay
+before starting the trainer and any rollout workers. Build the native
+attention extension first.
 
 ```bash
-export ASTR_OPS=attention=cuda_consistent,linear=cuda
+export ASTR_OPS=attention=cuda_consistent
 ```
 
-Both selections are needed. Prefill, decode and replay use 16-key tiles in
-fixed 256-token segments. Packed replay aligns each run to a segment boundary.
-Decode calculates segments in parallel and merges their FP32 partials in
-sequence order. Prefill and replay use the same merge directly in their query
-tiles. Attention operands and KV storage remain BF16.
-Replay backward recomputes the masked SDPA derivative with Torch. The linear
-mode uses native BF16 GEMM for the model projections and both LM-head scoring
-paths. This applies to BF16 full-attention models with supported native head
-dimensions and boolean masks. Raw model logprobs still precede temperature
-and sampling filters.
+Prefill, decode and replay use 16-key tiles in fixed 256-token segments.
+Packed replay aligns each run to a segment boundary. Decode calculates
+segments in parallel and merges their FP32 partials in sequence order.
+Prefill and replay use the same merge directly in their query tiles.
+Replay backward recomputes the masked SDPA derivative with Torch. This
+mode applies to BF16 full-attention models with supported native head
+dimensions and boolean masks.
 
-This mode is opt-in. The fixed segment size favors matching the rollout and
-replay numerics across layouts. The default scheduler tunes splits for each
-decode workload.
+The option aligns attention for identical Q/K/V. End-to-end logprobs can
+still differ when other operations, such as BF16 GEMM, use different
+numerical paths.
 
 ### Online Rollout
 

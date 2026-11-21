@@ -231,12 +231,31 @@ def _find_partial_tool_call(text: str, start_pos: int = 0):
     }
 
 
+def _tool_call_bounds(body: str, call: Dict):
+    """Include tags immediately wrapping a call, never tags inside its arguments."""
+    start = call["start"]
+    opening = re.search(r"<tool_call>\s*$", body[:start])
+    end = call.get("end", len(body))
+    if opening is None:
+        return start, end, False
+    tail = body[end:]
+    closing = "</tool_call>"
+    stripped = tail.lstrip()
+    if stripped.startswith(closing):
+        end += len(tail) - len(stripped) + len(closing)
+    elif closing.startswith(stripped):
+        # Withhold whitespace or a partially received closing delimiter.
+        end = len(body)
+    return opening.start(), end, True
+
+
 class SimpleJsonToolParser(BaseToolParser):
     """Parser for models that output tool calls as plain JSON objects.
 
     Detects ``{"name": "<func>", "arguments": {...}}`` anywhere in the
     generated text.  Handles single and (non-overlapping) multiple tool
-    calls.  Text preceding the first tool call is emitted as plain
+    calls, optionally wrapped in <tool_call> tags. Wrapped calls preserve
+    surrounding text without exposing delimiters. Bare JSON emits preceding
     ``content`` deltas.
     """
 
@@ -268,12 +287,15 @@ class SimpleJsonToolParser(BaseToolParser):
             if partial:
                 all_tcs = completed + [partial]
 
-        first_start = all_tcs[0]["start"]
-        if first_start > self._emitted_content_len:
-            content = body[self._emitted_content_len : first_start]
-            self._emitted_content_len = first_start
-            if content:
-                deltas.append({"content": content})
+        cursor = self._emitted_content_len
+        for tc in all_tcs:
+            start, end, tagged = _tool_call_bounds(body, tc)
+            if start > cursor and (tagged or tc is all_tcs[0]):
+                deltas.append({"content": body[cursor:start]})
+            cursor = max(cursor, end)
+        self._emitted_content_len = cursor
+        if tagged and all_tcs[-1]["complete"]:
+            self._emit_plain_content(body, deltas)
 
         for i, tc in enumerate(all_tcs):
             if i >= len(self._tc_state):
@@ -320,7 +342,9 @@ class SimpleJsonToolParser(BaseToolParser):
         return deltas
 
     def _emit_plain_content(self, body: str, deltas: List[Dict]) -> List[Dict]:
-        safe_end = self._safe_content_end(body)
+        safe_end = self._emitted_content_len + self._safe_content_end(
+            body[self._emitted_content_len :]
+        )
         if safe_end > self._emitted_content_len:
             deltas.append({"content": body[self._emitted_content_len : safe_end]})
             self._emitted_content_len = safe_end
@@ -339,6 +363,14 @@ class SimpleJsonToolParser(BaseToolParser):
         Anything withheld is flushed by :meth:`finalize` when generation
         ends without a tool call, so plain text is never lost.
         """
+        opening = "<tool_call>"
+        tag_start = body.find(opening)
+        if tag_start >= 0:
+            body = body[:tag_start]
+        for size in range(1, min(len(body), len(opening) - 1) + 1):
+            if body.endswith(opening[:size]):
+                body = body[:-size]
+                break
         pos = 0
         while True:
             brace = body.find("{", pos)
@@ -361,7 +393,11 @@ class SimpleJsonToolParser(BaseToolParser):
         non-streaming response.
         """
         if self._has_tool_calls:
-            return []
+            completed = _find_tool_calls(body)
+            if not completed or not _tool_call_bounds(body, completed[-1])[2]:
+                return []
+            if _find_partial_tool_call(body, completed[-1]["end"]):
+                return []
         deltas: List[Dict] = []
         if len(body) > self._emitted_content_len:
             deltas.append({"content": body[self._emitted_content_len :]})
@@ -375,7 +411,16 @@ class SimpleJsonToolParser(BaseToolParser):
         if not completed:
             return None
 
-        content = body[: completed[0]["start"]].strip() or None
+        parts = []
+        cursor = 0
+        for call in completed:
+            start, end, tagged = _tool_call_bounds(body, call)
+            if tagged or call is completed[0]:
+                parts.append(body[cursor:start])
+            cursor = end
+        if tagged:
+            parts.append(body[cursor:])
+        content = "".join(parts).strip() or None
         tool_calls = []
         for i, tc in enumerate(completed):
             tool_calls.append(

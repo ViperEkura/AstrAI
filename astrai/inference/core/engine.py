@@ -10,10 +10,7 @@ from typing import Callable, List, Optional, TypeVar
 
 import torch
 
-from astrai.extension.runtime.context import (
-    snapshot_op_selection,
-    use_op_selection,
-)
+from astrai.extension.runtime.context import use_op_selection
 from astrai.inference.core.cache.pool import BlockPool
 from astrai.inference.core.events import (
     FINISH_ABORTED,
@@ -22,7 +19,7 @@ from astrai.inference.core.events import (
 from astrai.inference.core.request import Request, RequestStatus
 from astrai.inference.core.scheduler import Scheduler
 from astrai.inference.core.versioning import PolicyVersionGuard
-from astrai.inference.worker.model_runner import GPUModelRunner
+from astrai.inference.worker.model_runner import GPUModelRunner, select_inference_ops
 from astrai.model.automodel import AutoModel
 from astrai.tokenize.tokenizer import AutoTokenizer
 
@@ -73,6 +70,7 @@ class EngineCore:
             raise ValueError("max_seq_len must be provided as argument or model config")
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
+        self.op_selection = select_inference_ops(config, self.device, self.dtype)
         self.enable_overlap = enable_overlap
         if cache is None:
             pool_kwargs = {}
@@ -101,7 +99,6 @@ class EngineCore:
             if generation_config is not None
             else getattr(model, "generation_config", {}),
         )
-        self.op_selection = snapshot_op_selection()
         with use_op_selection(self.op_selection):
             self.model_runner = GPUModelRunner(
                 model=model,

@@ -11,7 +11,7 @@ from astrai.extension import op_backend
 from astrai.extension.kernel.attention import attn_paged_decode
 from astrai.extension.runtime.loader import is_available
 from astrai.inference.core.cache import BlockPool, KVCacheManager
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.workspace import InferenceWorkspace
 from astrai.trainer.backend import run_batch

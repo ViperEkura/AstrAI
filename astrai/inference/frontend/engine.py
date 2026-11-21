@@ -28,7 +28,7 @@ import torch.nn as nn
 
 from astrai.extension.runtime.context import OpSelection
 from astrai.inference.core.cache.pool import BlockPool
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.inference.core.events import RequestError, TokenDelta
 from astrai.inference.frontend.input_processor import InputProcessor, ProcessedInput
 from astrai.inference.frontend.output_processor import OutputProcessor

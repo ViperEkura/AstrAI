@@ -6,7 +6,7 @@ weights shared with the trainer.  The core emits output events; it never
 detokenizes and never runs consumer callbacks.
 """
 
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.inference.core.planner import StepPlanner
 from astrai.inference.core.request import (
     GenerationResult,

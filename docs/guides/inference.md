@@ -41,7 +41,7 @@ options, not direct `build_engine()` or server CLI flags. With an already
 loaded and placed model/tokenizer, inject a configured core:
 
 ```python
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.inference.frontend.engine import InferenceEngine
 
 core = EngineCore(
@@ -73,6 +73,18 @@ For cache layout, scheduling, CUDA graphs and ownership, see
 `PrefillKVCache` and `DecodeKVCache`, defined on the model side in
 [model/kv_cache.py](../../astrai/model/kv_cache.py).
 For strict backend contracts, see [attention kernels](../developer/kernels/attention.md).
+
+## BF16 Batch Invariance
+
+Set `ASTRAI_BATCH_INVARIANT=1` before starting the native inference engine.
+This selects strict `cuda_consistent` attention and uses cuBLASLt with BF16
+reduced-precision reduction and split-K disabled. It requires CUDA BF16,
+a GQA model with a supported head dimension, and the native attention extension.
+
+The attention selection is local to the engine. PyTorch BLAS settings are
+process-wide, including for colocated training. Training replay selects its
+attention backend separately. For reproducible random sampling, pass the same
+request seed and sampling arguments.
 
 ## Launching the Server
 

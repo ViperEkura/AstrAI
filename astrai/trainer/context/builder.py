@@ -11,7 +11,7 @@ from torch import nn
 from torch.optim import Optimizer
 
 from astrai.config.train_config import TrainConfig, _TrainRuntimeDependencies
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.model.automodel import validate_model_state_dict
 from astrai.model.components.lora import LoRALinear, inject_lora
 from astrai.parallel.cp import CPState, CPStrategy, LossReduction

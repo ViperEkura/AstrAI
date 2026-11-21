@@ -15,7 +15,7 @@ Dependency rule (one-way): frontend → core → worker → model/KV ABI.
 """
 
 from astrai.inference.contracts import ModelRunnerOutput, SchedulerOutput
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.inference.core.events import (
     RequestError,
     RequestFinished,

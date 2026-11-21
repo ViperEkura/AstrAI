@@ -1,7 +1,7 @@
 from typing import Optional
 
 from astrai.extension import op_backend
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from tests.support.models import make_rollout_config
 from tests.support.tokenizers import FakeTokenizer

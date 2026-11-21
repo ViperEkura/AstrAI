@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from torch import Tensor
 
 from astrai.config.inference_config import InferenceConfig
 from astrai.extension.backend.attention import cuda as attention_cuda
-from astrai.extension.runtime.context import snapshot_op_selection
+from astrai.extension.runtime.context import OpSelection, snapshot_op_selection
 from astrai.extension.runtime.loader import is_available
 
 if TYPE_CHECKING:
@@ -30,6 +31,31 @@ from astrai.inference.worker.workspace import InferenceWorkspace
 from astrai.model.automodel import AutoModel
 
 logger = logging.getLogger(__name__)
+
+
+def select_inference_ops(config, device, dtype: torch.dtype) -> OpSelection:
+    """Resolve engine attention and configure BLAS before graph capture."""
+    selection = snapshot_op_selection()
+    if os.environ.get("ASTRAI_BATCH_INVARIANT") != "1":
+        return selection
+
+    if torch.device(device).type != "cuda" or dtype != torch.bfloat16:
+        raise ValueError("ASTRAI_BATCH_INVARIANT=1 requires CUDA BF16 inference")
+    attention_types = config.attention.layers or (config.attn_type,)
+    head_dim = config.head_dim or config.hidden_size // config.num_attention_heads
+    if set(attention_types) != {"gqa"} or head_dim not in attention_cuda.HEAD_DIMS:
+        raise ValueError(
+            "ASTRAI_BATCH_INVARIANT=1 requires a GQA model with a supported head dimension"
+        )
+    if not is_available("attention"):
+        raise RuntimeError(
+            "ASTRAI_BATCH_INVARIANT=1 requires the native attention extension"
+        )
+
+    # PyTorch's BLAS settings apply to all work in this process.
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (False, False)
+    return selection.with_choices({"attention": "cuda_consistent"})
 
 
 def _attention_supports_graph(head_dim: int, dtype: torch.dtype) -> bool:

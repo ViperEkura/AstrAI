@@ -4,7 +4,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from tests.support.core_contracts import scheduler as scheduler
 from tests.support.task import make_mock_tokenizer, make_scheduler
 
@@ -26,9 +26,7 @@ def test_stop_cannot_clear_a_restarted_successor_after_join():
 
     def join(timeout):
         old.is_alive.return_value = False
-        with patch(
-            "astrai.inference.core.engine_core.threading.Thread", return_value=new
-        ):
+        with patch("astrai.inference.core.engine.threading.Thread", return_value=new):
             core.start()  # exact stop-join / final-cleanup race window
 
     old.join.side_effect = join

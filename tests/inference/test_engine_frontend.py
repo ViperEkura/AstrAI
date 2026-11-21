@@ -63,7 +63,7 @@ import threading
 
 import pytest
 
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.inference.core.events import (
     FINISH_LENGTH,
     FINISH_STOP_TOKEN,

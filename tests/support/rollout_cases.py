@@ -2,7 +2,7 @@ import threading
 
 import torch
 
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.trainer.backend import ColocatedBackend
 from astrai.trainer.rollout import (
     BaseRewardModel,

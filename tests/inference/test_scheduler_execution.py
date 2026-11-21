@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from astrai.extension import is_available
 from astrai.inference import EngineCore
 from astrai.inference.contracts import SchedulerOutput
 from astrai.inference.core.request import Request
@@ -19,7 +20,8 @@ from astrai.inference.worker.pending import (
 )
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.backend import run_batch
-from tests.support.models import make_rollout_config
+from tests.support.capabilities import skip_no_cuda
+from tests.support.models import make_rollout_config, make_seeded_gqa_model
 from tests.support.scheduler import (
     make_contract_scheduler,
     make_real_scheduler,
@@ -299,6 +301,62 @@ def test_run_batch_greedy_reproducible_across_calls(cpu_device):
         assert all(len(ids) == 6 for ids in first)
     finally:
         scheduler.stop()
+
+
+def test_batch_invariance_requires_cuda_bf16(monkeypatch, cpu_device):
+    monkeypatch.setenv("ASTRAI_BATCH_INVARIANT", "1")
+    with pytest.raises(ValueError, match="requires CUDA BF16 inference"):
+        make_real_scheduler(cpu_device)
+
+
+@pytest.mark.cuda
+@skip_no_cuda
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_batch_invariant_decode_matches_prefill(monkeypatch, cuda_graph):
+    if not (is_available("attention") and torch.cuda.is_bf16_supported()):
+        pytest.skip("Native BF16 attention is required")
+
+    monkeypatch.setenv("ASTRAI_BATCH_INVARIANT", "1")
+    blas = torch.backends.cuda.preferred_blas_library()
+    matmul = torch.backends.cuda.matmul
+    reduction = matmul.allow_bf16_reduced_precision_reduction
+    model = make_seeded_gqa_model(
+        "cuda", dtype=torch.bfloat16, max_position_embeddings=384
+    ).eval()
+    try:
+        core = EngineCore(
+            model,
+            FakeTokenizer(),
+            max_batch_size=4,
+            enable_cuda_graph=cuda_graph,
+            generation_config={"eos_token_id": []},
+        )
+        try:
+            assert core.cuda_graph_enabled is cuda_graph
+            prompts = [list(range(8, 25)), list(range(26, 315))]
+            results = run_batch(
+                core,
+                prompts,
+                max_tokens=17,
+                temperature=1.0,
+                top_k=0,
+                seeds=[1, 2],
+                return_details=True,
+                return_logprobs=True,
+            )
+            assert all(not r.error_reason and len(r.token_ids) == 17 for r in results)
+            responses = [r.token_ids for r in results]
+            batched = core.score_ids(prompts, responses, per_token=True)
+            single = [
+                core.score_ids([p], [r], per_token=True)[0]
+                for p, r in zip(prompts, responses)
+            ]
+            assert batched == single == [r.logprobs for r in results]
+        finally:
+            core.stop()
+    finally:
+        torch.backends.cuda.preferred_blas_library(blas)
+        matmul.allow_bf16_reduced_precision_reduction = reduction
 
 
 def test_paged_pool_selected_via_scheduler_kwargs(cpu_device):

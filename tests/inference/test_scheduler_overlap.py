@@ -265,7 +265,7 @@ def test_stop_leaves_state_intact_when_loop_does_not_drain():
     assert scheduler.loop_thread is not None
     scheduler.release_finished.assert_not_called()
 
-    with patch("astrai.inference.core.engine_core.threading.Thread") as TH:
+    with patch("astrai.inference.core.engine.threading.Thread") as TH:
         scheduler.start()
         TH.assert_not_called()
 

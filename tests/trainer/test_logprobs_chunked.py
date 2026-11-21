@@ -16,7 +16,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 
 from astrai.extension import is_available, op_backend
-from astrai.inference.core.engine_core import EngineCore
+from astrai.inference.core.engine import EngineCore
 from astrai.parallel.setup import find_free_port
 from astrai.trainer.backend import ColocatedBackend
 from astrai.trainer.callbacks.optimization import GradientCheckpointingCallback

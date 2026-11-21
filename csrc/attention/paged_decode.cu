@@ -25,7 +25,8 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
                                 c10::optional<torch::Tensor> o_part_buf,
                                 c10::optional<torch::Tensor> ml_part_buf,
                                 c10::optional<torch::Tensor> out_buf,
-                                bool is_causal) {
+                                bool is_causal,
+                                bool consistent) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -52,7 +53,7 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            launch_decode<PagedKV<T>>(p, q, o_part_buf, ml_part_buf, stream);
+            launch_decode<PagedKV<T>>(p, q, o_part_buf, ml_part_buf, stream, consistent);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

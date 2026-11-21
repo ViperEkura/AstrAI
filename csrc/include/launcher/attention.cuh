@@ -130,11 +130,13 @@ template <int HEAD_DIM,
           typename KV,
           bool IsCausal,
           bool HasMask,
-          bool MaskCoversShape = false>
+          bool MaskCoversShape = false,
+          bool Consistent = false>
 struct PrefillKernel {
     using Config = PrefillConfig<HEAD_DIM, IsCausal>;
     using Traits =
-        KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES, typename KV::Elem>;
+        KernelTraits<HEAD_DIM, Consistent ? 16 : Config::BC, Config::WARPS,
+                     Config::STAGES, typename KV::Elem>;
 
     static dim3 plan(const AttentionParams& p) {
         // Each block owns BLOCK_M packed (head, row) rows; grid.y selects the KV head.
@@ -170,17 +172,22 @@ struct DecodeKernel {
                     Traits::NUM_THREADS>()};
     }
 
-    static DecodeLaunchPlan plan(const AttentionParams& p) { return make_decode_plan(query(p)); }
+    static DecodeLaunchPlan plan(const AttentionParams& p, bool consistent = false) {
+        // Match the left-to-right prefill reduction without a split merge.
+        if (consistent) {
+            const int blocks = p.kv_head * ((p.q_head / p.kv_head + 15) / 16);
+            return {dim3(blocks, p.batch, 1), true};
+        }
+        return make_decode_plan(query(p));
+    }
 
     static void launch(AttentionParams& p, const DecodeLaunchPlan& plan, cudaStream_t stream) {
         p.num_splits = static_cast<int>(plan.grid.z);
-        if constexpr (HEAD_DIM <= 128) {
-            if (plan.direct_output) {
-                attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits, KV>>
-                    <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
-                ASTRAI_LAUNCH_CHECK();
-                return;
-            }
+        if (plan.direct_output) {
+            attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits, KV>>
+                <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
+            ASTRAI_LAUNCH_CHECK();
+            return;
         }
         attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits>,
                          SplitEpilogue<Traits>><<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
@@ -203,7 +210,7 @@ template <typename Fn> inline auto with_head_dim(int head_dim, Fn&& fn) {
     throw std::runtime_error(head_dim_error(head_dim));
 }
 
-template <typename QSchedule, typename KV, typename Fn>
+template <typename QSchedule, typename KV, bool Consistent = false, typename Fn>
 inline auto with_prefill_kernel(const AttentionParams& p, Fn&& fn) {
     // Paged partial masks need extent checks; full coverage can omit them.
     // Dense keeps its checked kernel to avoid redundant compiler-generated comparisons.
@@ -215,20 +222,20 @@ inline auto with_prefill_kernel(const AttentionParams& p, Fn&& fn) {
             if (p.mask) {
                 if constexpr (KV::kPaged) {
                     if (mask_covers_shape)
-                        return fn(PrefillKernel<D, QSchedule, KV, true, true, true>{});
+                        return fn(PrefillKernel<D, QSchedule, KV, true, true, true, Consistent>{});
                 }
-                return fn(PrefillKernel<D, QSchedule, KV, true, true>{});
+                return fn(PrefillKernel<D, QSchedule, KV, true, true, false, Consistent>{});
             }
-            return fn(PrefillKernel<D, QSchedule, KV, true, false>{});
+            return fn(PrefillKernel<D, QSchedule, KV, true, false, false, Consistent>{});
         }
         if (p.mask) {
             if constexpr (KV::kPaged) {
                 if (mask_covers_shape)
-                    return fn(PrefillKernel<D, QSchedule, KV, false, true, true>{});
+                    return fn(PrefillKernel<D, QSchedule, KV, false, true, true, Consistent>{});
             }
-            return fn(PrefillKernel<D, QSchedule, KV, false, true>{});
+            return fn(PrefillKernel<D, QSchedule, KV, false, true, false, Consistent>{});
         }
-        return fn(PrefillKernel<D, QSchedule, KV, false, false>{});
+        return fn(PrefillKernel<D, QSchedule, KV, false, false, false, Consistent>{});
     });
 }
 
@@ -263,9 +270,12 @@ inline auto with_decode_kernel(const AttentionParams& p, Fn&& fn) {
 }
 
 template <typename QSchedule, typename KV>
-inline void launch_prefill(AttentionParams& p, cudaStream_t stream) {
-    with_prefill_kernel<QSchedule, KV>(
-        p, [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); });
+inline void launch_prefill(AttentionParams& p, cudaStream_t stream, bool consistent = false) {
+    auto launch = [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); };
+    if (consistent)
+        with_prefill_kernel<QSchedule, KV, true>(p, launch);
+    else
+        with_prefill_kernel<QSchedule, KV>(p, launch);
 }
 
 template <typename KV> inline void launch_decode(AttentionParams& p, cudaStream_t stream) {

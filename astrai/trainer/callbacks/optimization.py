@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, List, Optional, Type
 
 from torch import nn
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from astrai.extension.runtime.context import (
+    op_context,
+    snapshot_op_selection,
+    use_op_selection,
+)
 from astrai.trainer.callbacks.base import TrainCallback
 
 if TYPE_CHECKING:
@@ -46,9 +52,23 @@ class GradientCheckpointingCallback(TrainCallback):
         if self.modules and isinstance(module, self.modules):
             fn = module.forward
             module._original_forward = fn
-            module.forward = lambda *a, **kw: torch_checkpoint(
-                fn, *a, use_reentrant=False, **kw
-            )
+
+            def checkpointed_forward(*args, **kwargs):
+                if (
+                    op_context.choice("attention")[0] != "cuda_consistent"
+                    and op_context.choice("linear")[0] != "cuda"
+                ):
+                    return torch_checkpoint(fn, *args, use_reentrant=False, **kwargs)
+                selection = snapshot_op_selection()
+                return torch_checkpoint(
+                    fn,
+                    *args,
+                    use_reentrant=False,
+                    context_fn=lambda: (nullcontext(), use_op_selection(selection)),
+                    **kwargs,
+                )
+
+            module.forward = checkpointed_forward
 
     @staticmethod
     def _disable(module: nn.Module):

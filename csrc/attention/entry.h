@@ -124,9 +124,10 @@ inline void launch_decode(AttentionParams& p,
                           const torch::Tensor& q,
                           const c10::optional<torch::Tensor>& o_part,
                           const c10::optional<torch::Tensor>& ml_part,
-                          cudaStream_t stream) {
+                          cudaStream_t stream,
+                          bool consistent = false) {
     with_decode_kernel<KV>(p, [&](auto kernel) {
-        const auto plan = kernel.plan(p);
+        const auto plan = kernel.plan(p, consistent);
         auto workspace = resolve_split_buffers(o_part, ml_part, p, plan, q);
         kernel.launch(p, plan, stream);
     });

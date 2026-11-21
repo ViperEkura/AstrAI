@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
-_OPERATIONS = frozenset(("attention", "rotary", "swiglu", "syrk", "symm"))
+_OPERATIONS = frozenset(("attention", "linear", "rotary", "swiglu", "syrk", "symm"))
 _process_lock = threading.Lock()
 _process_choices: Optional[Dict[str, str]] = None
 _selection_revision = 0
@@ -88,6 +88,26 @@ class OpContext:
 
     def _state(self) -> OpSelection:
         return self._current.get() or OpSelection()
+
+    def choice(self, operation: str) -> Tuple[Optional[Any], str]:
+        """Read one choice without copying a snapshot for each projection."""
+        state = self._current.get()
+        if state is not None:
+            for key, value in reversed(state.choices):
+                if key == operation:
+                    if value is not None:
+                        return value, "context"
+                    break
+            if state.process_choices is not None:
+                for key, value in reversed(state.process_choices):
+                    if key == operation:
+                        return value, "env"
+                return None, "chain"
+        # set_op replaces the process dictionary rather than mutating it.
+        # Holding this reference therefore observes one consistent version.
+        choices = _process_choices if _process_choices is not None else _seed_process()
+        value = choices.get(operation)
+        return (value, "env") if value is not None else (None, "chain")
 
     def snapshot(self) -> OpSelection:
         state = self._state()

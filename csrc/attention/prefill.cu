@@ -18,7 +18,8 @@ torch::Tensor attn_prefill(torch::Tensor q,
                            c10::optional<torch::Tensor> mask,
                            c10::optional<double> scale,
                            int64_t layout,
-                           bool is_causal) {
+                           bool is_causal,
+                           bool consistent) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -33,7 +34,7 @@ torch::Tensor attn_prefill(torch::Tensor q,
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream);
+            launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream, consistent);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

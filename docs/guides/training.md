@@ -69,6 +69,26 @@ clipping interval. Optional `overlong_max_len`, `overlong_buffer_len` and
 `overlong_penalty_scale` apply a linear length penalty before group normalization.
 See [CLI options](params.md#strategy-specific) for defaults.
 
+For BF16 CUDA policies, enable matched rollout and replay forward paths by
+exporting the following before starting the trainer and any rollout workers.
+Build the native attention and GEMM extensions first.
+
+```bash
+export ASTR_OPS=attention=cuda_consistent,linear=cuda
+```
+
+Both selections are needed. The attention mode uses 16-key tiles in prefill
+and replay, aligns the start of each packed run to a tile boundary, and uses
+single-split paged decode. Attention operands and KV storage remain BF16.
+Replay backward recomputes the masked SDPA derivative with Torch. The linear
+mode uses native BF16 GEMM for the model projections and both LM-head scoring
+paths. This applies to BF16 full-attention models with supported native head
+dimensions and boolean masks. Raw model logprobs still precede temperature
+and sampling filters.
+
+This mode is opt-in because single-split decode can be slower for long
+prefixes at low concurrency.
+
 ### Online Rollout
 
 `online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with

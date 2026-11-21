@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from astrai.extension.backend.linear import linear
 from astrai.extension.kernel.cross_entropy import is_available, linear_cross_entropy
 from astrai.model.components.initialization import should_initialize
 
@@ -32,7 +33,7 @@ class Linear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return linear(x, self.weight, self.bias)
 
 
 class LinearCrossEntropyHead(Linear):

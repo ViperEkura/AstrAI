@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 def _attention_supports_graph(head_dim: int, dtype: torch.dtype) -> bool:
     choice = snapshot_op_selection().choice("attention")[0] or "auto"
     return (
-        choice in ("auto", "cuda")
+        choice in ("auto", "cuda", "cuda_consistent")
         and torch.cuda.is_available()
         and dtype in (torch.bfloat16, torch.float16)
         and is_available("attention")

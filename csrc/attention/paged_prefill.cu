@@ -23,7 +23,8 @@ torch::Tensor attn_paged_prefill(torch::Tensor q,
                                  torch::Tensor q_tile_to_index,
                                  c10::optional<torch::Tensor> mask,
                                  c10::optional<double> scale,
-                                 bool is_causal) {
+                                 bool is_causal,
+                                 bool consistent) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -39,7 +40,7 @@ torch::Tensor attn_paged_prefill(torch::Tensor q,
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            launch_prefill<PackedQSchedule, PagedKV<T>>(p, stream);
+            launch_prefill<PackedQSchedule, PagedKV<T>>(p, stream, consistent);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

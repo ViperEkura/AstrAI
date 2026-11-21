@@ -1,12 +1,18 @@
-"""Native CUDA attention backend for packed KV-cache inference."""
+"""Native CUDA attention for paged inference and consistent BF16 replay."""
 
 from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch import Tensor
+from torch.autograd.function import once_differentiable
 
+from astrai.extension.backend.attention import torch as torch_attention
 from astrai.extension.backend.attention.common import AttentionSpec, _check_fwd
-from astrai.extension.kernel.attention import attn_paged_decode, attn_paged_prefill
+from astrai.extension.kernel.attention import (
+    attn_paged_decode,
+    attn_paged_prefill,
+    attn_prefill,
+)
 from astrai.extension.runtime.loader import is_available
 
 if TYPE_CHECKING:
@@ -60,6 +66,78 @@ def supports(spec: AttentionSpec) -> bool:
     )
 
 
+def supports_consistent(spec: AttentionSpec) -> bool:
+    if spec.dtype != torch.bfloat16:
+        return False
+    if spec.kv_cache_kind != "none":
+        return supports(spec)
+    return (
+        spec.device.type == "cuda"
+        and spec.ndim == 4
+        and spec.head_dim in HEAD_DIMS
+        and (spec.scale is None or spec.scale > 0)
+        and (
+            spec.mask_kind == "none"
+            or (spec.mask_kind == str(torch.bool) and spec.mask_last_stride == 1)
+        )
+        and is_available("attention")
+    )
+
+
+class _ConsistentPrefill(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, mask, is_causal, scale):
+        ctx.save_for_backward(q, k, v, mask)
+        ctx.is_causal = is_causal
+        ctx.scale = scale
+        return attn_prefill(q, k, v, mask, is_causal, scale=scale, consistent=True)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        q, k, v, mask = ctx.saved_tensors
+        # Differentiate scaled dot-product attention with the same mask and
+        # scale. The reference backward is independent of the tile schedule
+        # and does not differentiate intermediate BF16 rounding.
+        with torch.enable_grad():
+            inputs = tuple(t.detach().requires_grad_(True) for t in (q, k, v))
+            result = torch_attention.forward(
+                *inputs, None, 0, mask, ctx.is_causal, scale=ctx.scale
+            )
+            grads = torch.autograd.grad(result, inputs, grad_output)
+        return *grads, None, None, None
+
+
+def forward_consistent(
+    q,
+    k,
+    v,
+    kv_cache,
+    layer_id,
+    attn_mask=None,
+    is_causal=False,
+    fwd=None,
+    *,
+    scale=None,
+):
+    if kv_cache is not None:
+        return forward(
+            q,
+            k,
+            v,
+            kv_cache,
+            layer_id,
+            attn_mask,
+            is_causal,
+            fwd,
+            scale=scale,
+            consistent=True,
+        )
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        return _ConsistentPrefill.apply(q, k, v, attn_mask, is_causal, scale)
+    return attn_prefill(q, k, v, attn_mask, is_causal, scale=scale, consistent=True)
+
+
 def forward(
     q: Tensor,
     k: Tensor,
@@ -71,6 +149,7 @@ def forward(
     fwd: Optional[str] = None,
     *,
     scale: Optional[float] = None,
+    consistent: bool = False,
 ) -> Tensor:
     _check_fwd(fwd)
     if kv_cache is None:
@@ -78,8 +157,12 @@ def forward(
     if attn_mask is not None:
         _validate_paged_mask(q, kv_cache, attn_mask, fwd)
     if fwd == "decode":
-        return _decode(q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale)
-    return _prefill(q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale)
+        return _decode(
+            q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale, consistent
+        )
+    return _prefill(
+        q, k, v, kv_cache, layer_id, attn_mask, is_causal, scale, consistent
+    )
 
 
 def _decode(
@@ -91,6 +174,7 @@ def _decode(
     attn_mask: Optional[Tensor],
     is_causal: bool,
     scale: Optional[float],
+    consistent: bool,
 ) -> Tensor:
     kv_indptr = kv_cache.kv_indptr
 
@@ -106,6 +190,7 @@ def _decode(
         mask=attn_mask,
         is_causal=is_causal,
         scale=scale,
+        consistent=consistent,
         o_part_buf=kv_cache.decode_o_part,
         ml_part_buf=kv_cache.decode_ml_part,
         out_buf=kv_cache.decode_out,
@@ -122,6 +207,7 @@ def _prefill(
     attn_mask: Optional[Tensor] = None,
     is_causal: bool = False,
     scale: Optional[float] = None,
+    consistent: bool = False,
 ) -> Tensor:
     loc = kv_cache.out_cache_loc
     kv_cache.k_buffer[layer_id, loc] = k
@@ -140,5 +226,6 @@ def _prefill(
         attn_mask,
         is_causal=is_causal,
         scale=scale,
+        consistent=consistent,
     )
     return out

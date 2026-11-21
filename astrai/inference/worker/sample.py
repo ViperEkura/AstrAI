@@ -51,6 +51,7 @@ def sample(
     return_logprobs: bool = False,
     meta: Optional[SamplingMeta] = None,
     seeds: Optional[List[Optional[int]]] = None,
+    uniforms: Optional[Tensor] = None,
 ):
     """Apply frequency penalty, temperature, top-k and top-p, then sample.
 
@@ -58,7 +59,9 @@ def sample(
     penalties or filtering. Frequency counts are supplied by the caller and
     remain unchanged. Per-request seeds do not advance the global RNG.
     The worker supplies cached metadata; standalone callers may use scalars
-    or per-row tensors without it.
+    or per-row tensors without it. Optional ``uniforms`` supply one
+    independent draw in [0, 1) per row for inverse-CDF sampling; None keeps
+    the ``seeds`` or shared-RNG sampling.
     """
     if meta is None:
         meta = SamplingMeta(
@@ -130,19 +133,35 @@ def sample(
                 1, indices, remove
             )
             logits[mask] = filter_value
-        probabilities = torch.softmax(logits, dim=-1)
-        if seeds is None:
-            tokens = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+        if uniforms is not None:
+            if seeds is not None:
+                raise ValueError("uniforms and seeds are mutually exclusive")
+            if uniforms.shape != logits.shape[:-1]:
+                raise ValueError("one sampling uniform is required per logit row")
+            # FP32 CDF sampling keeps request-local draws independent of row
+            # order, variable EOS and speculative steps later discarded.
+            cdf = torch.softmax(logits.float(), dim=-1).cumsum(dim=-1)
+            cdf = cdf / cdf[..., -1:]
+            uniforms = uniforms.to(device=cdf.device, dtype=cdf.dtype).clamp(
+                min=0, max=1 - 2**-24
+            )
+            tokens = torch.searchsorted(
+                cdf.contiguous(), uniforms.unsqueeze(-1).contiguous(), right=True
+            ).squeeze(-1)
         else:
-            if len(seeds) != logits.shape[0]:
-                raise ValueError("sampling seeds must match the batch size")
-            # One stateless uniform per row and a batched inverse-CDF draw, instead
-            # of a Generator plus multinomial launch per row on every decode step.
-            uniforms = _seed_uniforms(seeds).to(logits.device, non_blocking=True)
-            cdf = probabilities.double().cumsum(dim=-1)
-            target = (uniforms * cdf[:, -1]).unsqueeze(-1)
-            tokens = torch.searchsorted(cdf, target, right=True).squeeze(-1)
-            tokens = tokens.clamp_(max=probabilities.size(-1) - 1)
+            probabilities = torch.softmax(logits, dim=-1)
+            if seeds is None:
+                tokens = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+            else:
+                if len(seeds) != logits.shape[0]:
+                    raise ValueError("sampling seeds must match the batch size")
+                # One stateless uniform per row and a batched inverse-CDF draw, instead
+                # of a Generator plus multinomial launch per row on every decode step.
+                uniforms = _seed_uniforms(seeds).to(logits.device, non_blocking=True)
+                cdf = probabilities.double().cumsum(dim=-1)
+                target = (uniforms * cdf[:, -1]).unsqueeze(-1)
+                tokens = torch.searchsorted(cdf, target, right=True).squeeze(-1)
+                tokens = tokens.clamp_(max=probabilities.size(-1) - 1)
     if return_logprobs:
         return tokens, raw_log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     return tokens

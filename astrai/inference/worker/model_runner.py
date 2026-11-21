@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     # interface; importing it at runtime would create a core↔worker cycle.
     from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
 from astrai.inference.contracts import ExecutionRequest, SchedulerOutput
+from astrai.inference.sampling_rng import sampling_uniform
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.pending import (
     PendingExecution,
@@ -88,6 +89,7 @@ class SamplingBatchInfo:
     top_ps: Tensor  # float32 [B]
     freq_penalties: Tensor  # float32 [B]
     meta: SamplingMeta
+    seeded: bool = False
 
 
 @dataclass
@@ -114,6 +116,9 @@ def _build_sampling_batch_info(
     temps = [t.sampling.temperature for t in requests]
     top_ks = [t.sampling.top_k for t in requests]
     top_ps = [t.sampling.top_p for t in requests]
+    seeded = [t.sampling.sampling_seed is not None for t in requests]
+    if any(seeded) and not all(seeded):
+        raise ValueError("seeded sampling requires a seed for every batch request")
     freq_penalties = torch.tensor(freq_list, dtype=torch.float32, pin_memory=pin).to(
         device, non_blocking=True
     )
@@ -143,6 +148,7 @@ def _build_sampling_batch_info(
         top_ps=top_ps_t,
         freq_penalties=freq_penalties,
         meta=meta,
+        seeded=all(seeded),
     )
     return info
 
@@ -271,7 +277,10 @@ class GPUModelRunner:
         # during capture.
         config = model.config
         max_q_heads = config.num_attention_heads
-        head_dim = config.hidden_size // config.num_attention_heads
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
         graph_device = torch.device(self.device).type == "cuda"
         self._graph_supported = graph_device and _attention_supports_graph(
             head_dim, self.dtype
@@ -687,8 +696,18 @@ class GPUModelRunner:
                 0, indices, torch.ones_like(indices, dtype=counts.dtype)
             )
 
-        # Stateless per-request/per-position streams survive request reordering,
-        # worker repartitioning and scheduler compaction without touching global RNG.
+        uniforms = None
+        if info.seeded and not info.meta.greedy:
+            uniforms = torch.tensor(
+                [
+                    sampling_uniform(t.sampling.sampling_seed, t.sampling_position)
+                    for t in requests
+                ],
+                dtype=torch.float32,
+                pin_memory=str(self.device).startswith("cuda"),
+            ).to(self.device, non_blocking=True)
+
+        # Preserve the upstream per-request/per-position generator stream.
         seeds = [
             None
             if task.sampling.seed is None
@@ -709,6 +728,7 @@ class GPUModelRunner:
             return_logprobs=return_logprobs,
             **seed_kwargs,
             meta=info.meta,
+            uniforms=uniforms,
         )
         if return_logprobs:
             tokens, logprobs = result

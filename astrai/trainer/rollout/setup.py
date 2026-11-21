@@ -148,6 +148,7 @@ def configure_rollout(
                 max_batch_size=max_batch_size,
                 max_seq_len=max_seq_len,
                 policy_version=policy_version,
+                enable_overlap=getattr(cfg, "rollout_enable_overlap", False),
             )
         )
 
@@ -173,6 +174,7 @@ def configure_rollout(
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             policy_version=policy_version,
+            enable_overlap=getattr(cfg, "rollout_enable_overlap", False),
             enable_cuda_graph=enable_cuda_graph,
         )
 
@@ -227,6 +229,7 @@ def configure_rollout(
             temperature=cfg.rollout_temperature,
             top_k=cfg.rollout_top_k,
             top_p=cfg.rollout_top_p,
+            seed=getattr(cfg, "rollout_seed", None),
         ),
         output_device=train_device,
     )

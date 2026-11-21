@@ -372,6 +372,16 @@ _SPECS = [
     ),
     OptSpec("rollout_interval", "Algorithm", help="Steps between rollouts."),
     OptSpec(
+        "rollout_enable_overlap",
+        "Algorithm",
+        help="Use the native submit/commit rollout pipeline.",
+    ),
+    OptSpec(
+        "rollout_seed",
+        "Algorithm",
+        help="Seed sampling independently per prompt, version and response.",
+    ),
+    OptSpec(
         "rollout_max_policy_lag",
         "Algorithm",
         help="Maximum accepted rollout/live policy-version gap.",

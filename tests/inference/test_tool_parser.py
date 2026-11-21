@@ -18,7 +18,7 @@ from astrai.inference.network.tool_parser import SimpleJsonToolParser
         ),
         ('{"items": [1, 2, 3]}', '{"items": [1, 2, 3]}'),
         ('{"rows": [{"id": 1}, {"id": 2}]}', '{"rows": [{"id": 1}, {"id": 2}]}'),
-        ('{"text": "你好，世界"}', '{"text": "你好，世界"}'),
+        ('{"text": "Hello \U0001f30d"}', '{"text": "Hello \U0001f30d"}'),
         (r'{"text": "he said \"hello\""}', '{"text": "he said \\"hello\\""}'),
         (
             '{"code": "function(x) { return x + 1; }"}',
@@ -94,8 +94,8 @@ def test_partial_calls_emit_available_name_and_arguments(body, arguments):
             '{"a": {"b": {"c": 42}}}',
         ),
         (
-            '{"name": "translate", "arguments": {"text": "你好，世界"}}',
-            '{"text": "你好，世界"}',
+            '{"name": "translate", "arguments": {"text": "Hello \U0001f30d"}}',
+            '{"text": "Hello \U0001f30d"}',
         ),
         ('{"name": "add", "arguments": {"items": [1, 2, 3]}}', '{"items": [1, 2, 3]}'),
         (
@@ -257,3 +257,67 @@ def test_finalize_flushes_withheld_plain_json_content():
     assert joined == text
     assert not parser.has_tool_calls
     assert parser.finalize(text) == []
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+@pytest.mark.parametrize(
+    "prefix,middle,suffix",
+    [("", "", ""), ("Checking. ", "\nNext city. ", " Done.")],
+)
+def test_tagged_calls_preserve_text_and_stream_boundaries(
+    chunk_size, prefix, middle, suffix
+):
+    calls = [
+        {"name": "weather", "arguments": {"city": "London", "note": "</tool_call>"}},
+        {"name": "weather", "arguments": {"city": "Montr\u00e9al"}},
+    ]
+    blocks = [
+        "<tool_call>\n" + json.dumps(c, ensure_ascii=False) + "\n</tool_call>"
+        for c in calls
+    ]
+    body = prefix + blocks[0] + middle + blocks[1] + suffix
+    parser = SimpleJsonToolParser()
+    deltas = []
+    for end in range(chunk_size, len(body), chunk_size):
+        deltas.extend(parser.feed(body[:end]))
+    deltas.extend(parser.feed(body))
+    deltas.extend(parser.finalize(body))
+    content = "".join(d.get("content", "") for d in deltas)
+    assert content == prefix + middle + suffix
+    actual = {}
+    ids = []
+    for delta in deltas:
+        for call in delta.get("tool_calls", []):
+            result = actual.setdefault(call["index"], {"name": "", "arguments": ""})
+            if "id" in call:
+                ids.append(call["id"])
+            for key, value in call.get("function", {}).items():
+                result[key] += value
+    assert len(set(ids)) == 2
+    assert [r["name"] for r in actual.values()] == ["weather", "weather"]
+    assert [json.loads(r["arguments"]) for r in actual.values()] == [
+        c["arguments"] for c in calls
+    ]
+    complete = parser.parse_complete(body)
+    assert complete["content"] == (content.strip() or None)
+    assert [c["function"] for c in complete["tool_calls"]] == list(actual.values())
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Use <tool_call> tags when calling a tool.",
+        "Literal <tool_call>not JSON</tool_call> example.",
+        "Incomplete <tool_ca",
+        '<tool_call>{"city": "London"}</tool_call>',
+    ],
+)
+def test_literal_or_invalid_tool_tags_remain_content(body):
+    parser = SimpleJsonToolParser()
+    deltas = []
+    for end in range(1, len(body) + 1):
+        deltas.extend(parser.feed(body[:end]))
+    deltas.extend(parser.finalize(body))
+    assert "".join(d.get("content", "") for d in deltas) == body
+    assert parser.parse_complete(body) is None
+    assert not parser.has_tool_calls

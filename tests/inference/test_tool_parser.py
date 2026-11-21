@@ -18,7 +18,7 @@ from astrai.inference.network.tool_parser import SimpleJsonToolParser
         ),
         ('{"items": [1, 2, 3]}', '{"items": [1, 2, 3]}'),
         ('{"rows": [{"id": 1}, {"id": 2}]}', '{"rows": [{"id": 1}, {"id": 2}]}'),
-        ('{"text": "你好，世界"}', '{"text": "你好，世界"}'),
+        ('{"text": "Hello \U0001f30d"}', '{"text": "Hello \U0001f30d"}'),
         (r'{"text": "he said \"hello\""}', '{"text": "he said \\"hello\\""}'),
         (
             '{"code": "function(x) { return x + 1; }"}',
@@ -94,8 +94,8 @@ def test_partial_calls_emit_available_name_and_arguments(body, arguments):
             '{"a": {"b": {"c": 42}}}',
         ),
         (
-            '{"name": "translate", "arguments": {"text": "你好，世界"}}',
-            '{"text": "你好，世界"}',
+            '{"name": "translate", "arguments": {"text": "Hello \U0001f30d"}}',
+            '{"text": "Hello \U0001f30d"}',
         ),
         ('{"name": "add", "arguments": {"items": [1, 2, 3]}}', '{"items": [1, 2, 3]}'),
         (
@@ -268,8 +268,8 @@ def test_tagged_calls_preserve_text_and_stream_boundaries(
     chunk_size, prefix, middle, suffix
 ):
     calls = [
-        {"name": "weather", "arguments": {"city": "北京", "note": "</tool_call>"}},
-        {"name": "weather", "arguments": {"city": "上海"}},
+        {"name": "weather", "arguments": {"city": "London", "note": "</tool_call>"}},
+        {"name": "weather", "arguments": {"city": "Montr\u00e9al"}},
     ]
     blocks = [
         "<tool_call>\n" + json.dumps(c, ensure_ascii=False) + "\n</tool_call>"
@@ -309,7 +309,7 @@ def test_tagged_calls_preserve_text_and_stream_boundaries(
         "Use <tool_call> tags when calling a tool.",
         "Literal <tool_call>not JSON</tool_call> example.",
         "Incomplete <tool_ca",
-        '<tool_call>{"city": "北京"}</tool_call>',
+        '<tool_call>{"city": "London"}</tool_call>',
     ],
 )
 def test_literal_or_invalid_tool_tags_remain_content(body):

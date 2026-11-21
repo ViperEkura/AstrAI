@@ -16,6 +16,8 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from astrai.extension.kernel.attention import ROLLOUT_KV_SPLIT_SIZE
+from astrai.extension.runtime.context import snapshot_op_selection
 from astrai.model.components.mlp import RouterStats
 
 
@@ -361,6 +363,12 @@ def _packed_rollout_token_logprobs(
     )
     if not runs:
         return None
+    # Align packed run starts to the same logical KV segments as generation.
+    alignment = (
+        ROLLOUT_KV_SPLIT_SIZE
+        if snapshot_op_selection().choice("attention")[0] == "cuda_consistent"
+        else 1
+    )
     fill, place = [], {}
     for length, i in runs:  # first-fit decreasing; every run fits in width
         row = next((r for r, used in enumerate(fill) if used + length <= width), None)
@@ -368,7 +376,7 @@ def _packed_rollout_token_logprobs(
             row = len(fill)
             fill.append(0)
         place[i] = (row, fill[row])
-        fill[row] += length
+        fill[row] += (length + alignment - 1) // alignment * alignment
     rows = len(fill)
     source = np.full((rows, width), -1, dtype=np.int64)
     segment = -1 - np.arange(rows * width, dtype=np.int64).reshape(rows, width)

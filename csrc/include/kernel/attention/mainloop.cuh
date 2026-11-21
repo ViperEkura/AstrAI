@@ -33,7 +33,8 @@ template <typename Tile,
           typename KV,
           bool IsCausal,
           bool HasMask,
-          bool MaskCoversShape = false>
+          bool MaskCoversShape = false,
+          bool FixedSplits = false>
 struct PrefillMainloop {
     using Traits = Tile;
     static DEVICE_FORCEINLINE bool
@@ -121,33 +122,69 @@ struct PrefillMainloop {
             });
         };
 
-        // Prologue: issue first tile load
-        if (t_end >= 0)
-            load_tile(0, 0);
+        auto run_tiles = [&](int begin, int end) {
+            if (begin >= end)
+                return;
+            load_tile(begin, begin & 1);
+            for (int ti = begin; ti < end; ++ti) {
+                const int buf = ti & 1;
+                astrai::cp_async_wait_group<0>();
+                __syncthreads();
+                if (ti + 1 < end)
+                    load_tile(ti + 1, (ti + 1) & 1);
 
-        for (int ti = 0; ti <= t_end; ti++) {
-            int buf = ti & 1;
-
-            // Wait for current tile, then publish cross-warp + guard buffer reuse.
-            astrai::cp_async_wait_group<0>();
-            __syncthreads();
-            if (ti < t_end)
-                load_tile(ti + 1, (ti + 1) & 1);
-
-            const T* bK = sK + buf * Traits::BC * Traits::LD;
-            const T* bV = sV + buf * Traits::BC * Traits::LD;
-            int kv0 = ti * Traits::BC;
-
-            // Warp-level causal skip (dead branch eliminated when IsCausal == false)
-            if (!IsCausal || kv0 <= warp_max_m + query_start) {
-
-                typename Traits::ScoreFragment Sacc;
-                Mma::scores(Qa, bK, lane, Sacc);
-
-                softmax.update(kv0, scale_log2, Sacc, Oacc, lane, mask);
-
-                Mma::values(Sacc, bV, lane, Oacc);
+                const T* bK = sK + buf * Traits::BC * Traits::LD;
+                const T* bV = sV + buf * Traits::BC * Traits::LD;
+                const int kv0 = ti * Traits::BC;
+                if (!IsCausal || kv0 <= warp_max_m + query_start) {
+                    typename Traits::ScoreFragment Sacc;
+                    Mma::scores(Qa, bK, lane, Sacc);
+                    softmax.update(kv0, scale_log2, Sacc, Oacc, lane, mask);
+                    Mma::values(Sacc, bV, lane, Oacc);
+                }
             }
+        };
+
+        if constexpr (FixedSplits) {
+            const int split_tiles = p.kv_split_size / Traits::BC;
+            if (t_end < split_tiles) {
+                run_tiles(0, t_end + 1);
+            } else {
+                // Keep prefill partials in registers. Decode schedules the same
+                // segments on separate CTAs and uses the same merge recurrence.
+                typename Traits::OutputFragment total;
+                Mma::clear(total);
+                WarpSoftmax<Traits> stats;
+                for (int begin = 0; begin <= t_end; begin += split_tiles) {
+                    if (begin)
+                        __syncthreads(); // Drain readers before reusing the K/V buffers.
+                    softmax = {};
+                    Mma::clear(Oacc);
+                    run_tiles(begin, min(begin + split_tiles, t_end + 1));
+#pragma unroll
+                    for (int row = 0; row < 2; ++row) {
+                        if (softmax.rows[row].l == 0.0f)
+                            continue;
+                        float alpha, beta;
+                        merge_softmax(stats.rows[row], softmax.rows[row], alpha, beta, scale_log2);
+#pragma unroll
+                        for (int j = 0; j < Traits::DN8; ++j) {
+                            total[j][2 * row] =
+                                merge_output(total[j][2 * row], Oacc[j][2 * row], alpha, beta);
+                            total[j][2 * row + 1] =
+                                merge_output(total[j][2 * row + 1], Oacc[j][2 * row + 1], alpha, beta);
+                        }
+                    }
+                }
+                softmax = stats;
+#pragma unroll
+                for (int j = 0; j < Traits::DN8; ++j)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        Oacc[j][i] = total[j][i];
+            }
+        } else {
+            run_tiles(0, t_end + 1);
         }
 
         tile.rows = rows;
@@ -167,7 +204,8 @@ struct PrefillMainloop {
  * KV = ContigKV or PagedKV; HasMask is compile-time. Traits =
  * KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
  */
-template <typename Tile, typename KV, bool HasMask, bool SkipEmptySplits = false>
+template <typename Tile, typename KV, bool HasMask, bool SkipEmptySplits = false,
+          bool FixedSplits = false>
 struct DecodeMainloop {
     using Traits = Tile;
     static DEVICE_FORCEINLINE bool
@@ -220,10 +258,14 @@ struct DecodeMainloop {
         const AttentionMask<HasMask> mask{p, rows, seq_len, seq_len, va, vb};
 
         const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
-        const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
+        const int tiles_per_split = FixedSplits ? p.kv_split_size / Traits::BC
+                                               : (tiles_total + p.num_splits - 1) / p.num_splits;
         const int ti_begin = split * tiles_per_split;
         const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
-        if constexpr (SkipEmptySplits && KV::kPaged) {
+        if constexpr (FixedSplits) {
+            if (ti_begin >= tiles_total)
+                return false;
+        } else if constexpr (SkipEmptySplits && KV::kPaged) {
             // Skip empty splits only when a graph reuses much less than its capacity.
             if (skip_empty_decode_splits(p, seq_len) && split > 0 && ti_begin >= tiles_total)
                 return false;

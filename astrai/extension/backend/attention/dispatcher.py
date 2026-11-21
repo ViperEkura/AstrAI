@@ -55,6 +55,9 @@ class AttentionDispatcher(OpDispatcher[AttentionSpec]):
         if choice == "cuda":
             if cuda.supports(spec):
                 return cuda.forward
+        elif choice == "cuda_consistent":
+            if cuda.supports_consistent(spec):
+                return cuda.forward_consistent
         elif choice == "flash":
             if flash.supports(spec):
                 return flash.forward

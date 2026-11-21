@@ -130,11 +130,13 @@ template <int HEAD_DIM,
           typename KV,
           bool IsCausal,
           bool HasMask,
-          bool MaskCoversShape = false>
+          bool MaskCoversShape = false,
+          bool FixedSplits = false>
 struct PrefillKernel {
     using Config = PrefillConfig<HEAD_DIM, IsCausal>;
     using Traits =
-        KernelTraits<HEAD_DIM, Config::BC, Config::WARPS, Config::STAGES, typename KV::Elem>;
+        KernelTraits<HEAD_DIM, FixedSplits ? 16 : Config::BC, Config::WARPS,
+                     Config::STAGES, typename KV::Elem>;
 
     static dim3 plan(const AttentionParams& p) {
         // Each block owns BLOCK_M packed (head, row) rows; grid.y selects the KV head.
@@ -144,14 +146,15 @@ struct PrefillKernel {
     }
 
     static void launch(const AttentionParams& p, dim3 grid, cudaStream_t stream) {
-        using Mainloop = PrefillMainloop<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape>;
+        using Mainloop = PrefillMainloop<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape, FixedSplits>;
         attention_kernel<Mainloop, OutputEpilogue<Traits, QSchedule, true>>
             <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
 };
 
-template <int HEAD_DIM, typename KV, bool HasMask, bool SkipEmptySplits = false>
+template <int HEAD_DIM, typename KV, bool HasMask, bool SkipEmptySplits = false,
+          bool FixedSplits = false>
 struct DecodeKernel {
     // BC=16 retains the existing shared-memory/register footprint and occupancy.
     using Traits = KernelTraits<HEAD_DIM, 16, 1, 2, typename KV::Elem>;
@@ -165,27 +168,33 @@ struct DecodeKernel {
                 HEAD_DIM,
                 (kv_len + Traits::BC - 1) / Traits::BC,
                 decode_wave_capacity<
-                    attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits>,
+                    attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits, FixedSplits>,
                                      SplitEpilogue<Traits>>,
                     Traits::NUM_THREADS>()};
     }
 
-    static DecodeLaunchPlan plan(const AttentionParams& p) { return make_decode_plan(query(p)); }
+    static DecodeLaunchPlan plan(const AttentionParams& p) {
+        if constexpr (FixedSplits) {
+            const int blocks = p.kv_head * ((p.q_head / p.kv_head + 15) / 16);
+            const int length = KV::host_kv_len(p);
+            const int splits = length > 0 ? (length - 1) / p.kv_split_size + 1 : 1;
+            return {dim3(blocks, p.batch, splits), splits == 1};
+        }
+        return make_decode_plan(query(p));
+    }
 
     static void launch(AttentionParams& p, const DecodeLaunchPlan& plan, cudaStream_t stream) {
         p.num_splits = static_cast<int>(plan.grid.z);
-        if constexpr (HEAD_DIM <= 128) {
-            if (plan.direct_output) {
-                attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits, KV>>
-                    <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
-                ASTRAI_LAUNCH_CHECK();
-                return;
-            }
+        if (plan.direct_output) {
+            attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits, KV>>
+                <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
+            ASTRAI_LAUNCH_CHECK();
+            return;
         }
-        attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits>,
+        attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits, FixedSplits>,
                          SplitEpilogue<Traits>><<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
-        split_kv_combine<KV, Traits::BC, SkipEmptySplits>
+        split_kv_combine<KV, Traits::BC, SkipEmptySplits, FixedSplits>
             <<<p.batch * p.q_head, HEAD_DIM, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
@@ -203,7 +212,7 @@ template <typename Fn> inline auto with_head_dim(int head_dim, Fn&& fn) {
     throw std::runtime_error(head_dim_error(head_dim));
 }
 
-template <typename QSchedule, typename KV, typename Fn>
+template <typename QSchedule, typename KV, bool FixedSplits = false, typename Fn>
 inline auto with_prefill_kernel(const AttentionParams& p, Fn&& fn) {
     // Paged partial masks need extent checks; full coverage can omit them.
     // Dense keeps its checked kernel to avoid redundant compiler-generated comparisons.
@@ -215,26 +224,31 @@ inline auto with_prefill_kernel(const AttentionParams& p, Fn&& fn) {
             if (p.mask) {
                 if constexpr (KV::kPaged) {
                     if (mask_covers_shape)
-                        return fn(PrefillKernel<D, QSchedule, KV, true, true, true>{});
+                        return fn(PrefillKernel<D, QSchedule, KV, true, true, true, FixedSplits>{});
                 }
-                return fn(PrefillKernel<D, QSchedule, KV, true, true>{});
+                return fn(PrefillKernel<D, QSchedule, KV, true, true, false, FixedSplits>{});
             }
-            return fn(PrefillKernel<D, QSchedule, KV, true, false>{});
+            return fn(PrefillKernel<D, QSchedule, KV, true, false, false, FixedSplits>{});
         }
         if (p.mask) {
             if constexpr (KV::kPaged) {
                 if (mask_covers_shape)
-                    return fn(PrefillKernel<D, QSchedule, KV, false, true, true>{});
+                    return fn(PrefillKernel<D, QSchedule, KV, false, true, true, FixedSplits>{});
             }
-            return fn(PrefillKernel<D, QSchedule, KV, false, true>{});
+            return fn(PrefillKernel<D, QSchedule, KV, false, true, false, FixedSplits>{});
         }
-        return fn(PrefillKernel<D, QSchedule, KV, false, false>{});
+        return fn(PrefillKernel<D, QSchedule, KV, false, false, false, FixedSplits>{});
     });
 }
 
 template <int D, typename KV, typename Fn>
 inline auto with_decode_variant(const AttentionParams& p, Fn&& fn) {
     if constexpr (KV::kPaged) {
+        if (p.kv_split_size) {
+            if (p.mask)
+                return fn(DecodeKernel<D, KV, true, false, true>{});
+            return fn(DecodeKernel<D, KV, false, false, true>{});
+        }
         if (p.max_context_len >= SKIP_EMPTY_SPLITS_MIN_CAPACITY) {
             if (p.mask)
                 return fn(DecodeKernel<D, KV, true, true>{});
@@ -264,8 +278,11 @@ inline auto with_decode_kernel(const AttentionParams& p, Fn&& fn) {
 
 template <typename QSchedule, typename KV>
 inline void launch_prefill(AttentionParams& p, cudaStream_t stream) {
-    with_prefill_kernel<QSchedule, KV>(
-        p, [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); });
+    auto launch = [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); };
+    if (p.kv_split_size)
+        with_prefill_kernel<QSchedule, KV, true>(p, launch);
+    else
+        with_prefill_kernel<QSchedule, KV>(p, launch);
 }
 
 template <typename KV> inline void launch_decode(AttentionParams& p, cudaStream_t stream) {

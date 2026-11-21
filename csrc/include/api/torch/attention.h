@@ -28,7 +28,8 @@ torch::Tensor attn_prefill(torch::Tensor q,
                            c10::optional<torch::Tensor> mask,
                            c10::optional<double> scale,
                            int64_t layout,
-                           bool is_causal);
+                           bool is_causal,
+                           int64_t kv_split_size = 0);
 
 torch::Tensor attn_paged_decode(torch::Tensor q,
                                 torch::Tensor k_cache,
@@ -43,7 +44,8 @@ torch::Tensor attn_paged_decode(torch::Tensor q,
                                 c10::optional<torch::Tensor> o_part_buf,
                                 c10::optional<torch::Tensor> ml_part_buf,
                                 c10::optional<torch::Tensor> out_buf,
-                                bool is_causal);
+                                bool is_causal,
+                                int64_t kv_split_size = 0);
 
 torch::Tensor attn_paged_prefill(torch::Tensor q,
                                  torch::Tensor k_cache,
@@ -56,7 +58,8 @@ torch::Tensor attn_paged_prefill(torch::Tensor q,
                                  torch::Tensor q_tile_to_index,
                                  c10::optional<torch::Tensor> mask,
                                  c10::optional<double> scale,
-                                 bool is_causal);
+                                 bool is_causal,
+                                 int64_t kv_split_size = 0);
 
 } // namespace attention
 } // namespace astrai

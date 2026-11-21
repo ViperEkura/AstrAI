@@ -12,7 +12,9 @@ failure mode that matters, since a void* carries no type of its own.
 import pytest
 import torch
 
+from astrai.extension import attention, op_backend
 from astrai.extension.kernel.attention import (
+    ROLLOUT_KV_SPLIT_SIZE,
     attn_decode,
     attn_paged_decode,
     attn_paged_prefill,
@@ -702,3 +704,82 @@ def test_paged_prefill_short_mask_bounds(dtype, mask_rows, expand_rows, mask_col
         if mask_rows > 1:
             assert torch.count_nonzero(out[start + mask_rows : start + q_len]) == 0
         start += q_len
+
+
+@pytest.mark.cuda
+@skip_no_kernel
+@pytest.mark.parametrize(
+    "head_dim,groups,split_size",
+    [(32, 1, 16)]
+    + [
+        (dim, groups, ROLLOUT_KV_SPLIT_SIZE)
+        for dim, groups in ((32, 1), (64, 2), (128, 4), (256, 8))
+    ],
+)
+def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups, split_size):
+    torch.manual_seed(3407)
+    batch, length, kv_heads = 2, 513, 2
+    q_heads = kv_heads * groups
+    q = torch.randn(
+        batch, length, q_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k = torch.randn(batch, length, kv_heads, head_dim, dtype=q.dtype, device=q.device)
+    v = torch.randn_like(k)
+    table = torch.arange(batch * length, dtype=torch.int32, device=q.device).view(
+        batch, length
+    )
+    requests = torch.arange(batch, dtype=torch.int32, device=q.device)
+    mask = torch.ones(batch, length, dtype=torch.bool, device=q.device)
+    mask[0, 2::5] = False
+    mask[1] = False
+    dense = attn_prefill(q, k, v, mask, is_causal=True, kv_split_size=split_size)
+    assert torch.count_nonzero(dense[1]) == 0
+
+    # Test the usual preallocated workspace, including expansion when the
+    # 16-token case needs 33 logical splits.
+    o_part = torch.empty(batch, q_heads, 32, head_dim, device=q.device)
+    ml_part = torch.empty(batch, q_heads, 32, 2, device=q.device)
+    for end in (1, 15, 16, 17, 255, 256, 257, 511, 512, 513):
+        indptr = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * end
+        actual = attn_paged_decode(
+            q[:, end - 1].contiguous(),
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            table,
+            requests,
+            indptr,
+            mask=mask,
+            o_part_buf=o_part,
+            ml_part_buf=ml_part,
+            kv_split_size=split_size,
+        )
+        torch.testing.assert_close(actual, dense[:, end - 1], rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@skip_no_kernel
+def test_consistent_bf16_attention_gradients_match_math_reference():
+    torch.manual_seed(3407)
+    q, k, v = (x.requires_grad_() for x in _contig(torch.bfloat16))
+    mask = torch.ones(1, Q_LEN, KV_LEN, device=q.device, dtype=torch.bool)
+    mask[:, 2] = False
+    scale = 0.19
+    with op_backend(attention="cuda_consistent"):
+        output = attention(q, k, v, attn_mask=mask, scale=scale)
+    upstream = torch.randn_like(output)
+    actual = torch.autograd.grad(output, (q, k, v), upstream)
+
+    q64, k64, v64 = (x.detach().double().requires_grad_() for x in (q, k, v))
+    scores = q64.transpose(1, 2) @ k64.repeat_interleave(2, dim=2).permute(0, 2, 3, 1)
+    # Zero the fully masked row before softmax so it contributes zero gradient.
+    allowed = mask[:, None]
+    scores = (scores * scale).masked_fill(~allowed, -torch.inf)
+    scores = scores.masked_fill(~allowed.any(dim=-1, keepdim=True), 0)
+    probs = scores.softmax(dim=-1).masked_fill(~allowed, 0)
+    reference_output = (
+        probs @ v64.repeat_interleave(2, dim=2).transpose(1, 2)
+    ).transpose(1, 2)
+    expected = torch.autograd.grad(reference_output, (q64, k64, v64), upstream.double())
+    for observed, reference in zip(actual, expected):
+        error = (observed.double() - reference).norm() / reference.norm()
+        assert error < 0.01

@@ -16,12 +16,12 @@ import torch.nn as nn
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from astrai.extension.backend.linear import linear
 from astrai.extension.runtime.context import (
     op_context,
     snapshot_op_selection,
     use_op_selection,
 )
+from astrai.model.components.linear import linear
 from astrai.model.components.mlp import RouterStats
 
 

@@ -5,6 +5,7 @@ from astrai.model.value import ValueModel
 from astrai.trainer.strategy import (
     PPOStrategy,
     compute_gae,
+    rollout_token_logprobs,
 )
 from astrai.trainer.strategy import ppo as strategy_module
 from tests.support.models import make_frozen, make_model, make_rollout_config
@@ -202,6 +203,25 @@ def test_ppo_loss_is_finite_and_differentiable(ppo_strategy):
         for p in strategy.critic.parameters()
     )
     assert all(p.grad is None for p in strategy.ref_model.parameters())
+
+
+def test_ppo_matches_tempered_behavior_for_ratio_and_kl_reward(ppo_strategy):
+    strategy, device = ppo_strategy
+    strategy.rollout_temperature = 0.6
+    r = make_rollout_result(device=device)
+    inputs = r.prompts, r.prompt_mask, r.responses, r.response_mask
+    with torch.no_grad():
+        r.logprobs_old = rollout_token_logprobs(
+            strategy.model, *inputs, temperature=0.6
+        )["logprobs"]
+    batch = strategy.prepare_from_rollout(r)
+    metrics = strategy.compute_loss_output(batch)["metrics"]
+    for key in ("ratio_min", "ratio_max"):
+        assert metrics[key] == pytest.approx(1.0, abs=1e-5)
+    # Identical actor and reference give zero KL reward on every token.
+    strategy.kl_coef = 0
+    _, returns = strategy._compute_advantages(*inputs, r.rewards, r.logprobs_old)
+    torch.testing.assert_close(r.returns, returns)
 
 
 def test_ppo_requires_behavior_logprobs(ppo_strategy):

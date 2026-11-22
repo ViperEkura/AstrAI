@@ -56,7 +56,7 @@ def sample(
 ):
     """Apply frequency penalty, temperature, top-k and top-p, then sample.
 
-    True returns raw model log probabilities. Online GRPO requests
+    True returns raw model log probabilities. Online training requests
     "temperature" to score positive-temperature samples before top-k/top-p.
     The caller supplies frequency counts. Per-request seeds leave the global
     RNG unchanged.

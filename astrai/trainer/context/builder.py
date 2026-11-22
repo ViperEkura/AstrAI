@@ -338,7 +338,7 @@ class TrainContextBuilder:
         kwargs.setdefault("moe_aux_loss_coef", cfg.moe_aux_loss_coef)
         kwargs.setdefault("gradient_chunked_logprobs", cfg.gradient_chunked_logprobs)
         capabilities = StrategyFactory.capabilities(cfg.strategy)
-        if cfg.strategy == "online_grpo":
+        if capabilities.online:
             kwargs["rollout_temperature"] = cfg.rollout_temperature
         if capabilities.reference_model:
             kwargs["ref_model"] = create_ref_model(

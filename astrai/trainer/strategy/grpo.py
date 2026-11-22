@@ -68,7 +68,6 @@ class GRPOStrategy(BaseStrategy):
         overlong_max_len: Optional[int] = None,
         overlong_buffer_len: int = 0,
         overlong_penalty_scale: float = 1.0,
-        rollout_temperature: float = 1.0,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
@@ -97,7 +96,6 @@ class GRPOStrategy(BaseStrategy):
         self.overlong_penalty_scale = self._validate_non_negative_real(
             overlong_penalty_scale, "overlong_penalty_scale"
         )
-        self.rollout_temperature = rollout_temperature
         self.kl_coef = kl_coef
         self.group_size = group_size
 
@@ -205,12 +203,10 @@ class GRPOStrategy(BaseStrategy):
         if prompt_mask is None:
             prompt_mask = prompts.ne(0)
 
+        inputs = prompts, prompt_mask, responses, masks
         policy_output = rollout_token_logprobs(
             self.model,
-            prompts,
-            prompt_mask,
-            responses,
-            masks,
+            *inputs,
             grad_chunked=self.gradient_chunked_logprobs,
             temperature=self.rollout_temperature,
         )
@@ -220,20 +216,14 @@ class GRPOStrategy(BaseStrategy):
             if behavior_logprobs is None:
                 token_log_probs_old = rollout_token_logprobs(
                     self.old_model,
-                    prompts,
-                    prompt_mask,
-                    responses,
-                    masks,
+                    *inputs,
                     temperature=self.rollout_temperature,
                 )["logprobs"]
             else:
                 token_log_probs_old = behavior_logprobs
             token_log_probs_ref = rollout_token_logprobs(
                 self.ref_model,
-                prompts,
-                prompt_mask,
-                responses,
-                masks,
+                *inputs,
                 temperature=self.rollout_temperature,
             )["logprobs"]
 

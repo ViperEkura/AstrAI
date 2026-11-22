@@ -69,12 +69,11 @@ class DPOStrategy(BaseStrategy):
         )[None, None, :, :]  # [1, 1, S, S]
         full_mask = key_pad & causal  # [B*2, 1, S, S] — composed
 
+        inputs = concat_ids, full_mask, concat_loss_mask, self.reduction
         policy_output = get_logprobs(
             self.model,
-            concat_ids,
-            full_mask,
-            concat_loss_mask,
-            self.reduction,
+            *inputs,
+            temperature=self.rollout_temperature,
             grad_chunked=self.gradient_chunked_logprobs,
         )
         log_pi = policy_output["logprobs"]
@@ -83,10 +82,8 @@ class DPOStrategy(BaseStrategy):
         with torch.no_grad():
             ref_output = get_logprobs(
                 self.ref_model,
-                concat_ids,
-                full_mask,
-                concat_loss_mask,
-                self.reduction,
+                *inputs,
+                temperature=self.rollout_temperature,
             )
             log_ref = ref_output["logprobs"]
 

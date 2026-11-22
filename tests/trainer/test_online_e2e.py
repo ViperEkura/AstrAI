@@ -120,7 +120,7 @@ def test_online_rollout_end_to_end(online_env, strategy, strategy_kwargs, with_c
             make_online_value_model, model_config
         )
         config_kwargs["critic_optimizer_fn"] = make_online_optimizer
-    train_config = _online_config(online_env, **config_kwargs)
+    train_config = _online_config(online_env, rollout_temperature=0.8, **config_kwargs)
 
     trainer = Trainer(train_config)
     trainer.train(param_path=test_dir)

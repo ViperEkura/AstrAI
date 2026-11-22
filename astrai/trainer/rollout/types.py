@@ -127,7 +127,6 @@ class SamplingParams:
     group_size: int = 8
     frequency_penalty: float = 0.0
     rep_window: int = 64
-    temperature_logprobs: bool = False
 
 
 @dataclass(frozen=True)

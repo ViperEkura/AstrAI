@@ -5,6 +5,7 @@ from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import (
     DPOStrategy,
     GRPOStrategy,
+    rollout_token_logprobs,
 )
 from tests.support.models import make_frozen, make_model, make_rollout_config
 from tests.support.rollout import FakeExecutor, make_rollout_result
@@ -74,6 +75,28 @@ def test_dpo_prepare_from_rollout_conditions_responses_on_prompt(cpu_device):
     assert torch.equal(batch["rejected_attention_mask"][:, :6], r.prompt_mask)
     assert torch.equal(batch["chosen_attention_mask"][:, 6:], expected_best_mask)
     assert torch.equal(batch["rejected_attention_mask"][:, 6:], expected_worst_mask)
+
+
+def test_dpo_scores_both_sides_of_preference_at_rollout_temperature(cpu_device):
+    strategy = _make_dpo(cpu_device)
+    strategy.rollout_temperature = 0.6
+    result = make_rollout_result(B=1, G=2, device=cpu_device)
+    result.rewards[0] = torch.tensor([1.0, 0.0])
+    inputs = result.prompts, result.prompt_mask, result.responses, result.response_mask
+    with torch.no_grad():
+        strategy.model.lm_head.weight.mul_(1.5)
+
+        def margin(model):
+            scores = rollout_token_logprobs(model, *inputs, temperature=0.6)[
+                "logprobs"
+            ].sum(-1)
+            return scores[0, 0] - scores[0, 1]
+
+        expected = -torch.nn.functional.logsigmoid(
+            strategy.beta * (margin(strategy.model) - margin(strategy.ref_model))
+        )
+    actual = strategy.compute_loss(strategy.prepare_from_rollout(result))
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("make_strategy", [_make_grpo, _make_dpo], ids=["grpo", "dpo"])

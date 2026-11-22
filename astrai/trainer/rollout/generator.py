@@ -128,7 +128,7 @@ class RolloutGenerator:
             top_p=params.top_p,
             frequency_penalty=params.frequency_penalty,
             rep_window=params.rep_window,
-            return_logprobs="temperature" if params.temperature_logprobs else True,
+            return_logprobs="temperature" if params.temperature > 0 else True,
             return_details=True,
             **({"seeds": seeds} if seeds is not None else {}),
         )

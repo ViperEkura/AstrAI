@@ -180,7 +180,6 @@ def configure_rollout(
         max_tokens=cfg.rollout_max_tokens,
         group_size=group_size,
         temperature=cfg.rollout_temperature,
-        temperature_logprobs=cfg.strategy == "online_grpo",
         top_k=cfg.rollout_top_k,
         top_p=cfg.rollout_top_p,
     )
@@ -230,9 +229,7 @@ def configure_rollout(
     # decode, val-specific group size), inheriting every unset field
     # from the training rollout; with rollout_val_device set it runs
     # on a dedicated replica instead of the training backend.
-    val_params = replace(
-        generator.params, temperature_logprobs=False, **cfg.rollout_val_overrides()
-    )
+    val_params = replace(generator.params, **cfg.rollout_val_overrides())
     if val_device is None:
         val_generator = generator
     else:

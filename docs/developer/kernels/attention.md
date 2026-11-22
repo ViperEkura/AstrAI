@@ -80,6 +80,11 @@ copy pipeline, tile schedules and numerical recurrence.
 `epilogue.cuh` contains output handling and split combination.
 `kernel.cuh` defines their shared storage/result contract and the device entry.
 
+For power-of-two page sizes, the KV address context computes the shift once
+per request/head and reuses it in the tile loop. Other page sizes retain
+integer division. This changes neither the public parameters nor the launch
+specializations and does not depend on a GPU architecture.
+
 ## Native launch dispatch
 
 Attention follows the same typed query, plan, and launch structure as GEMM,

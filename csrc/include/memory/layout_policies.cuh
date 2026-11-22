@@ -253,6 +253,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
         const int* pages;
         int64_t pool_stride;
         int64_t head_off;
+        int page_shift;
     };
 
     static DEVICE_FORCEINLINE const T* kptr(const AttentionParams& p) {
@@ -305,14 +306,16 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
 
     template <int HEAD_DIM>
     static DEVICE_FORCEINLINE Context make_ctx(const AttentionParams& p, int batch, int kv_head) {
+        const int shift = (p.page_size & (p.page_size - 1)) == 0 ? __ffs(p.page_size) - 1 : -1;
         return {p.page_table + (int64_t)batch * p.table_stride,
-                (int64_t)p.kv_head * HEAD_DIM, (int64_t)kv_head * HEAD_DIM};
+                (int64_t)p.kv_head * HEAD_DIM, (int64_t)kv_head * HEAD_DIM, shift};
     }
     static DEVICE_FORCEINLINE int
     resolve_token(const AttentionParams& p, const Context& c, int kc, bool valid) {
         if (!valid) return -1;
         if (kc < 0 || kc >= p.kv_len) return -1;
-        const int block = p.page_size == 1 ? kc : kc / p.page_size;
+        // Cache the power-of-two divisor once per request, outside the KV tile loop.
+        const int block = c.page_shift >= 0 ? kc >> c.page_shift : kc / p.page_size;
         const int page = c.pages[block];
         if (page < 0 || page >= p.num_pages) __trap();
         return page * p.page_size + (kc - block * p.page_size);

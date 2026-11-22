@@ -161,6 +161,7 @@ class BlockPool:
         device: Optional[torch.device] = None,
         start_pos: Optional[int] = None,
         incremental: bool = False,
+        refresh_pages: bool = True,
     ) -> KVCache:
         """Assemble the ``KVCache`` metadata for a batch of requests.
 
@@ -172,6 +173,7 @@ class BlockPool:
                          If ``None``, produce **decode** cache (last position).
             incremental: if ``True``, reuse workspace state from previous step
                          by incrementing counters in-place (decode hot path).
+            refresh_pages: whether the allocation strategy changed a page mapping.
 
         Returns:
             ``KVCache`` dataclass with the correct output shapes for the
@@ -194,7 +196,8 @@ class BlockPool:
         if not incremental:
             rows.copy_(torch.tensor(req_indices, dtype=torch.int32, device=device))
         pages = workspace.page_table[:b]
-        torch.index_select(table, 0, rows, out=pages)
+        if not incremental or refresh_pages:
+            torch.index_select(table, 0, rows, out=pages)
         if start_pos is None:
             if incremental:
                 past.add_(1)
@@ -212,6 +215,7 @@ class BlockPool:
                 workspace.decode_o_part,
                 workspace.decode_ml_part,
                 workspace.decode_out,
+                layer_views=self._storage.layer_views,
             )
 
         lengths = [n - start_pos for n in seq_lens]
@@ -223,7 +227,12 @@ class BlockPool:
         )
         past.fill_(start_pos)
         return PrefillKVCache(
-            self._storage.k_buffer, self._storage.v_buffer, pages, past, offsets
+            self._storage.k_buffer,
+            self._storage.v_buffer,
+            pages,
+            past,
+            offsets,
+            layer_views=self._storage.layer_views,
         )
 
 
@@ -408,7 +417,7 @@ class KVCacheManager:
             and _is_steady_increment(prev.sig, prev.seq_lens, sig, seq_lens)
         )
         # Publish newly allocated pages before gathering this batch’s rows.
-        self._strategy.flush_pages(states, device or workspace.device)
+        pages_changed = self._strategy.flush_pages(states, device or workspace.device)
 
         bound = self._pool.bind_tasks(
             req_indices,
@@ -417,6 +426,7 @@ class KVCacheManager:
             device=device,
             start_pos=start_pos,
             incremental=incremental,
+            refresh_pages=pages_changed,
         )
 
         self._bind_state = _BindState(

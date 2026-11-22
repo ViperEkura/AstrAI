@@ -26,10 +26,11 @@ def _model_cache_attention(q, k, v, cache, layer, mask, is_causal):
     else:
         offsets = cache.cu_seqlens_q
         workspace = (None, None, None)
+    k_cache, v_cache = cache.layer(layer)
     return _cache_attention(
         q,
-        cache.k_buffer[layer],
-        cache.v_buffer[layer],
+        k_cache,
+        v_cache,
         k,
         v,
         cache.cache_seqlens,

@@ -424,13 +424,15 @@ class AllocationStrategy(ABC):
         materialized_end: int,
     ) -> None: ...
 
-    def flush_pages(self, states: List[RequestCacheState], device) -> None:
+    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
         """Publish newly assigned physical pages to the request table.
 
         Only the paged strategy stages slots on the host; the default is a
         no-op for strategies whose page table rows are already current
         (contiguous rows are pre-filled and never rewritten).
+        Returns whether this call changed a page mapping.
         """
+        return False
 
     def invalidate_cache(self) -> int:
         """Drop reusable KV entries after an inference weight update."""
@@ -564,7 +566,7 @@ class PagedStrategy(AllocationStrategy):
             )
         state._flushed = count
 
-    def flush_pages(self, states: List[RequestCacheState], device) -> None:
+    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
         updates = [
             (state.req_idx, col, state.pages[col])
             for state in states
@@ -577,6 +579,7 @@ class PagedStrategy(AllocationStrategy):
             self._req_pool.page_table[rows, columns] = pages
             for state in states:
                 state._flushed = len(state.pages)
+        return bool(updates)
 
     def record_hashes(
         self,

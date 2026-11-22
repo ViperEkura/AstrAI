@@ -32,7 +32,8 @@ torch::Tensor attention_with_kvcache(torch::Tensor q, torch::Tensor kc, torch::T
                     kc.sizes() == vc.sizes(),
                 "expected contiguous 4D caches");
     TORCH_CHECK(kc.size(1) > 0 && kc.size(2) == k.size(1) && kc.size(3) == q.size(2) &&
-                    k.size(2) == q.size(2) && k.size(1) > 0 && q.size(1) % k.size(1) == 0 &&
+                    k.size(2) == q.size(2) && k.size(1) > 0 && q.size(1) > 0 &&
+                    q.size(1) % k.size(1) == 0 &&
                     q.stride(2) == 1 && k.stride(2) == 1,
                 "invalid cache heads or strides");
     for (const auto& t : {past, pages})

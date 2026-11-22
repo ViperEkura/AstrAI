@@ -1,8 +1,8 @@
 """Device KV storage, logical-to-physical page mappings and per-step metadata."""
 
 import threading
-from dataclasses import dataclass
-from typing import List, Optional, Union
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -60,6 +60,11 @@ class KVStorage:
             device=device,
             dtype=dtype,
         )
+        # Storage never changes shape; create layer views once for every step.
+        self.layer_views = tuple(
+            (self.k_buffer[i].detach(), self.v_buffer[i].detach())
+            for i in range(n_layers)
+        )
 
 
 @dataclass
@@ -70,6 +75,14 @@ class BaseKVCache:
     v_buffer: Tensor
     page_table: Tensor
     cache_seqlens: Tensor
+    layer_views: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = field(
+        default=None, kw_only=True, repr=False
+    )
+
+    def layer(self, index: int) -> Tuple[Tensor, Tensor]:
+        if self.layer_views is not None and not torch.is_grad_enabled():
+            return self.layer_views[index]
+        return self.k_buffer[index], self.v_buffer[index]
 
 
 @dataclass

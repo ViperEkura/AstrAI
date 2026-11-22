@@ -33,9 +33,9 @@ def attention_varlen(
     k: Tensor,
     v: Tensor,
     cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
+    cu_seqlens_k: Optional[Tensor],
     is_causal: bool,
-    scale: float,
+    scale: Optional[float],
 ) -> Tensor:
     return get_module("attention").attention_varlen(
         q, k, v, cu_seqlens_q, cu_seqlens_k, is_causal, scale

@@ -386,3 +386,52 @@ def test_extend_batch_falls_back_when_pool_runs_dry():
     assert results == [True, True, False, False]
     for tid, ok in zip(ids, results):
         assert (mgr._states[tid].length == 2) == ok
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
+)
+def test_decode_reuses_pages_and_layer_views_until_mapping_changes(device, monkeypatch):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    pool = BlockPool(
+        2, 1, 32, 2, 16, torch.device(device), torch.float32, page_size=4, n_tokens=32
+    )
+    manager = KVCacheManager(pool)
+    workspace = make_cache_workspace(pool)
+    assert manager.alloc_slots("a", [1, 2])
+    assert manager.alloc_slots("b", [8, 9])
+    gathers = []
+    index_select = torch.index_select
+
+    def gather(*args, **kwargs):
+        gathers.append(1)
+        return index_select(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "index_select", gather)
+    first = manager.bind(["a", "b"], workspace)
+    address = first.page_table.data_ptr()
+    for pos in (2, 3):
+        assert all(manager.extend_slots_batch(["a", "b"], [pos, pos]))
+        bound = manager.bind(["a", "b"], workspace)
+        assert manager.bind_was_steady
+        assert bound.cache_seqlens.tolist() == [pos, pos]
+        assert bound.page_table.data_ptr() == address
+    assert len(gathers) == 1
+    with torch.no_grad():
+        assert bound.layer(1)[0] is first.layer(1)[0]
+        bound.layer(1)[0].fill_(3)
+    torch.testing.assert_close(
+        pool._storage.k_buffer[1], torch.full_like(pool._storage.k_buffer[1], 3)
+    )
+    # Crossing a physical page boundary refreshes mappings, preserving addresses.
+    assert all(manager.extend_slots_batch(["a", "b"], [4, 4]))
+    crossed = manager.bind(["a", "b"], workspace)
+    assert len(gathers) == 2
+    assert crossed.page_table.data_ptr() == address
+    for i, key in enumerate(("a", "b")):
+        assert crossed.page_table[i, :2].tolist() == manager._states[key].pages
+    # Reordering requests must refresh even if all their pages already exist.
+    reordered = manager.bind(["b", "a"], workspace)
+    assert len(gathers) == 3
+    assert reordered.page_table[0, :2].tolist() == manager._states["b"].pages

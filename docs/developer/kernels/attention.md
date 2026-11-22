@@ -21,6 +21,11 @@ and cache calls; backend capability checks and strict/soft selection remain
 in this layer. CUDA, Torch and Flash modules implement the selected calls.
 The three stateless `kernel/attention.py` wrappers alone translate arguments
 to the compiled ABI. They do not select backends or retain cache state.
+CUDA validates tensors while packing native arguments. Torch/Flash use
+`kernel/attention_validation.py` for their contracts and reference metadata;
+the dispatcher does not repeat shape, dtype or offset validation. Backend
+capability checks only decide which implementation can execute a call.
+The public cache layout rule is also defined in that kernel contract module.
 
 The model-side adapter selects the current layer's buffers and the step's
 query offsets or graph scratch. It passes only tensors and scalar options
@@ -43,7 +48,8 @@ physical_page = page_table[b, block]
 The runner binds the batch's page table and past lengths once per step. Chunked
 prefill supplies the first position of the current chunk and packed Q offsets.
 Decode reuses stable metadata, output and split buffers across graph replays.
-The model selects its layer's K/V views. The cache type preserves one-token
+The storage prepares each layer's K/V views once. Model inference selects
+those retained views; gradient-enabled reference calls obtain fresh views. The cache type preserves one-token
 prefill and routes request-local masks through an internal entry.
 
 ## Attention tool responsibilities

@@ -7,7 +7,7 @@ from pathlib import Path
 def test_attention_python_dependency_boundaries():
     root = Path(__file__).resolve().parents[2] / "astrai" / "extension"
     files = list((root / "backend" / "attention").glob("*.py"))
-    files.append(root / "kernel" / "attention.py")
+    files.extend((root / "kernel").glob("attention*.py"))
     for file in files:
         tree = ast.parse(file.read_text())
         kernel = file.parent.name == "kernel"

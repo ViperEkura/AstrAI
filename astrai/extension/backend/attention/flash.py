@@ -11,6 +11,7 @@ from astrai.extension.backend.attention.common import (
     _flash_attn,
     flash_attn_available,
 )
+from astrai.extension.kernel import attention_validation as contract
 
 
 def supports(spec: AttentionSpec) -> bool:
@@ -35,6 +36,7 @@ def forward(
             "Flash attention cannot handle a custom attention mask; "
             "use a causal mask or select Torch attention."
         )
+    contract.dense(q, k, v, scale)
     fa = _flash_attn
     if fa is None:
         raise RuntimeError(
@@ -55,7 +57,13 @@ def forward_cache(
     q, kc, vc, k, v, past, pages, qs, mask, causal, workspace=(None, None, None)
 ):
     # FA2's paged path requires blocks in multiples of 256.
-    if qs is None and kc.size(1) % 256 == 0:
+    if (
+        qs is None
+        and kc.ndim == 4
+        and kc.size(1) % 256 == 0
+        and (q.ndim == 3 or (q.ndim == 4 and q.size(1) == 1))
+    ):
+        q, k, v, qs, original = contract.cache(q, kc, vc, k, v, past, pages, qs)
         return _flash_attn.flash_attn_with_kvcache(
             q[:, None],
             kc,
@@ -65,7 +73,7 @@ def forward_cache(
             cache_seqlens=past,
             block_table=pages,
             causal=causal,
-        )[:, 0]
+        )[:, 0].reshape(original)
     return reference.forward_cache(
         q, kc, vc, k, v, past, pages, qs, mask, causal, dense=forward
     )

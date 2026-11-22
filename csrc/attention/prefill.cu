@@ -35,7 +35,7 @@ torch::Tensor attn_prefill(torch::Tensor q,
         q.scalar_type(),
         [&](auto tag) {
             using T = typename decltype(tag)::Type;
-            launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream);
+            launch_attention<T>(p, stream);
         },
         [](at::ScalarType dtype) {
             return unsupported_dtype_message<AttentionTypes>("attention", dtype);

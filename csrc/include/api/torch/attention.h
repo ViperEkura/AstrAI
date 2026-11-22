@@ -67,5 +67,13 @@ torch::Tensor attention_varlen(torch::Tensor q, torch::Tensor k, torch::Tensor v
                                c10::optional<torch::Tensor> cu_seqlens_k, bool is_causal,
                                c10::optional<double> scale);
 
+
+torch::Tensor cache_forward(torch::Tensor q, torch::Tensor kc, torch::Tensor vc,
+                            torch::Tensor k, torch::Tensor v, torch::Tensor past,
+                            torch::Tensor pages, c10::optional<torch::Tensor> qs,
+                            c10::optional<torch::Tensor> mask, bool causal, int64_t split,
+                            c10::optional<torch::Tensor> op, c10::optional<torch::Tensor> ml,
+                            c10::optional<torch::Tensor> output);
+
 } // namespace attention
 } // namespace astrai

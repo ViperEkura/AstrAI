@@ -327,17 +327,29 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
     }
 
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
+        if (p.cache_seqlens) {
+            const int added = p.qo_indptr ? p.qo_indptr[batch+1]-p.qo_indptr[batch] : 1;
+            return p.cache_seqlens[batch] + added;
+        }
         return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
     }
 
     template <int HEAD_DIM>
     static DEVICE_FORCEINLINE Context make_ctx(const AttentionParams& p, int batch, int kv_head) {
-        return {p.req_pool_indices[batch], (int64_t)p.max_context_len,
+        return {p.cache_seqlens ? batch : p.req_pool_indices[batch],
+                p.cache_seqlens ? p.table_stride : p.max_context_len,
                 (int64_t)p.kv_head * HEAD_DIM, (int64_t)kv_head * HEAD_DIM};
     }
     static DEVICE_FORCEINLINE int
     resolve_token(const AttentionParams& p, const Context& c, int kc, bool valid) {
-        return valid ? p.req_to_token[c.req_idx * c.rtt_stride + kc] : -1;
+        if (!valid) return -1;
+        if (!p.cache_seqlens)
+            return p.req_to_token[c.req_idx * c.rtt_stride + kc];
+        if (kc < 0 || kc >= p.max_context_len) return -1;
+        const int block = p.page_size == 1 ? kc : kc / p.page_size;
+        const int page = p.req_to_token[c.req_idx * c.rtt_stride + block];
+        if (page < 0 || page >= p.num_pages) return -1;
+        return page * p.page_size + (kc - block * p.page_size);
     }
     static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(const AttentionParams& p,
                                                         const Context& c,

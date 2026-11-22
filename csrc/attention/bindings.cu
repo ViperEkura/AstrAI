@@ -9,6 +9,7 @@
  */
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("_cache_forward", &astrai::attention::cache_forward);
     m.def("attention_varlen", &astrai::attention::attention_varlen,
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cu_seqlens_q"),
           py::arg("cu_seqlens_k") = py::none(), py::arg("is_causal") = false,

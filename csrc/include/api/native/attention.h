@@ -47,6 +47,10 @@ struct AttentionParams {
     const int* qo_indptr = nullptr;        // [batch + 1] or nullptr for decode
     const int* q_tile_to_batch = nullptr;  // [num_q_tiles], prefill only
     const int* q_tile_to_index = nullptr;  // [num_q_tiles], prefill only
+    const int* cache_seqlens = nullptr; // past lengths; set for block-table storage
+    int page_size = 1;
+    int table_stride = 0;
+    int num_pages = 0;
     const bool* mask = nullptr;
 
     // Shape

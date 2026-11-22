@@ -79,7 +79,7 @@ torch::Tensor attention_varlen(torch::Tensor q, torch::Tensor k, torch::Tensor v
             q.scalar_type(),
             [&](auto tag) {
                 using T = typename decltype(tag)::Type;
-                launch_prefill<VarlenQSchedule, VarlenKV<T>>(p, stream);
+                launch_attention_varlen<T>(p, stream);
             },
             [](at::ScalarType d) {
                 return unsupported_dtype_message<AttentionTypes>("varlen", d);

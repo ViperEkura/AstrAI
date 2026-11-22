@@ -72,7 +72,7 @@ inline void finish_pack(c10::optional<double> scale, AttentionParams& p) {
     TORCH_CHECK(p.batch > 0 && p.q_head > 0 && p.kv_head > 0 && p.q_len > 0,
                 "attention batch, heads, and query length must be positive");
     checked_int(static_cast<int64_t>(p.batch) * p.q_head, "attention batch * q_head");
-    with_head_dim(p.head_dim, [](auto) {});
+    detail::with_head_dim(p.head_dim, [](auto) {});
     p.scale = (float)value;
     p.o_ptr = nullptr;
     p.o_part = nullptr;
@@ -93,7 +93,7 @@ struct SplitWorkspace {
 inline SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& o_part_buf,
                                             const c10::optional<torch::Tensor>& ml_part_buf,
                                             AttentionParams& p,
-                                            const DecodeLaunchPlan& plan,
+                                            const detail::DecodeLaunchPlan& plan,
                                             const torch::Tensor& q) {
     const bool has_o = o_part_buf.has_value() && o_part_buf->defined();
     const bool has_ml = ml_part_buf.has_value() && ml_part_buf->defined();

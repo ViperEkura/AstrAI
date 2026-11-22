@@ -1,16 +1,304 @@
+/*
+ * Attention dispatch: select a kernel type, build a launch plan, then execute.
+ * The typed visitor binds planning and launch to the same specialization.
+ * Pure CUDA, no torch: native harnesses use the production dispatch path.
+ * Kernel bodies live in kernel/attention/mainloop.cuh.
+ */
+
 #pragma once
 
-#include <kernel/attention/append.cuh>
-#include <kernel/attention/dispatch.cuh>
+#include <algorithm>
+#include <atomic>
+#include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 
-namespace astrai::attention {
+#include <api/native/attention.h>
+#include <kernel/attention/append.cuh>
+#include <kernel/attention/epilogue.cuh>
+#include <kernel/attention/mainloop.cuh>
+#include <memory/layout_policies.cuh>
+#include <utils/launch.cuh>
+
+namespace astrai {
+namespace attention {
+namespace detail {
+
+/*
+ * The one list of instantiated head dims — the dispatch switch, the error
+ * message and (drift-asserted) the Python backend's HEAD_DIMS all read it.
+ */
+#define ASTRAI_ATTN_HEAD_DIMS(X) X(32) X(64) X(128) X(256)
+
+/*
+ * A head dim no kernel was instantiated for — the launch discipline: never
+ * run a kernel that was not built for the shape.
+ */
+inline std::string head_dim_error(int head_dim) {
+    std::string message = "ASTRAI: attention: head_dim " + std::to_string(head_dim) +
+                          " has no kernel instantiation (instantiated:";
+#define ASTRAI_HEAD_DIM_ROW(D) message += " " + std::to_string(D);
+    ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_ROW)
+#undef ASTRAI_HEAD_DIM_ROW
+    return message + ")";
+}
+
+/*
+ * Split-KV count: fill exactly one wave of blocks.
+ *
+ * The GPU runs blocks in waves of (SM count x resident blocks per SM). A
+ * grid smaller than a wave leaves SMs idle; a grid that crosses into a
+ * second wave pays a full extra wave of latency for the few straggler
+ * blocks. So the split count is chosen to bring the grid as close to one
+ * full wave as possible without crossing it:
+ *   grid = base_blocks * splits <= wave_capacity
+ *   =>   splits = floor(wave_capacity / base_blocks)
+ * The work caps still apply: never more splits than the tile count allows
+ * (each split needs at least min_tiles_per_split tiles to not be pure
+ * combine overhead) and never more than MAX_SPLITS.
+ */
+inline int compute_num_splits(int base_blocks,
+                              int tiles_total,
+                              int wave_capacity,
+                              int min_tiles_per_split = 1) {
+    int cap = std::min(tiles_total / std::max(min_tiles_per_split, 1), MAX_SPLITS);
+    if (cap <= 1)
+        return 1;
+    return std::max(1, std::min(wave_capacity / std::max(base_blocks, 1), cap));
+}
+
+/*
+ * Cache wave capacity per kernel instantiation and device. Head dims and mask
+ * variants can have different register footprints.
+ */
+template <auto Kernel, int Threads> inline int decode_wave_capacity() {
+    static std::atomic<int> cached[64] = {};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess)
+        return 1;
+    const bool cacheable = device >= 0 && device < 64;
+    if (cacheable) {
+        const int value = cached[device].load(std::memory_order_relaxed);
+        if (value)
+            return value;
+    }
+    int sms = 0, per_sm = 0;
+    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        return 1;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, Kernel, Threads, 0) != cudaSuccess ||
+        per_sm < 1)
+        per_sm = 1;
+    const int capacity = std::max(1, sms * per_sm);
+    if (cacheable)
+        cached[device].store(capacity, std::memory_order_relaxed);
+    return capacity;
+}
+
+// Tile shape is a compile-time property of the prefill specialization.
+template <int HEAD_DIM, bool IsCausal> struct PrefillConfig {
+    static_assert(HEAD_DIM == 32 || HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
+    static constexpr int BC = HEAD_DIM == 256 ? 16 : (IsCausal && HEAD_DIM <= 64 ? 64 : 32);
+    static constexpr int WARPS = 4;
+    static constexpr int STAGES = 2;
+};
+
+struct DecodePlanQuery {
+    int batch;
+    int q_heads;
+    int kv_heads;
+    int head_dim;
+    int kv_tiles;
+    int wave_capacity;
+};
+
+struct DecodeLaunchPlan {
+    dim3 grid;
+    bool direct_output;
+};
+
+// Pure split policy, shared by all layouts and independently testable.
+inline DecodeLaunchPlan make_decode_plan(const DecodePlanQuery& query) {
+    const int passes = (query.q_heads / query.kv_heads + 15) / 16;
+    const int blocks_per_batch = query.kv_heads * passes;
+    const int splits =
+        compute_num_splits(query.batch * blocks_per_batch, query.kv_tiles, query.wave_capacity, 2);
+    // Wider direct-output kernels lose graph latency; retain the combine path.
+    return {dim3(blocks_per_batch, query.batch, splits), splits == 1 && query.head_dim <= 128};
+}
+
+template <int HEAD_DIM,
+          typename QSchedule,
+          typename KV,
+          bool IsCausal,
+          bool HasMask,
+          bool MaskCoversShape = false,
+          bool FixedSplits = false>
+struct PrefillKernel {
+    using Config = PrefillConfig<HEAD_DIM, IsCausal>;
+    using Traits =
+        KernelTraits<HEAD_DIM, FixedSplits ? 16 : Config::BC, Config::WARPS,
+                     Config::STAGES, typename KV::Elem>;
+
+    static dim3 plan(const AttentionParams& p) {
+        // Each block owns BLOCK_M packed (head, row) rows; grid.y selects the KV head.
+        constexpr int BLOCK_M = Traits::BR * Config::WARPS;
+        return dim3(QSchedule::packed_grid_x(p, BLOCK_M, BLOCK_M), p.kv_head,
+                    QSchedule::host_grid_batch(p));
+    }
+
+    static void launch(const AttentionParams& p, dim3 grid, cudaStream_t stream) {
+        using Mainloop = PrefillMainloop<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape, FixedSplits>;
+        attention_kernel<Mainloop, OutputEpilogue<Traits, true>>
+            <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
+    }
+};
+
+template <int HEAD_DIM, typename KV, bool HasMask, bool SkipEmptySplits = false,
+          bool FixedSplits = false>
+struct DecodeKernel {
+    // BC=16 retains the existing shared-memory/register footprint and occupancy.
+    using Traits = KernelTraits<HEAD_DIM, 16, 1, 2, typename KV::Elem>;
+
+    static DecodePlanQuery query(const AttentionParams& p) {
+        const int kv_len = KV::host_kv_len(p);
+        // Keep the partial-output kernel as the occupancy reference for both modes.
+        return {p.batch,
+                p.q_head,
+                p.kv_head,
+                HEAD_DIM,
+                (kv_len + Traits::BC - 1) / Traits::BC,
+                decode_wave_capacity<
+                    attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits, FixedSplits>,
+                                     SplitEpilogue<Traits>>,
+                    Traits::NUM_THREADS>()};
+    }
+
+    static DecodeLaunchPlan plan(const AttentionParams& p) {
+        if constexpr (FixedSplits) {
+            const int blocks = p.kv_head * ((p.q_head / p.kv_head + 15) / 16);
+            const int length = KV::host_kv_len(p);
+            const int splits = length > 0 ? (length - 1) / p.kv_split_size + 1 : 1;
+            return {dim3(blocks, p.batch, splits), splits == 1};
+        }
+        return make_decode_plan(query(p));
+    }
+
+    static void launch(AttentionParams& p, const DecodeLaunchPlan& plan, cudaStream_t stream) {
+        p.num_splits = static_cast<int>(plan.grid.z);
+        if (plan.direct_output) {
+            attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits>>
+                <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
+            ASTRAI_LAUNCH_CHECK();
+            return;
+        }
+        attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits, FixedSplits>,
+                         SplitEpilogue<Traits>><<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
+        split_kv_combine<KV, Traits::BC, SkipEmptySplits, FixedSplits>
+            <<<p.batch * p.q_head, HEAD_DIM, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
+    }
+};
+
+// One head-dimension switch serves torch entries, native launches and plan inspection.
+template <typename Fn> inline auto with_head_dim(int head_dim, Fn&& fn) {
+    switch (head_dim) {
+#define ASTRAI_HEAD_DIM_CASE(D)                                                                    \
+    case D:                                                                                        \
+        return fn(std::integral_constant<int, D>{});
+        ASTRAI_ATTN_HEAD_DIMS(ASTRAI_HEAD_DIM_CASE)
+#undef ASTRAI_HEAD_DIM_CASE
+    }
+    throw std::runtime_error(head_dim_error(head_dim));
+}
+
+template <typename QSchedule, typename KV, bool FixedSplits = false, typename Fn>
+inline auto with_prefill_kernel(const AttentionParams& p, Fn&& fn) {
+    // Paged partial masks need extent checks; full coverage can omit them.
+    // Dense keeps its checked kernel to avoid redundant compiler-generated comparisons.
+    const bool mask_covers_shape = KV::kPaged && p.mask && p.mask_k_size >= KV::host_kv_len(p) &&
+                                   (p.mask_q_size == 1 || p.mask_q_size >= p.q_len);
+    return with_head_dim(p.head_dim, [&](auto dim) {
+        constexpr int D = decltype(dim)::value;
+        if (p.is_causal) {
+            if (p.mask) {
+                if constexpr (KV::kPaged) {
+                    if (mask_covers_shape)
+                        return fn(PrefillKernel<D, QSchedule, KV, true, true, true, FixedSplits>{});
+                }
+                return fn(PrefillKernel<D, QSchedule, KV, true, true, false, FixedSplits>{});
+            }
+            return fn(PrefillKernel<D, QSchedule, KV, true, false, false, FixedSplits>{});
+        }
+        if (p.mask) {
+            if constexpr (KV::kPaged) {
+                if (mask_covers_shape)
+                    return fn(PrefillKernel<D, QSchedule, KV, false, true, true, FixedSplits>{});
+            }
+            return fn(PrefillKernel<D, QSchedule, KV, false, true, false, FixedSplits>{});
+        }
+        return fn(PrefillKernel<D, QSchedule, KV, false, false, false, FixedSplits>{});
+    });
+}
+
+template <int D, typename KV, typename Fn>
+inline auto with_decode_variant(const AttentionParams& p, Fn&& fn) {
+    if constexpr (KV::kPaged) {
+        if (p.kv_split_size) {
+            if (p.mask)
+                return fn(DecodeKernel<D, KV, true, false, true>{});
+            return fn(DecodeKernel<D, KV, false, false, true>{});
+        }
+        if (p.kv_len >= SKIP_EMPTY_SPLITS_MIN_CAPACITY) {
+            if (p.mask)
+                return fn(DecodeKernel<D, KV, true, true>{});
+            return fn(DecodeKernel<D, KV, false, true>{});
+        }
+    }
+    if (p.mask)
+        return fn(DecodeKernel<D, KV, true>{});
+    return fn(DecodeKernel<D, KV, false>{});
+}
+
+template <typename KV, typename Fn>
+inline auto with_decode_kernel(const AttentionParams& p, Fn&& fn) {
+    return with_head_dim(p.head_dim, [&](auto dim) {
+        constexpr int D = decltype(dim)::value;
+        // Keep scalar new-token loads out of the aligned kernel's unrolled loader.
+        if constexpr (KV::kPaged) {
+            if (!KV::new_kv_aligned(p)) {
+                using UnalignedKV = PagedKV<typename KV::Elem, false>;
+                return with_decode_variant<D, UnalignedKV>(p, fn);
+            }
+        }
+        // A single right-aligned query needs no independent causal specialization.
+        return with_decode_variant<D, KV>(p, fn);
+    });
+}
+
+template <typename QSchedule, typename KV>
+inline void launch_prefill(AttentionParams& p, cudaStream_t stream) {
+    auto launch = [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); };
+    if (p.kv_split_size)
+        with_prefill_kernel<QSchedule, KV, true>(p, launch);
+    else
+        with_prefill_kernel<QSchedule, KV>(p, launch);
+}
+
+template <typename KV> inline void launch_decode(AttentionParams& p, cudaStream_t stream) {
+    with_decode_kernel<KV>(p, [&](auto kernel) { kernel.launch(p, kernel.plan(p), stream); });
+}
+
+} // namespace detail
 
 template <typename T> inline void launch_attention(AttentionParams& p, cudaStream_t stream) {
-    launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream);
+    detail::launch_prefill<DenseQSchedule, ContigKV<T>>(p, stream);
 }
 
 template <typename T> inline void launch_attention_varlen(AttentionParams& p, cudaStream_t stream) {
-    launch_prefill<VarlenQSchedule, VarlenKV<T>>(p, stream);
+    detail::launch_prefill<VarlenQSchedule, VarlenKV<T>>(p, stream);
 }
 
 // The caller owns split storage, including workspace supplied for graph replay.
@@ -18,10 +306,11 @@ template <typename T, typename Decode>
 inline void launch_attention_with_kvcache(AttentionParams& p, cudaStream_t stream, Decode decode) {
     if (p.cu_seqlens_q) {
         append_kv<T><<<p.q_len, 128, 0, stream>>>(p);
-        launch_prefill<VarlenQSchedule, PagedKV<T>>(p, stream);
+        detail::launch_prefill<VarlenQSchedule, PagedKV<T>>(p, stream);
     } else {
-        with_decode_kernel<PagedKV<T>>(p, [&](auto kernel) { decode(kernel, kernel.plan(p)); });
+        detail::with_decode_kernel<PagedKV<T>>(p, [&](auto kernel) { decode(kernel, kernel.plan(p)); });
     }
 }
 
-} // namespace astrai::attention
+} // namespace attention
+} // namespace astrai

@@ -13,6 +13,20 @@ All three support GQA. Rectangular causal attention aligns at the bottom right.
 A fully masked row returns zero. The cache operator scales by `1 / sqrt(head_dim)`.
 Native FP16 and BF16 kernels cover head dimensions 32, 64, 128 and 256.
 
+## Dispatch and ownership
+
+All three functions build an immutable `AttentionSpec` and use the same
+`AttentionDispatcher` and context key. Its mode distinguishes dense, packed
+and cache calls; backend capability checks and strict/soft selection remain
+in this layer. CUDA, Torch and Flash modules implement the selected calls.
+The three stateless `kernel/attention.py` wrappers alone translate arguments
+to the compiled ABI. They do not select backends or retain cache state.
+
+The model-side adapter selects the current layer's buffers and the step's
+query offsets or graph scratch. It passes only tensors and scalar options
+to the private cache dispatcher entry, which preserves request-local masks.
+Extension code does not import model cache classes.
+
 ## Query scheduling and KV addressing
 
 Dense queries use the rectangular grid. The packed schedule finds each tile's
@@ -63,8 +77,9 @@ copy pipeline, tile schedules and numerical recurrence.
 ## Native launch dispatch
 
 Attention follows the same typed query, plan, and launch structure as GEMM,
-with three operation launchers in `launcher/attention.cuh` and shared dispatch in
-`kernel/attention/dispatch.cuh`:
+with three operation launchers and their private shared dispatch in
+`launcher/attention.cuh`. The device-only `kernel/attention/` directory owns
+mainloops, addressing, masks and epilogues:
 
 1. `with_prefill_kernel` / `with_decode_kernel` select the head dimension
    and mask specialization once. Prefill also selects causality. Paged
@@ -84,8 +99,8 @@ device sequence lengths. Every call plans from its current shape; residual
 split fields in `AttentionParams` do not bypass planning. Paged decode uses
 the host cache capacity, so device lengths can change during graph replay.
 The existing tile recipes, occupancy reference and split limits are retained.
-The native `launch_prefill` and `launch_decode` functions share that selection
-with the Torch entry. The Torch cache entry retains scratch tensors through
+The private tiled and split-KV helpers share that selection with the three
+operation launchers; they are not separate operator entry points. The Torch cache entry retains scratch tensors through
 launch; no call-wrapper object or Dispatch/Entry class is needed.
 Scratch still uses the kernel's `MAX_SPLITS` stride, and caller-supplied
 buffers are validated even when direct output needs no scratch.

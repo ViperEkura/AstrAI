@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from astrai.extension.backend.attention.cache import _model_cache_attention
+from astrai.model.components.attention import _model_cache_attention
 from astrai.model.kv_cache import DecodeKVCache, PrefillKVCache
 
 

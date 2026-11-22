@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.extension.backend import apply_rotary_emb, attention
-from astrai.extension.backend.attention.cache import _model_cache_attention
+from astrai.extension.backend.attention.dispatcher import _cache_attention
 from astrai.factory import BaseFactory
 from astrai.model.components.conv import Conv1d
 from astrai.model.components.gdn_ops import (
@@ -16,7 +16,29 @@ from astrai.model.components.gdn_ops import (
 from astrai.model.components.initialization import should_initialize
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
-from astrai.model.kv_cache import KVCache
+from astrai.model.kv_cache import DecodeKVCache, KVCache
+
+
+def _model_cache_attention(q, k, v, cache, layer, mask, is_causal):
+    if isinstance(cache, DecodeKVCache):
+        offsets = None
+        workspace = (cache.decode_o_part, cache.decode_ml_part, cache.decode_out)
+    else:
+        offsets = cache.cu_seqlens_q
+        workspace = (None, None, None)
+    return _cache_attention(
+        q,
+        cache.k_buffer[layer],
+        cache.v_buffer[layer],
+        k,
+        v,
+        cache.cache_seqlens,
+        cache.page_table,
+        offsets,
+        mask,
+        is_causal,
+        workspace,
+    )
 
 
 class AttnFactory(BaseFactory[nn.Module]):

@@ -82,3 +82,104 @@ def forward(
         .permute(0, 2, 1, 3)
         .contiguous()
     )
+
+
+def forward_varlen(q, k, v, qs, ks, is_causal, scale):
+    qoffs, koffs = qs.tolist(), ks.tolist()
+    for offsets, tokens in ((qoffs, q.size(0)), (koffs, k.size(0))):
+        if (
+            offsets[0] != 0
+            or offsets[-1] != tokens
+            or any(a > b for a, b in zip(offsets, offsets[1:]))
+        ):
+            raise ValueError("invalid segment offsets")
+    result = []
+    for i in range(len(qoffs) - 1):
+        qr = q[qoffs[i] : qoffs[i + 1]]
+        kr = k[koffs[i] : koffs[i + 1]]
+        vr = v[koffs[i] : koffs[i + 1]]
+        if not qr.size(0) or not kr.size(0):
+            result.append(torch.zeros_like(qr))
+        else:
+            result.append(
+                forward(
+                    qr[None],
+                    kr[None],
+                    vr[None],
+                    is_causal=is_causal,
+                    scale=scale,
+                )[0]
+            )
+    return torch.cat(result)
+
+
+def forward_cache(
+    q,
+    kc,
+    vc,
+    k,
+    v,
+    past,
+    pages,
+    qs,
+    mask,
+    causal,
+    workspace=(None, None, None),
+    *,
+    dense=forward,
+):
+    offsets = list(range(past.numel() + 1)) if qs is None else qs.tolist()
+    lengths = past.tolist()
+    size = kc.size(1)
+    if (
+        offsets[0] != 0
+        or offsets[-1] != q.size(0)
+        or any(a > b for a, b in zip(offsets, offsets[1:]))
+    ):
+        raise ValueError("invalid query offsets")
+    mask = _mask_view(mask)
+    if mask is not None and (
+        mask.device != q.device
+        or mask.size(0) not in (1, len(lengths))
+        or mask.size(1) not in (1, q.size(1))
+        or not 0 < mask.size(-1) <= pages.size(1) * size
+        or not 0 < mask.size(-2) <= (q.size(0) if qs is not None else 1)
+    ):
+        raise ValueError("invalid request-local paged mask")
+    slots = []
+    for i, n in enumerate(lengths):
+        length = n + offsets[i + 1] - offsets[i]
+        if n < 0 or length > pages.size(1) * size:
+            raise ValueError("request exceeds cache capacity")
+        active = pages[i, : (length + size - 1) // size]
+        if any(page < 0 or page >= kc.size(0) for page in active.tolist()):
+            raise ValueError("page index outside cache")
+        pos = torch.arange(length, device=q.device)
+        slots.append(active[pos // size].long() * size + pos % size)
+    keys = kc.view(-1, *kc.shape[-2:])
+    values = vc.view_as(keys)
+    output = []
+    for i, (start, end) in enumerate(zip(offsets, offsets[1:])):
+        sl = slots[i]
+        keys[sl[lengths[i] :]] = k[start:end]
+        values[sl[lengths[i] :]] = v[start:end]
+        if start == end:
+            output.append(q[start:end])
+            continue
+        local = None
+        if mask is not None:
+            item = mask[:1] if mask.size(0) == 1 else mask[i : i + 1]
+            allowed = torch.ones(
+                (1, 1, end - start, sl.numel()), dtype=torch.bool, device=q.device
+            )
+            local = _packed_mask(item, allowed, end - start)
+        output.append(
+            dense(
+                q[None, start:end],
+                keys[sl][None],
+                values[sl][None],
+                local,
+                causal,
+            )[0]
+        )
+    return torch.cat(output)

@@ -4,8 +4,9 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from astrai.extension.backend.attention import torch as torch_attention
+from astrai.extension.kernel import attention as kernel
 from astrai.extension.kernel.attention import ROLLOUT_KV_SPLIT_SIZE
-from astrai.extension.runtime.loader import get_module, is_available
+from astrai.extension.runtime.loader import is_available
 
 HEAD_DIMS = (32, 64, 128, 256)
 
@@ -25,7 +26,7 @@ def supports(spec):
 
 
 def forward(q, k, v, mask=None, is_causal=False, *, scale=None):
-    return get_module("attention").attention(q, k, v, mask, scale, is_causal, 0)
+    return kernel.attention(q, k, v, mask, is_causal, scale=scale)
 
 
 class _ConsistentPrefill(torch.autograd.Function):
@@ -34,8 +35,8 @@ class _ConsistentPrefill(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, mask)
         ctx.is_causal = is_causal
         ctx.scale = scale
-        return get_module("attention").attention(
-            q, k, v, mask, scale, is_causal, ROLLOUT_KV_SPLIT_SIZE
+        return kernel.attention(
+            q, k, v, mask, is_causal, scale=scale, kv_split_size=ROLLOUT_KV_SPLIT_SIZE
         )
 
     @staticmethod
@@ -57,6 +58,37 @@ class _ConsistentPrefill(torch.autograd.Function):
 def forward_consistent(q, k, v, mask=None, is_causal=False, *, scale=None):
     if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
         return _ConsistentPrefill.apply(q, k, v, mask, is_causal, scale)
-    return get_module("attention").attention(
-        q, k, v, mask, scale, is_causal, ROLLOUT_KV_SPLIT_SIZE
+    return kernel.attention(
+        q, k, v, mask, is_causal, scale=scale, kv_split_size=ROLLOUT_KV_SPLIT_SIZE
+    )
+
+
+def forward_varlen(q, k, v, qs, ks, is_causal, scale):
+    return kernel.attention_varlen(q, k, v, qs, ks, is_causal, scale)
+
+
+def forward_cache(
+    q, kc, vc, k, v, past, pages, qs, mask, causal, workspace=(None, None, None)
+):
+    return kernel.attention_with_kvcache(
+        q, kc, vc, k, v, past, pages, qs, mask, causal, workspace=workspace
+    )
+
+
+def forward_cache_consistent(
+    q, kc, vc, k, v, past, pages, qs, mask, causal, workspace=(None, None, None)
+):
+    return kernel.attention_with_kvcache(
+        q,
+        kc,
+        vc,
+        k,
+        v,
+        past,
+        pages,
+        qs,
+        mask,
+        causal,
+        workspace=workspace,
+        kv_split_size=ROLLOUT_KV_SPLIT_SIZE,
     )

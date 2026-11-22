@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from astrai.extension.backend.attention import torch as reference
 from astrai.extension.backend.attention.common import (
     AttentionSpec,
     _flash_attn,
@@ -48,3 +49,23 @@ def forward(
         softmax_scale=scale,
     )
     return out.contiguous()
+
+
+def forward_cache(
+    q, kc, vc, k, v, past, pages, qs, mask, causal, workspace=(None, None, None)
+):
+    # FA2's paged path requires blocks in multiples of 256.
+    if qs is None and kc.size(1) % 256 == 0:
+        return _flash_attn.flash_attn_with_kvcache(
+            q[:, None],
+            kc,
+            vc,
+            k=k[:, None],
+            v=v[:, None],
+            cache_seqlens=past,
+            block_table=pages,
+            causal=causal,
+        )[:, 0]
+    return reference.forward_cache(
+        q, kc, vc, k, v, past, pages, qs, mask, causal, dense=forward
+    )

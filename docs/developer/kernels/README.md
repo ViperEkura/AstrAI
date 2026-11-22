@@ -214,12 +214,12 @@ of model, cache, fallback, and backend-selection policy.
 - Tests that specifically exercise a compiled kernel may import from
   `astrai.extension.kernel`.
 
-Native attention tests can select the compiled module directly:
+Native attention tests can call the stateless compiled-kernel adapter:
 
 ```python
-from astrai.extension.runtime.loader import get_module
+from astrai.extension.kernel.attention import attention
 
-output = get_module("attention").attention(q, k, v, mask=mask, is_causal=True)
+output = attention(q, k, v, mask=mask, is_causal=True)
 ```
 
 Model code uses the three public attention functions described in [Attention](attention.md).

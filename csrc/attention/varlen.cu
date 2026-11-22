@@ -49,7 +49,7 @@ static AttentionParams pack_varlen(const torch::Tensor& q, const torch::Tensor& 
     p.is_causal = causal;
     p.scale = scale;
     TORCH_CHECK(std::isfinite(p.scale) && p.scale > 0, "native scale must be positive and finite");
-    with_head_dim(p.head_dim, [](auto) {});
+    detail::with_head_dim(p.head_dim, [](auto) {});
     return p;
 }
 

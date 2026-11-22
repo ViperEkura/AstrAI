@@ -17,15 +17,15 @@ using namespace astrai::attention;
 /* Dispatch resolves head_dim from the element type, keeping the harness torch-free. */
 using bf16 = astrai::bf16;
 
-// Plan checks exercise the public dispatcher without allocating or launching kernels.
-static bool same_decode_plan(const DecodeLaunchPlan& a, const DecodeLaunchPlan& b) {
+// Plan checks exercise the native planner without allocating or launching kernels.
+static bool same_decode_plan(const detail::DecodeLaunchPlan& a, const detail::DecodeLaunchPlan& b) {
     return a.grid.x == b.grid.x && a.grid.y == b.grid.y && a.grid.z == b.grid.z &&
            a.direct_output == b.direct_output;
 }
 
-template <int D, typename KV, bool HasMask, bool SkipEmptySplits>
-static bool
-decode_type_matches(DecodeKernel<D, KV, HasMask, SkipEmptySplits>, int dim, bool has_mask) {
+template <int D, typename KV, bool HasMask, bool SkipEmptySplits, bool FixedSplits>
+static bool decode_type_matches(
+    detail::DecodeKernel<D, KV, HasMask, SkipEmptySplits, FixedSplits>, int dim, bool has_mask) {
     return D == dim && HasMask == has_mask;
 }
 
@@ -38,8 +38,7 @@ static int check_decode_query(bool paged, int dim, bool has_mask, bool causal) {
     p.kv_head = 2;
     p.head_dim = dim;
     p.q_len = 1;
-    p.kv_len = 17;
-    p.max_context_len = 513;
+    p.kv_len = paged ? 513 : 17;
     p.is_causal = causal;
     p.mask = has_mask ? &mask : nullptr;
     // Planning must neither trust the prior split count nor modify caller state.
@@ -47,7 +46,7 @@ static int check_decode_query(bool paged, int dim, bool has_mask, bool causal) {
     unsigned char before[sizeof(p)];
     std::memcpy(before, &p, sizeof(p));
     bool pass = false;
-    with_decode_kernel<KV>(p, [&](auto kernel) {
+    detail::with_decode_kernel<KV>(p, [&](auto kernel) {
         const auto query = kernel.query(p);
         const auto first = kernel.plan(p);
         pass = decode_type_matches(kernel, dim, has_mask) && query.batch == 3 &&
@@ -60,10 +59,10 @@ static int check_decode_query(bool paged, int dim, bool has_mask, bool causal) {
         pass = pass && same_decode_plan(first, second) && std::memcmp(before, &p, sizeof(p)) == 0;
         // Reusing the parameter object for shorter KV must produce a fresh plan.
         p.kv_len = 1;
-        p.max_context_len = 1;
         p.num_splits = MAX_SPLITS;
     });
-    const auto shorter = with_decode_kernel<KV>(p, [&](auto kernel) { return kernel.plan(p); });
+    const auto shorter =
+        detail::with_decode_kernel<KV>(p, [&](auto kernel) { return kernel.plan(p); });
     pass = pass && shorter.grid.z == 1 && shorter.direct_output == (dim <= 128);
     if (!pass)
         printf("FAILED decode query: paged=%d D=%d mask=%d causal=%d\n", paged, dim, has_mask,
@@ -73,7 +72,7 @@ static int check_decode_query(bool paged, int dim, bool has_mask, bool causal) {
 
 static int run_plan_tests() {
     struct Case {
-        DecodePlanQuery query;
+        detail::DecodePlanQuery query;
         unsigned int x, y, splits;
         bool direct;
     };
@@ -92,7 +91,7 @@ static int run_plan_tests() {
     int fail = 0;
     for (int i = 0; i < static_cast<int>(sizeof(cases) / sizeof(cases[0])); ++i) {
         const auto& c = cases[i];
-        const auto plan = make_decode_plan(c.query);
+        const auto plan = detail::make_decode_plan(c.query);
         if (plan.grid.x != c.x || plan.grid.y != c.y || plan.grid.z != c.splits ||
             plan.direct_output != c.direct) {
             printf("FAILED decode split policy case %d\n", i);
@@ -112,7 +111,7 @@ static int run_plan_tests() {
     unsupported.head_dim = 96;
     bool rejected = false;
     try {
-        with_decode_kernel<ContigKV<bf16>>(unsupported, [](auto) {});
+        detail::with_decode_kernel<ContigKV<bf16>>(unsupported, [](auto) {});
     } catch (const std::runtime_error& error) {
         rejected = std::string(error.what()).find("96") != std::string::npos;
     }
@@ -189,9 +188,9 @@ static int run_contig_test(int B, int Hq, int Hk, int ql, int kl, int D, int cau
         setup_scratch(p, sc);
         p.o_part = sc.o_part;
         p.ml_part = sc.ml_part;
-        launch_decode<ContigKV<bf16>>(p, 0);
+        detail::launch_decode<ContigKV<bf16>>(p, 0);
     } else {
-        launch_prefill<DenseQSchedule, ContigKV<bf16>>(p, 0);
+        detail::launch_prefill<DenseQSchedule, ContigKV<bf16>>(p, 0);
     }
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
@@ -287,8 +286,8 @@ static void bench_contig(int B, int Hq, int Hk, int ql, int kl, int D, int causa
     if (causal)
         flops *= 0.5;
     BenchResult r =
-        decode ? bench_kernel([&] { launch_decode<ContigKV<bf16>>(p, 0); }, 3, 10, flops)
-               : bench_kernel([&] { launch_prefill<DenseQSchedule, ContigKV<bf16>>(p, 0); }, 3, 10,
+        decode ? bench_kernel([&] { detail::launch_decode<ContigKV<bf16>>(p, 0); }, 3, 10, flops)
+               : bench_kernel([&] { detail::launch_prefill<DenseQSchedule, ContigKV<bf16>>(p, 0); }, 3, 10,
                               flops);
 
     char cfg[64];

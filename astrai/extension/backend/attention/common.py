@@ -55,6 +55,7 @@ class AttentionSpec(OpSpec):
     mask_last_stride: int
     is_causal: bool
     scale: Optional[float]
+    mode: str = "dense"
 
     @property
     def operation(self) -> str:

@@ -312,7 +312,9 @@ def test_paged_decode_graph_replays_split_append(dtype, dim, width):
 def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
     torch.manual_seed(26)
     batch, heads, kv_heads, width = 2, 6, 2, 8192
-    length_cases = ((8191, 1), (17, 33), (1, 513), (0, 2048))
+    # Appending one token requires final length >= 1; length 1 tests an empty
+    # history. Fully masked rows below still exercise zero-output split merging.
+    length_cases = ((8191, 1), (17, 33), (1, 513), (1, 2048))
     q = torch.randn(batch, heads, dim, device="cuda", dtype=dtype)
     k_cache = torch.randn(batch * width, kv_heads, dim, device="cuda", dtype=q.dtype)
     v_cache = torch.randn_like(k_cache)
@@ -367,10 +369,8 @@ def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
         scratch.fill_(float("nan"))
         ml.fill_(float("nan"))
         graph.replay()
+        assert torch.count_nonzero(captured[0, 0]) == 0
         for b, length in enumerate(lengths):
-            if length == 0:
-                assert torch.count_nonzero(captured[b]) == 0
-                continue
             slot = b * width + length - 1
             torch.testing.assert_close(k_cache[slot], new_k[b], rtol=0, atol=0)
             torch.testing.assert_close(v_cache[slot], new_v[b], rtol=0, atol=0)

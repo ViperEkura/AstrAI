@@ -1,21 +1,18 @@
 """Attention Dispatcher capability and execution tests."""
 
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from astrai.extension import attention, op_backend, paged_attention, set_op
+from astrai.extension import attention, attention_with_kvcache, op_backend, set_op
 from astrai.extension.backend.attention import AttentionDispatcher, cuda, flash
 from astrai.extension.backend.attention import torch as native
 from astrai.extension.runtime.operation import ExplicitSelectionError
 
 
-def _spec(q, *, cache=None, mask=None, fwd=None, scale=None):
-    return AttentionDispatcher().build_spec(
-        q, q, q, cache, 0, mask, False, fwd, scale=scale
-    )
+def _spec(q, *, mask=None, scale=None):
+    return AttentionDispatcher().build_spec(q, q, q, mask, False, scale=scale)
 
 
 def test_explicit_incapable_choice_is_strict():
@@ -29,10 +26,7 @@ def test_process_choice_is_soft():
     q = torch.zeros(1, 2, 4, 8)
     set_op("attention", "cuda")
     try:
-        assert (
-            AttentionDispatcher().dispatch(q, q, q, None, 0, None, False, None)
-            is native.forward
-        )
+        assert AttentionDispatcher().dispatch(q, q, q, None, False) is native.forward
     finally:
         set_op("attention", None)
 
@@ -50,13 +44,10 @@ def test_flash_capability_checks_device_dtype_and_mask(monkeypatch):
 def test_cuda_training_is_never_selected(monkeypatch):
     monkeypatch.setattr(cuda, "is_available", lambda name: True)
     q = torch.empty(2, 4, 64, dtype=torch.bfloat16, requires_grad=True)
-    spec = replace(_spec(q, cache=object(), fwd="decode"), device=torch.device("cuda"))
+    spec = replace(_spec(q), device=torch.device("cuda"))
     assert spec.needs_backward
-    assert not cuda.supports(spec)
     with pytest.raises(ExplicitSelectionError):
-        AttentionDispatcher().select(
-            spec, "cuda", "explicit", q, q, q, object(), 0, None, False, "decode"
-        )
+        AttentionDispatcher().select(spec, "cuda", "explicit", q, q, q, None, False)
 
 
 @pytest.mark.parametrize("q_len,kv_len", [(7, 3), (3, 7)])
@@ -85,23 +76,7 @@ def test_flash_packed_mask_rejected_before_cache_mutation():
     q = torch.zeros(2, 4, 8, dtype=torch.bfloat16)
     mask = torch.ones(1, 4, dtype=torch.bool)
     with pytest.raises(ValueError, match="custom attention mask"):
-        flash.forward(q, q, q, object(), 0, attn_mask=mask, fwd="prefill")
-
-
-def test_cuda_paged_mask_shape_rejected_before_cache_write():
-    q = torch.zeros(2, 2, 64)
-    kv = torch.zeros(2, 1, 64)
-    cache = SimpleNamespace(
-        req_pool_indices=torch.zeros(1, dtype=torch.int32),
-        req_to_token=torch.zeros(1, 4, dtype=torch.int32),
-        k_buffer=torch.ones(1, 4, 1, 64),
-        v_buffer=torch.ones(1, 4, 1, 64),
-    )
-    full_mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
-    with pytest.raises(ValueError, match="request-local"):
-        cuda.forward(q, kv, kv, cache, 0, full_mask, fwd="prefill")
-    assert torch.count_nonzero(cache.k_buffer - 1) == 0
-    assert torch.count_nonzero(cache.v_buffer - 1) == 0
+        flash.forward(q, q, q, attn_mask=mask)
 
 
 def test_attention_layout_and_cache_are_explicit():
@@ -110,5 +85,5 @@ def test_attention_layout_and_cache_are_explicit():
         attention(q, q, q)
     with pytest.raises(TypeError):
         attention(q, q, q, None)
-    with pytest.raises(TypeError, match="PrefillKVCache or DecodeKVCache"):
-        paged_attention(q, q, q, kv_cache=None, layer_id=0)
+    with pytest.raises(TypeError):
+        attention_with_kvcache(q, q, q)

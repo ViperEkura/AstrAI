@@ -1,6 +1,6 @@
 """KV cache subsystem: buffers, strategies, pool management.
 
-The physical buffers (``KVCache`` / ``KVStorage`` / ``ReqToTokenPool``) live on
+The physical buffers (``KVCache`` / ``KVStorage`` / ``RequestPageTable``) live on
 the model side in :mod:`astrai.model.kv_cache` — the attention layer consumes
 them directly — and are re-exported here so existing imports keep working.
 """
@@ -14,7 +14,7 @@ from astrai.inference.core.cache.strategy import (
     RadixCache,
     RequestCacheState,
 )
-from astrai.model.kv_cache import KVCache, KVStorage, ReqToTokenPool
+from astrai.model.kv_cache import KVCache, KVStorage, RequestPageTable
 
 __all__ = [
     "AllocationStrategy",
@@ -26,6 +26,6 @@ __all__ = [
     "KVStorage",
     "PagedStrategy",
     "RadixCache",
-    "ReqToTokenPool",
+    "RequestPageTable",
     "RequestCacheState",
 ]

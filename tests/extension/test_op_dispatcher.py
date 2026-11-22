@@ -55,6 +55,6 @@ def test_attention_spec_checks_all_projected_inputs_for_backward():
     q = torch.randn(1, 2, 4, 8)
     k = torch.randn_like(q, requires_grad=True)
     v = torch.randn_like(q)
-    spec = AttentionDispatcher().build_spec(q, k, v, None, 0, None, False, None)
+    spec = AttentionDispatcher().build_spec(q, k, v, None, False)
     assert spec.needs_backward
     assert spec.phase == "train"

@@ -54,8 +54,7 @@ endif()
 # Target name, library kind, and sources; modules declare shared object dependencies here.
 set(KERNEL_TARGETS
     "quantize_entry|OBJECT|quantize/entry.cu"
-    "attention|MODULE|attention/decode.cu attention/prefill.cu attention/paged_decode.cu
-        attention/paged_prefill.cu attention/varlen.cu attention/cache.cu attention/bindings.cu"
+    "attention|MODULE|attention/attention.cu attention/varlen.cu attention/cache.cu attention/bindings.cu"
     "rotary_emb|MODULE|rotary_emb.cu"
     "swiglu|MODULE|swiglu.cu"
     "cross_entropy|MODULE|cross_entropy.cu"

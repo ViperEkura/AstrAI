@@ -16,24 +16,7 @@ using namespace astrai::attention;
 // Element type is the dispatcher's parameter; head_dim resolves inside.
 using bf16 = astrai::bf16;
 
-static int make_q_tile_mapping(const std::vector<int>& q_lens, int** d_batch, int** d_tile) {
-    constexpr int ROWS = 64;
-    std::vector<int> h_batch;
-    std::vector<int> h_tile;
-    for (int b = 0; b < (int)q_lens.size(); ++b) {
-        int n_tiles = (q_lens[b] + ROWS - 1) / ROWS;
-        for (int tile = 0; tile < n_tiles; ++tile) {
-            h_batch.push_back(b);
-            h_tile.push_back(tile);
-        }
-    }
-    size_t bytes = h_batch.size() * sizeof(int);
-    cudaMalloc(d_batch, bytes);
-    cudaMalloc(d_tile, bytes);
-    cudaMemcpy(*d_batch, h_batch.data(), bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(*d_tile, h_tile.data(), bytes, cudaMemcpyHostToDevice);
-    return (int)h_batch.size();
-}
+
 
 /*
  * ---- CPU reference: paged decode with variable seq_lens ----
@@ -191,7 +174,7 @@ struct PagedRig {
     std::vector<int> h_rtt, h_rpi, h_kvi, h_qoi;
 
     bf16 *d_q, *d_o, *d_k, *d_v;
-    int *d_rtt, *d_rpi, *d_kvi, *d_qoi = nullptr;
+    int *d_rtt, *d_past, *d_qoi = nullptr;
     bool* d_mask = nullptr;
     float *d_op = nullptr, *d_ml = nullptr;
 
@@ -230,8 +213,7 @@ struct PagedRig {
         CUDA_CHECK(cudaMalloc(&d_k, kv_elems * sizeof(bf16)));
         CUDA_CHECK(cudaMalloc(&d_v, kv_elems * sizeof(bf16)));
         CUDA_CHECK(cudaMalloc(&d_rtt, (size_t)num_reqs * max_ctx * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_rpi, (size_t)B * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_kvi, (size_t)(B + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_past, (size_t)B * sizeof(int)));
         if (ragged)
             CUDA_CHECK(cudaMalloc(&d_qoi, (B + 1) * sizeof(int)));
         if (split_partials) {
@@ -250,8 +232,7 @@ struct PagedRig {
         cudaFree(d_k);
         cudaFree(d_v);
         cudaFree(d_rtt);
-        cudaFree(d_rpi);
-        cudaFree(d_kvi);
+        cudaFree(d_past);
         if (d_qoi)
             cudaFree(d_qoi);
         if (d_mask)
@@ -296,8 +277,9 @@ struct PagedRig {
         for (int b = 0; b < B; b++)
             h_kvi[b + 1] = h_kvi[b] + kv_lens[b];
         cudaMemcpy(d_rtt, h_rtt.data(), h_rtt.size() * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_rpi, h_rpi.data(), h_rpi.size() * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_kvi, h_kvi.data(), h_kvi.size() * sizeof(int), cudaMemcpyHostToDevice);
+        std::vector<int> past(B);
+        for (int b = 0; b < B; ++b) past[b] = kv_lens[b] - q_lens[b];
+        cudaMemcpy(d_past, past.data(), B * sizeof(int), cudaMemcpyHostToDevice);
         if (d_qoi) {
             h_qoi.assign(B + 1, 0);
             for (int b = 0; b < B; b++)
@@ -324,16 +306,16 @@ struct PagedRig {
         p.q_len = total_q;
         p.q_l_stride = Hq * D;
         p.q_h_stride = D;
-        p.q_d_stride = 1;
-        p.max_context_len = max_ctx;
+        p.kv_len = max_ctx;
         p.scale = 1.0f / sqrtf((float)D);
         p.q_ptr = d_q;
         p.k_ptr = d_k;
         p.v_ptr = d_v;
-        p.req_to_token = d_rtt;
-        p.req_pool_indices = d_rpi;
-        p.kv_indptr = d_kvi;
-        p.qo_indptr = d_qoi;
+        p.page_table = d_rtt;
+        p.table_stride = max_ctx;
+        p.num_pages = pool_size;
+        p.cache_seqlens = d_past;
+        p.cu_seqlens_q = d_qoi;
         p.o_ptr = d_o;
         p.o_part = d_op;
         p.ml_part = d_ml;
@@ -446,14 +428,11 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq, int seed) {
     AttentionParams p = rig.base_params();
     p.is_causal = false;
     p.mask = rig.d_mask;
-    p.mask_b_size = B;
-    p.mask_h_size = 1;
     p.mask_q_size = 1;
     p.mask_k_size = rig.max_sl;
     p.mask_b_stride = rig.max_sl;
     p.mask_h_stride = 0;
     p.mask_q_stride = 0;
-    p.mask_k_stride = 1;
     launch_decode<PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
 
@@ -494,18 +473,11 @@ static int run_prefill_test(int B,
                           rig.h_qoi.data(), nullptr, 0, 0, B, Hq, Hkv, HEAD_DIM, rig.max_ctx,
                           causal, ref);
 
-    int *d_qtb, *d_qti;
-    int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
     AttentionParams p = rig.base_params();
     p.is_causal = causal;
-    p.q_tile_to_batch = d_qtb;
-    p.q_tile_to_index = d_qti;
-    p.num_q_tiles = num_q_tiles;
-    launch_prefill<PackedQSchedule, PagedKV<bf16>>(p, 0);
+    launch_prefill<VarlenQSchedule, PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
-    cudaFree(d_qtb);
-    cudaFree(d_qti);
 
     int fail = rig.check(cfg, ref);
     free(qf);
@@ -545,27 +517,17 @@ template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_
                           rig.h_qoi.data(), rig.h_mask, q_len, q_len, 1, Hq, Hkv, HEAD_DIM,
                           rig.max_ctx, 0, ref);
 
-    int *d_qtb, *d_qti;
-    int num_q_tiles = make_q_tile_mapping(ql, &d_qtb, &d_qti);
 
     AttentionParams p = rig.base_params();
     p.is_causal = false;
     p.mask = rig.d_mask;
-    p.mask_b_size = 1;
-    p.mask_h_size = 1;
     p.mask_q_size = q_len;
     p.mask_k_size = q_len;
     p.mask_b_stride = 0;
     p.mask_h_stride = 0;
     p.mask_q_stride = q_len;
-    p.mask_k_stride = 1;
-    p.q_tile_to_batch = d_qtb;
-    p.q_tile_to_index = d_qti;
-    p.num_q_tiles = num_q_tiles;
-    launch_prefill<PackedQSchedule, PagedKV<bf16>>(p, 0);
+    launch_prefill<VarlenQSchedule, PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
-    cudaFree(d_qtb);
-    cudaFree(d_qti);
 
     int fail = rig.check(cfg, ref);
     free(qf);
@@ -612,16 +574,11 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     rig.fill_indices();
 
     std::vector<int> q_lens(B, q_len);
-    int *d_qtb, *d_qti;
-    int num_q_tiles = make_q_tile_mapping(q_lens, &d_qtb, &d_qti);
 
     AttentionParams p = rig.base_params();
     p.is_causal = causal;
-    p.q_tile_to_batch = d_qtb;
-    p.q_tile_to_index = d_qti;
-    p.num_q_tiles = num_q_tiles;
 
-    auto launch = [&]() { launch_prefill<PackedQSchedule, PagedKV<bf16>>(p, 0); };
+    auto launch = [&]() { launch_prefill<VarlenQSchedule, PagedKV<bf16>>(p, 0); };
     /*
      * FLOPs = 2 * (QK^T + PV) = 4 * effective_qk_pairs * Hq * D.
      * Non-causal: effective = q_len * kv_len.
@@ -643,8 +600,6 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     snprintf(cfg, sizeof(cfg), "PRE B=%d Hq=%2d Hk=%d q=%4d kv=%4d D=%3d c=%d", B, Hq, Hkv, q_len,
              kv_len, HEAD_DIM, causal);
     print_bench_row(cfg, r);
-    cudaFree(d_qtb);
-    cudaFree(d_qti);
 }
 
 int main() {

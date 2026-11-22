@@ -60,3 +60,35 @@ def test_paged_append_crosses_physical_blocks(device, regular):
         torch.testing.assert_close(out[a:b].float(), ref, rtol=0.03, atol=0.035)
     torch.testing.assert_close(ks, oldk, rtol=0, atol=0)
     torch.testing.assert_close(vs, oldv, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_available("attention"),
+    reason="native CUDA required",
+)
+def test_native_entries_and_regular_cache_layout():
+    from astrai.extension.runtime.loader import get_module
+
+    native = get_module("attention")
+    assert {name for name in dir(native) if not name.startswith("_")} == {
+        "attention",
+        "attention_varlen",
+        "attention_with_kvcache",
+    }
+    q = torch.randn(2, 3, 2, 64, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    kc = torch.zeros(2, 4, 2, 64, device=q.device, dtype=q.dtype)
+    vc = torch.zeros_like(kc)
+    pages = torch.tensor([[1], [0]], device=q.device, dtype=torch.int32)
+    past = torch.zeros(2, device=q.device, dtype=torch.int32)
+    out = native.attention_with_kvcache(q, kc, vc, k, v, past, pages, is_causal=True)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+        is_causal=True,
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), expected, rtol=0.03, atol=0.035)
+    torch.testing.assert_close(kc.flip(0)[:, :3], k, rtol=0, atol=0)
+    torch.testing.assert_close(vc.flip(0)[:, :3], v, rtol=0, atol=0)

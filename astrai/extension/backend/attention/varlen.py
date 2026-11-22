@@ -94,8 +94,6 @@ def attention_varlen(
                     qr[None],
                     kr[None],
                     vr[None],
-                    None,
-                    0,
                     is_causal=is_causal,
                     scale=scale,
                 )[0]

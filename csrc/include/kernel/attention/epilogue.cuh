@@ -20,14 +20,14 @@ template <typename Traits, bool Vectorized = false> struct OutputEpilogue {
             const float inv = sum > 1e-20f ? 1.0f / sum : 0.0f;
 #pragma unroll
             for (int i = 0; i < Traits::DN8; ++i) {
-                const int d = (i * Traits::FragmentLayout::kN + column) * p.q_d_stride;
+                const int d = (i * Traits::FragmentLayout::kN + column);
                 const float x = tile.accum.output[i][2 * r] * inv;
                 const float y = tile.accum.output[i][2 * r + 1] * inv;
                 if constexpr (Vectorized) {
                     astrai::store2<T>(out + d, x, y);
                 } else {
                     out[d] = ElemTrait<T>::from_float(x);
-                    out[d + p.q_d_stride] = ElemTrait<T>::from_float(y);
+                    out[d + 1] = ElemTrait<T>::from_float(y);
                 }
             }
         }
@@ -91,7 +91,7 @@ __global__ void split_kv_combine(const AttentionParams p) {
             acc = merge_output(acc, op[s * p.head_dim + d], alpha, beta);
         }
         const float inv = total.l > 1e-20f ? 1.0f / total.l : 0.0f;
-        const int o_off = KV::q_base(p, batch, q_head) + d * p.q_d_stride;
+        const int o_off = KV::q_base(p, batch, q_head) + d;
         static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
         return;
     }
@@ -122,7 +122,7 @@ __global__ void split_kv_combine(const AttentionParams p) {
             acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
         }
         const float inv = st.l > 1e-20f ? 1.0f / st.l : 0.0f;
-        const int o_off = KV::q_base(p, batch, q_head) + d * p.q_d_stride;
+        const int o_off = KV::q_base(p, batch, q_head) + d;
         static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
         return;
     }
@@ -145,7 +145,7 @@ __global__ void split_kv_combine(const AttentionParams p) {
     float acc = 0.0f;
     for (int s = 0; s < active_splits; s++)
         acc = fmaf(op[s * p.head_dim + d], __shfl_sync(0xFFFFFFFF, weight, s), acc);
-    const int o_off = KV::q_base(p, batch, q_head) + d * p.q_d_stride;
+    const int o_off = KV::q_base(p, batch, q_head) + d;
     static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);
 }
 

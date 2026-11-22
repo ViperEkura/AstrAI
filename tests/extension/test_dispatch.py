@@ -27,9 +27,7 @@ def test_nested_choices_restore_and_operators_are_independent():
         with op_backend(attention="cuda"):
             assert RotaryDispatcher().dispatch(x, freqs) is _torch_apply
         assert (
-            attention.AttentionDispatcher().dispatch(
-                x, x, x, None, 0, None, False, None
-            )
+            attention.AttentionDispatcher().dispatch(x, x, x, None, False)
             is attention.torch.forward
         )
 

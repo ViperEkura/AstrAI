@@ -3,10 +3,12 @@ import torch
 
 from astrai.inference.core.cache import KVCacheManager
 from tests.support.cache import (
+    appended_slots,
     assert_allocator_cache_consistent,
     make_cache_workspace,
     make_paged_pool,
     make_paged_pool_ps64,
+    physical_slots,
 )
 from tests.support.cache import kv_device as kv_device
 
@@ -30,7 +32,12 @@ def test_page_pool_prefix_hit_populates_request_mapping():
 
     assert second_state.cached == len(prompt)
     assert (
-        pool.req_pool.req_to_token[second_state.req_idx, : len(prompt)].tolist()
+        physical_slots(
+            pool.req_pool.page_table[second_state.req_idx],
+            pool.page_size,
+            0,
+            len(prompt),
+        ).tolist()
         == expected
     )
 
@@ -104,9 +111,9 @@ def test_chunked_prefix_only_reuses_fully_written_kv(kv_device):
 
     for start, end in [(0, 2), (2, 4), (4, 6), (6, 8)]:
         kv = task_cache.bind(["writer"], ws, start_pos=start, seq_ends=[end])
-        assert kv.out_cache_loc.numel() == end - start
-        kv.k_buffer[0, kv.out_cache_loc] = expected_k[start:end]
-        kv.v_buffer[0, kv.out_cache_loc] = expected_v[start:end]
+        assert appended_slots(kv).numel() == end - start
+        kv.k_buffer[0].flatten(0, 1)[appended_slots(kv)] = expected_k[start:end]
+        kv.v_buffer[0].flatten(0, 1)[appended_slots(kv)] = expected_v[start:end]
         task_cache.record_block_hashes(
             "writer", prompt, start // pool.page_size, materialized_end=end
         )
@@ -118,12 +125,20 @@ def test_chunked_prefix_only_reuses_fully_written_kv(kv_device):
         assert reader.cached == n_cached
         assert reader.pages[:n_pages] == writer.pages[:n_pages]
         assert set(reader.pages[n_pages:]).isdisjoint(writer.pages[n_pages:])
-        cached_slots = pool.req_pool.req_to_token[reader.req_idx, :n_cached]
-        torch.testing.assert_close(kv.k_buffer[0, cached_slots], expected_k[:n_cached])
-        torch.testing.assert_close(kv.v_buffer[0, cached_slots], expected_v[:n_cached])
-        unwritten = pool.req_pool.req_to_token[writer.req_idx, end : len(prompt)]
-        assert torch.isnan(kv.k_buffer[0, unwritten]).all().item()
-        assert torch.isnan(kv.v_buffer[0, unwritten]).all().item()
+        cached_slots = physical_slots(
+            pool.req_pool.page_table[reader.req_idx], pool.page_size, 0, n_cached
+        )
+        torch.testing.assert_close(
+            kv.k_buffer[0].flatten(0, 1)[cached_slots], expected_k[:n_cached]
+        )
+        torch.testing.assert_close(
+            kv.v_buffer[0].flatten(0, 1)[cached_slots], expected_v[:n_cached]
+        )
+        unwritten = physical_slots(
+            pool.req_pool.page_table[writer.req_idx], pool.page_size, end, len(prompt)
+        )
+        assert torch.isnan(kv.k_buffer[0].flatten(0, 1)[unwritten]).all().item()
+        assert torch.isnan(kv.v_buffer[0].flatten(0, 1)[unwritten]).all().item()
         task_cache.free_slots("reader")
         assert_allocator_cache_consistent(pool.strategy._alloc, pool.strategy._prefix)
 

@@ -249,7 +249,7 @@ inline auto with_decode_variant(const AttentionParams& p, Fn&& fn) {
                 return fn(DecodeKernel<D, KV, true, false, true>{});
             return fn(DecodeKernel<D, KV, false, false, true>{});
         }
-        if (p.max_context_len >= SKIP_EMPTY_SPLITS_MIN_CAPACITY) {
+        if (p.kv_len >= SKIP_EMPTY_SPLITS_MIN_CAPACITY) {
             if (p.mask)
                 return fn(DecodeKernel<D, KV, true, true>{});
             return fn(DecodeKernel<D, KV, false, true>{});

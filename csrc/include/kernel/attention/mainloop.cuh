@@ -42,11 +42,11 @@ struct PrefillMainloop {
         int batch, packed0;
         QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
 
-        // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
+        // The storage and query policies supply request-local lengths.
         const int seq_len = KV::kv_len(p, batch);
         const int q_len = QSchedule::q_len(p, batch);
         if constexpr (KV::kPaged || std::is_same_v<QSchedule, VarlenQSchedule>) {
-            // The host tile map pads the last query tile of each request.
+            // The final work tile may extend past this query segment.
             if (packed0 >= G * q_len)
                 return false;
         }
@@ -141,7 +141,7 @@ struct DecodeMainloop {
         const int G = min(MAX_G, G_total - g_begin);
         const int q_head0 = kv_head * G_total + g_begin;
 
-        // Per-request seq_len (paged reads kv_indptr; contig uses p.kv_len).
+        // Decode uses the materialized prefix plus the appended token.
         const int seq_len = KV::kv_len(p, batch);
         const auto kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
         // Fold scale * log2(e) into the softmax exponent.

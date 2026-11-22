@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from astrai.extension.kernel.attention import attn_prefill
+from astrai.extension.runtime.loader import get_module
 from tests.support.capabilities import skip_no_kernel
 from tests.support.models import D
 
@@ -47,9 +47,11 @@ def test_mask_layouts_match_reference(dimensions, all_true):
             mask[..., 4:] = False
     if dimensions == 4:
         mask = mask[:, None]
-    actual = attn_prefill(q, k, v, mask=mask, is_causal=False)
+    actual = get_module("attention").attention(q, k, v, mask=mask, is_causal=False)
     if all_true:
-        expected = attn_prefill(q, k, v, mask=None, is_causal=False)
+        expected = get_module("attention").attention(
+            q, k, v, mask=None, is_causal=False
+        )
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     else:
         torch.testing.assert_close(

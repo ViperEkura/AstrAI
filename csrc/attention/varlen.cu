@@ -41,13 +41,11 @@ static AttentionParams pack_varlen(const torch::Tensor& q, const torch::Tensor& 
     p.q_h_stride = q.stride(1);
     p.kv_l_stride = k.stride(0);
     p.kv_h_stride = k.stride(1);
-    p.q_d_stride = 1;
-    p.kv_d_stride = 1;
     p.q_ptr = q.data_ptr();
     p.k_ptr = k.data_ptr();
     p.v_ptr = v.data_ptr();
-    p.qo_indptr = qs.data_ptr<int>();
-    p.kv_indptr = ks.data_ptr<int>();
+    p.cu_seqlens_q = qs.data_ptr<int>();
+    p.cu_seqlens_k = ks.data_ptr<int>();
     p.is_causal = causal;
     p.scale = scale;
     TORCH_CHECK(std::isfinite(p.scale) && p.scale > 0, "native scale must be positive and finite");
@@ -71,7 +69,7 @@ torch::Tensor attention_varlen(torch::Tensor q, torch::Tensor k, torch::Tensor v
                          scale.value_or(1.0 / std::sqrt(q.size(2))));
     auto out = torch::empty_like(q);
     auto stream = at::cuda::getCurrentCUDAStream();
-    validate_offsets<<<(p.batch + 127) / 128, 128, 0, stream>>>(p.qo_indptr, p.kv_indptr,
+    validate_offsets<<<(p.batch + 127) / 128, 128, 0, stream>>>(p.cu_seqlens_q, p.cu_seqlens_k,
                                                                 p.batch, p.q_len, p.kv_len);
     p.o_ptr = out.data_ptr();
     if (p.q_len)

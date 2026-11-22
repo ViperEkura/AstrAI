@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch as _torch
 from torch import Tensor
@@ -15,9 +15,6 @@ try:
     import flash_attn as _flash_attn
 except ImportError:
     _flash_attn = None
-
-if TYPE_CHECKING:
-    from astrai.model.kv_cache import KVCache
 
 
 @functools.lru_cache(maxsize=1)
@@ -40,11 +37,6 @@ def flash_attn_available() -> bool:
         return False
 
 
-def _check_fwd(fwd: Optional[str]) -> None:
-    if fwd not in (None, "prefill", "decode"):
-        raise ValueError(f"unsupported attention forward mode: {fwd}")
-
-
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
     if n_rep == 1:
         return x
@@ -59,43 +51,11 @@ def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
 @dataclass(frozen=True)
 class AttentionSpec(OpSpec):
     head_dim: int
-    ndim: int
     mask_kind: str
-    mask_ndim: int
     mask_last_stride: int
-    kv_cache_kind: str
     is_causal: bool
-    fwd: Optional[str]
     scale: Optional[float]
 
     @property
     def operation(self) -> str:
         return "attention"
-
-
-def _attention_spec(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    kv_cache: Optional["KVCache"],
-    attn_mask: Optional[Tensor],
-    is_causal: bool,
-    fwd: Optional[str],
-    scale: Optional[float] = None,
-) -> AttentionSpec:
-    return AttentionSpec(
-        device=q.device,
-        dtype=q.dtype,
-        phase="train" if fwd is None else "infer",
-        needs_backward=_torch.is_grad_enabled()
-        and any(t.requires_grad for t in (q, k, v)),
-        head_dim=q.size(-1),
-        ndim=q.dim(),
-        mask_kind="none" if attn_mask is None else str(attn_mask.dtype),
-        mask_ndim=0 if attn_mask is None else attn_mask.ndim,
-        mask_last_stride=0 if attn_mask is None else attn_mask.stride(-1),
-        kv_cache_kind="none" if kv_cache is None else type(kv_cache).__name__,
-        is_causal=is_causal,
-        fwd=fwd,
-        scale=scale,
-    )

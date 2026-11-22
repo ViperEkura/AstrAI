@@ -1,79 +1,26 @@
-/*
- * Attention entry points: implemented by the attention .cu files, which own
- * the pybind surface; the device vocabulary stays in kernel/ (torch-free).
- */
-
 #pragma once
 
 #include <torch/types.h>
-
 #include <c10/util/Optional.h>
 
-namespace astrai {
-namespace attention {
+namespace astrai::attention {
 
-torch::Tensor attn_decode(torch::Tensor q,
-                          torch::Tensor k,
-                          torch::Tensor v,
-                          c10::optional<torch::Tensor> mask,
-                          c10::optional<double> scale,
-                          int64_t layout,
-                          c10::optional<torch::Tensor> o_part_buf,
-                          c10::optional<torch::Tensor> ml_part_buf,
-                          bool is_causal);
-
-torch::Tensor attn_prefill(torch::Tensor q,
-                           torch::Tensor k,
-                           torch::Tensor v,
-                           c10::optional<torch::Tensor> mask,
-                           c10::optional<double> scale,
-                           int64_t layout,
-                           bool is_causal,
-                           int64_t kv_split_size = 0);
-
-torch::Tensor attn_paged_decode(torch::Tensor q,
-                                torch::Tensor k_cache,
-                                torch::Tensor v_cache,
-                                torch::Tensor req_to_token,
-                                torch::Tensor req_pool_indices,
-                                torch::Tensor kv_indptr,
-                                c10::optional<torch::Tensor> new_k,
-                                c10::optional<torch::Tensor> new_v,
-                                c10::optional<torch::Tensor> mask,
-                                c10::optional<double> scale,
-                                c10::optional<torch::Tensor> o_part_buf,
-                                c10::optional<torch::Tensor> ml_part_buf,
-                                c10::optional<torch::Tensor> out_buf,
-                                bool is_causal,
-                                int64_t kv_split_size = 0);
-
-torch::Tensor attn_paged_prefill(torch::Tensor q,
-                                 torch::Tensor k_cache,
-                                 torch::Tensor v_cache,
-                                 torch::Tensor req_to_token,
-                                 torch::Tensor req_pool_indices,
-                                 torch::Tensor kv_indptr,
-                                 torch::Tensor qo_indptr,
-                                 torch::Tensor q_tile_to_batch,
-                                 torch::Tensor q_tile_to_index,
-                                 c10::optional<torch::Tensor> mask,
-                                 c10::optional<double> scale,
-                                 bool is_causal,
-                                 int64_t kv_split_size = 0);
-
+torch::Tensor attention(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                        c10::optional<torch::Tensor> mask, c10::optional<double> scale,
+                        bool is_causal, int64_t kv_split_size);
 
 torch::Tensor attention_varlen(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                torch::Tensor cu_seqlens_q,
                                c10::optional<torch::Tensor> cu_seqlens_k, bool is_causal,
                                c10::optional<double> scale);
 
+torch::Tensor attention_with_kvcache(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+                                     torch::Tensor k_new, torch::Tensor v_new,
+                                     torch::Tensor cache_seqlens, torch::Tensor page_table,
+                                     c10::optional<torch::Tensor> cu_seqlens_q,
+                                     c10::optional<torch::Tensor> mask, bool is_causal,
+                                     int64_t kv_split_size, c10::optional<torch::Tensor> o_part,
+                                     c10::optional<torch::Tensor> ml_part,
+                                     c10::optional<torch::Tensor> output);
 
-torch::Tensor cache_forward(torch::Tensor q, torch::Tensor kc, torch::Tensor vc,
-                            torch::Tensor k, torch::Tensor v, torch::Tensor past,
-                            torch::Tensor pages, c10::optional<torch::Tensor> qs,
-                            c10::optional<torch::Tensor> mask, bool causal, int64_t split,
-                            c10::optional<torch::Tensor> op, c10::optional<torch::Tensor> ml,
-                            c10::optional<torch::Tensor> output);
-
-} // namespace attention
-} // namespace astrai
+} // namespace astrai::attention

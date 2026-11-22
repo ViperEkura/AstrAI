@@ -8,7 +8,7 @@
 #include <utils/define.cuh>
 
 /*
- * Q scheduling is independent of K/V storage. DenseQSchedule/PackedQSchedule
+ * Q scheduling is independent of K/V storage. DenseQSchedule/VarlenQSchedule
  * map Q tiles; ContigKV/PagedKV resolve logical K/V positions and bind Elem.
  * make_ctx hoists per-(batch, kv_head) address state outside the load loops.
  */
@@ -113,61 +113,12 @@ struct DenseQSchedule {
     }
 };
 
-struct PackedQSchedule {
-    static HOST_FORCEINLINE int host_grid_batch(const AttentionParams&) { return 1; }
-
-    /*
-     * PackGQA-folded prefill mapping: the host tile maps are built in
-     * HOST_Q_TILE_ROWS granularity and stay head-agnostic; host tile t covers
-     * rows [t*HQR, (t+1)*HQR) of every head, i.e. packed idx
-     * [t*HQR*G, ...+HQR*G). Blocks carve that space in block_m steps; the
-     * kernel decodes h = idx % G over the request-local packed index.
-     * qo_indptr is a device pointer — the host grid derives from the tile
-     * count alone (a request's last tile is padded up by the host builder).
-     */
-    static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int, int block_m) {
-        const int blocks_per_host_tile = (p.q_head / p.kv_head) * HOST_Q_TILE_ROWS / block_m;
-        return p.num_q_tiles * blocks_per_host_tile;
-    }
-
-    static constexpr int MIN_REVERSE_Q_TILES = 16;
-
-    template <bool IsCausal>
-    static DEVICE_FORCEINLINE int
-    order_work(const AttentionParams& p, int physical, int work_count) {
-        if constexpr (IsCausal) {
-            // Long causal tiles read more K/V; launch the tail before the first tile.
-            if (p.num_q_tiles >= MIN_REVERSE_Q_TILES)
-                return work_count - 1 - physical;
-        }
-        return physical;
-    }
-
-    static DEVICE_FORCEINLINE void
-    map_packed_block(const AttentionParams& p, int block_m, int q_block, int& batch, int& packed0) {
-        const int G = p.q_head / p.kv_head;
-        const int blocks_per_host_tile = G * HOST_Q_TILE_ROWS / block_m;
-        const int host_tile = q_block / blocks_per_host_tile;
-        batch = p.q_tile_to_batch[host_tile];
-        const int in_tile = q_block - host_tile * blocks_per_host_tile;
-        packed0 = p.q_tile_to_index[host_tile] * HOST_Q_TILE_ROWS * G + in_tile * block_m;
-    }
-
-    static DEVICE_FORCEINLINE int q_len(const AttentionParams& p, int batch) {
-        return p.qo_indptr[batch + 1] - p.qo_indptr[batch];
-    }
-
-    static DEVICE_FORCEINLINE int q_base(const AttentionParams& p, int batch, int q_head) {
-        return p.qo_indptr[batch] * p.q_l_stride + q_head * p.q_h_stride;
-    }
-};
-
 /*
  * Per-element K/V global addresses for one (kc, d) position of a K/V tile.
  * The pointers are ALWAYS the computed addresses (never nullptr) — callers
  * gate on `valid` (cp.async src_size=0, or a guarded scalar deref).  `valid`
  * starts as "within the request's seq_len"; the paged policy further degrades
- * it when req_to_token maps the position to a negative slot (empty padding).
+ * it when the block table contains an invalid page (empty padding).
  * This matches the original hand-rolled load loops, where the address was
  * always formed and the predicate decided whether anything was read.
  */
@@ -193,15 +144,28 @@ static DEVICE_FORCEINLINE int segment_for_tile(const int* offsets, int batch, in
     return lo;
 }
 
-struct VarlenQSchedule : PackedQSchedule {
+struct VarlenQSchedule {
+    static HOST_FORCEINLINE int host_grid_batch(const AttentionParams&) { return 1; }
+    template <bool IsCausal>
+    static DEVICE_FORCEINLINE int order_work(const AttentionParams&, int physical, int count) {
+        return IsCausal ? count - 1 - physical : physical;
+    }
+    static DEVICE_FORCEINLINE int q_len(const AttentionParams& p, int batch) {
+        return p.cu_seqlens_q[batch + 1] - p.cu_seqlens_q[batch];
+    }
+
+    static DEVICE_FORCEINLINE int q_base(const AttentionParams& p, int batch, int q_head) {
+        return p.cu_seqlens_q[batch] * p.q_l_stride + q_head * p.q_h_stride;
+    }
+
     static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int, int rows) {
         return int((int64_t)p.q_len * (p.q_head / p.kv_head) / rows) + p.batch;
     }
     static DEVICE_FORCEINLINE void map_packed_block(const AttentionParams& p, int rows,
                                                    int tile, int& batch, int& packed0) {
         const int group = p.q_head / p.kv_head;
-        batch = segment_for_tile(p.qo_indptr, p.batch, group, rows, tile);
-        const int first = int((int64_t)p.qo_indptr[batch] * group / rows) + batch;
+        batch = segment_for_tile(p.cu_seqlens_q, p.batch, group, rows, tile);
+        const int first = int((int64_t)p.cu_seqlens_q[batch] * group / rows) + batch;
         packed0 = (tile - first) * rows;
     }
 };
@@ -250,7 +214,7 @@ template <typename T> struct ContigKV {
         const bool valid = token >= 0;
         const int safe_token = valid ? token : 0;
         const int64_t gmem_off =
-            (int64_t)c.kv_base + (int64_t)safe_token * p.kv_l_stride + (int64_t)d * p.kv_d_stride;
+            (int64_t)c.kv_base + (int64_t)safe_token * p.kv_l_stride + (int64_t)d;
         const T* __restrict__ k = kptr(p);
         const T* __restrict__ v = vptr(p);
         return {&k[gmem_off], &v[gmem_off], valid};
@@ -272,12 +236,12 @@ template <typename T> struct ContigKV {
 
 template <typename T> struct VarlenKV : ContigKV<T> {
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
-        return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
+        return p.cu_seqlens_k[batch + 1] - p.cu_seqlens_k[batch];
     }
     template <int D>
     static DEVICE_FORCEINLINE typename ContigKV<T>::Context
     make_ctx(const AttentionParams& p, int batch, int head) {
-        return {p.kv_indptr[batch] * p.kv_l_stride + head * p.kv_h_stride};
+        return {p.cu_seqlens_k[batch] * p.kv_l_stride + head * p.kv_h_stride};
     }
 };
 
@@ -286,8 +250,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
     using Elem = T;
     static constexpr bool kPaged = true;
     struct Context {
-        int req_idx;
-        int64_t rtt_stride;
+        const int* pages;
         int64_t pool_stride;
         int64_t head_off;
     };
@@ -305,7 +268,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
         return static_cast<const T*>(p.new_v_ptr);
     }
 
-    static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) { return p.max_context_len; }
+    static HOST_FORCEINLINE int host_kv_len(const AttentionParams& p) { return p.kv_len; }
 
     // Check both ends of the new-token copy without reading device metadata.
     static HOST_FORCEINLINE bool new_kv_aligned(const AttentionParams& p) {
@@ -315,7 +278,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
             reinterpret_cast<uintptr_t>(p.k_ptr) | reinterpret_cast<uintptr_t>(p.v_ptr) |
             reinterpret_cast<uintptr_t>(p.new_k_ptr) | reinterpret_cast<uintptr_t>(p.new_v_ptr);
         const uintptr_t batch_stride =
-            p.batch > 1 ? static_cast<uintptr_t>(p.new_kv_b_stride) * sizeof(T) : 0;
+            p.batch > 1 ? static_cast<uintptr_t>(p.new_kv_token_stride) * sizeof(T) : 0;
         const uintptr_t head_stride =
             p.kv_head > 1 ? static_cast<uintptr_t>(p.new_kv_h_stride) * sizeof(T) : 0;
         return ((addresses | batch_stride | head_stride) & 15) == 0;
@@ -327,28 +290,31 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
     }
 
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
-        if (p.cache_seqlens) {
-            const int added = p.qo_indptr ? p.qo_indptr[batch+1]-p.qo_indptr[batch] : 1;
-            return p.cache_seqlens[batch] + added;
+        int added = 1;
+        if (p.cu_seqlens_q) {
+            const int begin = p.cu_seqlens_q[batch], end = p.cu_seqlens_q[batch + 1];
+            if (begin < 0 || end < begin || end > p.q_len)
+                __trap();
+            added = end - begin;
         }
-        return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
+        const int past = p.cache_seqlens[batch];
+        if (past < 0 || past > p.kv_len - added)
+            __trap();
+        return past + added;
     }
 
     template <int HEAD_DIM>
     static DEVICE_FORCEINLINE Context make_ctx(const AttentionParams& p, int batch, int kv_head) {
-        return {p.cache_seqlens ? batch : p.req_pool_indices[batch],
-                p.cache_seqlens ? p.table_stride : p.max_context_len,
+        return {p.page_table + (int64_t)batch * p.table_stride,
                 (int64_t)p.kv_head * HEAD_DIM, (int64_t)kv_head * HEAD_DIM};
     }
     static DEVICE_FORCEINLINE int
     resolve_token(const AttentionParams& p, const Context& c, int kc, bool valid) {
         if (!valid) return -1;
-        if (!p.cache_seqlens)
-            return p.req_to_token[c.req_idx * c.rtt_stride + kc];
-        if (kc < 0 || kc >= p.max_context_len) return -1;
+        if (kc < 0 || kc >= p.kv_len) return -1;
         const int block = p.page_size == 1 ? kc : kc / p.page_size;
-        const int page = p.req_to_token[c.req_idx * c.rtt_stride + block];
-        if (page < 0 || page >= p.num_pages) return -1;
+        const int page = c.pages[block];
+        if (page < 0 || page >= p.num_pages) __trap();
         return page * p.page_size + (kc - block * p.page_size);
     }
     static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(const AttentionParams& p,
@@ -368,7 +334,7 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
                                                  int kv_head,
                                                  int d) {
         const int64_t off =
-            (int64_t)batch * p.new_kv_b_stride + (int64_t)kv_head * p.new_kv_h_stride + d;
+            (int64_t)batch * p.new_kv_token_stride + (int64_t)kv_head * p.new_kv_h_stride + d;
         const T* __restrict__ nk = new_kptr(p);
         const T* __restrict__ nv = new_vptr(p);
         return {&nk[off], &nv[off], true, AlignedNewKV};

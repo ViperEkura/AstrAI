@@ -85,3 +85,25 @@ def make_paged_pool_ps64(**kwargs):
     return make_paged_pool(
         **{"max_seq_len": 256, "page_size": 64, "n_tokens": 512, **kwargs}
     )
+
+
+def physical_slots(row, page_size, start, end):
+    positions = torch.arange(start, end, device=row.device, dtype=torch.int32)
+    return row[positions // page_size] * page_size + positions % page_size
+
+
+def appended_slots(cache):
+    size = cache.k_buffer.size(2)
+    lengths = (
+        cache.cu_seqlens_q.diff().tolist()
+        if hasattr(cache, "cu_seqlens_q")
+        else [1] * cache.page_table.size(0)
+    )
+    return torch.cat(
+        [
+            physical_slots(row, size, past, past + length)
+            for row, past, length in zip(
+                cache.page_table, cache.cache_seqlens.tolist(), lengths
+            )
+        ]
+    )

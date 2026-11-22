@@ -14,7 +14,7 @@ constexpr int SKIP_EMPTY_SPLITS_MIN_CAPACITY = 8192;
 constexpr int SKIP_EMPTY_SPLITS_CAPACITY_RATIO = 8;
 
 DEVICE_FORCEINLINE bool skip_empty_decode_splits(const AttentionParams& p, int seq_len) {
-    return seq_len < p.max_context_len / SKIP_EMPTY_SPLITS_CAPACITY_RATIO;
+    return seq_len < p.kv_len / SKIP_EMPTY_SPLITS_CAPACITY_RATIO;
 }
 
 // Each lane holds two rows of an m16n8 accumulator. Coordinates are local to the request.
@@ -72,12 +72,12 @@ template <bool Causal> struct VisibleKeys {
 
 template <class Layout, bool HasMask, bool MaskCoversShape = false> struct AttentionMask {
     const bool* mask;
-    int base[2], end[2], key_stride, columns[2];
+    int base[2], end[2], columns[2];
 
     template <bool Causal>
     DEVICE_FORCEINLINE AttentionMask(const AttentionParams& p, const QueryRows& q,
                                      VisibleKeys<Causal> keys, int lane)
-        : mask(p.mask), key_stride(p.mask_k_stride),
+        : mask(p.mask),
           columns{Layout::column(lane), Layout::column(lane, 1)} {
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -102,7 +102,7 @@ template <class Layout, bool HasMask, bool MaskCoversShape = false> struct Atten
             for (int i = 0; i < 4; ++i) {
                 const int key = kv0 + Layout::kN * n + columns[i & 1];
                 const int r = i / 2;
-                if (key >= end[r] || (HasMask && !mask[base[r] + key * key_stride]))
+                if (key >= end[r] || (HasMask && !mask[base[r] + key]))
                     scores[n][i] = -FLT_MAX;
             }
         }

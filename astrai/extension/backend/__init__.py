@@ -6,7 +6,6 @@ from astrai.extension.backend.attention import (
     attention,
     attention_varlen,
     attention_with_kvcache,
-    paged_attention,
 )
 from astrai.extension.backend.newton_schulz import newton_schulz, symm_out, syrk_out
 from astrai.extension.backend.rotary import apply_rotary_emb
@@ -23,5 +22,4 @@ __all__ = [
     "attention",
     "attention_varlen",
     "attention_with_kvcache",
-    "paged_attention",
 ]

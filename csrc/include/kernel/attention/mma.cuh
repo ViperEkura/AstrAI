@@ -69,7 +69,7 @@ template <typename Traits> struct AttentionMma {
 #pragma unroll
             for (int k = 0; k < Traits::KD; ++k) {
                 const int d = k * Atom::Shape::kK + column;
-                const auto* pair = reinterpret_cast<const unsigned*>(base + d * p.q_d_stride);
+                const auto* pair = reinterpret_cast<const unsigned*>(base + d);
                 // The A fragment stores two rows at d, followed by the same rows at d + 8.
                 frag[k][r] = row.valid ? pair[0] : 0u;
                 frag[k][r + 2] = row.valid ? pair[4] : 0u;

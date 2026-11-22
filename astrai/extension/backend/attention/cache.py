@@ -12,7 +12,7 @@ from astrai.extension.runtime.loader import get_module, is_available
 from astrai.extension.runtime.operation import ExplicitSelectionError
 
 
-def _reference(q, kc, vc, k, v, past, pages, qs, mask, causal):
+def _reference(q, kc, vc, k, v, past, pages, qs, mask, causal, dense=reference.forward):
     offsets = list(range(past.numel() + 1)) if qs is None else qs.tolist()
     lengths = past.tolist()
     size = kc.size(1)
@@ -37,7 +37,7 @@ def _reference(q, kc, vc, k, v, past, pages, qs, mask, causal):
         if n < 0 or length > pages.size(1) * size:
             raise ValueError("request exceeds cache capacity")
         active = pages[i, : (length + size - 1) // size]
-        if ((active < 0) | (active >= kc.size(0))).any():
+        if any(page < 0 or page >= kc.size(0) for page in active.tolist()):
             raise ValueError("page index outside cache")
         pos = torch.arange(length, device=q.device)
         slots.append(active[pos // size].long() * size + pos % size)
@@ -59,12 +59,10 @@ def _reference(q, kc, vc, k, v, past, pages, qs, mask, causal):
             )
             local = reference._packed_mask(item, allowed, end - start)
         output.append(
-            reference.forward(
+            dense(
                 q[None, start:end],
                 keys[sl][None],
                 values[sl][None],
-                None,
-                0,
                 local,
                 causal,
             )[0]
@@ -89,13 +87,14 @@ def _cache_impl(
         and (choice != "cuda_consistent" or q.dtype == torch.bfloat16)
     ):
         split = ROLLOUT_KV_SPLIT_SIZE if choice == "cuda_consistent" else 0
-        return get_module("attention")._cache_forward(
+        return get_module("attention").attention_with_kvcache(
             q, kc, vc, k, v, past, pages, qs, mask, causal, split, *workspace
         )
     if choice == "flash" and q.is_cuda and mask is None:
+        from astrai.extension.backend.attention import flash
         from astrai.extension.backend.attention.common import _flash_attn
 
-        if hasattr(_flash_attn, "flash_attn_varlen_func"):
+        if q.dtype in (torch.bfloat16, torch.float16) and flash.flash_attn_available():
             # Optional FA2 accepts paged cache blocks in multiples of 256.
             if qs is None and kc.size(1) % 256 == 0:
                 return _flash_attn.flash_attn_with_kvcache(
@@ -108,6 +107,9 @@ def _cache_impl(
                     block_table=pages,
                     causal=causal,
                 )[:, 0]
+            return _reference(
+                q, kc, vc, k, v, past, pages, qs, None, causal, flash.forward
+            )
     if origin == "context" and choice not in ("auto", "torch", "torch_native"):
         raise ExplicitSelectionError(
             f"{choice!r} cannot handle this cache attention call"
@@ -190,3 +192,27 @@ def attention_with_kvcache(
         None,
         is_causal,
     ).reshape(original)
+
+
+def _model_cache_attention(q, k, v, cache, layer, mask, is_causal):
+    from astrai.model.kv_cache import DecodeKVCache
+
+    if isinstance(cache, DecodeKVCache):
+        offsets = None
+        workspace = (cache.decode_o_part, cache.decode_ml_part, cache.decode_out)
+    else:
+        offsets = cache.cu_seqlens_q
+        workspace = (None, None, None)
+    return _cache_impl(
+        q,
+        cache.k_buffer[layer],
+        cache.v_buffer[layer],
+        k,
+        v,
+        cache.cache_seqlens,
+        cache.page_table,
+        offsets,
+        mask,
+        is_causal,
+        workspace,
+    )

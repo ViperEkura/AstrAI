@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension.backend import apply_rotary_emb, attention, paged_attention
+from astrai.extension.backend import apply_rotary_emb, attention
+from astrai.extension.backend.attention.cache import _model_cache_attention
 from astrai.factory import BaseFactory
 from astrai.model.components.conv import Conv1d
 from astrai.model.components.gdn_ops import (
@@ -100,14 +101,8 @@ class GQA(nn.Module):
         if kv_cache is None:
             sdqa_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
         else:
-            sdqa_out = paged_attention(
-                q,
-                k,
-                v,
-                kv_cache=kv_cache,
-                layer_id=self.layer_id,
-                mask=attn_mask,
-                is_causal=is_causal,
+            sdqa_out = _model_cache_attention(
+                q, k, v, kv_cache, self.layer_id, attn_mask, is_causal
             )
         sdqa_out = sdqa_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
@@ -505,14 +500,8 @@ class MLA(nn.Module):
         if kv_cache is None:
             attn_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
         else:
-            attn_out = paged_attention(
-                q,
-                k,
-                v,
-                kv_cache=kv_cache,
-                layer_id=self.layer_id,
-                mask=attn_mask,
-                is_causal=is_causal,
+            attn_out = _model_cache_attention(
+                q, k, v, kv_cache, self.layer_id, attn_mask, is_causal
             )
         attn_out = attn_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 

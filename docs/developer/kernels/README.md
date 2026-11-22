@@ -11,10 +11,9 @@ maps to one family of translation units under `csrc/` (headers live in the `csrc
 ## Overview
 | Kernel | File | Description |
 |--------|------|-------------|
-| `attn_decode` | `attention/decode.cu` | GQA decode attention (split-KV) |
-| `attn_prefill` | `attention/prefill.cu` | GQA prefill attention (split-Q) |
-| `attn_paged_decode` | `attention/paged_decode.cu` | Paged KV cache decode attention |
-| `attn_paged_prefill` | `attention/paged_prefill.cu` | Paged KV cache prefill attention (ragged batch) |
+| `attention` | `attention/attention.cu` | Dense attention |
+| `attention_varlen` | `attention/varlen.cu` | Forward attention over contiguous packed segments |
+| `attention_with_kvcache` | `attention/cache.cu` | Append K/V and attend over physical pages |
 | `newton_schulz` | `newton_schulz/{bindings,entry,kernels}.cu` | Generic BF16 SYRK/SYMM with measured tile dispatch |
 | `rotary_emb` | `rotary_emb.cu` | Fused rotary forward and input gradient |
 | `swiglu` | `swiglu.cu` | Fused SwiGLU forward and both input gradients |
@@ -215,17 +214,15 @@ of model, cache, fallback, and backend-selection policy.
 - Tests that specifically exercise a compiled kernel may import from
   `astrai.extension.kernel`.
 
-For example, `attn_prefill(...)` means "run this CUDA kernel" rather than "run
-attention using the best available implementation":
+Native attention tests can select the compiled module directly:
 
 ```python
-from astrai.extension.kernel import attn_prefill
+from astrai.extension.runtime.loader import get_module
 
-output = attn_prefill(q, k, v, mask=mask, is_causal=True)
+output = get_module("attention").attention(q, k, v, mask=mask, is_causal=True)
 ```
 
-If the kernel is unavailable, this call fails. Callers that need fallback and
-capability dispatch must use the public `attention(...)` entry point instead.
+Model code uses the three public attention functions described in [Attention](attention.md).
 
 ### Operator dispatch
 

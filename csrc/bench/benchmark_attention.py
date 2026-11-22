@@ -1,4 +1,4 @@
-"""Benchmark the four attention kernels against single-launch torch SDPA.
+"""Benchmark dense and cached attention for prefill and decode against torch SDPA.
 
 Suites (--suite): decode, prefill, paged_decode, paged_prefill, all. The
 torch side times one SDPA call per step over dense tensors: GQA expansion,
@@ -23,13 +23,8 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from astrai.extension import is_available
-from astrai.extension.kernel import (
-    attn_decode,
-    attn_paged_decode,
-    attn_paged_prefill,
-    attn_prefill,
-)
-from astrai.inference.worker.workspace import MAX_SPLITS, Q_TILE_ROWS
+from astrai.extension.runtime.loader import get_module
+from astrai.inference.worker.workspace import MAX_SPLITS
 from astrai.performance import measure_operations, summarize
 
 
@@ -43,16 +38,11 @@ class GqaConfig:
     head_dim: int
 
 
-DEFAULT_CONFIGS = (
-    GqaConfig("llama2_7b", 32, 8, 128),
-    GqaConfig("llama3_70b", 64, 8, 128),
-    GqaConfig("qwen2_7b", 28, 4, 128),
-    GqaConfig("llama3_8b_d64", 32, 8, 64),
-)
+DEFAULT_CONFIGS = (GqaConfig("astrai_2b", 16, 4, 128),)
 
 # (batch, per-request context length); context includes the token being
 # decoded (kv_len = context, the last slot written in-kernel).
-DECODE_CASES = ((1, 4096), (8, 4096), (32, 2048), (64, 1024))
+DECODE_CASES = ((1, 2048), (1, 4096), (8, 4096), (32, 2048), (64, 1024))
 # (batch, q_len); prefill from scratch so kv_len == q_len.
 PREFILL_CASES = ((1, 2048), (1, 4096), (4, 1024), (8, 512))
 
@@ -132,32 +122,29 @@ class PagedInputs:
     q: torch.Tensor
     k_cache: torch.Tensor
     v_cache: torch.Tensor
-    req_to_token: torch.Tensor
-    req_pool_indices: torch.Tensor
-    kv_indptr: torch.Tensor
+    page_table: torch.Tensor
+    slots: torch.Tensor
 
 
 def build_paged_inputs(
     config: GqaConfig, kv_lens: List[int], q_lens: Optional[List[int]]
 ) -> PagedInputs:
-    """Flat pool + page table: request ``i`` owns the contiguous slot range
-    ``[offset_i, offset_i + kv_len_i)``. Q is packed across requests when
-    ``q_lens`` is given (ragged prefill), else [B, Hq, D] (decode)."""
     batch = len(kv_lens)
+    page_size = 16
+    columns = (max(kv_lens) + page_size - 1) // page_size
+    table = torch.randperm(batch * columns, device="cuda", dtype=torch.int32).view(
+        batch, columns
+    )
     pool = torch.randn(
-        sum(kv_lens),
+        batch * columns,
+        page_size,
         config.hkv,
         config.head_dim,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    req_to_token = torch.zeros(batch, max(kv_lens), dtype=torch.int32, device="cuda")
-    offset = 0
-    for i, length in enumerate(kv_lens):
-        req_to_token[i, :length] = torch.arange(
-            offset, offset + length, dtype=torch.int32, device="cuda"
-        )
-        offset += length
+    positions = torch.arange(max(kv_lens), device="cuda")
+    slots = table[:, positions // page_size].long() * page_size + positions % page_size
     return PagedInputs(
         q=torch.randn(
             sum(q_lens) if q_lens is not None else batch,
@@ -168,9 +155,8 @@ def build_paged_inputs(
         ),
         k_cache=pool,
         v_cache=torch.randn_like(pool),
-        req_to_token=req_to_token,
-        req_pool_indices=torch.arange(batch, dtype=torch.int32, device="cuda"),
-        kv_indptr=cumsum_indptr(kv_lens),
+        page_table=table,
+        slots=slots,
     )
 
 
@@ -258,7 +244,7 @@ def benchmark_decode(
         return sdpa(q, k_expanded, v_expanded)
 
     def cuda_op() -> torch.Tensor:
-        return attn_decode(q, k, v, is_causal=True)
+        return get_module("attention").attention(q, k, v, is_causal=True)
 
     operations = {"torch": torch_op, "cuda": cuda_op}
     io_bytes = (2 * q.numel() + 2 * k.numel()) * q.element_size()
@@ -297,7 +283,7 @@ def benchmark_prefill(
         return sdpa(q, k_expanded, v_expanded, is_causal=True)
 
     def cuda_op() -> torch.Tensor:
-        return attn_prefill(q, k, v, is_causal=True)
+        return get_module("attention").attention(q, k, v, is_causal=True)
 
     operations = {"torch": torch_op, "cuda": cuda_op}
     io_bytes = (2 * q.numel() + 2 * k.numel()) * q.element_size()
@@ -344,34 +330,36 @@ def benchmark_paged_decode(
         batch, config.hq, config.head_dim, dtype=torch.bfloat16, device="cuda"
     )
 
+    past = torch.tensor(kv_lens, dtype=torch.int32, device="cuda") - 1
+    native = get_module("attention").attention_with_kvcache
+
     def cuda_op() -> torch.Tensor:
-        return attn_paged_decode(
+        return native(
             inputs.q,
             inputs.k_cache,
             inputs.v_cache,
-            inputs.req_to_token,
-            inputs.req_pool_indices,
-            inputs.kv_indptr,
-            new_k=new_k,
-            new_v=new_v,
+            new_k,
+            new_v,
+            past,
+            inputs.page_table,
             is_causal=True,
-            o_part_buf=o_part,
-            ml_part_buf=ml_part,
-            out_buf=out_buf,
+            o_part=o_part,
+            ml_part=ml_part,
+            output=out_buf,
         )
 
     # Reference-side data preparation happens once, outside the timed
     # closure: append the current-token K/V into the pool (the kernel does
     # this fused inside its launch), gather padded K/V, expand GQA heads.
     max_len = max(kv_lens)
-    slots = inputs.req_to_token[:, :max_len].long()
-    last_slots = inputs.req_to_token[
+    slots = inputs.slots
+    last_slots = inputs.slots[
         torch.arange(batch, device="cuda"), torch.tensor(kv_lens) - 1
     ].long()
-    inputs.k_cache[last_slots] = new_k
-    inputs.v_cache[last_slots] = new_v
-    k_expanded = repeat_kv_heads(inputs.k_cache[slots], n_rep)
-    v_expanded = repeat_kv_heads(inputs.v_cache[slots], n_rep)
+    inputs.k_cache.flatten(0, 1)[last_slots] = new_k
+    inputs.v_cache.flatten(0, 1)[last_slots] = new_v
+    k_expanded = repeat_kv_heads(inputs.k_cache.flatten(0, 1)[slots], n_rep)
+    v_expanded = repeat_kv_heads(inputs.v_cache.flatten(0, 1)[slots], n_rep)
     position = torch.arange(max_len, device="cuda")
     lengths = torch.tensor(kv_lens, device="cuda", dtype=torch.long)
     keep_mask = (position[None, :] < lengths[:, None])[:, None, None, :]
@@ -416,25 +404,22 @@ def benchmark_paged_prefill(
     inputs = build_paged_inputs(config, q_lens, q_lens)
     qo_indptr = cumsum_indptr(q_lens)
 
-    tile_batches, tile_indices = [], []
-    for request, length in enumerate(q_lens):
-        n_tiles = (length + Q_TILE_ROWS - 1) // Q_TILE_ROWS
-        tile_batches.extend([request] * n_tiles)
-        tile_indices.extend(range(n_tiles))
-    q_tile_to_batch = torch.tensor(tile_batches, dtype=torch.int32, device="cuda")
-    q_tile_to_index = torch.tensor(tile_indices, dtype=torch.int32, device="cuda")
+    past = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    packed_slots = torch.cat([row[:n] for row, n in zip(inputs.slots, q_lens)])
+    k_new = inputs.k_cache.flatten(0, 1)[packed_slots]
+    v_new = inputs.v_cache.flatten(0, 1)[packed_slots]
+    native = get_module("attention").attention_with_kvcache
 
     def cuda_op() -> torch.Tensor:
-        return attn_paged_prefill(
+        return native(
             inputs.q,
             inputs.k_cache,
             inputs.v_cache,
-            inputs.req_to_token,
-            inputs.req_pool_indices,
-            inputs.kv_indptr,
+            k_new,
+            v_new,
+            past,
+            inputs.page_table,
             qo_indptr,
-            q_tile_to_batch,
-            q_tile_to_index,
             is_causal=True,
         )
 
@@ -442,9 +427,9 @@ def benchmark_paged_prefill(
     # build the causal + validity mask. The timed reference is one SDPA call
     # plus the packed-row unpack.
     max_len = max(q_lens)
-    slots = inputs.req_to_token[:, :max_len].long()
-    k_expanded = repeat_kv_heads(inputs.k_cache[slots], n_rep)
-    v_expanded = repeat_kv_heads(inputs.v_cache[slots], n_rep)
+    slots = inputs.slots
+    k_expanded = repeat_kv_heads(inputs.k_cache.flatten(0, 1)[slots], n_rep)
+    v_expanded = repeat_kv_heads(inputs.v_cache.flatten(0, 1)[slots], n_rep)
     position = torch.arange(max_len, device="cuda")
     lengths = torch.tensor(q_lens, device="cuda", dtype=torch.long)
     causal = position[None, :, None] >= position[None, None, :]

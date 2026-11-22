@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.backends.cuda import SDPAParams, can_use_flash_attention
 
 from astrai.extension.backend.attention.common import _check_fwd, repeat_kv
 
@@ -70,26 +71,31 @@ def forward(
 ) -> Tensor:
     _check_fwd(fwd)
     if q.ndim == 4:
-        n_rep = q.size(2) // k.size(2)
-        if n_rep > 1:
-            k = repeat_kv(k, n_rep)
-            v = repeat_kv(v, n_rep)
         mask = _mask_view(attn_mask)
         sdpa_causal = is_causal
         if is_causal and (mask is not None or q.size(1) != k.size(1)):
             causal = _causal_mask(q.size(1), k.size(1), q.device)
             mask = _combine_mask(causal, mask)
             sdpa_causal = False
+        q, k, v = (x.transpose(1, 2) for x in (q, k, v))
+        grouped = q.size(1) > k.size(1)
+        # Keep KV compact through the CP collective when flash supports GQA.
+        native_gqa = (
+            grouped
+            and q.is_cuda
+            and can_use_flash_attention(
+                SDPAParams(q, k, v, mask, 0.0, sdpa_causal, True)
+            )
+        )
+        if grouped and not native_gqa:
+            repeat = q.size(1) // k.size(1)
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
         return (
             F.scaled_dot_product_attention(
-                q.permute(0, 2, 1, 3),
-                k.permute(0, 2, 1, 3),
-                v.permute(0, 2, 1, 3),
-                mask,
-                is_causal=sdpa_causal,
-                scale=scale,
+                q, k, v, mask, is_causal=sdpa_causal, scale=scale, enable_gqa=native_gqa
             )
-            .permute(0, 2, 1, 3)
+            .transpose(1, 2)
             .contiguous()
         )
 

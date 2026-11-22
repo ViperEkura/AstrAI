@@ -555,6 +555,7 @@ class TrainConfig(BaseConfig):
             "moe_aux_loss_coef",
             "rl_update_epochs",
             "rl_minibatch_prompts",
+            "rollout_temperature",
             "gradient_chunked_logprobs",
         }
         duplicates = sorted(reserved.intersection(values))

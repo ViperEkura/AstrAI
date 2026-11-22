@@ -26,6 +26,7 @@ from typing import Any, Callable, List, Optional, Protocol, TypeVar
 import torch
 from torch import nn
 
+from astrai.inference.contracts import LogprobRequest
 from astrai.inference.core.engine import EngineCore
 from astrai.inference.core.events import FINISH_STOP_TOKEN
 from astrai.inference.core.request import GenerationResult, Request
@@ -58,7 +59,7 @@ def run_batch(
     top_k: int = 50,
     frequency_penalty: float = 0.0,
     rep_window: int = 64,
-    return_logprobs: bool = False,
+    return_logprobs: LogprobRequest = False,
     return_details: bool = False,
     seeds: Optional[List[int]] = None,
 ) -> List[Any]:

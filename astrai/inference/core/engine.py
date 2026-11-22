@@ -11,6 +11,7 @@ from typing import Callable, List, Optional, TypeVar
 import torch
 
 from astrai.extension.runtime.context import use_op_selection
+from astrai.inference.contracts import LogprobRequest
 from astrai.inference.core.cache.pool import BlockPool
 from astrai.inference.core.events import (
     FINISH_ABORTED,
@@ -438,7 +439,7 @@ class EngineCore:
 
     @_synchronous
     def execute_requests(
-        self, requests: List[Request], return_logprobs: bool = False
+        self, requests: List[Request], return_logprobs: LogprobRequest = False
     ) -> None:
         """Drive tokenized requests through admission and execution to terminal."""
         self.scheduler.refresh_stop_ids()

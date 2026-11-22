@@ -63,6 +63,12 @@ Online rollout carries aligned `logprobs_old`, avoiding a second old-policy
 forward. Offline callers without these values must synchronize `old_model`
 between generation rounds. Only masked response targets contribute to the loss.
 
+Online GRPO uses `rollout_temperature` when sampling and scoring response
+tokens with the behavior, current and reference policies. Scores are computed
+before top-k/top-p truncation. Set `rollout_top_p=1` and `rollout_top_k=0`
+to sample from the distribution used in the policy ratio. Configure
+`rollout_val_temperature` and `rollout_val_top_p` independently for evaluation.
+
 `loss_aggregation="token"` weights valid tokens equally; `"sequence"` weights
 responses equally. `clip_eps_low` and `clip_eps_high` override the symmetric
 clipping interval. Optional `overlong_max_len`, `overlong_buffer_len` and

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     # Type-only dependency: the worker consumes the KV manager's ``bind``
     # interface; importing it at runtime would create a core↔worker cycle.
     from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
-from astrai.inference.contracts import ExecutionRequest, SchedulerOutput
+from astrai.inference.contracts import ExecutionRequest, LogprobRequest, SchedulerOutput
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.pending import (
     PendingExecution,
@@ -341,7 +341,7 @@ class GPUModelRunner:
         self,
         requests: List[ExecutionRequest],
         start_pos: int = 0,
-        return_logprobs: bool = False,
+        return_logprobs: LogprobRequest = False,
         num_tokens: Optional[List[int]] = None,
         *,
         plan: SchedulerOutput,
@@ -551,7 +551,7 @@ class GPUModelRunner:
     def submit_decode(
         self,
         requests: List[ExecutionRequest],
-        return_logprobs: bool = False,
+        return_logprobs: LogprobRequest = False,
         *,
         plan: SchedulerOutput,
     ) -> Optional[PendingExecution]:
@@ -678,7 +678,7 @@ class GPUModelRunner:
         self,
         logits: Tensor,
         requests: List[ExecutionRequest],
-        return_logprobs: bool = False,
+        return_logprobs: LogprobRequest = False,
         info: Optional[SamplingBatchInfo] = None,
         *,
         plan: SchedulerOutput,

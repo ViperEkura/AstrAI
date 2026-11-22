@@ -68,6 +68,7 @@ class GRPOStrategy(BaseStrategy):
         overlong_max_len: Optional[int] = None,
         overlong_buffer_len: int = 0,
         overlong_penalty_scale: float = 1.0,
+        rollout_temperature: float = 1.0,
         **kwargs,
     ):
         super().__init__(model, device, **kwargs)
@@ -96,6 +97,7 @@ class GRPOStrategy(BaseStrategy):
         self.overlong_penalty_scale = self._validate_non_negative_real(
             overlong_penalty_scale, "overlong_penalty_scale"
         )
+        self.rollout_temperature = rollout_temperature
         self.kl_coef = kl_coef
         self.group_size = group_size
 
@@ -210,18 +212,29 @@ class GRPOStrategy(BaseStrategy):
             responses,
             masks,
             grad_chunked=self.gradient_chunked_logprobs,
+            temperature=self.rollout_temperature,
         )
         token_log_probs_policy = policy_output["logprobs"]
         aux_loss = policy_output["aux_loss"]
         with torch.no_grad():
             if behavior_logprobs is None:
                 token_log_probs_old = rollout_token_logprobs(
-                    self.old_model, prompts, prompt_mask, responses, masks
+                    self.old_model,
+                    prompts,
+                    prompt_mask,
+                    responses,
+                    masks,
+                    temperature=self.rollout_temperature,
                 )["logprobs"]
             else:
                 token_log_probs_old = behavior_logprobs
             token_log_probs_ref = rollout_token_logprobs(
-                self.ref_model, prompts, prompt_mask, responses, masks
+                self.ref_model,
+                prompts,
+                prompt_mask,
+                responses,
+                masks,
+                temperature=self.rollout_temperature,
             )["logprobs"]
 
         token_masks = masks.float()

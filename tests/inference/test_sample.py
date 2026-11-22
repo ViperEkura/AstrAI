@@ -142,3 +142,18 @@ def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
 def test_seed_count_must_match_batch():
     with pytest.raises(ValueError, match="seeds"):
         sample(torch.zeros(2, 4), seeds=[1])
+
+
+@pytest.mark.parametrize("top_k", [0, 1])
+def test_temperature_logprobs_score_before_truncation(top_k):
+    logits = torch.tensor([[2.25, 1.5, -0.5], [-1.0, 0.5, 0.75]], dtype=torch.bfloat16)
+    temperatures = torch.tensor([0.8, 1.25])
+    tokens, actual = sample(
+        logits.clone(),
+        temperature=temperatures,
+        top_k=top_k,
+        return_logprobs="temperature",
+        seeds=[3, 7],
+    )
+    expected = (logits.float() / temperatures[:, None]).log_softmax(-1)
+    torch.testing.assert_close(actual, expected.gather(1, tokens[:, None]).squeeze(1))

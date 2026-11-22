@@ -67,7 +67,14 @@ def move_to_device(batch: Dict[str, Tensor], device: str) -> Dict[str, Tensor]:
 _CHUNK_LOGIT_BYTES = 64 * 1024 * 1024
 
 
-def _chunked_token_logprobs(hidden_states: Tensor, weight: Tensor, targets: Tensor):
+def _policy_logits(logits: Tensor, temperature: float) -> Tensor:
+    logits = logits.float()
+    return logits if temperature == 1.0 else logits / temperature
+
+
+def _chunked_token_logprobs(
+    hidden_states: Tensor, weight: Tensor, targets: Tensor, temperature: float = 1.0
+):
     """Per-token log-probs without materializing the full ``[N, S, V]`` tensor.
 
     The model forward is taken with ``skip_lm_head=True`` so only the
@@ -88,15 +95,14 @@ def _chunked_token_logprobs(hidden_states: Tensor, weight: Tensor, targets: Tens
     out = torch.empty(n * s, dtype=torch.float32, device=hidden_states.device)
     for start in range(0, n * s, rows_per_chunk):
         end = min(start + rows_per_chunk, n * s)
-        logits = flat_hidden[start:end] @ weight_t
-        logits = logits.float()
+        logits = _policy_logits(flat_hidden[start:end] @ weight_t, temperature)
         picked = logits.gather(-1, flat_targets[start:end].unsqueeze(-1)).squeeze(-1)
         out[start:end] = picked - torch.logsumexp(logits, dim=-1)
     return out.view(n, s)
 
 
 def _chunked_token_logprobs_grad(
-    hidden_states: Tensor, weight: Tensor, targets: Tensor
+    hidden_states: Tensor, weight: Tensor, targets: Tensor, temperature: float = 1.0
 ) -> Tensor:
     """Gradient-enabled twin of :func:`_chunked_token_logprobs`.
 
@@ -117,7 +123,7 @@ def _chunked_token_logprobs_grad(
     rows_per_chunk = max(1, _CHUNK_LOGIT_BYTES // (vocab * dtype_bytes))
 
     def chunk_logprobs(chunk_hidden: Tensor, chunk_targets: Tensor) -> Tensor:
-        logits = (chunk_hidden @ weight.t()).float()
+        logits = _policy_logits(chunk_hidden @ weight.t(), temperature)
         picked = logits.gather(-1, chunk_targets.unsqueeze(-1)).squeeze(-1)
         return picked - torch.logsumexp(logits, dim=-1)
 
@@ -194,6 +200,7 @@ def get_logprobs(
     loss_mask: Tensor,
     reduction: str,
     grad_chunked: bool = False,
+    temperature: float = 1.0,
 ) -> LogprobsOutput:
     """Compute token-wise log probabilities from model outputs.
 
@@ -256,10 +263,15 @@ def get_logprobs(
             else _chunked_token_logprobs
         )
         token_logprobs = chunk_fn(
-            outputs["hidden_states"], model.lm_head.weight, shifted_input_ids
+            outputs["hidden_states"],
+            model.lm_head.weight,
+            shifted_input_ids,
+            temperature,
         )
     else:
-        log_probs = torch.log_softmax(outputs["logits"].float(), dim=-1)
+        log_probs = torch.log_softmax(
+            _policy_logits(outputs["logits"], temperature), dim=-1
+        )
         token_logprobs = torch.gather(
             log_probs, dim=-1, index=shifted_input_ids.unsqueeze(-1)
         ).squeeze(-1)
@@ -320,6 +332,7 @@ def _packed_rollout_token_logprobs(
     responses: Tensor,
     response_masks: Tensor,
     grad_chunked: bool = False,
+    temperature: float = 1.0,
 ) -> Optional[LogprobsOutput]:
     """Score responses on unpadded (prompt, response) runs packed into rows.
 
@@ -424,7 +437,9 @@ def _packed_rollout_token_logprobs(
         return_lm_head_weight=chunked,
     )
     if not chunked:
-        log_probs = torch.log_softmax(outputs["logits"].float(), dim=-1)
+        log_probs = torch.log_softmax(
+            _policy_logits(outputs["logits"], temperature), dim=-1
+        )
         picked = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
     else:
         chunk_fn = (
@@ -436,6 +451,7 @@ def _packed_rollout_token_logprobs(
             outputs["hidden_states"].unsqueeze(0),
             outputs["lm_head_weight"],
             targets.unsqueeze(0),
+            temperature,
         ).squeeze(0)
     scatter = torch.from_numpy(np.concatenate(scatter)).to(device)
     logprobs = picked.new_zeros(batch_size * group_size * response_len)
@@ -454,6 +470,7 @@ def rollout_token_logprobs(
     responses: Tensor,
     response_masks: Tensor,
     grad_chunked: bool = False,
+    temperature: float = 1.0,
 ) -> LogprobsOutput:
     """Per-response-token log probabilities for a grouped rollout batch.
 
@@ -471,7 +488,13 @@ def rollout_token_logprobs(
         of response token j under ``model``.
     """
     packed = _packed_rollout_token_logprobs(
-        model, prompts, prompt_mask, responses, response_masks, grad_chunked
+        model,
+        prompts,
+        prompt_mask,
+        responses,
+        response_masks,
+        grad_chunked,
+        temperature,
     )
     if packed is not None:
         return packed
@@ -503,6 +526,7 @@ def rollout_token_logprobs(
         full_masks,
         "none",
         grad_chunked=grad_chunked,
+        temperature=temperature,
     )
     output["logprobs"] = output["logprobs"][:, prompt_len - 1 :].view(
         batch_size, group_size, response_len

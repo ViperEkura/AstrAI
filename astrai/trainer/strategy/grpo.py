@@ -203,25 +203,28 @@ class GRPOStrategy(BaseStrategy):
         if prompt_mask is None:
             prompt_mask = prompts.ne(0)
 
+        inputs = prompts, prompt_mask, responses, masks
         policy_output = rollout_token_logprobs(
             self.model,
-            prompts,
-            prompt_mask,
-            responses,
-            masks,
+            *inputs,
             grad_chunked=self.gradient_chunked_logprobs,
+            temperature=self.rollout_temperature,
         )
         token_log_probs_policy = policy_output["logprobs"]
         aux_loss = policy_output["aux_loss"]
         with torch.no_grad():
             if behavior_logprobs is None:
                 token_log_probs_old = rollout_token_logprobs(
-                    self.old_model, prompts, prompt_mask, responses, masks
+                    self.old_model,
+                    *inputs,
+                    temperature=self.rollout_temperature,
                 )["logprobs"]
             else:
                 token_log_probs_old = behavior_logprobs
             token_log_probs_ref = rollout_token_logprobs(
-                self.ref_model, prompts, prompt_mask, responses, masks
+                self.ref_model,
+                *inputs,
+                temperature=self.rollout_temperature,
             )["logprobs"]
 
         token_masks = masks.float()

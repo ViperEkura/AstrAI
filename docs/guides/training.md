@@ -91,6 +91,12 @@ numerical paths.
 
 ### Online Rollout
 
+Online GRPO, PPO and DPO share `rollout_temperature` for sampling and for
+policy and reference log probabilities. PPO uses these scores for its ratio
+and KL reward, and DPO for both responses in the preference pair. Scores
+precede top-k/top-p truncation. Use `rollout_top_p=1` and `rollout_top_k=0`
+for an exact sampling-policy ratio. Validation uses its own decoding settings.
+
 `online_grpo` and `online_dpo` use the respective GRPO and DPO strategies with
 a `RolloutRunner`. The runner renders prompts through the tokenizer chat
 template, generates grouped responses through the inference backend, then scores

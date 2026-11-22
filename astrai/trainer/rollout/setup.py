@@ -176,19 +176,19 @@ def configure_rollout(
             enable_cuda_graph=enable_cuda_graph,
         )
 
+    params = SamplingParams(
+        max_tokens=cfg.rollout_max_tokens,
+        group_size=group_size,
+        temperature=cfg.rollout_temperature,
+        top_k=cfg.rollout_top_k,
+        top_p=cfg.rollout_top_p,
+    )
     if getattr(cfg, "rollout_mode", "sync") == "async_round":
         if str(getattr(inference_model.config, "ffn_type", "mlp")) == "moe":
             raise ValueError(
                 "async_round currently supports dense models only: MoE auxiliary "
                 "loss is not equivalent across learner microbatches"
             )
-        params = SamplingParams(
-            max_tokens=cfg.rollout_max_tokens,
-            group_size=group_size,
-            temperature=cfg.rollout_temperature,
-            top_k=cfg.rollout_top_k,
-            top_p=cfg.rollout_top_p,
-        )
         resolved = resolve_async_rollout(
             cfg,
             train_device,
@@ -221,13 +221,7 @@ def configure_rollout(
     generator = RolloutGenerator(
         backend=train_backend,
         tokenizer=tokenizer,
-        params=SamplingParams(
-            max_tokens=cfg.rollout_max_tokens,
-            group_size=group_size,
-            temperature=cfg.rollout_temperature,
-            top_k=cfg.rollout_top_k,
-            top_p=cfg.rollout_top_p,
-        ),
+        params=params,
         output_device=train_device,
     )
     reward_model = cfg.reward_model_fn()

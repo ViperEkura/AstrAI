@@ -1,10 +1,12 @@
-"""Sampling with cached host metadata and raw-model log probabilities."""
+"""Sampling with cached host metadata and optional token log probabilities."""
 
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
+
+from astrai.inference.contracts import LogprobRequest
 
 
 @dataclass(frozen=True)
@@ -48,15 +50,16 @@ def sample(
     frequency_penalty: Union[float, Tensor] = 0.0,
     frequency_counts: Optional[Tensor] = None,
     filter_value: float = -float("inf"),
-    return_logprobs: bool = False,
+    return_logprobs: LogprobRequest = False,
     meta: Optional[SamplingMeta] = None,
     seeds: Optional[List[Optional[int]]] = None,
 ):
     """Apply frequency penalty, temperature, top-k and top-p, then sample.
 
-    Returned log probabilities use the original model distribution, before
-    penalties or filtering. Frequency counts are supplied by the caller and
-    remain unchanged. Per-request seeds do not advance the global RNG.
+    True returns raw model log probabilities. Online training requests
+    "temperature" to score positive-temperature samples before top-k/top-p.
+    The caller supplies frequency counts. Per-request seeds leave the global
+    RNG unchanged.
     The worker supplies cached metadata; standalone callers may use scalars
     or per-row tensors without it.
     """
@@ -78,8 +81,13 @@ def sample(
             if isinstance(frequency_penalty, Tensor)
             else frequency_penalty != 0,
         )
-    raw_log_probs = (
-        torch.log_softmax(logits.float(), dim=-1) if return_logprobs else None
+    tempered = return_logprobs == "temperature"
+    if tempered and meta.greedy:
+        raise ValueError("temperature log probabilities require positive temperature")
+    if tempered:
+        logits = logits.float()
+    log_probs = (
+        logits.float().log_softmax(-1) if return_logprobs and not tempered else None
     )
     if meta.greedy and not meta.has_freq:
         tokens = logits.argmax(dim=-1)
@@ -102,6 +110,8 @@ def sample(
                 else max(temperature, 1e-8)
             )
             logits = logits / temp
+        if tempered:
+            log_probs = logits.float().log_softmax(-1)
         k = min(meta.max_top_k, logits.size(-1))
         if k > 0:
             values = torch.topk(logits, k, dim=-1).values
@@ -144,5 +154,5 @@ def sample(
             tokens = torch.searchsorted(cdf, target, right=True).squeeze(-1)
             tokens = tokens.clamp_(max=probabilities.size(-1) - 1)
     if return_logprobs:
-        return tokens, raw_log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+        return tokens, log_probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
     return tokens

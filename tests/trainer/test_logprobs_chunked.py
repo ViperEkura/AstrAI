@@ -72,9 +72,9 @@ def test_chunked_path_engages_only_without_grad(cpu_device, monkeypatch):
     calls = []
     original = strategy_module._chunked_token_logprobs
 
-    def spy(hidden_states, weight, targets):
+    def spy(hidden_states, weight, targets, temperature):
         calls.append(hidden_states.shape)
-        return original(hidden_states, weight, targets)
+        return original(hidden_states, weight, targets, temperature)
 
     monkeypatch.setattr("astrai.trainer.strategy.ops._chunked_token_logprobs", spy)
 
@@ -87,7 +87,8 @@ def test_chunked_path_engages_only_without_grad(cpu_device, monkeypatch):
     assert calls == []
 
 
-def test_rollout_logprobs_score_unpadded_runs(cpu_device):
+@pytest.mark.parametrize("temperature", [0.8, 1.0])
+def test_rollout_logprobs_score_unpadded_runs(cpu_device, temperature):
     model, _ = make_model(cpu_device)
     torch.manual_seed(5)
     batch, group, prompt_len, response_len = 2, 3, 6, 5
@@ -103,7 +104,9 @@ def test_rollout_logprobs_score_unpadded_runs(cpu_device):
     seen = []
     hook = model.register_forward_pre_hook(lambda _, args: seen.append(args[0].numel()))
     with torch.no_grad():
-        out = rollout_token_logprobs(model, prompts, prompt_mask, responses, masks)
+        out = rollout_token_logprobs(
+            model, prompts, prompt_mask, responses, masks, temperature=temperature
+        )
     hook.remove()
     assert seen == [55]  # five runs packed in rows of 11, not 6 padded rows
     for b in range(batch):
@@ -117,7 +120,7 @@ def test_rollout_logprobs_score_unpadded_runs(cpu_device):
             ids = torch.cat([prompt, response])[None]
             with torch.no_grad():
                 logits = model(ids[:, :-1])["logits"].float()
-            ref = torch.log_softmax(logits, -1)[0, prompt.numel() - 1 :]
+            ref = torch.log_softmax(logits / temperature, -1)[0, prompt.numel() - 1 :]
             ref = ref.gather(-1, response[:, None]).squeeze(-1)
             torch.testing.assert_close(
                 out["logprobs"][b, g, :n], ref, rtol=1e-5, atol=1e-5
@@ -136,21 +139,33 @@ def test_packed_rollout_logprobs_keep_the_grad_chunked_choice(cpu_device, monkey
     calls = []
     original = strategy_module._chunked_token_logprobs_grad
 
-    def spy(hidden_states, weight, targets):
+    def spy(hidden_states, weight, targets, temperature):
         calls.append(hidden_states.shape[1])
-        return original(hidden_states, weight, targets)
+        return original(hidden_states, weight, targets, temperature)
 
     monkeypatch.setattr("astrai.trainer.strategy.ops._chunked_token_logprobs_grad", spy)
-    full = rollout_token_logprobs(model, prompts, prompt_mask, responses, masks)
+    full = rollout_token_logprobs(
+        model, prompts, prompt_mask, responses, masks, temperature=0.8
+    )
     assert calls == []
     chunked = rollout_token_logprobs(
-        model, prompts, prompt_mask, responses, masks, grad_chunked=True
+        model,
+        prompts,
+        prompt_mask,
+        responses,
+        masks,
+        grad_chunked=True,
+        temperature=0.8,
     )
     assert calls == [7]
     torch.testing.assert_close(
         full["logprobs"], chunked["logprobs"], rtol=1e-5, atol=1e-5
     )
-    full["logprobs"].sum().backward()
+    full_grad = torch.autograd.grad(full["logprobs"].sum(), model.lm_head.weight)[0]
+    chunked_grad = torch.autograd.grad(chunked["logprobs"].sum(), model.lm_head.weight)[
+        0
+    ]
+    torch.testing.assert_close(chunked_grad, full_grad, rtol=1e-5, atol=1e-5)
 
 
 def _ddp_packed_worker(rank, world_size, port):

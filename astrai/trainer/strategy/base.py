@@ -39,10 +39,13 @@ class BaseStrategy(ABC):
         self,
         model: Union[nn.Module, Callable[..., Dict[str, Tensor]]],
         device: str,
+        *,
+        rollout_temperature: float = 1.0,
         **kwargs,
     ):
         self.model = model
         self.device = device
+        self.rollout_temperature = rollout_temperature
         self.executor = kwargs.pop("executor", None)
         self.moe_aux_loss_coef = kwargs.pop("moe_aux_loss_coef", 0.01)
         self.gradient_chunked_logprobs = bool(

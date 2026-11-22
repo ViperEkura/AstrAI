@@ -126,7 +126,12 @@ class PPOStrategy(BaseStrategy):
 
         if self.ref_model is not None and self.kl_coef > 0:
             ref_logprobs = rollout_token_logprobs(
-                self.ref_model, prompts, prompt_mask, responses, response_masks
+                self.ref_model,
+                prompts,
+                prompt_mask,
+                responses,
+                response_masks,
+                temperature=self.rollout_temperature,
             )["logprobs"]
             # k3 per-token KL estimator folded into the reward.
             kl_penalty = behavior_logprobs.float() - ref_logprobs
@@ -202,6 +207,7 @@ class PPOStrategy(BaseStrategy):
             responses,
             masks,
             grad_chunked=self.gradient_chunked_logprobs,
+            temperature=self.rollout_temperature,
         )
         token_log_probs_policy = policy_output["logprobs"]
 

@@ -713,7 +713,7 @@ def test_paged_prefill_short_mask_bounds(dtype, mask_rows, expand_rows, mask_col
     [(32, 1, 16)]
     + [
         (dim, groups, ROLLOUT_KV_SPLIT_SIZE)
-        for dim, groups in ((32, 1), (64, 2), (128, 4), (256, 8))
+        for dim, groups in ((32, 1), (64, 2), (64, 17), (128, 4), (256, 8))
     ],
 )
 def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups, split_size):

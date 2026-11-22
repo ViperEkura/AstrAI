@@ -59,106 +59,80 @@ DEVICE_FORCEINLINE float merge_output(float total, float part, float alpha, floa
     return __fmaf_rn(total, alpha, __fmul_rn(part, beta));
 }
 
-/* Subtract-first keeps corr=1 exactly when the raw max is unchanged. */
-DEVICE_FORCEINLINE float softmax_remax(float& m, float cand, float& corr, float s2) {
-    float nm = fmaxf(m, cand);
-    corr = exp2f((m - nm) * s2);
-    m = nm;
-    return nm;
+// Four neighboring lanes contribute columns to the same MMA row.
+DEVICE_FORCEINLINE float quad_sum(float x) {
+    x += __shfl_xor_sync(0xffffffff, x, 1);
+    return x + __shfl_xor_sync(0xffffffff, x, 2);
 }
 
-/* Warp-local row recurrence; mask policy supplies visibility, not addresses here. */
-template <typename Traits> struct WarpSoftmax {
-    using Layout = typename Traits::FragmentLayout;
+enum class SumReduction { PerTile, Deferred };
+
+template <typename Traits> struct AttentionAccumulator {
     SoftmaxState rows[2];
-    template <typename Mask>
-    __device__ inline void update(int kv0,
-                                  float scale_log2,
-                                  typename Traits::ScoreFragment& Sacc,
-                                  typename Traits::OutputFragment& Oacc,
-                                  int lane,
-                                  const Mask& mask) {
-        float& m0 = rows[0].m;
-        float& m1 = rows[1].m;
-        float& l0 = rows[0].l;
-        float& l1 = rows[1].l;
+    typename Traits::OutputFragment output{};
 
-        int tid4 = lane & 3;
-
-        float rmax0 = -FLT_MAX, rmax1 = -FLT_MAX;
+    template <SumReduction Reduction = SumReduction::PerTile>
+    DEVICE_FORCEINLINE void update_softmax(typename Traits::ScoreFragment& scores,
+                                           float scale_log2, int row_count = 2) {
 #pragma unroll
-        for (int n8 = 0; n8 < Traits::NC8; n8++) {
-            int cc = kv0 + n8 * Layout::kN + 2 * tid4;
-            int c1 = cc + 1;
-            bool b0 = mask.is_masked(0, cc);
-            bool b1 = mask.is_masked(0, c1);
-            bool b2 = mask.is_masked(1, cc);
-            bool b3 = mask.is_masked(1, c1);
-            float s0 = b0 ? -FLT_MAX : Sacc[n8][0];
-            float s1 = b1 ? -FLT_MAX : Sacc[n8][1];
-            float s2 = b2 ? -FLT_MAX : Sacc[n8][2];
-            float s3 = b3 ? -FLT_MAX : Sacc[n8][3];
-            Sacc[n8][0] = s0;
-            Sacc[n8][1] = s1;
-            Sacc[n8][2] = s2;
-            Sacc[n8][3] = s3;
-            rmax0 = fmaxf(rmax0, fmaxf(s0, s1));
-            rmax1 = fmaxf(rmax1, fmaxf(s2, s3));
-        }
-        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
-        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
-        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
-        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
-
-        float corr0, corr1;
-        float nm0 = softmax_remax(m0, rmax0, corr0, scale_log2);
-        float nm1 = softmax_remax(m1, rmax1, corr1, scale_log2);
-
-        /* Clamp the empty state's scaled max to 0. This keeps masked scores at
-         * -FLT_MAX, so exp2 yields 0 rather than 1 for the softmax sentinel.
-         */
-        float nm2_0 = softmax_scaled_max(nm0, scale_log2);
-        float nm2_1 = softmax_scaled_max(nm1, scale_log2);
-
-        float rsum0 = 0.0f, rsum1 = 0.0f;
+        for (int r = 0; r < 2; ++r) {
+            if (r >= row_count) {
 #pragma unroll
-        for (int n8 = 0; n8 < Traits::NC8; n8++) {
-            /* The compiler contracts x*s2 - nm2 into an FFMA feeding MUFU.EX2,
-             * avoiding a separate scale multiply for each score.
-             */
-            float p0 = exp2f(Sacc[n8][0] * scale_log2 - nm2_0);
-            float p1 = exp2f(Sacc[n8][1] * scale_log2 - nm2_0);
-            float p2 = exp2f(Sacc[n8][2] * scale_log2 - nm2_1);
-            float p3 = exp2f(Sacc[n8][3] * scale_log2 - nm2_1);
-            Sacc[n8][0] = p0;
-            Sacc[n8][1] = p1;
-            Sacc[n8][2] = p2;
-            Sacc[n8][3] = p3;
-            rsum0 += p0 + p1;
-            rsum1 += p2 + p3;
-        }
-        rsum0 += __shfl_xor_sync(0xFFFFFFFF, rsum0, 1);
-        rsum0 += __shfl_xor_sync(0xFFFFFFFF, rsum0, 2);
-        rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 1);
-        rsum1 += __shfl_xor_sync(0xFFFFFFFF, rsum1, 2);
-        l0 = l0 * corr0 + rsum0;
-        l1 = l1 * corr1 + rsum1;
-
-        /* Skip O rescaling when the max is unchanged: corr is exactly 1.0f, so
-         * multiplying by it would leave each value bit-identical.
-         */
-        if (corr0 != 1.0f) {
+                for (int n = 0; n < Traits::NC8; ++n)
+                    scores[n][2 * r] = scores[n][2 * r + 1] = 0.0f;
+                continue;
+            }
+            auto& state = rows[r];
+            float m = state.m;
 #pragma unroll
-            for (int j = 0; j < Traits::DN8; j++) {
-                Oacc[j][0] *= corr0;
-                Oacc[j][1] *= corr0;
+            for (int n = 0; n < Traits::NC8; ++n)
+                m = fmaxf(m, fmaxf(scores[n][2 * r], scores[n][2 * r + 1]));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 2));
+            const float corr = exp2f((state.m - m) * scale_log2);
+            state.m = m;
+            const float scaled_max = softmax_scaled_max(m, scale_log2);
+            float sum = 0.0f;
+#pragma unroll
+            for (int n = 0; n < Traits::NC8; ++n) {
+                auto& x = scores[n][2 * r];
+                auto& y = scores[n][2 * r + 1];
+                x = exp2f(x * scale_log2 - scaled_max);
+                y = exp2f(y * scale_log2 - scaled_max);
+                sum += x + y;
+            }
+            if constexpr (Reduction == SumReduction::PerTile)
+                sum = quad_sum(sum);
+            state.l = state.l * corr + sum;
+            if (corr != 1.0f) {
+#pragma unroll
+                for (int n = 0; n < Traits::DN8; ++n) {
+                    output[n][2 * r] *= corr;
+                    output[n][2 * r + 1] *= corr;
+                }
             }
         }
-        if (corr1 != 1.0f) {
+    }
+
+    // The running maximum is shared within a row, so lane sums can be combined once.
+    DEVICE_FORCEINLINE void finish_sum() {
 #pragma unroll
-            for (int j = 0; j < Traits::DN8; j++) {
-                Oacc[j][2] *= corr1;
-                Oacc[j][3] *= corr1;
+        for (int r = 0; r < 2; ++r)
+            rows[r].l = quad_sum(rows[r].l);
+    }
+
+    DEVICE_FORCEINLINE void merge(const AttentionAccumulator& part, float scale_log2) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            if (part.rows[r].l == 0.0f)
+                continue;
+            float alpha, beta;
+            merge_softmax(rows[r], part.rows[r], alpha, beta, scale_log2);
+#pragma unroll
+            for (int n = 0; n < Traits::DN8; ++n) {
+#pragma unroll
+                for (int i = 2 * r; i < 2 * r + 2; ++i)
+                    output[n][i] = merge_output(output[n][i], part.output[n][i], alpha, beta);
             }
         }
     }

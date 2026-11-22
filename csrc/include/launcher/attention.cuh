@@ -147,7 +147,7 @@ struct PrefillKernel {
 
     static void launch(const AttentionParams& p, dim3 grid, cudaStream_t stream) {
         using Mainloop = PrefillMainloop<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape, FixedSplits>;
-        attention_kernel<Mainloop, OutputEpilogue<Traits, QSchedule, true>>
+        attention_kernel<Mainloop, OutputEpilogue<Traits, true>>
             <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
@@ -186,7 +186,7 @@ struct DecodeKernel {
     static void launch(AttentionParams& p, const DecodeLaunchPlan& plan, cudaStream_t stream) {
         p.num_splits = static_cast<int>(plan.grid.z);
         if (plan.direct_output) {
-            attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits, KV>>
+            attention_kernel<DecodeMainloop<Traits, KV, HasMask>, OutputEpilogue<Traits>>
                 <<<plan.grid, Traits::NUM_THREADS, 0, stream>>>(p);
             ASTRAI_LAUNCH_CHECK();
             return;

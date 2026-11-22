@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <datatype/element.cuh>
+#include <kernel/attention/kernel.cuh>
 #include <memory/layout_policies.cuh>
 #include <mma/ldmatrix.cuh>
 #include <mma/mma.cuh>
@@ -58,72 +59,72 @@ template <typename Traits> struct AttentionMma {
     using QueryFragment = typename Traits::QueryFragment;
     using ScoreFragment = typename Traits::ScoreFragment;
     using OutputFragment = typename Traits::OutputFragment;
-    static __device__ inline void clear(OutputFragment& output) {
+    static DEVICE_FORCEINLINE void load_query(const AttentionParams& p, const QueryRows& q,
+                                              int lane, QueryFragment& frag) {
+        const int column = Traits::FragmentLayout::column(lane);
 #pragma unroll
-        for (int j = 0; j < Traits::DN8; ++j)
-            output[j][0] = output[j][1] = output[j][2] = output[j][3] = 0.0f;
-    }
-
-    static __device__ inline void load_query(const T* __restrict__ qa,
-                                             const T* __restrict__ qb,
-                                             int stride_d,
-                                             int off_a,
-                                             int off_b,
-                                             bool va,
-                                             bool vb,
-                                             int tid4,
-                                             QueryFragment& Qa) {
+        for (int r = 0; r < 2; ++r) {
+            const auto& row = q.row[r];
+            const T* base = static_cast<const T*>(p.q_ptr) + row.offset;
 #pragma unroll
-        for (int kt = 0; kt < Traits::KD; kt++) {
-            int c = kt * Atom::Shape::kK + tid4 * 2;
-            const unsigned* pau = reinterpret_cast<const unsigned*>(&qa[off_a + c * stride_d]);
-            const unsigned* pbu = reinterpret_cast<const unsigned*>(&qb[off_b + c * stride_d]);
-            Qa[kt][0] = va ? pau[0] : 0u;
-            Qa[kt][1] = vb ? pbu[0] : 0u;
-            Qa[kt][2] = va ? pau[4] : 0u;
-            Qa[kt][3] = vb ? pbu[4] : 0u;
-        }
-    }
-
-    static __device__ inline void scores(const QueryFragment& Qa,
-                                         const typename Traits::Elem* __restrict__ sK,
-                                         int lane,
-                                         ScoreFragment& Sacc) {
-#pragma unroll
-        for (int n8 = 0; n8 < Traits::NC8; n8++) {
-            Sacc[n8][0] = Sacc[n8][1] = Sacc[n8][2] = Sacc[n8][3] = 0.0f;
-            int krow_l = n8 * Atom::Shape::kN + (lane & 7);
-            int kcol_h = (lane & 8) ? 8 : 0;
-#pragma unroll
-            for (int kt = 0; kt < Traits::KD; kt++) {
-                unsigned b[Atom::kBRegs];
-                astrai::ldmatrix_x2<typename Traits::Elem>(
-                    b, &sK[krow_l * Traits::LD +
-                           Traits::SharedLayout::column(kt * Atom::Shape::kK + kcol_h, krow_l)]);
-                Atom::fma(Sacc[n8], Qa[kt], b, Sacc[n8]);
+            for (int k = 0; k < Traits::KD; ++k) {
+                const int d = k * Atom::Shape::kK + column;
+                const auto* pair = reinterpret_cast<const unsigned*>(base + d * p.q_d_stride);
+                // The A fragment stores two rows at d, followed by the same rows at d + 8.
+                frag[k][r] = row.valid ? pair[0] : 0u;
+                frag[k][r + 2] = row.valid ? pair[4] : 0u;
             }
         }
     }
 
-    static __device__ inline void values(const ScoreFragment& Sacc,
+    // An x4 load supplies the B fragments for two adjacent m16n8 operations.
+    template <bool Transpose>
+    static DEVICE_FORCEINLINE void load_b_pair(unsigned (&b)[4], const T* tile, int row, int col) {
+        const auto offset = row * Traits::LD + Traits::SharedLayout::column(col, row);
+        astrai::ldmatrix_x4_lane<Transpose>(b, __cvta_generic_to_shared(tile + offset));
+    }
+
+    static DEVICE_FORCEINLINE void scores(const QueryFragment& query, const T* keys,
+                                         int lane, ScoreFragment& scores) {
+        constexpr int N = Atom::Shape::kN;
+#pragma unroll
+        for (int n = 0; n < Traits::NC8; n += 2) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                scores[n][i] = scores[n + 1][i] = 0.0f;
+            // Lanes 0..15 address the first K fragment and 16..31 the next eight keys.
+            const int row = n * N + (lane & 7) + (lane / 16) * N;
+#pragma unroll
+            for (int k = 0; k < Traits::KD; ++k) {
+                unsigned b[4];
+                load_b_pair<false>(b, keys, row, k * Atom::Shape::kK + (lane & 8));
+                Atom::fma(scores[n], query[k], b, scores[n]);
+                Atom::fma(scores[n + 1], query[k], b + 2, scores[n + 1]);
+            }
+        }
+    }
+
+    static __device__ inline void values(const ScoreFragment& weights,
                                          const typename Traits::Elem* __restrict__ sV,
                                          int lane,
                                          OutputFragment& Oacc) {
 #pragma unroll
         for (int kt2 = 0; kt2 < Traits::KT2; kt2++) {
             unsigned Pa[Atom::kARegs];
-            Pa[0] = ElemTrait<T>::pack2(Sacc[kt2 * 2][0], Sacc[kt2 * 2][1]);
-            Pa[1] = ElemTrait<T>::pack2(Sacc[kt2 * 2][2], Sacc[kt2 * 2][3]);
-            Pa[2] = ElemTrait<T>::pack2(Sacc[kt2 * 2 + 1][0], Sacc[kt2 * 2 + 1][1]);
-            Pa[3] = ElemTrait<T>::pack2(Sacc[kt2 * 2 + 1][2], Sacc[kt2 * 2 + 1][3]);
-            int vrow_l = kt2 * Atom::Shape::kK + (lane & 15);
 #pragma unroll
-            for (int dn8 = 0; dn8 < Traits::DN8; dn8++) {
-                unsigned b[Atom::kBRegs];
-                astrai::ldmatrix_x2<typename Traits::Elem, true>(
-                    b, &sV[vrow_l * Traits::LD +
-                           Traits::SharedLayout::column(dn8 * Atom::Shape::kN, vrow_l)]);
-                Atom::fma(Oacc[dn8], Pa, b, Oacc[dn8]);
+            for (int n = 0; n < 2; ++n) {
+                const auto& p = weights[2 * kt2 + n];
+                Pa[2 * n] = ElemTrait<T>::pack2(p[0], p[1]);
+                Pa[2 * n + 1] = ElemTrait<T>::pack2(p[2], p[3]);
+            }
+            const int row = kt2 * Atom::Shape::kK + (lane & 15);
+#pragma unroll
+            for (int n = 0; n < Traits::DN8; n += 2) {
+                unsigned b[4];
+                const int col = (n + lane / 16) * Atom::Shape::kN;
+                load_b_pair<true>(b, sV, row, col);
+                Atom::fma(Oacc[n], Pa, b, Oacc[n]);
+                Atom::fma(Oacc[n + 1], Pa, b + 2, Oacc[n + 1]);
             }
         }
     }

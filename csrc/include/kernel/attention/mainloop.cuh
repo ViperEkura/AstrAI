@@ -6,28 +6,14 @@
 #include <api/native/attention.h>
 #include <arith/softmax.cuh>
 #include <kernel/attention/kernel.cuh>
+#include <kernel/attention/mma.cuh>
 #include <memory/layout_policies.cuh>
 
 namespace astrai {
 namespace attention {
 
-/*
- * Tensor-core prefill flash attention, unified across contiguous and paged
- * K/V via the KV template parameter; S = Q@K^T and O = P@V run on
- * mma.sync.m16n8k16 (f32 accumulate), one warp owning 16 packed rows.
- *
- * PackGQA head folding (FA3-style): the block's row space is the packed
- * (head, row) space of one kv-head group — packed idx in [0, G*rows) with
- * h = idx % G, m = idx / G. Every block covers BLOCK_M = BR*WARPS packed
- * rows of one host tile, K/V tiles loaded once per block and shared by all
- * G heads' rows; any G packs with zero idle warps (G=6 no longer wastes 25%
- * of every block). Rows past a head's q_len tail are masked per-row; G=1
- * (MHA) degenerates to the unfolded layout.
- *
- * KV = ContigKV<T> or PagedKV<T> (T = Traits::Elem); IsCausal/HasMask are
- * compile-time bools — dead branches eliminated in the compute loop.
- * Traits = KernelTraits<HEAD_DIM, BC, WARPS=4, STAGES=2, Elem>.
- */
+// A CTA shares K/V across its warps. Within a KV head, successive packed
+// rows span the query heads of one token before advancing to the next token.
 template <typename Tile,
           typename QSchedule,
           typename KV,
@@ -45,9 +31,6 @@ struct PrefillMainloop {
 
         const int warp = threadIdx.x / 32;
         const int lane = threadIdx.x % 32;
-        const int gid = Layout::row(lane);         // 0..7
-        const int tid4 = Layout::column(lane) / 2; // 0..3
-
         constexpr int BLOCK_M = Traits::BR * Traits::WARPS; // packed rows per block
 
         const int G = p.q_head / p.kv_head;
@@ -59,14 +42,6 @@ struct PrefillMainloop {
         int batch, packed0;
         QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
 
-        // Map packed GQA rows to their request-local head and query positions.
-        const int ia = packed0 + warp * Traits::BR + gid;
-        const int ib = ia + 8;
-        const int h0 = ia % G;
-        const int h1 = ib % G;
-        const int mra = ia / G; // row within the head
-        const int mrb = ib / G;
-
         // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
         const int seq_len = KV::kv_len(p, batch);
         const int q_len = QSchedule::q_len(p, batch);
@@ -75,54 +50,28 @@ struct PrefillMainloop {
             if (packed0 >= G * q_len)
                 return false;
         }
-        const int query_start = seq_len - q_len;
+        const int warp_begin = packed0 + warp * Traits::BR;
+        tile.query = QueryRows::prefill<Layout, QSchedule>(p, batch, warp_begin, kv_head, G, q_len, lane);
+        typename Traits::QueryFragment query;
+        Mma::load_query(p, tile.query, lane, query);
+
+        const VisibleKeys<IsCausal> keys{seq_len, q_len};
+        const AttentionMask<Layout, HasMask, MaskCoversShape> mask{p, tile.query, keys, lane};
+        const int full_tiles = keys.count(packed0 / G) / Traits::BC;
+        const int warp_end = keys.count((warp_begin + Traits::BR - 1) / G);
+        const int block_end = keys.count((packed0 + BLOCK_M - 1) / G);
+        const int tiles = block_end / Traits::BC + (block_end % Traits::BC != 0);
         const auto kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
-
-        // Q stays in registers; K/V share a double buffer.
-        T* sK = storage.k;
-        T* sV = storage.v;
-
-        // Reuse a Q base within one head; GQA row pairs may cross a head boundary.
-        const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
-        const bool va = mra < q_len, vb = mrb < q_len;
-        const T* qb = (h1 == h0) ? q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0)
-                                 : q_gmem + QSchedule::q_base(p, batch, kv_head * G + h1);
-        typename Traits::QueryFragment Qa;
-        Mma::load_query(q_gmem + QSchedule::q_base(p, batch, kv_head * G + h0), qb, p.q_d_stride,
-                        mra * p.q_l_stride, mrb * p.q_l_stride, va, vb, tid4, Qa);
-
-        auto& Oacc = tile.output;
-        Mma::clear(Oacc);
-        auto& softmax = tile.softmax;
-
-        // Causal and explicit-mask bounds are fixed for the warp's query rows.
-        const int maxc0 = IsCausal ? min(seq_len, query_start + mra + 1) : seq_len;
-        const int maxc1 = IsCausal ? min(seq_len, query_start + mrb + 1) : seq_len;
-        const AttentionRows rows{batch, kv_head * G + h0, kv_head * G + h1, mra, mrb};
-        const AttentionMask<HasMask, MaskCoversShape> mask{p, rows, maxc0, maxc1, va, vb};
-
-        const int tiles = (seq_len + Traits::BC - 1) / Traits::BC;
-
-        // Bound the shared loop by the block's deepest visible query.
-        const int warp_max_m = (packed0 + (warp + 1) * Traits::BR - 1) / G;
-        const int block_max_m = (packed0 + BLOCK_M - 1) / G;
-
-        int t_end = tiles - 1;
-        if constexpr (IsCausal) {
-            int bt = (block_max_m + query_start) / Traits::BC;
-            if (bt < t_end)
-                t_end = bt;
-        }
 
         // Load tile via predicated cp.async and KV policy
         auto load_tile = [&](int ti, int buf) {
-            KVTileLoader<Traits>::load(sK, sV, ti, buf, seq_len, [&](int kc, int d, bool valid) {
+            KVTileLoader<Traits>::load(storage.k, storage.v, ti, buf, seq_len, [&](int kc, int d, bool valid) {
                 int token = KV::resolve_token(p, kctx, kc, valid);
                 return KV::kv_addr_from_token(p, kctx, token, d);
             });
         };
 
-        auto run_tiles = [&](int begin, int end) {
+        auto run_tiles = [&](int begin, int end, AttentionAccumulator<Traits>& accum) {
             if (begin >= end)
                 return;
             load_tile(begin, begin & 1);
@@ -133,77 +82,43 @@ struct PrefillMainloop {
                 if (ti + 1 < end)
                     load_tile(ti + 1, (ti + 1) & 1);
 
-                const T* bK = sK + buf * Traits::BC * Traits::LD;
-                const T* bV = sV + buf * Traits::BC * Traits::LD;
+                const T* bK = storage.k + buf * Traits::BC * Traits::LD;
+                const T* bV = storage.v + buf * Traits::BC * Traits::LD;
                 const int kv0 = ti * Traits::BC;
-                if (!IsCausal || kv0 <= warp_max_m + query_start) {
-                    typename Traits::ScoreFragment Sacc;
-                    Mma::scores(Qa, bK, lane, Sacc);
-                    softmax.update(kv0, scale_log2, Sacc, Oacc, lane, mask);
-                    Mma::values(Sacc, bV, lane, Oacc);
+                if (!IsCausal || kv0 < warp_end) {
+                    typename Traits::ScoreFragment scores;
+                    Mma::scores(query, bK, lane, scores);
+                    if (HasMask || ti >= full_tiles)
+                        mask.apply(scores, kv0);
+                    // Fixed segments reproduce the decode reduction order for replay.
+                    constexpr auto reduction = FixedSplits ? SumReduction::PerTile : SumReduction::Deferred;
+                    accum.template update_softmax<reduction>(scores, scale_log2);
+                    Mma::values(scores, bV, lane, accum.output);
                 }
             }
         };
 
         if constexpr (FixedSplits) {
             const int split_tiles = p.kv_split_size / Traits::BC;
-            if (t_end < split_tiles) {
-                run_tiles(0, t_end + 1);
-            } else {
-                // Keep prefill partials in registers. Decode schedules the same
-                // segments on separate CTAs and uses the same merge recurrence.
-                typename Traits::OutputFragment total;
-                Mma::clear(total);
-                WarpSoftmax<Traits> stats;
-                for (int begin = 0; begin <= t_end; begin += split_tiles) {
+            if (tiles > split_tiles) {
+                for (int begin = 0; begin < tiles; begin += split_tiles) {
                     if (begin)
                         __syncthreads(); // Drain readers before reusing the K/V buffers.
-                    softmax = {};
-                    Mma::clear(Oacc);
-                    run_tiles(begin, min(begin + split_tiles, t_end + 1));
-#pragma unroll
-                    for (int row = 0; row < 2; ++row) {
-                        if (softmax.rows[row].l == 0.0f)
-                            continue;
-                        float alpha, beta;
-                        merge_softmax(stats.rows[row], softmax.rows[row], alpha, beta, scale_log2);
-#pragma unroll
-                        for (int j = 0; j < Traits::DN8; ++j) {
-                            total[j][2 * row] =
-                                merge_output(total[j][2 * row], Oacc[j][2 * row], alpha, beta);
-                            total[j][2 * row + 1] =
-                                merge_output(total[j][2 * row + 1], Oacc[j][2 * row + 1], alpha, beta);
-                        }
-                    }
+                    AttentionAccumulator<Traits> partial;
+                    run_tiles(begin, min(begin + split_tiles, tiles), partial);
+                    tile.accum.merge(partial, scale_log2);
                 }
-                softmax = stats;
-#pragma unroll
-                for (int j = 0; j < Traits::DN8; ++j)
-#pragma unroll
-                    for (int i = 0; i < 4; ++i)
-                        Oacc[j][i] = total[j][i];
+                return true;
             }
-        } else {
-            run_tiles(0, t_end + 1);
         }
-
-        tile.rows = rows;
-        tile.valid0 = va;
-        tile.valid1 = vb;
+        run_tiles(0, tiles, tile.accum);
+        if constexpr (!FixedSplits)
+            tile.accum.finish_sum();
         return true;
     }
 };
 
-/*
- * Split-K (FlashDecoding) tensor-core decode, unified across contiguous
- * and paged K/V via the KV template parameter. Decode has q_len == 1, so
- * the G = q_head/kv_head query heads pack into the M=16 rows of
- * mma.sync.m16n8k16, turning G independent GEMVs into one GEMM reusing
- * each K/V tile across all G heads (head-packing details in PrefillMainloop above).
- *
- * KV = ContigKV or PagedKV; HasMask is compile-time. Traits =
- * KernelTraits<HEAD_DIM, BC=16, WARPS=1, STAGES=2, Elem>.
- */
+// Each decode CTA processes a KV split for up to one MMA tile of query heads.
 template <typename Tile, typename KV, bool HasMask, bool SkipEmptySplits = false,
           bool FixedSplits = false>
 struct DecodeMainloop {
@@ -215,15 +130,12 @@ struct DecodeMainloop {
         using Layout = typename Traits::FragmentLayout;
 
         const int lane = threadIdx.x;
-        const int gid = Layout::row(lane);
-        const int tid4 = Layout::column(lane) / 2;
-
         const int pass = blockIdx.x / p.kv_head;
         const int kv_head = blockIdx.x % p.kv_head;
         const int batch = blockIdx.y;
         const int split = blockIdx.z;
 
-        constexpr int MAX_G = 16;
+        constexpr int MAX_G = Traits::BR;
         const int G_total = p.q_head / p.kv_head;
         const int g_begin = pass * MAX_G;
         const int G = min(MAX_G, G_total - g_begin);
@@ -239,23 +151,12 @@ struct DecodeMainloop {
         T* sK = storage.k;
         T* sV = storage.v;
 
-        // Decode packs GQA query heads into the MMA row dimension.
-        const T* __restrict__ q_gmem = static_cast<const T*>(p.q_ptr);
-        const int q_base = KV::q_base(p, batch, q_head0);
-        const int qra = gid;
-        const int qrb = gid + 8;
-        const bool va = qra < G, vb = qrb < G;
-        typename Traits::QueryFragment Qa;
-        Mma::load_query(q_gmem + q_base, q_gmem + q_base, p.q_d_stride, qra * p.q_h_stride,
-                        qrb * p.q_h_stride, va, vb, tid4, Qa);
-
-        auto& Oacc = tile.output;
-        Mma::clear(Oacc);
-        auto& softmax = tile.softmax;
-
-        // Visibility is fixed for these query rows across all K/V tiles.
-        const AttentionRows rows{batch, q_head0 + gid, q_head0 + gid + 8, 0, 0};
-        const AttentionMask<HasMask> mask{p, rows, seq_len, seq_len, va, vb};
+        // A group of up to eight heads occupies only the first row fragment per lane.
+        const int row_count = G <= Layout::kRowGroup ? 1 : 2;
+        tile.query = QueryRows::decode<Layout, KV>(p, batch, q_head0, G, lane);
+        typename Traits::QueryFragment query;
+        Mma::load_query(p, tile.query, lane, query);
+        const AttentionMask<Layout, HasMask> mask{p, tile.query, VisibleKeys<false>{seq_len, 1}, lane};
 
         const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
         const int tiles_per_split = FixedSplits ? p.kv_split_size / Traits::BC
@@ -298,12 +199,12 @@ struct DecodeMainloop {
             const T* bV = sV + buf * Traits::BC * Traits::LD;
             int kv0 = (ti_begin + it) * Traits::BC;
 
-            typename Traits::ScoreFragment Sacc;
-            Mma::scores(Qa, bK, lane, Sacc);
-
-            softmax.update(kv0, scale_log2, Sacc, Oacc, lane, mask);
-
-            Mma::values(Sacc, bV, lane, Oacc);
+            typename Traits::ScoreFragment scores;
+            Mma::scores(query, bK, lane, scores);
+            if (HasMask || seq_len - kv0 < Traits::BC)
+                mask.apply(scores, kv0);
+            tile.accum.update_softmax(scores, scale_log2, row_count);
+            Mma::values(scores, bV, lane, tile.accum.output);
         };
 
         if (ntiles >= STAGES) {
@@ -334,9 +235,6 @@ struct DecodeMainloop {
                 process_tile(it, it);
         }
 
-        tile.rows = rows;
-        tile.valid0 = va;
-        tile.valid1 = vb;
         return true;
     }
 };

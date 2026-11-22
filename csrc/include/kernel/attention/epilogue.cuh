@@ -1,41 +1,33 @@
 #pragma once
 
+#include <datatype/element.cuh>
 #include <kernel/attention/kernel.cuh>
 
 namespace astrai::attention {
 
 // Prefill retains packed stores; decode retains scalar stores and its register footprint.
-template <typename Traits, typename Addressing, bool Vectorized = false> struct OutputEpilogue {
+template <typename Traits, bool Vectorized = false> struct OutputEpilogue {
     static DEVICE_FORCEINLINE void store(const AttentionParams& p,
                                          const AttentionTile<Traits>& tile) {
         using T = typename Traits::Elem;
-        const auto& output = tile.output;
-        const float inv0 = tile.softmax.rows[0].l > 1e-20f ? 1.0f / tile.softmax.rows[0].l : 0.0f;
-        const float inv1 = tile.softmax.rows[1].l > 1e-20f ? 1.0f / tile.softmax.rows[1].l : 0.0f;
-        const auto rows = tile.rows;
-        const int head0 = Addressing::q_base(p, rows.batch, rows.head0);
-        const int head1 =
-            rows.head1 == rows.head0 ? head0 : Addressing::q_base(p, rows.batch, rows.head1);
-        T* out0 = static_cast<T*>(p.o_ptr) + head0 + rows.qrow0 * p.q_l_stride;
-        T* out1 = static_cast<T*>(p.o_ptr) + head1 + rows.qrow1 * p.q_l_stride;
         const int column = Traits::FragmentLayout::column(threadIdx.x % 32);
 #pragma unroll
-        for (int i = 0; i < Traits::DN8; ++i) {
-            const int d = (i * 8 + column) * p.q_d_stride;
-            if (tile.valid0) {
+        for (int r = 0; r < 2; ++r) {
+            if (!tile.query.row[r].valid)
+                continue;
+            T* out = static_cast<T*>(p.o_ptr) + tile.query.row[r].offset;
+            const float sum = tile.accum.rows[r].l;
+            const float inv = sum > 1e-20f ? 1.0f / sum : 0.0f;
+#pragma unroll
+            for (int i = 0; i < Traits::DN8; ++i) {
+                const int d = (i * Traits::FragmentLayout::kN + column) * p.q_d_stride;
+                const float x = tile.accum.output[i][2 * r] * inv;
+                const float y = tile.accum.output[i][2 * r + 1] * inv;
                 if constexpr (Vectorized) {
-                    astrai::store2<T>(out0 + d, output[i][0] * inv0, output[i][1] * inv0);
+                    astrai::store2<T>(out + d, x, y);
                 } else {
-                    out0[d] = ElemTrait<T>::from_float(output[i][0] * inv0);
-                    out0[d + p.q_d_stride] = ElemTrait<T>::from_float(output[i][1] * inv0);
-                }
-            }
-            if (tile.valid1) {
-                if constexpr (Vectorized) {
-                    astrai::store2<T>(out1 + d, output[i][2] * inv1, output[i][3] * inv1);
-                } else {
-                    out1[d] = ElemTrait<T>::from_float(output[i][2] * inv1);
-                    out1[d + p.q_d_stride] = ElemTrait<T>::from_float(output[i][3] * inv1);
+                    out[d] = ElemTrait<T>::from_float(x);
+                    out[d + p.q_d_stride] = ElemTrait<T>::from_float(y);
                 }
             }
         }
@@ -49,20 +41,20 @@ template <typename Traits> struct SplitEpilogue {
         const int column = Traits::FragmentLayout::column(threadIdx.x % 32);
 #pragma unroll
         for (int row = 0; row < 2; ++row) {
-            if (!(row == 0 ? tile.valid0 : tile.valid1))
+            if (!tile.query.row[row].valid)
                 continue;
-            const int head = row == 0 ? tile.rows.head0 : tile.rows.head1;
+            const int head = tile.query.row[row].head;
             const size_t slot =
-                (size_t(tile.rows.batch) * p.q_head + head) * p.split_stride + blockIdx.z;
+                (size_t(tile.query.batch) * p.q_head + head) * p.split_stride + blockIdx.z;
             float* output = p.o_part + slot * Traits::HEAD_DIM;
 #pragma unroll
             for (int i = 0; i < Traits::DN8; ++i) {
-                output[i * 8 + column] = tile.output[i][row * 2];
-                output[i * 8 + column + 1] = tile.output[i][row * 2 + 1];
+                output[i * 8 + column] = tile.accum.output[i][row * 2];
+                output[i * 8 + column + 1] = tile.accum.output[i][row * 2 + 1];
             }
             if (column == 0) {
-                p.ml_part[slot * 2] = tile.softmax.rows[row].m;
-                p.ml_part[slot * 2 + 1] = tile.softmax.rows[row].l;
+                p.ml_part[slot * 2] = tile.accum.rows[row].m;
+                p.ml_part[slot * 2 + 1] = tile.accum.rows[row].l;
             }
         }
     }

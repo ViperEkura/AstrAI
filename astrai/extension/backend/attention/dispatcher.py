@@ -85,12 +85,11 @@ def attention(
     mask: Optional[Tensor] = None,
     is_causal: bool = False,
     scale: Optional[float] = None,
-    implementation: Optional[str] = None,
 ) -> Tensor:
     """Attend over dense [batch, sequence, heads, head_dim] tensors."""
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("dense attention requires 4D Q, K and V")
-    return _dispatch(q, k, v, None, 0, mask, is_causal, None, scale, implementation)
+    return _dispatch(q, k, v, None, 0, mask, is_causal, None, scale, None)
 
 
 def paged_attention(

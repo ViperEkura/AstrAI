@@ -45,7 +45,7 @@ struct PrefillMainloop {
         // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
         const int seq_len = KV::kv_len(p, batch);
         const int q_len = QSchedule::q_len(p, batch);
-        if constexpr (KV::kPaged) {
+        if constexpr (KV::kPaged || std::is_same_v<QSchedule, VarlenQSchedule>) {
             // The host tile map pads the last query tile of each request.
             if (packed0 >= G * q_len)
                 return false;

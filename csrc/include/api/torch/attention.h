@@ -61,5 +61,11 @@ torch::Tensor attn_paged_prefill(torch::Tensor q,
                                  bool is_causal,
                                  int64_t kv_split_size = 0);
 
+
+torch::Tensor attention_varlen(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                               torch::Tensor cu_seqlens_q,
+                               c10::optional<torch::Tensor> cu_seqlens_k, bool is_causal,
+                               c10::optional<double> scale);
+
 } // namespace attention
 } // namespace astrai

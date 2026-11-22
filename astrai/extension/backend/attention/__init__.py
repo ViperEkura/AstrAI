@@ -6,10 +6,12 @@ from astrai.extension.backend.attention.dispatcher import (
     attention,
     paged_attention,
 )
+from astrai.extension.backend.attention.varlen import attention_varlen
 
 __all__ = [
     "AttentionDispatcher",
     "AttentionSpec",
     "attention",
+    "attention_varlen",
     "paged_attention",
 ]

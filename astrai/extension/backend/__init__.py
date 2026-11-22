@@ -4,6 +4,7 @@ from astrai.extension.backend.attention import (
     AttentionDispatcher,
     AttentionSpec,
     attention,
+    attention_varlen,
     paged_attention,
 )
 from astrai.extension.backend.newton_schulz import newton_schulz, symm_out, syrk_out
@@ -19,5 +20,6 @@ __all__ = [
     "AttentionDispatcher",
     "AttentionSpec",
     "attention",
+    "attention_varlen",
     "paged_attention",
 ]

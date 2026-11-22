@@ -9,6 +9,10 @@
  */
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("attention_varlen", &astrai::attention::attention_varlen,
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cu_seqlens_q"),
+          py::arg("cu_seqlens_k") = py::none(), py::arg("is_causal") = false,
+          py::arg("scale") = py::none());
     m.def("attn_decode", &astrai::attention::attn_decode, py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("mask") = py::none(), py::arg("scale") = py::none(),
           py::arg("layout") = (int64_t)astrai::attention::BHLD, py::arg("o_part_buf") = py::none(),

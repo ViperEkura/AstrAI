@@ -178,6 +178,34 @@ struct KVAddr {
     bool vector_aligned = true;
 };
 
+// An extra tile per segment makes this device-only schedule independent of
+// max_seqlen. Prefix differences own enough tiles even for unaligned starts.
+static DEVICE_FORCEINLINE int segment_for_tile(const int* offsets, int batch, int group,
+                                              int tile_size, int tile) {
+    int lo = 0, hi = batch;
+    while (lo + 1 < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if ((int64_t)offsets[mid] * group / tile_size + mid <= tile)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+struct VarlenQSchedule : PackedQSchedule {
+    static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int, int rows) {
+        return int((int64_t)p.q_len * (p.q_head / p.kv_head) / rows) + p.batch;
+    }
+    static DEVICE_FORCEINLINE void map_packed_block(const AttentionParams& p, int rows,
+                                                   int tile, int& batch, int& packed0) {
+        const int group = p.q_head / p.kv_head;
+        batch = segment_for_tile(p.qo_indptr, p.batch, group, rows, tile);
+        const int first = int((int64_t)p.qo_indptr[batch] * group / rows) + batch;
+        packed0 = (tile - first) * rows;
+    }
+};
+
 // Contiguous K/V
 template <typename T> struct ContigKV {
     using Elem = T;
@@ -239,6 +267,17 @@ template <typename T> struct ContigKV {
                                                  int token,
                                                  bool) {
         return kv_addr_from_token(p, c, token, d);
+    }
+};
+
+template <typename T> struct VarlenKV : ContigKV<T> {
+    static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
+        return p.kv_indptr[batch + 1] - p.kv_indptr[batch];
+    }
+    template <int D>
+    static DEVICE_FORCEINLINE typename ContigKV<T>::Context
+    make_ctx(const AttentionParams& p, int batch, int head) {
+        return {p.kv_indptr[batch] * p.kv_l_stride + head * p.kv_h_stride};
     }
 };
 

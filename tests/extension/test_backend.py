@@ -76,9 +76,8 @@ def test_attention_causal_scale_and_mask_share_one_contract(q_len, kv_len, scale
         attn_mask=causal & padding[:, None, None, :],
         scale=scale,
     ).transpose(1, 2)
-    actual = attention(
-        q, k, v, mask=padding, is_causal=True, implementation="torch", scale=scale
-    )
+    with op_backend(attention="torch"):
+        actual = attention(q, k, v, mask=padding, is_causal=True, scale=scale)
     torch.testing.assert_close(actual, expected)
 
 

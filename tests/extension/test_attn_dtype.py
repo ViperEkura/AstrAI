@@ -765,7 +765,7 @@ def test_consistent_bf16_attention_gradients_match_math_reference():
     mask[:, 2] = False
     scale = 0.19
     with op_backend(attention="cuda_consistent"):
-        output = attention(q, k, v, attn_mask=mask, scale=scale)
+        output = attention(q, k, v, mask=mask, scale=scale)
     upstream = torch.randn_like(output)
     actual = torch.autograd.grad(output, (q, k, v), upstream)
 

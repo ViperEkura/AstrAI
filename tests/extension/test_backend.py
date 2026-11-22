@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from astrai.extension import attention, op_backend, set_op
+from astrai.extension import attention, op_backend, paged_attention, set_op
 from astrai.extension.backend.attention import AttentionDispatcher, cuda, flash
 from astrai.extension.backend.attention import torch as native
 from astrai.extension.runtime.operation import ExplicitSelectionError
@@ -77,7 +77,7 @@ def test_attention_causal_scale_and_mask_share_one_contract(q_len, kv_len, scale
         scale=scale,
     ).transpose(1, 2)
     actual = attention(
-        q, k, v, attn_mask=padding, is_causal=True, implementation="torch", scale=scale
+        q, k, v, mask=padding, is_causal=True, implementation="torch", scale=scale
     )
     torch.testing.assert_close(actual, expected)
 
@@ -103,3 +103,13 @@ def test_cuda_paged_mask_shape_rejected_before_cache_write():
         cuda.forward(q, kv, kv, cache, 0, full_mask, fwd="prefill")
     assert torch.count_nonzero(cache.k_buffer - 1) == 0
     assert torch.count_nonzero(cache.v_buffer - 1) == 0
+
+
+def test_attention_layout_and_cache_are_explicit():
+    q = torch.zeros(2, 4, 8)
+    with pytest.raises(ValueError, match="4D"):
+        attention(q, q, q)
+    with pytest.raises(TypeError):
+        attention(q, q, q, None)
+    with pytest.raises(TypeError, match="PrefillKVCache or DecodeKVCache"):
+        paged_attention(q, q, q, kv_cache=None, layer_id=0)

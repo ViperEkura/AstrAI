@@ -61,7 +61,7 @@ def test_gated_deltanet_rejects_inference_cache():
     config = AutoRegressiveLMConfig(**TINY_CONFIG, attn_type="gdn")
     model = AutoRegressiveLM(config)
     with pytest.raises(NotImplementedError, match="not wired into the paged cache"):
-        model(torch.tensor([1, 2]), kv_cache=object(), fwd="decode")
+        model(torch.tensor([1, 2]), kv_cache=object())
 
 
 def test_gated_deltanet_rejects_invalid_configuration():

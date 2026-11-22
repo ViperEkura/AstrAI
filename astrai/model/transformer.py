@@ -87,7 +87,7 @@ class TransformerModel(nn.Module):
         input_mask: Optional[Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         position_ids: Optional[Tensor] = None,
-        fwd: Optional[str] = None,
+        *,
         logits_positions: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         x = self.embed_tokens(input_ids)
@@ -107,7 +107,6 @@ class TransformerModel(nn.Module):
                 mask.tensor,
                 kv_cache,
                 mask.is_causal,
-                fwd,
             )
             x = layer_output["hidden_states"]
             stats = layer_output.get("router_stats")

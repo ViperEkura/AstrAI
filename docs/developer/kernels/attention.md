@@ -16,13 +16,19 @@ use FlashAttention or torch autograd. The compiled-kernel wrappers in
 back.
 
 ```python
-from astrai.extension import attention, op_backend
+from astrai.extension import attention, op_backend, paged_attention
 
 with op_backend(attention="torch"):
-    output = attention(q, k, v)
+    output = attention(q, k, v, mask=mask, is_causal=True)
+
+# Inference uses the cache that the runner bound for this step.
+output = paged_attention(q_step, k_new, v_new, kv_cache=cache, layer_id=0, is_causal=True)
 ```
 
-`attention(..., implementation="cuda")` overrides the context for one call.
+Both entries accept three positional tensors. A `PrefillKVCache` selects paged prefill,
+including one-token chunks. A `DecodeKVCache` selects decode.
+
+`implementation="cuda"` overrides the context for one call.
 An explicit argument or context choice raises when unsupported.
 `set_op("attention", "cuda")` and `ASTR_OPS=attention=cuda` are soft process
 defaults with automatic fallback. `EngineCore` captures the context choice

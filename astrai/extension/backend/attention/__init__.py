@@ -4,10 +4,12 @@ from astrai.extension.backend.attention.common import AttentionSpec
 from astrai.extension.backend.attention.dispatcher import (
     AttentionDispatcher,
     attention,
+    paged_attention,
 )
 
 __all__ = [
     "AttentionDispatcher",
     "AttentionSpec",
     "attention",
+    "paged_attention",
 ]

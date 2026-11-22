@@ -203,7 +203,6 @@ def _warmup_cuda_graphs(
                 ids_in,
                 kv_cache=kv,
                 position_ids=pos_in,
-                fwd="prefill",
                 logits_positions=torch.tensor(
                     [warmup_len - 1], dtype=torch.long, device=dev
                 ),
@@ -248,7 +247,6 @@ def _warmup_cuda_graphs(
                     input_ids=ids_buf,
                     kv_cache=kv,
                     position_ids=ws.position_ids[:b],
-                    fwd="decode",
                 )
 
         for tid in request_ids:
@@ -442,7 +440,6 @@ class GPUModelRunner:
                     start_pos=start_pos,
                     seq_ends=[start_pos + n for n in num_tokens],
                 ),
-                fwd="prefill",
                 logits_positions=last_token_indices,
             )
             logits = outputs["logits"]
@@ -528,7 +525,6 @@ class GPUModelRunner:
                 kv_cache=self.kv_manager.bind(
                     request_ids, self._workspace, start_pos=0
                 ),
-                fwd="prefill",
                 logits_positions=logits_positions,
             )
             logits = outputs["logits"]
@@ -655,14 +651,12 @@ class GPUModelRunner:
                     input_ids=input_ids,
                     kv_cache=kv_cache,
                     position_ids=ws.position_ids[:b],
-                    fwd="decode",
                 )
             else:
                 outputs = self.model(
                     input_ids,
                     kv_cache=kv_cache,
                     position_ids=ws.position_ids[:b],
-                    fwd="decode",
                 )
             logits = outputs["logits"]
 

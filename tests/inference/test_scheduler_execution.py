@@ -98,7 +98,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     executor._workspace.max_batch_size = 16  # Add max_batch_size for validation
     all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
 
-    def fake_model(ids, *, position_ids, kv_cache, fwd, logits_positions):
+    def fake_model(ids, *, position_ids, kv_cache, logits_positions):
         return {"logits": all_logits[logits_positions]}
 
     executor.model = MagicMock(side_effect=fake_model)

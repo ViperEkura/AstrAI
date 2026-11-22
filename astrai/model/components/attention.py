@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension.backend import apply_rotary_emb, attention
+from astrai.extension.backend import apply_rotary_emb, attention, paged_attention
 from astrai.factory import BaseFactory
 from astrai.model.components.conv import Conv1d
 from astrai.model.components.gdn_ops import (
@@ -78,7 +78,6 @@ class GQA(nn.Module):
         attn_mask: Tensor = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
-        fwd: Optional[str] = None,
     ) -> Tensor:
         q = self._split_heads(self.q_proj(x), self.n_heads)
         k = self._split_heads(self.k_proj(x), self.n_kv_heads)
@@ -98,9 +97,19 @@ class GQA(nn.Module):
             q = apply_rotary_emb(q, rotary_emb)
             k = apply_rotary_emb(k, rotary_emb)
 
-        sdqa_out = attention(
-            q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
-        ).reshape(*x.shape[:-1], self.n_heads * self.head_dim)
+        if kv_cache is None:
+            sdqa_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
+        else:
+            sdqa_out = paged_attention(
+                q,
+                k,
+                v,
+                kv_cache=kv_cache,
+                layer_id=self.layer_id,
+                mask=attn_mask,
+                is_causal=is_causal,
+            )
+        sdqa_out = sdqa_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
         if self.use_gated_attention:
             sdqa_out = sdqa_out * F.sigmoid(self.gate(x))
@@ -305,9 +314,8 @@ class GDN(nn.Module):
         attn_mask: Optional[Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = True,
-        fwd: Optional[str] = None,
     ) -> Tensor:
-        if kv_cache is not None or fwd is not None:
+        if kv_cache is not None:
             raise NotImplementedError(
                 "Gated DeltaNet inference state is not wired into the paged cache; call "
                 "prefill()/decode_step() with a GDNState instead"
@@ -466,7 +474,6 @@ class MLA(nn.Module):
         attn_mask: Tensor = None,
         kv_cache: Optional[KVCache] = None,
         is_causal: bool = False,
-        fwd: Optional[str] = None,
     ) -> Tensor:
         q = self.q_proj(x)
         q = q.reshape(*x.shape[:-1], self.n_heads, self.head_dim)
@@ -495,9 +502,19 @@ class MLA(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        attn_out = attention(
-            q, k, v, kv_cache, self.layer_id, attn_mask, is_causal, fwd
-        ).reshape(*x.shape[:-1], self.n_heads * self.head_dim)
+        if kv_cache is None:
+            attn_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
+        else:
+            attn_out = paged_attention(
+                q,
+                k,
+                v,
+                kv_cache=kv_cache,
+                layer_id=self.layer_id,
+                mask=attn_mask,
+                is_causal=is_causal,
+            )
+        attn_out = attn_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
         if self.use_gated_attention:
             attn_out = attn_out * F.sigmoid(self.gate(x))

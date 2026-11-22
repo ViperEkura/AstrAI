@@ -184,13 +184,14 @@ def test_export_handles_tied_names_unmanaged_weights_and_buffers(
         torch.testing.assert_close(actual[name], value, atol=0, rtol=0)
 
 
-def _sharded_config(path, policy, shard_state=True):
+def _sharded_config(path, policy, shard_state=True, cp_size=1):
     config = make_resume_config(
         path,
         precision=policy,
         dp_mode="ddp",
-        dp_size=2,
-        batch_per_device=1,
+        dp_size=2 // cp_size,
+        cp_size=cp_size,
+        batch_per_device=cp_size,
         backend="nccl",
         device="cuda",
     )
@@ -204,26 +205,30 @@ def _sharded_config(path, policy, shard_state=True):
 
 
 @pytest.mark.parametrize(
-    "compute,source_sharded,target_sharded",
+    "compute,source_sharded,target_sharded,cp_size",
     [
-        ("bfloat16", True, True),
-        ("float32", True, False),
-        ("float32", False, True),
+        ("bfloat16", True, True, 1),
+        ("bfloat16", True, False, 2),
+        ("float32", True, False, 1),
+        ("float32", False, True, 1),
     ],
 )
 @pytest.mark.cuda
 @pytest.mark.distributed
 @requires_nccl(2)
 def test_sharded_trainer_export_resume_matches_continuous_training(
-    tmp_path, compute, source_sharded, target_sharded
+    tmp_path, monkeypatch, compute, source_sharded, target_sharded, cp_size
 ):
+    if cp_size > 1:
+        monkeypatch.setenv("ASTR_OPS", "attention=torch")
     policy = PrecisionConfig(compute_dtype=compute, export_dtype="float16")
     baseline_dir, source_dir, resumed_dir = [
         tmp_path / name for name in ("baseline", "source", "resumed")
     ]
-    Trainer(_sharded_config(baseline_dir, policy, source_sharded)).train()
+    Trainer(_sharded_config(baseline_dir, policy, source_sharded, cp_size)).train()
     Trainer(
-        _sharded_config(source_dir, policy, source_sharded), callbacks=[_StopAfterOne()]
+        _sharded_config(source_dir, policy, source_sharded, cp_size),
+        callbacks=[_StopAfterOne()],
     ).train()
     source = source_dir / "epoch_0_step_1"
     saved = Checkpoint.load(str(source))
@@ -239,7 +244,7 @@ def test_sharded_trainer_export_resume_matches_continuous_training(
     )
     warm = PreloadedState()
     loader = ResumeLoader(
-        _sharded_config(tmp_path / "warm", policy),
+        _sharded_config(tmp_path / "warm", policy, cp_size=cp_size),
         str(source),
         False,
         None,
@@ -249,7 +254,10 @@ def test_sharded_trainer_export_resume_matches_continuous_training(
     torch.testing.assert_close(warm.state_dict, saved.state_dict, rtol=0, atol=0)
     Trainer(
         _sharded_config(
-            resumed_dir, replace(policy, export_dtype="float32"), target_sharded
+            resumed_dir,
+            replace(policy, export_dtype="float32"),
+            target_sharded,
+            cp_size,
         )
     ).train(param_path=str(source), resume=True)
     baseline = Checkpoint.load(str(baseline_dir / "epoch_0_step_4"))

@@ -72,10 +72,8 @@ class TrainContextBuilder:
             self.config.optimizer,
             model,
             self.config.precision,
-            process_group=self.config.executor_kwargs.get(
-                "process_group",
-                self._topology.dp_group if self._topology is not None else None,
-            ),
+            # CP peers replicate weights and synchronize gradients over the DDP group.
+            process_group=self.config.executor_kwargs.get("process_group"),
         )
 
     def _instantiate_scheduler(self, optimizer, dataset_len: int):
@@ -104,7 +102,7 @@ class TrainContextBuilder:
             device_type=self.config.device_type,
         )
         if self.config.optimizer.params.get("shard_state", False) and (
-            not self._topology.is_trivial or self.config.dp_mode == "fsdp"
+            self._topology.tp_size > 1 or self.config.dp_mode == "fsdp"
         ):
             raise NotImplementedError(
                 "Optimizer state ownership requires replicated none/DDP parameters"

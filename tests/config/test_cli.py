@@ -121,6 +121,23 @@ def test_cli_rejects_unknown_yaml_parameters(tmp_path):
     assert "Unknown config keys: learner_device" in result.output
 
 
+def test_cli_previews_external_callback_without_importing_it(tmp_path):
+    make_rollout_config(max_position_embeddings=8).to_file(tmp_path / "config.json")
+    config = tmp_path / "train.yaml"
+    config.write_text(
+        f"training:\n  train_type: seq\n  param_path: {tmp_path}\n"
+        f"  data_root_path: {tmp_path}\n"
+        "callbacks:\n  - type: experiment.metrics:RolloutMetrics\n"
+        "    params:\n      threshold: 0.2\n"
+    )
+    result = CliRunner().invoke(
+        train_module.train_command, ["--config", str(config), "--dry-run"]
+    )
+    assert result.exit_code == 0, (result.output, result.exception)
+    row = next(line for line in result.output.splitlines() if "Callbacks" in line)
+    assert "experiment.metrics:RolloutMetrics" in row and "'threshold': 0.2" in row
+
+
 @pytest.mark.parametrize(
     "optimizer, flags, expected",
     [

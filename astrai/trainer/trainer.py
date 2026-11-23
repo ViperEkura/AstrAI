@@ -16,9 +16,15 @@ from astrai.trainer.callbacks import (
     GradientClippingCallback,
     MetricCallback,
     ProgressBarCallback,
+    RolloutMetricsBatch,
     TrainCallback,
 )
-from astrai.trainer.components import stop_loader_workers
+from astrai.trainer.callbacks.base import RolloutMetricTotals
+from astrai.trainer.callbacks.metrics import (
+    add_rollout_metric_totals,
+    reduce_rollout_metrics,
+)
+from astrai.trainer.components import resolve_component, stop_loader_workers
 from astrai.trainer.context import TrainContext, TrainContextBuilder
 from astrai.trainer.rollout.batching import slice_batch
 from astrai.trainer.session import TrainSession
@@ -61,16 +67,53 @@ class Trainer:
             ProgressBarCallback(cfg.n_epoch),
         ]
 
-    def _call_callbacks(self, method_name: str, context: TrainContext):
+    def _callback_methods(self, name):
+        default = getattr(TrainCallback, name)
         for callback in self.callbacks:
-            method = getattr(callback, method_name, None)
-            if method:
-                method(context)
+            method = getattr(callback, name, None)
+            if method is not None and getattr(method, "__func__", None) is not default:
+                yield method
 
-    def _after_commit(self, context: TrainContext, *, agree_stop: bool) -> None:
+    def _call_callbacks(self, method_name: str, context: TrainContext):
+        for method in self._callback_methods(method_name):
+            method(context)
+
+    @staticmethod
+    def _collect_rollout_metrics(context, hooks, result, real_count, totals):
+        if not hooks or not real_count:
+            return
+        batch = RolloutMetricsBatch(
+            policy_version=result.policy_version,
+            rewards=result.rewards[:real_count].detach().to(device="cpu", copy=True),
+            response_lengths=result.response_mask[:real_count].sum(dim=-1).cpu(),
+            prompt_texts=tuple(result.prompt_texts[:real_count]),
+            finish_reasons=tuple(
+                tuple(reasons) for reasons in result.finish_reasons[:real_count]
+            ),
+        )
+        for hook in hooks:
+            values = hook(context, batch)
+            if values:
+                add_rollout_metric_totals(totals, values)
+
+    @staticmethod
+    def _commit_metrics(context, rollout_metrics):
+        if context.rank == 0 and rollout_metrics:
+            context.metric_history.stage(
+                {"type": "rollout", "epoch": context.epoch, **rollout_metrics}
+            )
+        return context.metric_history.commit(
+            context.optimizer_step, context.consumed_samples
+        )
+
+    def _after_commit(self, context, records, *, agree_stop: bool) -> None:
         self._call_callbacks("after_optimizer_step", context)
         if agree_stop:
             self._agree_stop(context)
+        if context.rank == 0 and records:
+            for hook in self._callback_methods("on_log"):
+                for record in records:
+                    hook(context, dict(record))
 
     @staticmethod
     def _step_policy(context: TrainContext) -> None:
@@ -86,7 +129,9 @@ class Trainer:
         context.rollout.apply_weight_update(None, update)
         context.rollout.step()
 
-    def _commit_global_update(self, context: TrainContext, new_data: bool) -> None:
+    def _commit_global_update(
+        self, context: TrainContext, new_data: bool, rollout_metrics=None
+    ):
         """Commit a global update; failed runs retain the previous safe cursor.
 
         The step advances before the observers run, so the hooks that log or
@@ -120,15 +165,16 @@ class Trainer:
             raise
         if context.grad_snr_tracker is not None:
             context.grad_snr_tracker.commit(context.optimizer_step)
-        context.metric_history.commit(context.optimizer_step, context.consumed_samples)
+        return self._commit_metrics(context, rollout_metrics)
 
     def _commit_online_update(
-        self, context: TrainContext, batch, new_data: bool
-    ) -> None:
+        self, context: TrainContext, batch, new_data: bool, rollout_metrics=None
+    ):
         """Account for published actor versions, even if later work fails."""
         context.checkpoint_safe = False
         context.metric_history.discard_pending()
         version_before = context.rollout.policy_version
+        records = []
         try:
             self._call_callbacks("before_optimizer_step", context)
             self._step_policy(context)
@@ -144,18 +190,25 @@ class Trainer:
                     context.optimizer.zero_grad()
                     if context.scheduler:
                         context.scheduler.step()
-                    context.metric_history.commit(
-                        context.optimizer_step, context.consumed_samples
-                    )
+                    records = self._commit_metrics(context, rollout_metrics)
                 except BaseException:
                     context.metric_history.discard_pending()
                     raise
                 context.checkpoint_safe = True
             else:
                 context.metric_history.discard_pending()
+        return records
 
     def _train_batch(self, context: TrainContext, batch) -> None:
         context.checkpoint_safe = False
+        hooks = tuple(self._callback_methods("on_rollout_end"))
+        rollout_metrics = None
+        if hooks:
+            totals: RolloutMetricTotals = {}
+            self._collect_rollout_metrics(
+                context, hooks, batch, batch.prompts.shape[0], totals
+            )
+            rollout_metrics = reduce_rollout_metrics(context, totals)
         executor = context.executor
         with executor.accumulate_explicit(context.model, sync=True):
             self._call_callbacks("on_batch_begin", context)
@@ -177,8 +230,10 @@ class Trainer:
                 raise RuntimeError("training update has no valid loss")
             context.loss = float(update_loss.item())
             context.metrics = update_metrics
-            self._commit_online_update(context, batch, new_data=True)
-            self._after_commit(context, agree_stop=False)
+            records = self._commit_online_update(
+                context, batch, new_data=True, rollout_metrics=rollout_metrics
+            )
+            self._after_commit(context, records, agree_stop=False)
             self._call_callbacks("on_batch_end", context)
 
     def _should_stop(self, context: TrainContext) -> bool:
@@ -227,6 +282,7 @@ class Trainer:
         window_samples: int,
         window_end: int,
         final_update: bool,
+        rollout_metrics: Optional[Dict[str, float]] = None,
     ) -> None:
         """Reduce true objective numerators before committing one update."""
         local_count = 0.0
@@ -279,11 +335,13 @@ class Trainer:
         context.metrics["loss"] = context.loss
         if final_update:
             context.pending_samples = window_samples
-        self._commit_global_update(context, new_data=final_update)
+        records = self._commit_global_update(
+            context, new_data=final_update, rollout_metrics=rollout_metrics
+        )
         if final_update:
             context.epoch_sample_offset = window_end
             context.checkpoint_safe = True
-        self._after_commit(context, agree_stop=final_update)
+        self._after_commit(context, records, agree_stop=final_update)
 
     def _train_global_epoch(self, context: TrainContext, epoch: int) -> None:
         if context.epoch < epoch and context.epoch_sample_offset == context.dataset_len:
@@ -299,6 +357,7 @@ class Trainer:
         iterator = iter(context.dataloader)
         context.train_iterator = iterator
         context.on_shutdown("train_loader", partial(stop_loader_workers, iterator))
+        rollout_hooks = tuple(self._callback_methods("on_rollout_end"))
         for window_start, window_samples, microbatches in sampler.windows():
             if context.stop_agreed:
                 break
@@ -308,10 +367,16 @@ class Trainer:
             ]
             context.checkpoint_safe = False
             online = context.rollout is not None
+            rollout_metrics = None
             if online:
                 prepared = []
-                for batch, _real_count in batches:
-                    result, _ = context.rollout(batch)
+                totals: RolloutMetricTotals = {}
+                for batch, real_count in batches:
+                    result, fresh = context.rollout(batch)
+                    if fresh:
+                        self._collect_rollout_metrics(
+                            context, rollout_hooks, result, real_count, totals
+                        )
                     prepared.append(
                         {
                             key: value.detach().cpu()
@@ -322,6 +387,8 @@ class Trainer:
                             ).items()
                         }
                     )
+                if rollout_hooks:
+                    rollout_metrics = reduce_rollout_metrics(context, totals)
             else:
                 prepared = []
 
@@ -358,7 +425,9 @@ class Trainer:
                     window_samples,
                     window_start + window_samples,
                     final_update=final_update,
+                    rollout_metrics=rollout_metrics,
                 )
+                rollout_metrics = None
 
         if not context.stop_agreed:
             stop_loader_workers(iterator)
@@ -406,6 +475,17 @@ class Trainer:
         # Seed before the context is built so initialisation and data drawing start
         # from a defined state. The sampler has its own epoch-seeded generator.
         seed_everything(self.train_config.random_seed, get_rank())
+        callbacks = self.callbacks
+        self.callbacks = callbacks + [
+            resolve_component(spec.type)(**spec.params)
+            for spec in self.train_config.callbacks
+        ]
+        try:
+            self._run_session(param_path, resume)
+        finally:
+            self.callbacks = callbacks
+
+    def _run_session(self, param_path: Optional[str], resume: bool):
         with TrainSession(
             lambda: (
                 TrainContextBuilder(self.train_config)

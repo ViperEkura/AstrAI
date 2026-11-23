@@ -136,6 +136,68 @@ def test_online_rollout_end_to_end(online_env, strategy, strategy_kwargs, with_c
         assert "value_model" not in checkpoint.extra
 
 
+class ExperimentReward(LengthRewardModel):
+    def score(self, prompts, responses):
+        return torch.tensor(
+            [[0.0, 0.0] if "Summarize" in prompt else [0.0, 1.0] for prompt in prompts]
+        )
+
+
+class ExperimentMetrics:
+    def __init__(self, log_path):
+        self.log_path = Path(log_path)
+
+    def on_rollout_end(self, context, batch):
+        assert batch.rewards.shape[0] == len(batch.prompt_texts)
+        all_wrong = batch.rewards.eq(0).all(dim=1)
+        return {
+            "experiment/all_wrong_rate": (all_wrong.sum().item(), all_wrong.numel())
+        }
+
+    def on_log(self, context, record):
+        assert context.rank == 0
+        if record["type"] == "rollout":
+            with self.log_path.open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+
+
+@pytest.mark.distributed
+def test_configured_rollout_metrics_reduce_and_resume(online_env, tmp_path):
+    log_path = tmp_path / "external.jsonl"
+    config = _online_config(
+        online_env,
+        dataset_length=3,
+        batch_per_device=1,
+        grad_accum_steps=2,
+        epoch_tail_policy="flush",
+        dp_mode="ddp",
+        dp_size=2,
+        backend="gloo",
+        device_type="cpu",
+        start_method="spawn",
+        rl_update_epochs=2,
+        reward_model_fn=ExperimentReward,
+        callbacks=[
+            ComponentSpec(
+                type=f"{__name__}:ExperimentMetrics",
+                params={"log_path": str(log_path)},
+            )
+        ],
+    )
+    Trainer(config).train(param_path=online_env["test_dir"])
+    first = Path(config.ckpt_dir) / "epoch_0_step_2"
+    Trainer(replace(config, n_epoch=2)).train(param_path=str(first), resume=True)
+    last = Path(config.ckpt_dir) / "epoch_1_step_4"
+    published = [
+        row
+        for row in map(json.loads, (last / "metric.jsonl").read_text().splitlines())
+        if row["type"] == "rollout"
+    ]
+    assert published == list(map(json.loads, log_path.read_text().splitlines()))
+    assert [row["step"] for row in published] == [1, 3]
+    assert [row["experiment/all_wrong_rate"] for row in published] == [1 / 3, 1 / 3]
+
+
 def test_online_config_rejects_contradictory_policy_lag(online_env):
     """rollout_max_policy_lag below rollout_interval - 1 guarantees a fatal
     RolloutVersionError mid-training; it must fail at config time instead."""
@@ -251,6 +313,7 @@ def test_ddp_online_grpo_end_to_end(online_env):
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="four CUDA devices required")
 def test_async_round_ddp_two_learners_two_workers(online_env):
     test_dir = online_env["test_dir"]
+    log_path = Path(test_dir) / "experiment.jsonl"
     config = _online_config(
         online_env,
         device_type="cuda",
@@ -262,11 +325,21 @@ def test_async_round_ddp_two_learners_two_workers(online_env):
         rollout_temperature=0.7,
         rollout_top_p=0.9,
         ckpt_interval=5000,
+        reward_model_fn=ExperimentReward,
+        callbacks=[
+            ComponentSpec(
+                type=f"{__name__}:ExperimentMetrics",
+                params={"log_path": str(log_path)},
+            )
+        ],
     )
     Trainer(config).train(param_path=test_dir)
     checkpoint = Checkpoint.load(os.path.join(test_dir, "ckpt", "epoch_1_step_1"))
     assert checkpoint.meta["policy_version"] == 1
     assert checkpoint.consumed_samples == 4
+    record = json.loads(log_path.read_text())
+    assert record["consumed_samples"] == 4
+    assert record["experiment/all_wrong_rate"] == 1 / 4
 
 
 @pytest.mark.distributed

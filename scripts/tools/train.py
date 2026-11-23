@@ -583,8 +583,12 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
     kwargs["metrics"] = metrics
     kwargs["precision"] = None
     component_blocks = {}
+    callback_specs = []
     if config_path:
         raw_config = load_yaml_config(config_path)
+        callback_specs = raw_config.get("callbacks", [])
+        if not isinstance(callback_specs, list):
+            raise click.UsageError("callbacks must be a list of component specs")
         if "precision" in raw_config:
             if not isinstance(raw_config["precision"], dict):
                 raise click.UsageError("precision must be a mapping")
@@ -659,7 +663,7 @@ def train_command(ctx, config_path, dry_run, metrics, **kwargs):
     kwargs["dp_size"] = kwargs.pop("dp_size") or 1
 
     try:
-        train(dry_run=dry_run, **kwargs)
+        train(dry_run=dry_run, callbacks=callback_specs, **kwargs)
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
 
@@ -689,6 +693,8 @@ def print_dry_run(config: TrainConfig, param_path: str, resume: bool) -> None:
         ("Load state dict", config.state_dict_load_options(resume)),
         ("Resume", resume),
     ]
+    if config.callbacks:
+        rows.append(("Callbacks", [asdict(spec) for spec in config.callbacks]))
     click.secho("\n=== Training Plan (dry-run) ===", fg="cyan", bold=True)
     for key, value in rows:
         click.echo(f"  {key:<20s} : {value}")

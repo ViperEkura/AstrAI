@@ -12,7 +12,7 @@ import torch.distributed as dist
 
 from astrai.parallel import only_on_rank
 from astrai.parallel.setup import get_current_device
-from astrai.trainer.callbacks.base import TrainCallback
+from astrai.trainer.callbacks.base import RolloutMetricTotals, TrainCallback
 from astrai.trainer.callbacks.metric_util import (
     ctx_get_grad_norm,
     ctx_get_grad_snr,
@@ -24,6 +24,40 @@ from astrai.trainer.callbacks.metric_util import (
 
 if TYPE_CHECKING:
     from astrai.trainer.context import TrainContext
+
+
+def add_rollout_metric_totals(
+    totals: RolloutMetricTotals, values: RolloutMetricTotals
+) -> None:
+    for name, (numerator, denominator) in values.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {"type", "step", "consumed_samples", "epoch"}
+        ):
+            raise ValueError(f"Invalid rollout metric name: {name!r}")
+        if (
+            not math.isfinite(numerator)
+            or not math.isfinite(denominator)
+            or denominator < 0
+        ):
+            raise ValueError(f"Invalid rollout metric totals for {name!r}")
+        total, count = totals.get(name, (0.0, 0.0))
+        totals[name] = (total + float(numerator), count + float(denominator))
+
+
+def reduce_rollout_metrics(
+    context: TrainContext, local: RolloutMetricTotals
+) -> Dict[str, float]:
+    if context.dp_size > 1 and dist.is_initialized():
+        # Experiments can contribute different metric names on different ranks.
+        # Gather only scalar totals, once per rollout window.
+        shards = [None] * context.dp_size
+        dist.all_gather_object(shards, local, group=context.topology.dp_group)
+        local = {}
+        for shard in shards:
+            add_rollout_metric_totals(local, shard)
+    return {name: total / count for name, (total, count) in local.items() if count > 0}
 
 
 class MetricCallback(TrainCallback):

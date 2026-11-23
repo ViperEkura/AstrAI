@@ -80,6 +80,27 @@ records and leaves the checkpoint unsafe. Without a version advance, the round
 does not advance counters. TrainSession discards any remaining pending records
 before shutdown callbacks attempt an emergency save.
 
+## Experiment metrics
+
+`on_rollout_end(context, batch)` receives a CPU snapshot of a freshly scored
+training rollout. The snapshot contains the sampled policy version, prompt
+texts, rewards, response lengths and finish reasons in prompt-group order.
+Synchronous padding rows and cached rollouts are excluded. Each callback can
+return a mapping from metric names to `(numerator, denominator)` pairs. All
+contributions for a name use the same units. Trainer sums them across the
+rollout window and data-parallel ranks, then divides once. A metric with a
+zero global denominator is omitted.
+
+The rollout record is committed with the first successful optimizer update
+for that window. Replaying the same rollouts for more learner updates produces
+no additional records. A resume inherits records from the selected checkpoint.
+
+`on_log(context, record)` receives a copy of each newly committed record on
+global rank zero, after the optimizer hooks. The record includes its step and
+sample cursor. Use this hook for output and avoid distributed collectives
+inside it. Historical records from a resume are available in the checkpoint's
+`metric.jsonl`.
+
 ## Persistence and resume
 
 CheckpointCallback captures a history snapshot and writes metric.jsonl inside

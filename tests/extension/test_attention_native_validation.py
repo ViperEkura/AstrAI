@@ -87,3 +87,26 @@ def test_native_segment_contracts(mode, invalid):
             )
     torch.testing.assert_close(kc, before[0])
     torch.testing.assert_close(vc, before[1])
+
+
+@pytest.mark.parametrize("operand", ["q", "k"])
+def test_native_checks_singleton_strides_before_narrowing(operand):
+    q = torch.randn(1, 1, 2, 64, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    tensors = {"q": q, "k": k}
+    value = tensors[operand]
+    value = value.as_strided(value.shape, (1 << 32, *value.stride()[1:]))
+    if operand == "q":
+        q = value
+    else:
+        k = value
+        v = v.as_strided(v.shape, value.stride())
+    with pytest.raises(RuntimeError, match="int32"):
+        get_module("attention").attention(q, k, v)
+
+
+@pytest.mark.parametrize("split", [-16, 1 << 32])
+def test_native_checks_split_before_narrowing(split):
+    q = torch.randn(1, 1, 2, 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="KV split size"):
+        get_module("attention").attention(q, q, q, kv_split_size=split)

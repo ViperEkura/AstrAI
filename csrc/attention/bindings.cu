@@ -1,5 +1,5 @@
-#include <torch/extension.h>
 #include <api/torch/attention.h>
+#include <torch/extension.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     using namespace astrai::attention;

@@ -28,10 +28,16 @@ The three stateless `kernel/attention.py` wrappers alone translate arguments
 to the compiled ABI. They do not select backends or retain cache state.
 The three native C++ entries own tensor validation before launching work:
 dense checks and packing live in attention.cu, varlen in varlen.cu, and cache
-in cache.cu. Shared native checks cover dtype, masks, integer bounds and scratch.
+in cache.cu. Shared native checks cover dtype, masks, integer bounds, scale and split settings.
+Dense Q/stride extraction stays in attention.cu; cache.cu owns split workspace
+allocation and its tensor lifetimes. entry.h contains only helpers used by
+multiple native entries.
 Python only rejects ambiguous routing options; it does not repeat native tensor
 metadata checks. Torch reference entries retain the checks needed to run without
-a compiled extension. GPU offset and page values are checked on-device.
+a compiled extension. Varlen prefix sums are a caller contract: start at zero, remain nondecreasing,
+and end at the corresponding token total. Native varlen checks metadata without
+launching a separate value-validation kernel. Torch reference execution checks
+values while materializing segment indices; paged kernels retain their addressing guards.
 
 GQA and MLA share the model-side scaled_dot_product_attention function, which binds the
 current layer's K/V views, query offsets and workspace before calling attention.

@@ -1,29 +1,27 @@
 """Torch reference attention backend."""
 
-from typing import TYPE_CHECKING, Optional
+import math
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension.backend.attention.common import _check_fwd, repeat_kv
-
-if TYPE_CHECKING:
-    from astrai.model.kv_cache import KVCache
+from astrai.extension.backend.attention.common import _cache_view, repeat_kv
 
 
-def _mask_view(mask: Optional[Tensor]) -> Optional[Tensor]:
+def _mask_view(mask):
     """Attention masks use batch/key, batch/query/key or batch/head/query/key."""
     if mask is None:
         return None
     if mask.dtype != torch.bool and not mask.is_floating_point():
         raise ValueError("attention mask must be boolean or floating point")
+    if mask.ndim not in (2, 3, 4):
+        raise ValueError("attention mask must be 2D, 3D or 4D")
     if mask.ndim == 2:
         return mask[:, None, None, :]
     if mask.ndim == 3:
         return mask[:, None, :, :]
-    if mask.ndim != 4:
-        raise ValueError("attention mask must be 2D, 3D or 4D")
     return mask
 
 
@@ -60,97 +58,199 @@ def forward(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    kv_cache: Optional["KVCache"],
-    layer_id: int,
     attn_mask: Optional[Tensor] = None,
     is_causal: bool = False,
-    fwd: Optional[str] = None,
     *,
     scale: Optional[float] = None,
 ) -> Tensor:
-    _check_fwd(fwd)
-    if q.ndim == 4:
-        n_rep = q.size(2) // k.size(2)
-        if n_rep > 1:
-            k = repeat_kv(k, n_rep)
-            v = repeat_kv(v, n_rep)
-        mask = _mask_view(attn_mask)
-        sdpa_causal = is_causal
-        if is_causal and (mask is not None or q.size(1) != k.size(1)):
-            causal = _causal_mask(q.size(1), k.size(1), q.device)
-            mask = _combine_mask(causal, mask)
-            sdpa_causal = False
-        return (
-            F.scaled_dot_product_attention(
-                q.permute(0, 2, 1, 3),
-                k.permute(0, 2, 1, 3),
-                v.permute(0, 2, 1, 3),
-                mask,
-                is_causal=sdpa_causal,
-                scale=scale,
-            )
-            .permute(0, 2, 1, 3)
-            .contiguous()
+    # Reference execution can run without the CUDA extension.
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("dense attention requires 4D Q/K/V")
+    if (
+        k.shape != v.shape
+        or q.size(0) != k.size(0)
+        or q.size(-1) != k.size(-1)
+        or k.size(2) == 0
+        or q.size(2) == 0
+        or q.size(2) % k.size(2)
+    ):
+        raise ValueError("incompatible dense Q/K/V shapes or heads")
+    if scale is not None and not math.isfinite(scale):
+        raise ValueError("attention scale must be finite")
+    n_rep = q.size(2) // k.size(2)
+    k, v = repeat_kv(k, n_rep), repeat_kv(v, n_rep)
+    mask = _mask_view(attn_mask)
+    sdpa_causal = is_causal
+    if is_causal and (mask is not None or q.size(1) != k.size(1)):
+        causal = _causal_mask(q.size(1), k.size(1), q.device)
+        mask = _combine_mask(causal, mask)
+        sdpa_causal = False
+    return (
+        F.scaled_dot_product_attention(
+            q.permute(0, 2, 1, 3),
+            k.permute(0, 2, 1, 3),
+            v.permute(0, 2, 1, 3),
+            mask,
+            is_causal=sdpa_causal,
+            scale=scale,
         )
-
-    if kv_cache is None or kv_cache.qo_indptr is None:
-        raise ValueError("packed attention requires KV cache metadata")
-    mask_view = _mask_view(attn_mask)
-    if mask_view is not None:
-        if mask_view.device != q.device:
-            raise ValueError("packed mask must be on Q's device")
-        if mask_view.size(0) not in (1, kv_cache.seq_lens.size(0)):
-            raise ValueError("packed mask batch mismatch")
-        if mask_view.size(1) not in (1, q.size(1)):
-            raise ValueError("packed mask head mismatch")
-        max_mask_rows = 1 if fwd == "decode" else q.size(0)
-        if mask_view.size(-2) < 1 or mask_view.size(-2) > max_mask_rows:
-            raise ValueError("packed mask query axis must use request-local rows")
-        if not 0 < mask_view.size(-1) <= kv_cache.req_to_token.size(1):
-            raise ValueError("packed mask key axis exceeds cache capacity")
-    kv_cache.k_buffer[layer_id, kv_cache.out_cache_loc] = k
-    kv_cache.v_buffer[layer_id, kv_cache.out_cache_loc] = v
-
-    # Pad the ragged batch to [B, max_q, max_kv] so one batched SDPA call
-    # replaces B per-request calls. The bool mask folds the per-request
-    # causal offset (seq_len - q_len) and the kv padding together; padded
-    # q rows gather slot/row 0 and are dropped by the [q_valid] unpack,
-    # which restores the packed qo_indptr order.
-    qo_indptr = kv_cache.qo_indptr
-    q_lens = qo_indptr[1:] - qo_indptr[:-1]
-    seq_lens = kv_cache.seq_lens
-    max_q = int(q_lens.max())
-    max_kv = int(seq_lens.max())
-
-    pos = torch.arange(max_kv, device=q.device)
-    kv_valid = pos.unsqueeze(0) < seq_lens.unsqueeze(1)
-    token_index = kv_cache.req_to_token[kv_cache.req_pool_indices, :max_kv]
-    token_index = token_index.masked_fill(~kv_valid, 0)
-    k_b = kv_cache.k_buffer[layer_id, token_index]
-    v_b = kv_cache.v_buffer[layer_id, token_index]
-    n_rep = q.size(1) // k.size(1)
-    if n_rep > 1:
-        k_b = repeat_kv(k_b, n_rep)
-        v_b = repeat_kv(v_b, n_rep)
-
-    q_pos = torch.arange(max_q, device=q.device)
-    q_valid = q_pos.unsqueeze(0) < q_lens.unsqueeze(1)
-    q_index = (qo_indptr[:-1].unsqueeze(1) + q_pos.unsqueeze(0)).masked_fill(
-        ~q_valid, 0
+        .permute(0, 2, 1, 3)
+        .contiguous()
     )
-    causal = (
-        (seq_lens - q_lens).unsqueeze(1).unsqueeze(2) + q_pos.view(1, max_q, 1)
-    ) >= pos.view(1, 1, max_kv)
-    allowed = kv_valid[:, None, None, :]
-    if is_causal:
-        allowed = allowed & causal.unsqueeze(1)
-    mask = _packed_mask(mask_view, allowed, max_q)
 
-    out = F.scaled_dot_product_attention(
-        q[q_index].permute(0, 2, 1, 3),
-        k_b.permute(0, 2, 1, 3),
-        v_b.permute(0, 2, 1, 3),
-        attn_mask=mask,
-        scale=scale,
-    )
-    return out.permute(0, 2, 1, 3)[q_valid]
+
+def forward_varlen(q, k, v, qs, ks, is_causal, scale):
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        raise RuntimeError("varlen attention supports forward only")
+    if q.ndim != 3 or k.ndim != 3 or k.shape != v.shape:
+        raise ValueError("expected matching THD Q/K/V layouts")
+    if ks is None and q.size(0) != k.size(0):
+        raise ValueError("shared offsets require equal Q and KV token counts")
+    ks = qs if ks is None else ks
+    for ptr in (qs, ks):
+        if (
+            ptr.ndim != 1
+            or ptr.numel() < 2
+            or ptr.dtype != torch.int32
+            or ptr.device != q.device
+            or not ptr.is_contiguous()
+        ):
+            raise ValueError("expected contiguous int32 segment offsets on Q's device")
+    if qs.numel() != ks.numel():
+        raise ValueError("Q and KV segment counts must match")
+    qoffs, koffs = qs.tolist(), ks.tolist()
+    for offsets, tokens in ((qoffs, q.size(0)), (koffs, k.size(0))):
+        if (
+            offsets[0] != 0
+            or offsets[-1] != tokens
+            or any(a > b for a, b in zip(offsets, offsets[1:]))
+        ):
+            raise ValueError("invalid segment offsets")
+    result = []
+    for i in range(len(qoffs) - 1):
+        qr = q[qoffs[i] : qoffs[i + 1]]
+        kr = k[koffs[i] : koffs[i + 1]]
+        vr = v[koffs[i] : koffs[i + 1]]
+        if not qr.size(0) or not kr.size(0):
+            result.append(torch.zeros_like(qr))
+        else:
+            result.append(
+                forward(
+                    qr[None],
+                    kr[None],
+                    vr[None],
+                    is_causal=is_causal,
+                    scale=scale,
+                )[0]
+            )
+    return torch.cat(result)
+
+
+def forward_cache(
+    q,
+    kc,
+    vc,
+    k,
+    v,
+    past,
+    pages,
+    qs,
+    mask,
+    causal,
+    workspace=(None, None, None),
+    *,
+    dense=forward,
+):
+    if (
+        q.ndim not in (3, 4)
+        or k.ndim != q.ndim
+        or k.shape != v.shape
+        or q.shape[:-2] != k.shape[:-2]
+        or kc.ndim != 4
+        or kc.shape != vc.shape
+        or kc.size(1) <= 0
+        or k.shape[-2:] != kc.shape[-2:]
+        or q.size(-1) != k.size(-1)
+        or k.size(-2) == 0
+        or q.size(-2) == 0
+        or q.size(-2) % k.size(-2)
+        or not kc.is_contiguous()
+        or not vc.is_contiguous()
+        or any(t.device != q.device or t.dtype != q.dtype for t in (k, v, kc, vc))
+    ):
+        raise ValueError("incompatible cache and appended Q/K/V tensors")
+    if (
+        past.ndim != 1
+        or past.numel() == 0
+        or pages.ndim != 2
+        or pages.size(0) != past.numel()
+    ):
+        raise ValueError("expected past lengths [B] and page table [B, blocks]")
+    if qs is not None:
+        if q.ndim != 3 or qs.ndim != 1 or qs.numel() != past.numel() + 1:
+            raise ValueError("expected THD queries and [B+1] offsets")
+    elif q.size(0) != past.numel():
+        raise ValueError("expected BSHD queries or one THD row per request")
+    for tensor in (past, pages, qs):
+        if tensor is not None and (
+            tensor.dtype != torch.int32
+            or tensor.device != q.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("expected contiguous int32 metadata on Q's device")
+    q, k, v, qs, original = _cache_view(q, k, v, qs)
+    offsets = list(range(past.numel() + 1)) if qs is None else qs.tolist()
+    lengths = past.tolist()
+    size = kc.size(1)
+    if (
+        offsets[0] != 0
+        or offsets[-1] != q.size(0)
+        or any(a > b for a, b in zip(offsets, offsets[1:]))
+    ):
+        raise ValueError("invalid query offsets")
+    mask = _mask_view(mask)
+    if mask is not None and (
+        mask.device != q.device
+        or mask.size(0) not in (1, past.numel())
+        or mask.size(1) not in (1, q.size(1))
+        or not 0 < mask.size(-1) <= pages.size(1) * size
+        or not 0 < mask.size(-2) <= (q.size(0) if qs is not None else 1)
+    ):
+        raise ValueError("invalid request-local paged mask")
+    slots = []
+    for i, n in enumerate(lengths):
+        length = n + offsets[i + 1] - offsets[i]
+        if n < 0 or length > pages.size(1) * size:
+            raise ValueError("request exceeds cache capacity")
+        active = pages[i, : (length + size - 1) // size]
+        if any(page < 0 or page >= kc.size(0) for page in active.tolist()):
+            raise ValueError("page index outside cache")
+        pos = torch.arange(length, device=q.device)
+        slots.append(active[pos // size].long() * size + pos % size)
+    keys = kc.view(-1, *kc.shape[-2:])
+    values = vc.view_as(keys)
+    output = []
+    for i, (start, end) in enumerate(zip(offsets, offsets[1:])):
+        sl = slots[i]
+        keys[sl[lengths[i] :]] = k[start:end]
+        values[sl[lengths[i] :]] = v[start:end]
+        if start == end:
+            output.append(q[start:end])
+            continue
+        local = None
+        if mask is not None:
+            item = mask[:1] if mask.size(0) == 1 else mask[i : i + 1]
+            allowed = torch.ones(
+                (1, 1, end - start, sl.numel()), dtype=torch.bool, device=q.device
+            )
+            local = _packed_mask(item, allowed, end - start)
+        output.append(
+            dense(
+                q[None, start:end],
+                keys[sl][None],
+                values[sl][None],
+                local,
+                causal,
+            )[0]
+        )
+    return torch.cat(output).reshape(original)

@@ -3,7 +3,7 @@
 The kernels are dtype-agnostic at the ABI (void* pointers, the element type
 being a compile-time kernel parameter) and instantiated per element type; each
 entry switches on q's ``at::ScalarType`` over the family's instantiation list
-(``AttentionTypes``) and refuses anything else.  These tests pin the two
+(BF16/FP16) and refuses anything else.  These tests pin the two
 halves of that contract: the instantiated type runs, and any other precision
 fails loudly instead of being reinterpreted as the instantiated one — the
 failure mode that matters, since a void* carries no type of its own.
@@ -13,17 +13,71 @@ import pytest
 import torch
 
 from astrai.extension import attention, op_backend
-from astrai.extension.kernel.attention import (
-    ROLLOUT_KV_SPLIT_SIZE,
-    attn_decode,
-    attn_paged_decode,
-    attn_paged_prefill,
-    attn_prefill,
-)
+from astrai.extension.kernel.attention import ROLLOUT_KV_SPLIT_SIZE
+from astrai.extension.runtime.loader import get_module
 from tests.support.capabilities import skip_no_kernel
 from tests.support.models import D
 
 Q_LEN, KV_LEN, N_HEADS, N_KV_HEADS = 8, 16, 4, 2
+
+
+def _append_decode(
+    q,
+    kc,
+    vc,
+    table,
+    rows,
+    lengths,
+    *,
+    new_k=None,
+    new_v=None,
+    mask=None,
+    is_causal=False,
+    o_part_buf=None,
+    ml_part_buf=None,
+    out_buf=None,
+    kv_split_size=0,
+):
+    pages = table[rows.long()]
+    past = lengths.diff() - 1
+    if new_k is None:
+        last = pages.gather(1, past.long()[:, None]).flatten().long()
+        new_k, new_v = kc[last], vc[last]
+    return get_module("attention").attention_with_kvcache(
+        q,
+        kc[:, None],
+        vc[:, None],
+        new_k,
+        new_v,
+        past,
+        pages,
+        mask=mask,
+        is_causal=is_causal,
+        kv_split_size=kv_split_size,
+        o_part=o_part_buf,
+        ml_part=ml_part_buf,
+        output=out_buf,
+    )
+
+
+def _append_chunk(q, kc, vc, table, offsets, q_lens, kv_lens, **kwargs):
+    past = torch.tensor(
+        [k - n for k, n in zip(kv_lens, q_lens)], device=q.device, dtype=torch.int32
+    )
+    slots = torch.cat(
+        [row[k - n : k] for row, k, n in zip(table, kv_lens, q_lens)]
+    ).long()
+    return get_module("attention").attention_with_kvcache(
+        q,
+        kc[:, None],
+        vc[:, None],
+        kc[slots],
+        vc[slots],
+        past,
+        table,
+        offsets,
+        **kwargs,
+    )
 
 
 def _contig(dtype):
@@ -52,17 +106,17 @@ def _paged(dtype):
 
 def _call_prefill(dtype):
     q, k, v = _contig(dtype)
-    return attn_prefill(q, k, v, is_causal=True)
+    return get_module("attention").attention(q, k, v, is_causal=True)
 
 
 def _call_decode(dtype):
     q, k, v = _contig(dtype)
-    return attn_decode(q[:, :1], k, v, is_causal=True)
+    return get_module("attention").attention(q[:, :1], k, v, is_causal=True)
 
 
 def _call_paged_decode(dtype):
     q, k, v, k_cache, v_cache, rtt, pool, indptr = _paged(dtype)
-    return attn_paged_decode(
+    return _append_decode(
         q, k_cache, v_cache, rtt, pool, indptr, new_k=k, new_v=v, is_causal=True
     )
 
@@ -109,7 +163,7 @@ def test_uninstantiated_head_dim_raises(dtype):
     q = torch.zeros(1, 1, N_HEADS, 96, device="cuda", dtype=dtype)
     k = torch.zeros(1, KV_LEN, N_KV_HEADS, 96, device="cuda", dtype=dtype)
     with pytest.raises(RuntimeError, match="head_dim 96 has no kernel instantiation"):
-        attn_decode(q, k, k)
+        get_module("attention").attention(q, k, k)
 
 
 def _reference(q, k, v, mask=None, causal=False, scale=None):
@@ -147,7 +201,7 @@ def test_prefill_signed_query_positions(dtype, q_len, kv_len, causal):
     q = torch.randn(2, q_len, 6, 64, device="cuda", dtype=dtype)
     k = torch.randn(2, kv_len, 2, 64, device="cuda", dtype=q.dtype)
     v = torch.randn_like(k)
-    out = attn_prefill(q, k, v, is_causal=causal, scale=0.17)
+    out = get_module("attention").attention(q, k, v, is_causal=causal, scale=0.17)
     expected = _reference(q, k, v, causal=causal, scale=0.17)
     torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
     if causal and q_len > kv_len:
@@ -170,7 +224,7 @@ def test_decode_mask_broadcast_and_temporary_workspace(dtype, kv_len):
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         stream.wait_stream(torch.cuda.current_stream())
-        out = attn_decode(q, k, v, mask=mask, scale=0.13)
+        out = get_module("attention").attention(q, k, v, mask=mask, scale=0.13)
         scratch = torch.empty(2, 6, 32, 64, device="cuda", dtype=torch.float32)
         scratch.fill_(999)
     torch.cuda.current_stream().wait_stream(stream)
@@ -204,7 +258,7 @@ def test_paged_decode_graph_replays_split_append(dtype, dim, width):
     output = torch.empty_like(q)
 
     def call():
-        return attn_paged_decode(
+        return _append_decode(
             q,
             k_cache,
             v_cache,
@@ -216,7 +270,6 @@ def test_paged_decode_graph_replays_split_append(dtype, dim, width):
             mask=mask,
             is_causal=False,
             out_buf=output,
-            scale=0.13,
         )
 
     warm = torch.cuda.Stream()
@@ -246,7 +299,6 @@ def test_paged_decode_graph_replays_split_append(dtype, dim, width):
                 k_cache[b * width : b * width + length][None],
                 v_cache[b * width : b * width + length][None],
                 mask=mask[:, :length],
-                scale=0.13,
             )
             torch.testing.assert_close(
                 captured[b], expected[0, 0], atol=0.02, rtol=0.02
@@ -260,7 +312,9 @@ def test_paged_decode_graph_replays_split_append(dtype, dim, width):
 def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
     torch.manual_seed(26)
     batch, heads, kv_heads, width = 2, 6, 2, 8192
-    length_cases = ((8191, 1), (17, 33), (1, 513), (0, 2048))
+    # Appending one token requires final length >= 1; length 1 tests an empty
+    # history. Fully masked rows below still exercise zero-output split merging.
+    length_cases = ((8191, 1), (17, 33), (1, 513), (1, 2048))
     q = torch.randn(batch, heads, dim, device="cuda", dtype=dtype)
     k_cache = torch.randn(batch * width, kv_heads, dim, device="cuda", dtype=q.dtype)
     v_cache = torch.randn_like(k_cache)
@@ -279,7 +333,7 @@ def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
     output = torch.empty_like(q)
 
     def call():
-        return attn_paged_decode(
+        return _append_decode(
             q,
             k_cache,
             v_cache,
@@ -289,7 +343,6 @@ def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
             new_k=new_k,
             new_v=new_v,
             mask=mask,
-            scale=0.13,
             o_part_buf=scratch,
             ml_part_buf=ml,
             out_buf=output,
@@ -316,10 +369,8 @@ def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
         scratch.fill_(float("nan"))
         ml.fill_(float("nan"))
         graph.replay()
+        assert torch.count_nonzero(captured[0, 0]) == 0
         for b, length in enumerate(lengths):
-            if length == 0:
-                assert torch.count_nonzero(captured[b]) == 0
-                continue
             slot = b * width + length - 1
             torch.testing.assert_close(k_cache[slot], new_k[b], rtol=0, atol=0)
             torch.testing.assert_close(v_cache[slot], new_v[b], rtol=0, atol=0)
@@ -328,7 +379,6 @@ def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
                 k_cache[None, b * width : b * width + length],
                 v_cache[None, b * width : b * width + length],
                 mask=mask[b : b + 1, :, :, :length],
-                scale=0.13,
             )
             torch.testing.assert_close(
                 captured[b], expected[0, 0], atol=0.02, rtol=0.02
@@ -381,7 +431,7 @@ def test_paged_decode_append_strided_sources(dtype, dim, length, masked, layout)
         mask = torch.ones(batch, width, device="cuda", dtype=torch.bool)
         mask[:, 1::3] = False
 
-    out = attn_paged_decode(
+    out = _append_decode(
         q,
         k_cache,
         v_cache,
@@ -391,7 +441,6 @@ def test_paged_decode_append_strided_sources(dtype, dim, length, masked, layout)
         new_k=new_k,
         new_v=new_v,
         mask=mask,
-        scale=0.17,
     )
 
     # Check every cache slot: only the two append destinations may change.
@@ -404,7 +453,6 @@ def test_paged_decode_append_strided_sources(dtype, dim, length, masked, layout)
             expected_k[slots][None],
             expected_v[slots][None],
             mask=None if mask is None else mask[b : b + 1, :count],
-            scale=0.17,
         )
         torch.testing.assert_close(out[b], expected[0, 0], atol=0.02, rtol=0.02)
 
@@ -436,7 +484,7 @@ def test_paged_decode_single_token_unaligned_cache_graph(dtype, unaligned_cache)
     output = torch.empty_like(q)
 
     def call():
-        return attn_paged_decode(
+        return _append_decode(
             q,
             caches[0],
             caches[1],
@@ -446,7 +494,6 @@ def test_paged_decode_single_token_unaligned_cache_graph(dtype, unaligned_cache)
             new_k=new_k,
             new_v=new_v,
             out_buf=output,
-            scale=0.17,
         )
 
     # A single appended token needs no cache reads; only its write destination
@@ -499,9 +546,7 @@ def test_paged_decode_combines_empty_and_partial_splits(dtype, dim):
     mask[1, 1:, :, 70:80] = True
     mask[1, 2, :, :2] = True
 
-    out = attn_paged_decode(
-        q, k_cache, v_cache, table, requests, indptr, mask=mask, scale=0.19
-    )
+    out = _append_decode(q, k_cache, v_cache, table, requests, indptr, mask=mask)
 
     for b, count in enumerate(lengths):
         expected = _reference(
@@ -509,7 +554,6 @@ def test_paged_decode_combines_empty_and_partial_splits(dtype, dim):
             k_cache[None, b * width : b * width + count],
             v_cache[None, b * width : b * width + count],
             mask=mask[b : b + 1, :, :, :count],
-            scale=0.19,
         )
         torch.testing.assert_close(out[b], expected[0, 0], atol=0.02, rtol=0.02)
     assert torch.count_nonzero(out[:, 0]) == 0
@@ -521,7 +565,7 @@ def test_split_workspace_pair_is_required():
     q, k, v, kc, vc, table, requests, indptr = _paged(torch.bfloat16)
     workspace = torch.empty(2, N_HEADS, 32, D, device="cuda", dtype=torch.float32)
     with pytest.raises(RuntimeError, match="provided together"):
-        attn_paged_decode(q, kc, vc, table, requests, indptr, o_part_buf=workspace)
+        _append_decode(q, kc, vc, table, requests, indptr, o_part_buf=workspace)
 
 
 @pytest.mark.cuda
@@ -530,7 +574,7 @@ def test_split_workspace_pair_is_required():
 def test_native_scale_never_silently_uses_default(scale):
     q, k, v = _contig(torch.bfloat16)
     with pytest.raises(RuntimeError, match="finite and positive"):
-        attn_prefill(q, k, v, scale=scale)
+        get_module("attention").attention(q, k, v, scale=scale)
 
 
 @pytest.mark.cuda
@@ -552,7 +596,9 @@ def test_prefill_four_axis_mask_layout(dtype, causal, shape):
     mask = storage[::2, ::2, ::2, : shape[3]]
     if shape[2] > 1:
         mask[:, :, -1] = False
-    out = attn_prefill(q, k, v, mask=mask, is_causal=causal, scale=0.17)
+    out = get_module("attention").attention(
+        q, k, v, mask=mask, is_causal=causal, scale=0.17
+    )
     ref = _reference(q, k, v, mask=mask, causal=causal, scale=0.17)
     torch.testing.assert_close(out, ref, atol=0.03, rtol=0.03)
 
@@ -573,7 +619,7 @@ def test_prefill_mask_query_axis_broadcast(dtype, rank, causal):
         mask = mask[:, None, :]
     elif rank == 4:
         mask = mask[:, None, None, :]
-    out = attn_prefill(q, k, v, mask=mask, is_causal=causal)
+    out = get_module("attention").attention(q, k, v, mask=mask, is_causal=causal)
     expected = _reference(q, k, v, mask=mask, causal=causal)
     torch.testing.assert_close(out, expected, atol=0.02, rtol=0.02)
 
@@ -594,34 +640,17 @@ def test_paged_prefill_ragged_tile_boundary(dtype, causal, q_lens, kv_lens):
     table = torch.arange(batch * width, device="cuda", dtype=torch.int32).view(
         batch, width
     )
-    requests = torch.arange(batch, device="cuda", dtype=torch.int32)
-    kv_indptr = torch.tensor(
-        [0, kv_lens[0], sum(kv_lens)], device="cuda", dtype=torch.int32
-    )
     qo_indptr = torch.tensor(
         [0, q_lens[0], sum(q_lens)], device="cuda", dtype=torch.int32
     )
-    q_tiles = [(length + 63) // 64 for length in q_lens]
-    tile_batches = torch.tensor(
-        [b for b, count in enumerate(q_tiles) for _ in range(count)],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    tile_indices = torch.tensor(
-        [tile for count in q_tiles for tile in range(count)],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    out = attn_paged_prefill(
+    out = _append_chunk(
         q,
         k_cache,
         v_cache,
         table,
-        requests,
-        kv_indptr,
         qo_indptr,
-        tile_batches,
-        tile_indices,
+        q_lens,
+        kv_lens,
         is_causal=causal,
     )
     start = 0
@@ -657,11 +686,7 @@ def test_paged_prefill_short_mask_bounds(dtype, mask_rows, expand_rows, mask_col
     table = torch.arange(batch * width, device="cuda", dtype=torch.int32).view(
         batch, width
     )
-    requests = torch.arange(batch, device="cuda", dtype=torch.int32)
-    kv_indptr = torch.tensor([0, 11, 28], device="cuda", dtype=torch.int32)
     qo_indptr = torch.tensor([0, 5, 14], device="cuda", dtype=torch.int32)
-    tile_batches = requests.clone()
-    tile_indices = torch.zeros(batch, device="cuda", dtype=torch.int32)
     row_mask = (torch.arange(mask_cols, device="cuda") % 3 != 1).view(
         1, 1, 1, mask_cols
     )
@@ -673,16 +698,14 @@ def test_paged_prefill_short_mask_bounds(dtype, mask_rows, expand_rows, mask_col
         if mask_rows > 1:
             mask[:, :, 1, 0] = False
 
-    out = attn_paged_prefill(
+    out = _append_chunk(
         q,
         k_cache,
         v_cache,
         table,
-        requests,
-        kv_indptr,
         qo_indptr,
-        tile_batches,
-        tile_indices,
+        q_lens,
+        kv_lens,
         mask=mask,
         is_causal=False,
     )
@@ -732,7 +755,9 @@ def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups, spli
     mask = torch.ones(batch, length, dtype=torch.bool, device=q.device)
     mask[0, 2::5] = False
     mask[1] = False
-    dense = attn_prefill(q, k, v, mask, is_causal=True, kv_split_size=split_size)
+    dense = get_module("attention").attention(
+        q, k, v, mask, is_causal=True, kv_split_size=split_size
+    )
     assert torch.count_nonzero(dense[1]) == 0
 
     # Test the usual preallocated workspace, including expansion when the
@@ -741,7 +766,7 @@ def test_consistent_bf16_attention_matches_paged_prefixes(head_dim, groups, spli
     ml_part = torch.empty(batch, q_heads, 32, 2, device=q.device)
     for end in (1, 15, 16, 17, 255, 256, 257, 511, 512, 513):
         indptr = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * end
-        actual = attn_paged_decode(
+        actual = _append_decode(
             q[:, end - 1].contiguous(),
             k.flatten(0, 1),
             v.flatten(0, 1),
@@ -765,7 +790,7 @@ def test_consistent_bf16_attention_gradients_match_math_reference():
     mask[:, 2] = False
     scale = 0.19
     with op_backend(attention="cuda_consistent"):
-        output = attention(q, k, v, attn_mask=mask, scale=scale)
+        output = attention(q, k, v, mask=mask, scale=scale)
     upstream = torch.randn_like(output)
     actual = torch.autograd.grad(output, (q, k, v), upstream)
 

@@ -7,14 +7,14 @@ seq_lens with padding mask), and end-to-end rollout run_batch.
 import pytest
 import torch
 
-from astrai.extension import op_backend
-from astrai.extension.kernel.attention import attn_paged_decode
+from astrai.extension import attention, op_backend
 from astrai.extension.runtime.loader import is_available
 from astrai.inference.core.cache import BlockPool, KVCacheManager
 from astrai.inference.core.engine import EngineCore
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.workspace import InferenceWorkspace
 from astrai.trainer.backend import run_batch
+from tests.support.cache import appended_slots
 from tests.support.capabilities import skip_no_cuda
 from tests.support.models import D
 from tests.support.tokenizers import FakeTokenizer
@@ -95,9 +95,7 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
     task_cache.alloc_slots("t2", prompt_ids[1])
     kv1 = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
-        out_torch = model(
-            input_ids, kv_cache=kv1, position_ids=position_ids, fwd="prefill"
-        )
+        out_torch = model(input_ids, kv_cache=kv1, position_ids=position_ids)
 
     task_cache.free_slots("t1")
     task_cache.free_slots("t2")
@@ -110,7 +108,6 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
                 input_ids,
                 kv_cache=kv2,
                 position_ids=position_ids,
-                fwd="prefill",
             )
 
     offset = 0
@@ -162,14 +159,12 @@ def test_masked_cached_chunk_prefill_matches_torch(cuda_model, mask_len):
                 input_mask=key_mask[:, :3],
                 position_ids=torch.arange(3, device=device),
                 kv_cache=task_cache.bind(["t"], workspace, start_pos=0, seq_ends=[3]),
-                fwd="prefill",
             )
             chunk = model(
                 ids[3:],
                 input_mask=key_mask,
                 position_ids=torch.arange(3, 6, device=device),
                 kv_cache=task_cache.bind(["t"], workspace, start_pos=3, seq_ends=[6]),
-                fwd="prefill",
             )
         return chunk["logits"]
 
@@ -209,7 +204,7 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     task_cache.alloc_slots("t2", prompt_ids[1])
     kv = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
-        model(input_ids, kv_cache=kv, position_ids=position_ids, fwd="prefill")
+        model(input_ids, kv_cache=kv, position_ids=position_ids)
 
     # Decode step — seq_lens are 9 and 7 (after extending)
     dec_ids = torch.tensor([99, 98], dtype=torch.long, device=device)
@@ -219,12 +214,12 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     task_cache.extend_slots("t2", 6)
     kv_t = task_cache.bind(["t1", "t2"], ws)
     with torch.inference_mode():
-        out_torch = model(dec_ids, kv_cache=kv_t, position_ids=dec_pos, fwd="decode")
+        out_torch = model(dec_ids, kv_cache=kv_t, position_ids=dec_pos)
 
     kv_c = task_cache.bind(["t1", "t2"], ws)
     with op_backend(attention="cuda"):
         with torch.inference_mode():
-            out_cuda = model(dec_ids, kv_cache=kv_c, position_ids=dec_pos, fwd="decode")
+            out_cuda = model(dec_ids, kv_cache=kv_c, position_ids=dec_pos)
 
     diff = (out_torch["logits"].float() - out_cuda["logits"].float()).abs().max().item()
     assert diff < 0.05, f"Decode diff (mixed seq_lens): {diff}"
@@ -259,27 +254,29 @@ def test_paged_decode_appends_new_kv_in_kernel():
     q = torch.randn(2, 2, D, device="cuda", dtype=torch.bfloat16)
     new_k = torch.randn(2, 1, D, device="cuda", dtype=torch.bfloat16)
     new_v = torch.randn(2, 1, D, device="cuda", dtype=torch.bfloat16)
-    out = attn_paged_decode(
-        q,
-        kv_cache.k_buffer[0],
-        kv_cache.v_buffer[0],
-        kv_cache.req_to_token,
-        kv_cache.req_pool_indices,
-        kv_cache.kv_indptr,
-        new_k=new_k,
-        new_v=new_v,
+    out = attention(
+        q[:, None],
+        new_k[:, None],
+        new_v[:, None],
+        k_cache=kv_cache.k_buffer[0],
+        v_cache=kv_cache.v_buffer[0],
+        cache_seqlens=kv_cache.cache_seqlens,
+        page_table=kv_cache.page_table,
         is_causal=True,
-        o_part_buf=kv_cache.decode_o_part,
-        ml_part_buf=kv_cache.decode_ml_part,
-        out_buf=kv_cache.decode_out,
     )
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
-        kv_cache.k_buffer[0, kv_cache.out_cache_loc], new_k, rtol=0, atol=0
+        kv_cache.k_buffer[0].flatten(0, 1)[appended_slots(kv_cache)],
+        new_k,
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
-        kv_cache.v_buffer[0, kv_cache.out_cache_loc], new_v, rtol=0, atol=0
+        kv_cache.v_buffer[0].flatten(0, 1)[appended_slots(kv_cache)],
+        new_v,
+        rtol=0,
+        atol=0,
     )
     assert torch.isfinite(out).all()
 
@@ -298,7 +295,9 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
         n_layers=2,
         n_kv_heads=1,
         head_dim=D,
-        max_batch_size=1,
+        max_batch_size=2,
+        n_tokens=128,
+        page_size=4,
         max_seq_len=64,
         device=device,
         dtype=torch.bfloat16,
@@ -315,36 +314,59 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
             input_ids,
             position_ids=position_ids,
             kv_cache=task_cache.bind(["t1"], ws, start_pos=0),
-            fwd="prefill",
         )
 
         task_cache.extend_slots("t1", len(prompt_ids))
         kv_cache = task_cache.bind(["t1"], ws)
-        assert kv_cache.req_to_token.dtype == torch.int32
-        assert kv_cache.req_pool_indices.dtype == torch.int32
-        assert kv_cache.out_cache_loc.dtype == torch.int32
+        assert kv_cache.page_table.dtype == torch.int32
+        assert kv_cache.cache_seqlens.dtype == torch.int32
+        assert appended_slots(kv_cache).dtype == torch.int32
 
         decode_args = {
             "input_ids": torch.tensor([9], dtype=torch.long, device=device),
             "position_ids": torch.tensor([len(prompt_ids)], device=device),
             "kv_cache": kv_cache,
-            "fwd": "decode",
         }
         graph = CUDAGraphRunner(enabled=True)
         graph.forward(model, key=(1,), **decode_args)
         graph.forward(model, key=(1,), **decode_args)
         first = graph.forward(model, key=(1,), **decode_args)["logits"].clone()
-        slot = kv_cache.out_cache_loc[0]
-        first_k = kv_cache.k_buffer[:, slot].clone()
-        first_v = kv_cache.v_buffer[:, slot].clone()
+        slot = appended_slots(kv_cache)[0]
+        first_k = kv_cache.k_buffer.flatten(1, 2)[:, slot].clone()
+        first_v = kv_cache.v_buffer.flatten(1, 2)[:, slot].clone()
 
         second = graph.forward(model, key=(1,), **decode_args)["logits"].clone()
         torch.cuda.synchronize()
 
     assert graph.has_graph((1,))
     torch.testing.assert_close(second, first, rtol=0, atol=0)
-    torch.testing.assert_close(kv_cache.k_buffer[:, slot], first_k, rtol=0, atol=0)
-    torch.testing.assert_close(kv_cache.v_buffer[:, slot], first_v, rtol=0, atol=0)
+    torch.testing.assert_close(
+        kv_cache.k_buffer.flatten(1, 2)[:, slot], first_k, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        kv_cache.v_buffer.flatten(1, 2)[:, slot], first_v, rtol=0, atol=0
+    )
+
+    # Replay the same capture with a different request, then cross a page boundary.
+    with op_backend(attention="cuda"), torch.inference_mode():
+        prompt = [32, 31, 30]
+        assert task_cache.alloc_slots("other", prompt)
+        model(
+            torch.tensor(prompt, device=device),
+            position_ids=torch.arange(3, device=device),
+            kv_cache=task_cache.bind(["other"], ws, start_pos=0),
+        )
+        for pos in (3, 4):
+            assert task_cache.extend_slots("other", pos)
+            bound = task_cache.bind(["other"], ws)
+            assert bound.page_table.data_ptr() == kv_cache.page_table.data_ptr()
+            assert bound.cache_seqlens.data_ptr() == kv_cache.cache_seqlens.data_ptr()
+            decode_args["input_ids"].fill_(40 + pos)
+            decode_args["position_ids"].fill_(pos)
+            decode_args["kv_cache"] = bound
+            replayed = graph.forward(model, key=(1,), **decode_args)["logits"].clone()
+            eager = model(**decode_args)["logits"]
+            torch.testing.assert_close(replayed, eager, rtol=0, atol=0)
 
 
 @pytest.mark.cuda
@@ -393,3 +415,53 @@ def test_run_batch_cuda_matches_torch_greedy(cuda_model):
     sched2.stop()
 
     assert out_torch == out_cuda, f"Torch={out_torch} != CUDA={out_cuda}"
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_available("attention"),
+    reason="native CUDA required",
+)
+def test_mla_chunk_and_decode_match_dense():
+    from astrai.model import AutoRegressiveLM
+    from tests.support.models import make_tiny_config
+
+    torch.manual_seed(17)
+    cfg = make_tiny_config(
+        attn_type="mla",
+        hidden_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=32,
+        kv_lora_rank=16,
+    )
+    device = torch.device("cuda")
+    model = AutoRegressiveLM(cfg).to(device=device, dtype=torch.bfloat16).eval()
+    pool = BlockPool(2, 1, 64, 1, 16, device, torch.bfloat16, page_size=4, n_tokens=16)
+    manager, workspace = KVCacheManager(pool), _ws(pool)
+    ids = torch.arange(1, 7, device=device)
+    pos = torch.arange(6, device=device)
+    assert manager.alloc_slots("request", ids[:5].tolist())
+    with torch.inference_mode(), op_backend(attention="torch"):
+        dense = model(ids[None])["logits"][0]
+    with torch.inference_mode(), op_backend(attention="cuda"):
+        chunks = []
+        for start, end in ((0, 1), (1, 5)):
+            cache = manager.bind(
+                ["request"], workspace, start_pos=start, seq_ends=[end]
+            )
+            chunks.append(
+                model(ids[start:end], position_ids=pos[start:end], kv_cache=cache)[
+                    "logits"
+                ]
+            )
+        assert manager.extend_slots("request", 5)
+        chunks.append(
+            model(
+                ids[5:],
+                position_ids=pos[5:],
+                kv_cache=manager.bind(["request"], workspace),
+            )["logits"]
+        )
+    torch.testing.assert_close(torch.cat(chunks), dense, rtol=0.035, atol=0.035)

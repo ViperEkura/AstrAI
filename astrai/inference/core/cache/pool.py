@@ -1,6 +1,6 @@
 """KV cache orchestration: BlockPool + KVCacheManager.
 
-BlockPool owns the physical buffers (``KVStorage`` + ``ReqToTokenPool``)
+BlockPool owns the physical buffers (``KVStorage`` + ``RequestPageTable``)
 and wires them to an allocation strategy.  It assembles the ``KVCache``
 dataclass passed to the model forward.
 
@@ -12,6 +12,7 @@ for the allocation policies.
 """
 
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -24,13 +25,13 @@ from astrai.inference.core.cache.strategy import (
     RadixCache,
     RequestCacheState,
 )
-from astrai.inference.worker.workspace import Q_TILE_ROWS, InferenceWorkspace
+from astrai.inference.worker.workspace import InferenceWorkspace
 from astrai.model.kv_cache import (
     DecodeKVCache,
     KVCache,
     KVStorage,
     PrefillKVCache,
-    ReqToTokenPool,
+    RequestPageTable,
 )
 
 # Re-export everything so existing ``from astrai.inference.core.cache import ...``
@@ -47,7 +48,7 @@ __all__ = [
     "PagedStrategy",
     "PrefillKVCache",
     "RadixCache",
-    "ReqToTokenPool",
+    "RequestPageTable",
     "RequestCacheState",
 ]
 
@@ -76,13 +77,14 @@ class _BindState:
 
     sig: Tuple
     seq_lens: List[int]
+    workspace: InferenceWorkspace
 
 
 # ---- pool + manager ----
 
 
 class BlockPool:
-    """Physical KV cache: buffers + req-to-token table + allocation strategy + bind.
+    """Physical KV cache: buffers + request page table + allocation strategy + bind.
 
     Does not know about requests — request lifecycle is managed by
     :class:`KVCacheManager`, which holds a reference to this pool.
@@ -100,6 +102,8 @@ class BlockPool:
         page_size: int = 1,
         n_tokens: Optional[int] = None,
     ):
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
         self.page_size = page_size
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
@@ -110,20 +114,23 @@ class BlockPool:
         self.head_dim = head_dim
 
         self.contiguous = n_tokens is None
-        self.n_tokens = max_batch_size * max_seq_len if self.contiguous else n_tokens
+        pages_per_req = (max_seq_len + page_size - 1) // page_size
+        self.n_tokens = (
+            max_batch_size * pages_per_req * page_size if self.contiguous else n_tokens
+        )
         if self.n_tokens > torch.iinfo(torch.int32).max:
             raise ValueError("KV cache token count exceeds the int32 slot index limit")
 
         self._storage = KVStorage(
-            self.n_tokens, n_layers, n_kv_heads, head_dim, device, dtype
+            self.n_tokens, n_layers, page_size, n_kv_heads, head_dim, device, dtype
         )
-        self._req_pool = ReqToTokenPool(max_batch_size, max_seq_len, device)
+        self._req_pool = RequestPageTable(max_batch_size, pages_per_req, device)
 
         if self.contiguous:
             for i in range(max_batch_size):
-                self._req_pool.req_to_token[i] = torch.arange(
-                    i * max_seq_len,
-                    (i + 1) * max_seq_len,
+                self._req_pool.page_table[i] = torch.arange(
+                    i * pages_per_req,
+                    (i + 1) * pages_per_req,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -143,7 +150,7 @@ class BlockPool:
         return self._strategy
 
     @property
-    def req_pool(self) -> ReqToTokenPool:
+    def req_pool(self) -> RequestPageTable:
         return self._req_pool
 
     def bind_tasks(
@@ -154,17 +161,19 @@ class BlockPool:
         device: Optional[torch.device] = None,
         start_pos: Optional[int] = None,
         incremental: bool = False,
+        refresh_pages: bool = True,
     ) -> KVCache:
         """Assemble the ``KVCache`` metadata for a batch of requests.
 
         Args:
-            req_indices: request slot indices (from ``ReqToTokenPool``).
+            req_indices: request slot indices (from ``RequestPageTable``).
             seq_lens:    current sequence length per request.
             workspace:   pre-allocated fixed-shape buffers (CUDA-graph safe).
             start_pos:   if set, produce **prefill** cache (full q_len range).
                          If ``None``, produce **decode** cache (last position).
             incremental: if ``True``, reuse workspace state from previous step
                          by incrementing counters in-place (decode hot path).
+            refresh_pages: whether the allocation strategy changed a page mapping.
 
         Returns:
             ``KVCache`` dataclass with the correct output shapes for the
@@ -174,100 +183,57 @@ class BlockPool:
             device = workspace.device
         b = len(req_indices)
 
-        rpi_buf = workspace.req_pool_indices
-        sl_buf = workspace.seq_lens
-        kvp_buf = workspace.kv_indptr
-        inc_buf = workspace.inc
-        ocl_buf = workspace.out_cache_loc
-
-        if incremental:
-            sl_buf[:b] += 1
-            kvp_buf[: b + 1] += inc_buf[: b + 1]
-        else:
-            rpi_buf[:b].copy_(
-                torch.tensor(req_indices, dtype=torch.int32, device=device)
-            )
-            sl_buf[:b].copy_(torch.tensor(seq_lens, dtype=torch.long, device=device))
-            kvp_buf[: b + 1].zero_()
-            kvp_buf[1 : b + 1] = sl_buf[:b].cumsum(0).to(torch.int32)
-
-        req_pool_indices = rpi_buf[:b]
-        seq_lens_t = sl_buf[:b]
-        kv_indptr = kvp_buf[: b + 1]
-
-        if start_pos is not None:
-            # Packed prefill concatenates each request's query tokens.
-            q_lens = [seq_len - start_pos for seq_len in seq_lens]
-            if any(q_len <= 0 for q_len in q_lens):
-                raise ValueError("prefill sequence lengths must exceed start_pos")
-            out_cache_loc = torch.cat(
-                [
-                    self._req_pool.req_to_token[
-                        req_pool_indices[i], start_pos : seq_lens[i]
-                    ]
-                    for i in range(b)
-                ]
-            )
-            workspace.qo_indptr[: b + 1].zero_()
-            workspace.qo_indptr[1 : b + 1].copy_(
-                torch.tensor(q_lens, dtype=torch.int32, device=device).cumsum(0)
-            )
-            qo_indptr = workspace.qo_indptr[: b + 1]
-            tile_batches = []
-            tile_indices = []
-            for batch, q_len in enumerate(q_lens):
-                n_tiles = (q_len + Q_TILE_ROWS - 1) // Q_TILE_ROWS
-                tile_batches.extend([batch] * n_tiles)
-                tile_indices.extend(range(n_tiles))
-            n_tiles = len(tile_batches)
-            workspace.q_tile_to_batch[:n_tiles].copy_(
-                torch.tensor(tile_batches, dtype=torch.int32, device=device)
-            )
-            workspace.q_tile_to_index[:n_tiles].copy_(
-                torch.tensor(tile_indices, dtype=torch.int32, device=device)
-            )
-            q_tile_to_batch = workspace.q_tile_to_batch[:n_tiles]
-            q_tile_to_index = workspace.q_tile_to_index[:n_tiles]
-
-            return PrefillKVCache(
-                k_buffer=self._storage.k_buffer,
-                v_buffer=self._storage.v_buffer,
-                req_to_token=self._req_pool.req_to_token,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens_t,
-                max_len=max(seq_lens),
-                kv_indptr=kv_indptr,
-                out_cache_loc=out_cache_loc,
-                qo_indptr=qo_indptr,
-                q_tile_to_batch=q_tile_to_batch,
-                q_tile_to_index=q_tile_to_index,
-            )
-        else:
-            # ---- decode: out_cache_loc is a single column (last position) ----
-            write_pos = seq_lens_t - 1
-            loc = self._req_pool.req_to_token[req_pool_indices, write_pos].unsqueeze(-1)
-            ocl_buf[:b].copy_(loc)
-            out_cache_loc = ocl_buf[:b].reshape(-1)
-            workspace.qo_indptr[: b + 1].copy_(inc_buf[: b + 1])
-            qo_indptr = workspace.qo_indptr[: b + 1]
-            decode_o_part = workspace.decode_o_part
-            decode_ml_part = workspace.decode_ml_part
-            decode_out = workspace.decode_out
-
+        rows = workspace.req_pool_indices[:b]
+        past = workspace.cache_seqlens[:b]
+        table = self._req_pool.page_table
+        shape = (workspace.req_pool_indices.numel(), table.size(1))
+        if workspace.page_table is None or workspace.page_table.shape != shape:
+            with torch.inference_mode(False):
+                workspace.page_table = torch.empty(
+                    shape, dtype=torch.int32, device=device
+                )
+            incremental = False
+        if not incremental:
+            rows.copy_(torch.tensor(req_indices, dtype=torch.int32, device=device))
+        pages = workspace.page_table[:b]
+        if not incremental or refresh_pages:
+            torch.index_select(table, 0, rows, out=pages)
+        if start_pos is None:
+            if incremental:
+                past.add_(1)
+            else:
+                past.copy_(
+                    torch.tensor(
+                        [n - 1 for n in seq_lens], dtype=torch.int32, device=device
+                    )
+                )
             return DecodeKVCache(
-                k_buffer=self._storage.k_buffer,
-                v_buffer=self._storage.v_buffer,
-                req_to_token=self._req_pool.req_to_token,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens_t,
-                max_len=max(seq_lens),
-                kv_indptr=kv_indptr,
-                out_cache_loc=out_cache_loc,
-                qo_indptr=qo_indptr,
-                decode_o_part=decode_o_part,
-                decode_ml_part=decode_ml_part,
-                decode_out=decode_out,
+                self._storage.k_buffer,
+                self._storage.v_buffer,
+                pages,
+                past,
+                workspace.decode_o_part,
+                workspace.decode_ml_part,
+                workspace.decode_out,
+                layer_views=self._storage.layer_views,
             )
+
+        lengths = [n - start_pos for n in seq_lens]
+        if min(lengths) <= 0:
+            raise ValueError("prefill sequence lengths must exceed start_pos")
+        offsets = workspace.cu_seqlens_q[: b + 1]
+        offsets.copy_(
+            torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device=device)
+        )
+        past.fill_(start_pos)
+        return PrefillKVCache(
+            self._storage.k_buffer,
+            self._storage.v_buffer,
+            pages,
+            past,
+            offsets,
+            layer_views=self._storage.layer_views,
+        )
 
 
 class KVCacheManager:
@@ -422,8 +388,7 @@ class KVCacheManager:
 
         ``seq_ends`` (chunked prefill) overrides the per-request sequence
         length with the chunk window's end: attention reads the prefix
-        ``[0, start_pos)`` plus this window only, and ``out_cache_loc``
-        covers exactly the window's write positions.  Without it the
+        ``[0, start_pos)`` plus this window only. Writes begin at ``start_pos``.  Without it the
         states' full lengths are used, as before.
         """
         states = [self._states[tid] for tid in request_ids]
@@ -432,6 +397,15 @@ class KVCacheManager:
         if seq_ends is not None:
             if len(seq_ends) != len(states):
                 raise ValueError("seq_ends must match request_ids in length")
+            if (
+                start_pos is None
+                or start_pos < 0
+                or any(
+                    not start_pos < end <= state.length
+                    for end, state in zip(seq_ends, states)
+                )
+            ):
+                raise ValueError("chunk must fit the reserved request interval")
             seq_lens = list(seq_ends)
         sig = tuple(req_indices)
 
@@ -439,24 +413,27 @@ class KVCacheManager:
         incremental = (
             start_pos is None
             and prev is not None
+            and prev.workspace is workspace
             and _is_steady_increment(prev.sig, prev.seq_lens, sig, seq_lens)
         )
-        self._bind_state = _BindState(sig, list(seq_lens))
-        self._bind_was_steady = incremental
+        # Publish newly allocated pages before gathering this batch’s rows.
+        pages_changed = self._strategy.flush_pages(states, device or workspace.device)
 
-        # req_to_token rows are read on-device by every decode bind
-        # (out_cache_loc gather), incremental or not — push any host-staged
-        # slot tails so the device rows are current before the gather runs.
-        self._strategy.flush_slots(states, device or workspace.device)
-
-        return self._pool.bind_tasks(
+        bound = self._pool.bind_tasks(
             req_indices,
             seq_lens,
             workspace,
             device=device,
             start_pos=start_pos,
             incremental=incremental,
+            refresh_pages=pages_changed,
         )
+
+        self._bind_state = _BindState(
+            sig if start_pos is None else None, list(seq_lens), workspace
+        )
+        self._bind_was_steady = incremental
+        return bound
 
     @property
     def bind_was_steady(self) -> bool:

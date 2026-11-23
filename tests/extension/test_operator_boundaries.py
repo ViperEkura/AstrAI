@@ -23,8 +23,8 @@ def _attention_inputs():
 def test_attention_rejects_int32_stride_overflow():
     q, k = _attention_inputs()
     q = q.as_strided(q.shape, (2**31, 32, 32, 1))
-    with pytest.raises(RuntimeError, match=r"q stride\(0\).*int32"):
-        get_module("attention").attn_prefill(q, k, k)
+    with pytest.raises(RuntimeError, match=r"Q shape or stride.*int32"):
+        get_module("attention").attention(q, k, k)
 
 
 @pytest.mark.cuda
@@ -32,7 +32,7 @@ def test_attention_rejects_int32_stride_overflow():
 def test_attention_rejects_empty_batch_before_launch():
     q, k = _attention_inputs()
     with pytest.raises(RuntimeError, match="batch, heads, and query length"):
-        get_module("attention").attn_prefill(q[:0], k[:0], k[:0])
+        get_module("attention").attention(q[:0], k[:0], k[:0])
 
 
 @pytest.mark.cuda

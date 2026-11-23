@@ -163,7 +163,6 @@ class GenerationBenchmark:
                     position_ids=torch.arange(
                         start_pos, end_pos, dtype=torch.long, device=self.device
                     ).repeat(batch_size),
-                    fwd="prefill",
                     skip_lm_head=skip_lm_head,
                 )
         torch.cuda.synchronize()
@@ -192,7 +191,6 @@ class GenerationBenchmark:
                 input_ids,
                 kv_cache=kv_cache,
                 position_ids=position_ids,
-                fwd="decode",
             )
 
     def run_prefill_benchmark(
@@ -225,7 +223,6 @@ class GenerationBenchmark:
                     input_ids,
                     kv_cache=kv_cache,
                     position_ids=position_ids,
-                    fwd="prefill",
                 )
 
         torch.cuda.synchronize()
@@ -236,7 +233,6 @@ class GenerationBenchmark:
                     input_ids,
                     kv_cache=kv_cache,
                     position_ids=position_ids,
-                    fwd="prefill",
                 )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
@@ -394,7 +390,6 @@ class GenerationBenchmark:
                     input_ids=input_ids_buf,
                     kv_cache=kv_cache,
                     position_ids=position_ids_buf,
-                    fwd="decode",
                 )
                 if end_event is not None:
                     end_event.record()
@@ -470,7 +465,6 @@ class GenerationBenchmark:
                     input_ids=input_ids_buf,
                     kv_cache=kv_cache,
                     position_ids=position_ids_buf,
-                    fwd="decode",
                 )
 
         for i in range(5):

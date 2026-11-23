@@ -135,8 +135,11 @@ classDiagram
     PagedStrategy --> RadixCache : optional prefix index
 ```
 
-A decode token requires an updated token-to-slot mapping even if it needs no
-new page. Page allocation and slot-map updates are separate operations.
+A decode token advances its past length. With a physical page table, the
+mapping only changes when a page is allocated or the request batch changes.
+The strategy reports whether it published new page IDs; steady decode reuses
+the workspace table otherwise. A page crossing refreshes the table in place,
+preserving the addresses captured by CUDA Graphs.
 
 Prefix publication requires
 `record_block_hashes(..., materialized_end=exclusive_token_end)`. The boundary

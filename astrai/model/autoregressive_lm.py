@@ -57,23 +57,16 @@ class AutoRegressiveLM(AutoModel):
         input_mask: Optional[Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         position_ids: Optional[Tensor] = None,
-        fwd: Optional[str] = None,
+        *,
         logits_positions: Optional[Tensor] = None,
         skip_lm_head: bool = False,
         return_lm_head_weight: bool = False,
     ) -> Dict[str, Tensor]:
-        if fwd is None:
+        if kv_cache is None:
             if input_ids.ndim != 2:
                 raise ValueError("training input_ids must be [batch, seq_len]")
-            if kv_cache is not None:
-                raise ValueError("training forward does not accept a KV cache")
-        elif fwd in ("prefill", "decode"):
-            if input_ids.ndim != 1:
-                raise ValueError("inference input_ids must be packed [tokens]")
-            if kv_cache is None:
-                raise ValueError("inference forward requires a KV cache")
-        else:
-            raise ValueError(f"unsupported forward mode: {fwd}")
+        elif input_ids.ndim != 1:
+            raise ValueError("inference input_ids must be packed [tokens]")
 
         if return_lm_head_weight and not skip_lm_head:
             raise ValueError("return_lm_head_weight requires skip_lm_head")
@@ -82,7 +75,6 @@ class AutoRegressiveLM(AutoModel):
             input_mask=input_mask,
             kv_cache=kv_cache,
             position_ids=position_ids,
-            fwd=fwd,
             logits_positions=logits_positions,
         )
         # skip_lm_head returns post-norm hidden states only, with logits

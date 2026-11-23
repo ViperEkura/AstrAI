@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional, OrderedDict, Tuple
 
 import torch
 
-from astrai.model.kv_cache import ReqToTokenPool
+from astrai.model.kv_cache import RequestPageTable
 
 # ---- data contract: per-request slot state ----
 
@@ -31,17 +31,13 @@ class RequestCacheState:
     lifecycle is atomic.  Owned by ``KVCacheManager``, consumed by
     every ``AllocationStrategy`` method.
 
-    ``slots`` mirrors the page-size-1 tail of ``req_to_token[req_idx]`` on
-    the host: ``extend`` appends to it instead of issuing one tiny H2D copy
-    per decoded token, and ``write_indices`` flushes the prefix it did not
-    already cover in one bulk write.
+    ``pages`` holds logical-to-physical page IDs; extensions flush only new IDs.
     """
 
     req_idx: int
     length: int = 0
     cached: int = 0
     pages: List[int] = field(default_factory=list)
-    _slots: List[int] = field(default_factory=list)
     _flushed: int = 0
 
 
@@ -428,13 +424,15 @@ class AllocationStrategy(ABC):
         materialized_end: int,
     ) -> None: ...
 
-    def flush_slots(self, states: List[RequestCacheState], device) -> None:
-        """Push host-staged slot maps to the device row.
+    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
+        """Publish newly assigned physical pages to the request table.
 
         Only the paged strategy stages slots on the host; the default is a
-        no-op for strategies whose req_to_token rows are already current
+        no-op for strategies whose page table rows are already current
         (contiguous rows are pre-filled and never rewritten).
+        Returns whether this call changed a page mapping.
         """
+        return False
 
     def invalidate_cache(self) -> int:
         """Drop reusable KV entries after an inference weight update."""
@@ -449,7 +447,7 @@ class ContiguousStrategy(AllocationStrategy):
     """Static contiguous allocation: slots are pre-assigned at pool init.
 
     No dynamic allocation or prefix caching.  All operations are no-ops
-    because ``ReqToTokenPool`` is pre-filled with contiguous ranges.
+    because ``RequestPageTable`` is pre-filled with contiguous ranges.
     """
 
     def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool:
@@ -489,7 +487,7 @@ class PagedStrategy(AllocationStrategy):
         alloc: Allocator,
         prefix: Optional[RadixCache],
         page_size: int,
-        req_pool: ReqToTokenPool,
+        req_pool: RequestPageTable,
         device,
     ):
         self._alloc = alloc
@@ -497,26 +495,6 @@ class PagedStrategy(AllocationStrategy):
         self._page_size = page_size
         self._req_pool = req_pool
         self._device = device
-        # Pinned staging for the per-step flush of host-staged slot tails:
-        # synchronous ``torch.tensor(..., device=)`` construction costs a
-        # blocking H2D per tensor per decode step; staging into pre-pinned
-        # buffers keeps those transfers asynchronous.  The ring depth of 2
-        # lets step t+1 write its staging while step t's transfer may still
-        # be in flight (same stream, so ordering is preserved either way).
-        # Pinned allocation needs a CUDA driver — CPU-only environments
-        # (CI) stage through pageable memory instead (the flush then just
-        # keeps its old blocking-copy behaviour).
-        max_batch = req_pool.req_to_token.shape[0]
-        pin = torch.cuda.is_available() and torch.device(device).type == "cuda"
-        self._flush_pin = [
-            (
-                torch.empty(max_batch, dtype=torch.int64, pin_memory=pin),
-                torch.empty(max_batch, dtype=torch.int64, pin_memory=pin),
-                torch.empty(max_batch, dtype=torch.int32, pin_memory=pin),
-            )
-            for _ in range(2)
-        ]
-        self._flush_ring = 0
 
     def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool:
         if self._prefix is not None:
@@ -549,16 +527,6 @@ class PagedStrategy(AllocationStrategy):
             if p < 0:
                 return False
             state.pages.append(p)
-        slot = state.pages[page_idx] * self._page_size + pos % self._page_size
-        if self._page_size == 1 and pos == len(state._slots):
-            # page_size=1 fast path: positions arrive in order, so the slot
-            # list extends by one element instead of each call issuing a
-            # single-element H2D copy to req_to_token (128 such copies per
-            # decode step at serving batch sizes). _slots is flushed to the
-            # device in bulk by write_indices/bind.
-            state._slots.append(slot)
-            return True
-        self._req_pool.req_to_token[state.req_idx, pos] = slot
         return True
 
     def extend_batch(
@@ -588,84 +556,30 @@ class PagedStrategy(AllocationStrategy):
                 return [self.extend(s, p) for s, p in zip(states, positions)]
             for i, p in zip(need, pages):
                 states[i].pages.append(p)
-        # Existing pages still need their new decode position mapped. Page
-        # reservation alone does not initialize the whole req_to_token row.
-        results = [True] * len(states)
-        for state, pos in zip(states, positions):
-            page_idx = pos // page_size
-            slot = state.pages[page_idx] * page_size + pos % page_size
-            if page_size == 1 and pos == len(state._slots):
-                state._slots.append(slot)
-            else:
-                self._req_pool.req_to_token[state.req_idx, pos] = slot
-        return results
+        return [True] * len(states)
 
     def write_indices(self, state: RequestCacheState, prompt_ids: List[int]) -> None:
-        total = min(len(prompt_ids), len(state.pages) * self._page_size)
-        if total <= 0:
-            return
-        # One H2D write per row: every per-position assignment is a separate
-        # tiny copy (~15us of driver overhead each), so a 512-token prompt
-        # spends ~8ms in the loop while the same row written once as a tensor
-        # costs ~60us. The position -> slot map is an affine function of the
-        # page ids, built on the host in bulk either way.
-        page_size = self._page_size
-        pages = state.pages
-        if page_size == 1:
-            vals = pages[:total]
-        else:
-            vals = []
-            for page_idx, p in enumerate(pages[: (total + page_size - 1) // page_size]):
-                base = p * page_size
-                n = min(page_size, total - page_idx * page_size)
-                vals.extend(range(base, base + n))
-        self._req_pool.req_to_token[state.req_idx, :total] = torch.tensor(
-            vals, dtype=torch.int32, device=self._device
-        )
-        state._slots = list(vals)
-        state._flushed = total
+        count = len(state.pages)
+        if count:
+            self._req_pool.page_table[state.req_idx, :count] = torch.tensor(
+                state.pages, dtype=torch.int32, device=self._device
+            )
+        state._flushed = count
 
-    def flush_slots(self, states: List[RequestCacheState], device) -> None:
-        # req_to_token rows are gathered on-device by every decode bind
-        # (out_cache_loc), so staged tails must land there before the
-        # gather runs — steady incremental steps included. The staged tails
-        # of the whole batch are concatenated into ONE tensor write (one
-        # H2D per step instead of one per request; 128 per-request copies cost
-        # ~5ms/step at serving batch sizes) using a built-once scatter
-        # index (request row, in-row offset) pairs.
-        flat_vals: List[int] = []
-        row_idx: List[int] = []
-        col_idx: List[int] = []
-        for state in states:
-            slots = state._slots
-            n = len(slots)
-            if n <= state._flushed:
-                continue
-            start = state._flushed
-            state._flushed = n
-            flat_vals.extend(slots[start:])
-            req = state.req_idx
-            row_idx.extend([req] * (n - start))
-            col_idx.extend(range(start, n))
-        if not flat_vals:
-            return
-        # Depth-2 pinned staging: writes go into the free ring slot, then
-        # a single non_blocking H2D per tensor replaces three blocking
-        # ``torch.tensor(..., device=)`` constructions.  Depth 2 (vs a
-        # single buffer) keeps the host writable while the previous
-        # transfer may still be queued — the caller (bind) runs strictly
-        # step-serial, but the same stream executes the copies in order
-        # regardless.
-        pin_rows, pin_cols, pin_vals = self._flush_pin[self._flush_ring]
-        self._flush_ring ^= 1
-        n = len(flat_vals)
-        pin_rows[:n] = torch.as_tensor(row_idx, dtype=torch.int64)
-        pin_cols[:n] = torch.as_tensor(col_idx, dtype=torch.int64)
-        pin_vals[:n] = torch.as_tensor(flat_vals, dtype=torch.int32)
-        rows = pin_rows[:n].to(self._device, non_blocking=True)
-        cols = pin_cols[:n].to(self._device, non_blocking=True)
-        vals = pin_vals[:n].to(self._device, non_blocking=True)
-        self._req_pool.req_to_token[rows, cols] = vals
+    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
+        updates = [
+            (state.req_idx, col, state.pages[col])
+            for state in states
+            for col in range(state._flushed, len(state.pages))
+        ]
+        if updates:
+            rows, columns, pages = torch.tensor(
+                updates, device=device, dtype=torch.int32
+            ).unbind(1)
+            self._req_pool.page_table[rows, columns] = pages
+            for state in states:
+                state._flushed = len(state.pages)
+        return bool(updates)
 
     def record_hashes(
         self,

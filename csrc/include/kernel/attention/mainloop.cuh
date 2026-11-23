@@ -42,16 +42,17 @@ struct PrefillMainloop {
         int batch, packed0;
         QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
 
-        // Per-request dims (from KV policy — paged reads kv_indptr/qo_indptr).
+        // The storage and query policies supply request-local lengths.
         const int seq_len = KV::kv_len(p, batch);
         const int q_len = QSchedule::q_len(p, batch);
-        if constexpr (KV::kPaged) {
-            // The host tile map pads the last query tile of each request.
+        if constexpr (KV::kPaged || std::is_same_v<QSchedule, VarlenQSchedule>) {
+            // The final work tile may extend past this query segment.
             if (packed0 >= G * q_len)
                 return false;
         }
         const int warp_begin = packed0 + warp * Traits::BR;
-        tile.query = QueryRows::prefill<Layout, QSchedule>(p, batch, warp_begin, kv_head, G, q_len, lane);
+        tile.query =
+            QueryRows::prefill<Layout, QSchedule>(p, batch, warp_begin, kv_head, G, q_len, lane);
         typename Traits::QueryFragment query;
         Mma::load_query(p, tile.query, lane, query);
 
@@ -65,10 +66,11 @@ struct PrefillMainloop {
 
         // Load tile via predicated cp.async and KV policy
         auto load_tile = [&](int ti, int buf) {
-            KVTileLoader<Traits>::load(storage.k, storage.v, ti, buf, seq_len, [&](int kc, int d, bool valid) {
-                int token = KV::resolve_token(p, kctx, kc, valid);
-                return KV::kv_addr_from_token(p, kctx, token, d);
-            });
+            KVTileLoader<Traits>::load(storage.k, storage.v, ti, buf, seq_len,
+                                       [&](int kc, int d, bool valid) {
+                                           int token = KV::resolve_token(p, kctx, kc, valid);
+                                           return KV::kv_addr_from_token(p, kctx, token, d);
+                                       });
         };
 
         auto run_tiles = [&](int begin, int end, AttentionAccumulator<Traits>& accum) {
@@ -91,7 +93,8 @@ struct PrefillMainloop {
                     if (HasMask || ti >= full_tiles)
                         mask.apply(scores, kv0);
                     // Fixed segments reproduce the decode reduction order for replay.
-                    constexpr auto reduction = FixedSplits ? SumReduction::PerTile : SumReduction::Deferred;
+                    constexpr auto reduction =
+                        FixedSplits ? SumReduction::PerTile : SumReduction::Deferred;
                     accum.template update_softmax<reduction>(scores, scale_log2);
                     Mma::values(scores, bV, lane, accum.output);
                 }
@@ -119,7 +122,10 @@ struct PrefillMainloop {
 };
 
 // Each decode CTA processes a KV split for up to one MMA tile of query heads.
-template <typename Tile, typename KV, bool HasMask, bool SkipEmptySplits = false,
+template <typename Tile,
+          typename KV,
+          bool HasMask,
+          bool SkipEmptySplits = false,
           bool FixedSplits = false>
 struct DecodeMainloop {
     using Traits = Tile;
@@ -141,7 +147,7 @@ struct DecodeMainloop {
         const int G = min(MAX_G, G_total - g_begin);
         const int q_head0 = kv_head * G_total + g_begin;
 
-        // Per-request seq_len (paged reads kv_indptr; contig uses p.kv_len).
+        // Decode uses the materialized prefix plus the appended token.
         const int seq_len = KV::kv_len(p, batch);
         const auto kctx = KV::template make_ctx<Traits::HEAD_DIM>(p, batch, kv_head);
         // Fold scale * log2(e) into the softmax exponent.
@@ -156,11 +162,12 @@ struct DecodeMainloop {
         tile.query = QueryRows::decode<Layout, KV>(p, batch, q_head0, G, lane);
         typename Traits::QueryFragment query;
         Mma::load_query(p, tile.query, lane, query);
-        const AttentionMask<Layout, HasMask> mask{p, tile.query, VisibleKeys<false>{seq_len, 1}, lane};
+        const AttentionMask<Layout, HasMask> mask{p, tile.query, VisibleKeys<false>{seq_len, 1},
+                                                  lane};
 
         const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
         const int tiles_per_split = FixedSplits ? p.kv_split_size / Traits::BC
-                                               : (tiles_total + p.num_splits - 1) / p.num_splits;
+                                                : (tiles_total + p.num_splits - 1) / p.num_splits;
         const int ti_begin = split * tiles_per_split;
         const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
         if constexpr (FixedSplits) {

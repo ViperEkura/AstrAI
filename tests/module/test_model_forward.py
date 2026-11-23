@@ -80,7 +80,6 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
         torch.tensor([1, 2, 3]),
         position_ids=torch.arange(3),
         kv_cache=cache.bind(["t"], workspace, start_pos=0),
-        fwd="prefill",
     )
     assert packed["logits"].shape == (3, config.vocab_size)
 
@@ -90,7 +89,6 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
         model(
             torch.tensor([[1, 2, 3]]),
             kv_cache=cache.bind(["t"], workspace, start_pos=0),
-            fwd="prefill",
         )
 
 
@@ -128,14 +126,12 @@ def test_cached_prefill_key_mask_matches_dense_attention():
             input_mask=key_mask[:, :2],
             position_ids=torch.arange(2),
             kv_cache=cache.bind(["t"], workspace, start_pos=0, seq_ends=[2]),
-            fwd="prefill",
         )
         chunk = model(
             ids[0, 2:],
             input_mask=key_mask,
             position_ids=torch.arange(2, 4),
             kv_cache=cache.bind(["t"], workspace, start_pos=2),
-            fwd="prefill",
         )["logits"]
 
     torch.testing.assert_close(chunk, dense[0])
@@ -173,7 +169,6 @@ def test_forward_logits_positions_projects_only_requested_rows():
         kwargs = dict(
             position_ids=position_ids,
             kv_cache=cache.bind(["t1", "t2"], workspace, start_pos=0),
-            fwd="prefill",
         )
         full = model(input_ids, **kwargs)
         sliced = model(input_ids, logits_positions=last_rows, **kwargs)

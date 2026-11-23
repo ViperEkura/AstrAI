@@ -1,99 +1,68 @@
 # Attention
 
-> Kernel modules `csrc/attention/` (module list in the [family overview](README.md#overview)); 
-> python adapters in `astrai/extension/kernel/attention.py`, dispatch policy in `astrai/extension/backend/attention/`.
+AstrAI exports one `attention` function from `astrai.extension`. Backend selection uses
+`op_backend(attention=...)` for a strict context choice or `set_op` for a process default.
 
-## Attention dispatch
+| Call | Tensor layout | Boundaries and behavior |
+|---|---|---|
+| `attention(q, k, v, *, mask=None, is_causal=False, scale=None)` | BSHD | Dense attention supports gradients. Boolean masks select visible keys and floating masks add to scores. |
+| `attention(q, k, v, cu_seqlens_q=offsets, cu_seqlens_k=None, is_causal=False, scale=None)` | THD | Forward-only. Contiguous device int32 prefix sums delimit paired segments. Omitted KV offsets reuse Q offsets. |
+| `attention(q, k, v, k_cache=kc, v_cache=vc, cache_seqlens=past, page_table=pages, cu_seqlens_q=None, mask=None, is_causal=False)` | BSHD or THD | Append the input K/V, update both caches in place, and return the attended Q rows. Packed queries require offsets; THD without offsets means one new token per request. |
 
-`AttentionDispatcher` builds an `AttentionSpec` for each call and selects a
-function from the `cuda`, `flash`, or `torch` modules in
-`astrai.extension.backend.attention`. There are no attention backend classes.
+All three paths support GQA. Rectangular causal attention aligns at the bottom right.
+A fully masked row returns zero. The cache operator scales by `1 / sqrt(head_dim)`.
+Native FP16 and BF16 kernels cover head dimensions 32, 64, 128 and 256.
 
-Automatic selection tries CUDA, FlashAttention, then torch SDPA. CUDA handles
-supported inference calls with a KV cache; training calls requiring backward
-use FlashAttention or torch autograd. The compiled-kernel wrappers in
-`astrai.extension.kernel.attention` execute one exact kernel and do not fall
-back.
+## Dispatch and ownership
+
+The public function resolves routing arguments, selects a backend with the
+existing `AttentionDispatcher`, and executes it directly. There is no additional
+execution wrapper or public mode parameter. Cache arguments take precedence over
+rank; otherwise BSHD selects dense and THD selects varlen. Partial cache arguments,
+dense offsets, and varlen masks are rejected before execution. Cache calls reject
+independent KV offsets and custom scale. Gradient requirements are derived from
+grad mode and Q/K/V, independently of the operation's layout. Backend capability
+checks and strict/soft selection remain in this layer. CUDA, Torch and Flash
+modules implement the selected calls.
+The three stateless `kernel/attention.py` wrappers alone translate arguments
+to the compiled ABI. They do not select backends or retain cache state.
+The three native C++ entries own tensor validation before launching work:
+dense checks and packing live in attention.cu, varlen in varlen.cu, and cache
+in cache.cu. Shared native checks cover dtype, masks, integer bounds, scale and split settings.
+Dense Q/stride extraction stays in attention.cu; cache.cu owns split workspace
+allocation and its tensor lifetimes. entry.h contains only helpers used by
+multiple native entries.
+Python only rejects ambiguous routing options; it does not repeat native tensor
+metadata checks. Torch reference entries retain the checks needed to run without
+a compiled extension. Varlen prefix sums are a caller contract: start at zero, remain nondecreasing,
+and end at the corresponding token total. Native varlen checks metadata without
+launching a separate value-validation kernel. Torch reference execution checks
+values while materializing segment indices; paged kernels retain their addressing guards.
+
+GQA and MLA share the model-side scaled_dot_product_attention function, which binds the
+current layer's K/V views, query offsets and workspace before calling attention.
+They are adjacent in the model module; GDN and its state follow them. Extension
+code does not import model cache classes.
+
+## Query scheduling and KV addressing
+
+Dense queries use the rectangular grid. The packed schedule finds each tile's
+request from the device prefix sums. Varlen K/V uses contiguous token ranges.
+Cache K/V uses physical pages, each shaped `[page_size, kv_heads, head_dim]`.
+For the i-th appended token of request b:
 
 ```python
-from astrai.extension import attention, op_backend
-
-with op_backend(attention="torch"):
-    output = attention(q, k, v)
+position = cache_seqlens[b] + i
+block, offset = divmod(position, page_size)
+physical_page = page_table[b, block]
 ```
 
-`attention(..., implementation="cuda")` overrides the context for one call.
-An explicit argument or context choice raises when unsupported.
-`set_op("attention", "cuda")` and `ASTR_OPS=attention=cuda` are soft process
-defaults with automatic fallback. `EngineCore` captures the context choice
-when it is constructed and installs it in its worker; requests do not carry
-an implementation choice.
-
-## Native dtype dispatch
-
-All four native attention entries instantiate BF16 and FP16 for Q, K, V and
-output, with FP32 accumulation. Q/K/V must share one dtype. FP16 uses the
-`mma.sync.m16n8k16` FP16 warp atom; both precisions reuse the same tile,
-workspace, mask and KV-layout implementation. FP32 is not a native attention
-instantiation and continues through backend fallback when selected implicitly.
-
-The private `csrc/attention/entry.h` owns
-`AttentionTypes = TypeList<bf16, fp16>`, shared by the four Torch entries.
-Each entry calls `visit_dtype<AttentionTypes>` directly and selects its
-launcher in the callback. The visitor, CUDA element/ScalarType mapping and
-`unsupported_dtype_message<List>` formatter live in
-`csrc/include/api/torch/dispatch.cuh`; the formatter also serves quantize.
-Torch dtype names and classification stay in the CUDA-free `api/torch/dtype.h`.
-Supported-type diagnostics derive from the same list used by dispatch.
-`api/native/attention.h` remains the framework-free parameter contract; `api/torch/attention.h` declares the Tensor entry points.
-
-## Python Wrappers
-
-`astrai/extension/kernel/attention.py` provides Python wrappers for each compiled attention kernel. Each wrapper calls its CUDA kernel directly and raises `RuntimeError` if the `.so` is not available. Fallback to torch SDPA is handled by the attention dispatcher, not the wrapper functions.
-
-
-Interface (all functions):
-```
-is_causal: True = causal mask; False = non-causal
-mask:      2D [batch, kv_len] or 3D [batch, q_len, kv_len] (bool, True=keep)
-```
-
-Layout convention: dense q/k/v use `[batch, seq_len, n_heads, head_dim]` (BLHD); packed inference uses `[total_q, n_heads, head_dim]`. `scale=None` selects `1/sqrt(head_dim)`. The public attention entry point accepts any finite scale; native CUDA currently accepts finite positive scales, and automatic selection routes other scales to a capable backend.
-
-## Q Scheduling and KV Addressing
-
-Prefill separates Q work scheduling from KV storage:
-
-- `DenseQSchedule` maps a rectangular grid directly with
-  `batch = blockIdx.z` and `q_tile = blockIdx.x`.
-- `PackedQSchedule` consumes a compact work map for a packed
-  `[total_q, q_heads, head_dim]` tensor.
-- `ContigKV` and `PagedKV` only provide KV lengths and translate logical KV
-  positions into physical addresses. They do not schedule Q blocks.
-
-For ragged Q lengths `[70, 10, 130]` and 64 rows per Q tile, cache binding
-builds:
-
-```text
-qo_indptr       = [0, 70, 80, 210]
-q_tile_to_batch = [0, 0, 1, 2, 2, 2]
-q_tile_to_index = [0, 1, 0, 0, 1, 2]
-```
-
-Paged prefill folds query heads and token rows into one packed row space:
-
-```text
-G = q_heads / kv_heads
-BLOCK_M = 16 * WARPS
-blocks_per_host_tile = G * HOST_Q_TILE_ROWS / BLOCK_M
-grid = (num_q_tiles * blocks_per_host_tile, kv_heads, 1)
-packed_row = token_row * G + head_in_group
-```
-
-Each block resolves its request using the host tile map and its packed row
-range inside that tile. The query schedule handles dense or packed rows;
-`ContigKV` and `PagedKV` resolve storage addresses. Both use the same tiled
-online softmax and tensor-core computation.
+The runner binds the batch's page table and past lengths once per step. Chunked
+prefill supplies the first position of the current chunk and packed Q offsets.
+Decode reuses stable metadata, output and split buffers across graph replays.
+The storage prepares each layer's K/V views once. Model inference selects
+those retained views; gradient-enabled reference calls obtain fresh views. The cache type preserves one-token
+prefill while all model calls use the same public attention entry.
 
 ## Attention tool responsibilities
 
@@ -121,36 +90,45 @@ copy pipeline, tile schedules and numerical recurrence.
 
 `kernel/attention/mainloop.cuh` contains both prefill and decode mainloops;
 `epilogue.cuh` contains output handling and split combination.
-`kernel.cuh` defines their shared storage/result contract and the device entry.
+`kernel.cuh` defines their shared storage/result contract, the attention entry
+and the paged KV append kernel. Prefill retains a separate append launch on the
+same stream before attention, so all query blocks observe the new K/V.
+
+For power-of-two page sizes, the KV address context computes the shift once
+per request/head and reuses it in the tile loop. Other page sizes retain
+integer division. This changes neither the public parameters nor the launch
+specializations and does not depend on a GPU architecture.
 
 ## Native launch dispatch
 
-Attention follows the same typed query, plan, and launch structure as GEMM,
-in the existing `launcher/attention.cuh`:
+The three operation launchers in `launcher/attention.cuh` select template
+specializations and launch directly. There are no kernel wrapper classes,
+query objects, launch plans, typed visitors or nested `detail` namespace.
+This follows the direct templated launch structure of
+[FlashAttention](https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/flash_fwd_launch_template.h);
+AstrAI retains its own tile recipes and memory policies.
 
-1. `with_prefill_kernel` / `with_decode_kernel` select the head dimension
-   and mask specialization once. Prefill also selects causality. Paged
-   prefill selects a mask-coverage specialization: full masks omit redundant
-   extent checks, while partial masks retain them. Cache capacity and total
-   query rows provide conservative bounds without device reads. Dense prefill
-   retains the checked mask kernel for stable compiler code generation.
-2. The selected kernel type builds a plan from host metadata. Decode uses a
-   `DecodePlanQuery` containing grid dimensions, KV tile count and cached
-   occupancy. `make_decode_plan` is a pure split policy.
-3. The torch entry validates or allocates scratch using that plan, then the
-   same kernel type launches it. Native harnesses use the same visitor and
-   planner without depending on torch.
+Each native entry checks BF16/FP16 support before dispatch, then directly calls
+its launcher with `bf16` first and `fp16` otherwise. Attention does not use type lists, dtype
+tags, recursive visitors or error-formatting callbacks.
 
-Plans contain launch geometry and output mode, never tensor addresses or
-device sequence lengths. Every call plans from its current shape; residual
-split fields in `AttentionParams` do not bypass planning. Paged decode uses
-the host cache capacity, so device lengths can change during graph replay.
-The existing tile recipes, occupancy reference and split limits are retained.
-The native `launch_prefill` and `launch_decode` functions share that selection
-with the Torch entry. The Torch overload retains scratch tensors through
-launch; no call-wrapper object or Dispatch/Entry class is needed.
-Scratch still uses the kernel's `MAX_SPLITS` stride, and caller-supplied
-buffers are validated even when direct output needs no scratch.
+Dense and varlen use `launch_attention_split_q` with different addressing.
+Cache appends K/V before tiled attention for packed queries; single-token
+queries use `launch_attention_split_kv` with fused append. The split-KV
+launcher selects fixed/adaptive splitting and direct/combined output itself.
+Head dimension, causality, mask coverage and aligned loads retain their existing
+specializations.
+
+Decode computes its split count from the current cache capacity and cached
+kernel occupancy. The only allocation callback belongs to the native caller:
+it validates reusable scratch or creates tensors after the split count is
+known, returning owners held through launch. It does not select or launch
+kernels. Caller scratch is validated even for direct output. This keeps Torch
+allocation outside the launcher without reserving unnecessary buffers.
+
+CUDA Graph replay continues to read device sequence lengths and page tables
+at stable addresses. Tile shapes, split limits and the occupancy reference
+are unchanged; no device synchronization or extra metadata kernel is added.
 
 Paged decode selects aligned or unaligned new-token loads from host pointer
 and stride metadata. The aligned kernel copies new K/V fragments in 16-byte
@@ -165,115 +143,6 @@ merges compute the common maximum, denominator and split weights independently
 in each warp. Output dimensions read the weights through warp shuffles for FP32
 accumulation, avoiding shared memory and block synchronization. Empty splits
 contribute zero, including fully masked rows.
-
-## Parameter boundaries
-
-The native parameter struct groups pointers first, then shapes, strides and
-control values, using natural alignment. `AttentionParams` carries the Boolean mask pointer plus flat
-`int` shape and stride fields in `[batch, head, query, key]` order:
-`mask_{b,h,q,k}_size` and `mask_{b,h,q,k}_stride`. Entry reads these from the
-mask tensor and inserts singleton axes for 2D/3D inputs. Singleton batch,
-head and query axes use zero strides; expanded axes keep their original
-shape bounds, even when their storage stride is zero. Batch/head sizes are
-validated at entry; query/key coverage checks read the corresponding shape
-fields. The key axis retains the existing contiguous requirement and
-short-mask boundary semantics. There is no separate tensor-view type,
-array-based metadata, or redundant query/key length fields. Both split-Q and
-split-KV use these same fields. The struct declares no defaults for mask
-shape/stride; entry initializes every field on every call, and native callers
-provide the shape and strides explicitly.
-
-- Callers choose `is_causal`, `mask` and `scale`. Dense alignment comes from
-  Q/K lengths; packed alignment comes from each request's device metadata.
-- Shapes and strides are extracted from tensors at entry. Native tensor layout
-  selection remains available; Python wrappers use BLHD consistently.
-- Page-table indices and Q tile maps belong to the cache/workspace binding.
-  They remain on device during CUDA Graph replay; no CPU length readback is
-  required. Tile maps cannot be inferred from packed Q shape alone.
-- Decode scratch tensors are a paired execution resource, retained until both
-  launches are submitted. Output buffers allow stable CUDA Graph addresses.
-  Split counts and direct-output selection are planned internally.
-- With lower-right alignment, a single decode query sees the full KV sequence.
-  Decode therefore shares one kernel for causal and noncausal calls.
-
-## Interface contract and execution ownership
-
-- Causality is an explicit boolean. No caller-supplied position offset is needed.
-  Dense queries align to the end of K/V: `query_position =
-  kv_len - q_len + query_row`. Packed queries use each request's lengths.
-  Fully masked rows return zero. The torch adapter constructs the same mask
-  for unequal lengths instead of relying on SDPA's upper-left alignment.
-- Boolean masks mean `True=keep`. Layouts are `[batch, key]`,
-  `[batch, query, key]`, or `[batch, head, query, key]`; singleton batch,
-  head and query axes broadcast. In packed inference, query rows are local to
-  the current request chunk, while key columns index absolute cache positions.
-  Missing rows or columns in a short mask are invisible. A two-dimensional
-  model padding mask stays on the key axis and uses `is_causal=True`, so each
-  cached chunk gets the correct causal offset. Torch also supports additive
-  floating masks. FlashAttention rejects custom masks before updating the
-  cache. The mask pointer is the single source of truth for selecting native
-  masked kernels.
-- `scale` is forwarded unchanged through backend selection and execution.
-  Unsupported native scales are rejected explicitly, never replaced by the
-  default. Existing external backends receive their original arguments when
-  the caller does not supply a scale.
-- Cached decode can append the current K/V in the attention kernel. The
-  caller reserves the destination and supplies sequence metadata including
-  that token. Attention does not advance the scheduler's sequence lengths.
-- Decode planning uses shape, the host KV capacity, and cached device occupancy
-  before allocating workspace. It does not inspect device sequence lengths.
-  One split writes the normalized output directly for head dimensions up to
-  128; dimension 256 retains the measured faster graph path. Other calls retain
-  the existing partial and combine kernels.
-- The native entry owns temporary workspace tensors until all launches are
-  enqueued on the current CUDA stream. Explicit scratch buffers must be passed
-  together, be contiguous FP32 tensors, and share Q's device. Graph callers
-  retain their persistent buffers and output; changing device-side request
-  lengths does not change the captured launch plan.
-
-## Implementation plan and performance gates
-
-1. Establish the shared contract and retain the existing fast kernel variants.
-   Separate split planning from launches, fix workspace ownership, and add
-   direct output for one split. Cover masks, signed causal positions, custom
-   scale, irregular layouts, fused append and graph replay. This is the
-   current implementation stage.
-2. Extend prefill configuration using measured query/key tile sizes, warp
-   counts and pipeline stages. Keep query scheduling and KV addressing as
-   compile-time policies. Check register and shared-memory limits for each
-   architecture; FA SM120 configurations are candidates for measurement.
-3. Add native training forward/backward together: forward retains FP32 LSE;
-   backward reconstructs probability tiles, computes row `dot(dO, O)`, and
-   accumulates dQ/dK/dV without storing the full attention matrix. Aggregate
-   GQA gradients over query-head groups. Register autograd and FakeTensor
-   behavior through the torch dispatcher before enabling compiled training.
-4. Evaluate a separate multi-warp decode variant for wider heads and long KV.
-   Its split policy must include combine overhead and preserve current fast
-   variants for shapes where the candidate does not improve performance.
-
-Before changing a default, compare baseline and candidate in one process in
-baseline/candidate/candidate/baseline order for three rounds, at matching
-precision, inputs and GPU clocks. Measure eager calls, graph execution and
-model-level training or inference separately. A reproducible regression in
-any representative shape blocks the default switch; averages do not hide it.
-Keep raw latency measurements per GPU. Eight-GPU training throughput estimates
-must be labelled as assuming linear scaling.
-
-Reference scope:
-
-- Implemented: [FA2 split launch](https://github.com/Dao-AILab/flash-attention/blob/e9cf2c1651d2303191eb40a739a3c135fda00999/csrc/flash_attn/src/flash_fwd_launch_template.h)
-  omits the combine launch when there is only one split. AstrAI uses direct
-  output for measured favorable head dimensions; its kernels were not copied.
-- Architecture check: [FA SM120 adapter](https://github.com/Dao-AILab/flash-attention/blob/e9cf2c1651d2303191eb40a739a3c135fda00999/flash_attn/cute/flash_fwd_sm120.py)
-  confirms SM80-style MMA and the smaller shared-memory capacity. No FA tile
-  configuration or pipeline was ported in this stage.
-- Planned only: [FA backward](https://github.com/Dao-AILab/flash-attention/blob/e9cf2c1651d2303191eb40a739a3c135fda00999/csrc/flash_attn/src/flash_bwd_kernel.h)
-  informs the LSE-based backward design in step 3. No native attention backward
-  was added here.
-- Planned only: [PyTorch custom operators](https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html)
-  describes dispatcher, autograd and FakeTensor integration for step 3. This
-  stage keeps the existing pybind interface.
-
 
 ## Gated DeltaNet reference path
 

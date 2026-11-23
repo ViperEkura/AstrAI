@@ -1,7 +1,6 @@
 """Pre-allocated buffers for the inference decode hot path.
 
-Mirrors FlashInfer / SGLang's global workspace pattern: all per-step tensors
-are allocated eagerly at init (nothing is lazy), so the decode step
+Mirrors FlashInfer / SGLang's global workspace pattern: all decode buffers have stable addresses after the first bind. Each step
 reads/writes fixed-address tensors with zero ``torch.empty`` calls during
 the hot loop — a prerequisite for CUDA-graph capture.
 """
@@ -13,7 +12,6 @@ from astrai.config.inference_config import InferenceConfig
 
 _CONFIG = InferenceConfig()
 MAX_SPLITS = _CONFIG.max_splits
-Q_TILE_ROWS = _CONFIG.q_tile_rows
 
 
 class InferenceWorkspace:
@@ -25,8 +23,7 @@ class InferenceWorkspace:
     - ``input_ids``: per-step token IDs filled from host — values are
       staged through a pinned buffer and bulk-copied into the stable
       device buffer (fixed address for CUDA-graph capture).
-    - KV-cache bind metadata (``req_pool_indices``, ``seq_lens``,
-      ``kv_indptr``, ``inc``, ``out_cache_loc``), written by
+    - KV-cache bind metadata (request rows, page table, past lengths, query offsets), written by
       ``BlockPool.bind_tasks`` when the model runner passes this workspace.
     - ``decode_o_part`` / ``decode_ml_part``: split-KV partial result buffers
       (mirrors FlashInfer's workspace).  One global alloc, reused by every
@@ -83,30 +80,14 @@ class InferenceWorkspace:
             self.req_pool_indices = torch.empty(
                 (max_batch_size,), dtype=torch.int32, device=device
             )
-            self.seq_lens = torch.empty(
-                (max_batch_size,), dtype=torch.long, device=device
+            self.cache_seqlens = torch.empty(
+                max_batch_size, dtype=torch.int32, device=device
             )
-            self.kv_indptr = torch.empty(
-                (max_batch_size + 1,), dtype=torch.int32, device=device
-            )
-            self.qo_indptr = torch.empty(
-                (max_batch_size + 1,), dtype=torch.int32, device=device
-            )
-            max_q_tiles = max_batch_size * (
-                (max_seq_len + Q_TILE_ROWS - 1) // Q_TILE_ROWS
-            )
-            self.q_tile_to_batch = torch.empty(
-                (max_q_tiles,), dtype=torch.int32, device=device
-            )
-            self.q_tile_to_index = torch.empty(
-                (max_q_tiles,), dtype=torch.int32, device=device
-            )
-            self.inc = torch.arange(
+            self.cu_seqlens_q = torch.empty(
                 max_batch_size + 1, dtype=torch.int32, device=device
             )
-            self.out_cache_loc = torch.empty(
-                (max_batch_size, 1), dtype=torch.int32, device=device
-            )
+            # The pool knows page size. Allocate this graph-stable table at first bind.
+            self.page_table = None
 
             # Per-step position IDs (must be at a fixed address for
             # CUDA-graph capture).

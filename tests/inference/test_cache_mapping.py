@@ -4,20 +4,22 @@ import torch
 from astrai.inference.core.cache import (
     BlockPool,
     KVCacheManager,
-    ReqToTokenPool,
+    RequestPageTable,
 )
-from tests.support.cache import kv_device as kv_device
 from tests.support.cache import (
+    appended_slots,
     make_cache_workspace,
     make_contiguous_pool,
     make_paged_pool,
     make_paged_pool_ps64,
+    physical_slots,
 )
+from tests.support.cache import kv_device as kv_device
 
 
-def test_req_to_token_pool_alloc_free():
-    pool = ReqToTokenPool(4, 128, torch.device("cpu"))
-    assert pool.req_to_token.dtype == torch.int32
+def test_request_page_table_alloc_free():
+    pool = RequestPageTable(4, 128, torch.device("cpu"))
+    assert pool.page_table.dtype == torch.int32
     slots = pool.alloc(2)
     assert len(slots) == 2
     assert len(pool.free_slots) == 2
@@ -25,18 +27,18 @@ def test_req_to_token_pool_alloc_free():
     assert len(pool.free_slots) == 4
 
 
-def test_req_to_token_pool_alloc_when_full():
-    pool = ReqToTokenPool(2, 128, torch.device("cpu"))
+def test_request_page_table_alloc_when_full():
+    pool = RequestPageTable(2, 128, torch.device("cpu"))
     pool.alloc(2)
     assert pool.alloc(1) is None
 
 
-def test_req_to_token_pool_write():
-    pool = ReqToTokenPool(4, 128, torch.device("cpu"))
+def test_request_page_table_write():
+    pool = RequestPageTable(4, 128, torch.device("cpu"))
     slots = pool.alloc(1)
     pool.write((slots[0], slice(0, 3)), torch.tensor([10, 20, 30]))
-    assert pool.req_to_token[slots[0], 0].item() == 10
-    assert pool.req_to_token[slots[0], 2].item() == 30
+    assert pool.page_table[slots[0], 0].item() == 10
+    assert pool.page_table[slots[0], 2].item() == 30
 
 
 def test_page_pool_contiguous_task_alloc_free():
@@ -63,23 +65,21 @@ def test_page_pool_contiguous_bind_tasks_prefill():
     task_cache.alloc_slots("t1", list(range(10)))
     task_cache.alloc_slots("t2", list(range(10)))
     kv = task_cache.bind(["t1", "t2"], make_cache_workspace(pool), start_pos=0)
-    assert kv.out_cache_loc.shape == (20,)
-    assert kv.out_cache_loc.dtype == torch.int32
-    assert kv.seq_lens.tolist() == [10, 10]
-    assert kv.req_pool_indices.shape == (2,)
-    assert kv.req_pool_indices.dtype == torch.int32
+    assert appended_slots(kv).shape == (20,)
+    assert appended_slots(kv).dtype == torch.int32
+    assert kv.cache_seqlens.tolist() == [0, 0]
+    assert kv.page_table.size(0) == 2
+    assert kv.page_table.dtype == torch.int32
 
 
-def test_page_pool_bind_tasks_builds_compact_q_tile_mapping():
+def test_page_pool_bind_tasks_binds_packed_query_offsets():
     pool = make_contiguous_pool(max_batch_size=3, max_seq_len=256)
 
     kv = pool.bind_tasks(
         [0, 1, 2], [70, 10, 130], make_cache_workspace(pool), start_pos=0
     )
 
-    assert kv.qo_indptr.tolist() == [0, 70, 80, 210]
-    assert kv.q_tile_to_batch.tolist() == [0, 0, 1, 2, 2, 2]
-    assert kv.q_tile_to_index.tolist() == [0, 1, 0, 0, 1, 2]
+    assert kv.cu_seqlens_q.tolist() == [0, 70, 80, 210]
 
 
 def test_page_pool_contiguous_bind_tasks_decode():
@@ -91,8 +91,8 @@ def test_page_pool_contiguous_bind_tasks_decode():
     assert task_cache.extend_slots("t1", 10)
     assert task_cache.extend_slots("t2", 8)
     kv = task_cache.bind(["t1", "t2"], make_cache_workspace(pool))
-    assert kv.out_cache_loc.shape == (2,)
-    assert kv.seq_lens.tolist() == [11, 9]
+    assert appended_slots(kv).shape == (2,)
+    assert kv.cache_seqlens.tolist() == [10, 8]
 
 
 def test_page_pool_contiguous_bind_roundtrip():
@@ -104,12 +104,12 @@ def test_page_pool_contiguous_bind_roundtrip():
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
-    kv.k_buffer[0, kv.out_cache_loc] = k
-    kv.v_buffer[0, kv.out_cache_loc] = v
+    kv.k_buffer[0].flatten(0, 1)[appended_slots(kv)] = k
+    kv.v_buffer[0].flatten(0, 1)[appended_slots(kv)] = v
 
-    indices = kv.req_to_token[kv.req_pool_indices, :4]
-    gathered_k = kv.k_buffer[0, indices]
-    gathered_v = kv.v_buffer[0, indices]
+    indices = physical_slots(kv.page_table[0], pool.page_size, 0, 4)[None]
+    gathered_k = kv.k_buffer[0].flatten(0, 1)[indices]
+    gathered_v = kv.v_buffer[0].flatten(0, 1)[indices]
     assert torch.allclose(gathered_k, k)
     assert torch.allclose(gathered_v, v)
 
@@ -120,7 +120,7 @@ def test_page_pool_paged_task_alloc():
     assert task_cache.alloc_slots("t1", list(range(10)))
     state = task_cache._states["t1"]
     assert len(state.pages) == 10
-    assert pool.req_pool.req_to_token[state.req_idx, 0].item() == state.pages[0]
+    assert pool.req_pool.page_table[state.req_idx, 0].item() == state.pages[0]
 
 
 def test_page_pool_paged_task_extend():
@@ -129,8 +129,10 @@ def test_page_pool_paged_task_extend():
     task_cache.alloc_slots("t1", list(range(4)))
     assert task_cache.extend_slots("t1", 4)
     req_idx = task_cache._states["t1"].req_idx
-    slot = pool.req_pool.req_to_token[req_idx, 4].item()
-    assert slot >= 0
+    task_cache.bind(["t1"], make_cache_workspace(pool))
+    assert (
+        pool.req_pool.page_table[req_idx, 4].item() == task_cache._states["t1"].pages[4]
+    )
 
 
 def test_page_pool_paged_task_free_releases_slots():
@@ -150,11 +152,11 @@ def test_page_pool_paged_bind_roundtrip():
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
     v = torch.randn(1, 4, 2, 4)
-    kv.k_buffer[0, kv.out_cache_loc] = k
-    kv.v_buffer[0, kv.out_cache_loc] = v
+    kv.k_buffer[0].flatten(0, 1)[appended_slots(kv)] = k
+    kv.v_buffer[0].flatten(0, 1)[appended_slots(kv)] = v
 
-    indices = kv.req_to_token[kv.req_pool_indices, :4]
-    gathered_k = kv.k_buffer[0, indices]
+    indices = physical_slots(kv.page_table[0], pool.page_size, 0, 4)[None]
+    gathered_k = kv.k_buffer[0].flatten(0, 1)[indices]
     assert torch.allclose(gathered_k, k)
 
 
@@ -185,11 +187,11 @@ def test_page_pool_paged_ps64_bind_roundtrip():
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
     k = torch.randn(1, 128, 2, 4)
     v = torch.randn(1, 128, 2, 4)
-    kv.k_buffer[0, kv.out_cache_loc] = k
-    kv.v_buffer[0, kv.out_cache_loc] = v
+    kv.k_buffer[0].flatten(0, 1)[appended_slots(kv)] = k
+    kv.v_buffer[0].flatten(0, 1)[appended_slots(kv)] = v
 
-    indices = kv.req_to_token[kv.req_pool_indices, :128]
-    gathered_k = kv.k_buffer[0, indices]
+    indices = physical_slots(kv.page_table[0], pool.page_size, 0, 128)[None]
+    gathered_k = kv.k_buffer[0].flatten(0, 1)[indices]
     assert torch.allclose(gathered_k, k)
 
 
@@ -212,7 +214,7 @@ def test_page_pool_paged_steady_decode_slots_reach_device():
     for pos in range(4, 10):
         assert task_cache.extend_slots("t1", pos)
         task_cache.bind(["t1"], ws)
-        device_row = pool.req_pool.req_to_token[state.req_idx, : pos + 1].tolist()
+        device_row = pool.req_pool.page_table[state.req_idx, : pos + 1].tolist()
         expected = [p * pool.page_size for p in state.pages[: pos + 1]]
         assert device_row == expected
 
@@ -259,7 +261,6 @@ def test_extend_batch_matches_per_task_extend():
         sa = mgr_a._states[tid]
         sb = mgr_b._states[tid]
         assert sa.pages == sb.pages
-        assert sa._slots == sb._slots
         assert sa.length == sb.length == 4
 
     # Next positions stay in lockstep, and bind flushes both equally.
@@ -271,7 +272,6 @@ def test_extend_batch_matches_per_task_extend():
     for tid in ids:
         sa = mgr_a._states[tid]
         sb = mgr_b._states[tid]
-        assert sa._slots == sb._slots
         assert sa.length == sb.length == 5
 
     # A missing request fails alone; the rest still extend.
@@ -295,7 +295,7 @@ def test_paged_extend_batch_preserves_real_kv_across_mixed_positions(
         assert task_cache.alloc_slots(request_id, list(range(length)))
         state = task_cache._states[request_id]
         # Unmapped positions must never be mistaken for physical slot zero.
-        pool.req_pool.req_to_token[state.req_idx, length:].fill_(-1)
+        pool.req_pool.page_table[state.req_idx, len(state.pages) :].fill_(-1)
 
     pool._storage.k_buffer.fill_(float("nan"))
     pool._storage.v_buffer.fill_(float("nan"))
@@ -303,8 +303,8 @@ def test_paged_extend_batch_preserves_real_kv_across_mixed_positions(
         sum(prompt_lens) * 8, dtype=pool.dtype, device=kv_device
     ).reshape(-1, 2, 4)
     kv = task_cache.bind(ids, ws, start_pos=0)
-    kv.k_buffer[0, kv.out_cache_loc] = initial
-    kv.v_buffer[0, kv.out_cache_loc] = -initial - 1
+    kv.k_buffer[0].flatten(0, 1)[appended_slots(kv)] = initial
+    kv.v_buffer[0].flatten(0, 1)[appended_slots(kv)] = -initial - 1
     expected = list(initial.split(prompt_lens))
 
     # Includes all-in-page steps, page crossings and mixed in-page/crossing
@@ -318,20 +318,24 @@ def test_paged_extend_batch_preserves_real_kv_across_mixed_positions(
             + pos % pool.page_size
             for request_id, pos in zip(ids, positions)
         ]
-        assert kv.out_cache_loc.tolist() == expected_slots
-        assert kv.seq_lens.tolist() == [pos + 1 for pos in positions]
+        assert appended_slots(kv).tolist() == expected_slots
+        assert kv.cache_seqlens.tolist() == positions
         assert len(set(expected_slots)) == len(ids)
         new_k = torch.arange(len(ids) * 8, dtype=pool.dtype, device=kv_device).reshape(
             -1, 2, 4
         ) + 1000 * (step + 1)
-        kv.k_buffer[0, kv.out_cache_loc] = new_k
-        kv.v_buffer[0, kv.out_cache_loc] = -new_k - 1
+        kv.k_buffer[0].flatten(0, 1)[appended_slots(kv)] = new_k
+        kv.v_buffer[0].flatten(0, 1)[appended_slots(kv)] = -new_k - 1
         for i, (request_id, pos) in enumerate(zip(ids, positions)):
             expected[i] = torch.cat([expected[i], new_k[i : i + 1]])
             row = task_cache._states[request_id].req_idx
-            slots = pool.req_pool.req_to_token[row, : pos + 1]
-            torch.testing.assert_close(kv.k_buffer[0, slots], expected[i])
-            torch.testing.assert_close(kv.v_buffer[0, slots], -expected[i] - 1)
+            slots = physical_slots(
+                pool.req_pool.page_table[row], pool.page_size, 0, pos + 1
+            )
+            torch.testing.assert_close(kv.k_buffer[0].flatten(0, 1)[slots], expected[i])
+            torch.testing.assert_close(
+                kv.v_buffer[0].flatten(0, 1)[slots], -expected[i] - 1
+            )
 
 
 def test_paged_extend_batch_fallback_still_maps_in_page_positions():
@@ -342,16 +346,16 @@ def test_paged_extend_batch_fallback_still_maps_in_page_positions():
     for request_id, length in zip(ids, lengths):
         assert task_cache.alloc_slots(request_id, list(range(length)))
         state = task_cache._states[request_id]
-        pool.req_pool.req_to_token[state.req_idx, length:].fill_(-1)
+        pool.req_pool.page_table[state.req_idx, len(state.pages) :].fill_(-1)
 
     # Three page crossings but only two pages remain; the first request
     # needs no new page and must still have its intra-page write mapped.
     assert task_cache.extend_slots_batch(ids, lengths) == [True, True, True, False]
     kv = task_cache.bind(ids[:3], make_cache_workspace(pool))
-    assert kv.out_cache_loc.tolist() == [5, 20, 24]
+    assert appended_slots(kv).tolist() == [5, 20, 24]
     assert [task_cache._states[rid].length for rid in ids] == [6, 5, 5, 4]
     last = task_cache._states[ids[-1]]
-    assert pool.req_pool.req_to_token[last.req_idx, 4].item() == -1
+    assert pool.req_pool.page_table[last.req_idx, 1].item() == -1
 
 
 def test_extend_batch_falls_back_when_pool_runs_dry():
@@ -382,3 +386,52 @@ def test_extend_batch_falls_back_when_pool_runs_dry():
     assert results == [True, True, False, False]
     for tid, ok in zip(ids, results):
         assert (mgr._states[tid].length == 2) == ok
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
+)
+def test_decode_reuses_pages_and_layer_views_until_mapping_changes(device, monkeypatch):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    pool = BlockPool(
+        2, 1, 32, 2, 16, torch.device(device), torch.float32, page_size=4, n_tokens=32
+    )
+    manager = KVCacheManager(pool)
+    workspace = make_cache_workspace(pool)
+    assert manager.alloc_slots("a", [1, 2])
+    assert manager.alloc_slots("b", [8, 9])
+    gathers = []
+    index_select = torch.index_select
+
+    def gather(*args, **kwargs):
+        gathers.append(1)
+        return index_select(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "index_select", gather)
+    first = manager.bind(["a", "b"], workspace)
+    address = first.page_table.data_ptr()
+    for pos in (2, 3):
+        assert all(manager.extend_slots_batch(["a", "b"], [pos, pos]))
+        bound = manager.bind(["a", "b"], workspace)
+        assert manager.bind_was_steady
+        assert bound.cache_seqlens.tolist() == [pos, pos]
+        assert bound.page_table.data_ptr() == address
+    assert len(gathers) == 1
+    with torch.no_grad():
+        assert bound.layer(1)[0] is first.layer(1)[0]
+        bound.layer(1)[0].fill_(3)
+    torch.testing.assert_close(
+        pool._storage.k_buffer[1], torch.full_like(pool._storage.k_buffer[1], 3)
+    )
+    # Crossing a physical page boundary refreshes mappings, preserving addresses.
+    assert all(manager.extend_slots_batch(["a", "b"], [4, 4]))
+    crossed = manager.bind(["a", "b"], workspace)
+    assert len(gathers) == 2
+    assert crossed.page_table.data_ptr() == address
+    for i, key in enumerate(("a", "b")):
+        assert crossed.page_table[i, :2].tolist() == manager._states[key].pages
+    # Reordering requests must refresh even if all their pages already exist.
+    reordered = manager.bind(["b", "a"], workspace)
+    assert len(gathers) == 3
+    assert reordered.page_table[0, :2].tolist() == manager._states["b"].pages

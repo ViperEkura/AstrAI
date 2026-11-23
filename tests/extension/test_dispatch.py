@@ -6,10 +6,14 @@ import pytest
 import torch
 
 from astrai.extension import (
+    ExplicitSelectionError,
     op_backend,
     set_op,
     snapshot_op_selection,
     use_op_selection,
+)
+from astrai.extension import (
+    attention as dense,
 )
 from astrai.extension.backend import apply_rotary_emb
 from astrai.extension.backend.rotary import RotaryDispatcher, _torch_apply
@@ -27,9 +31,7 @@ def test_nested_choices_restore_and_operators_are_independent():
         with op_backend(attention="cuda"):
             assert RotaryDispatcher().dispatch(x, freqs) is _torch_apply
         assert (
-            attention.AttentionDispatcher().dispatch(
-                x, x, x, None, 0, None, False, None
-            )
+            attention.AttentionDispatcher().dispatch(x, x, x, None, False)
             is attention.torch.forward
         )
 
@@ -96,3 +98,41 @@ class TestRotaryDispatch:
         ref_grad = torch.autograd.grad(ref, ref_x, grad.float())[0]
         torch.testing.assert_close(output.float(), ref.float(), atol=2e-2, rtol=1e-2)
         torch.testing.assert_close(grad_x.float(), ref_grad, atol=2e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("mode", ["dense", "varlen", "cache"])
+def test_attention_modes_share_selection_policy(mode, monkeypatch):
+    monkeypatch.setattr(context, "_process_choices", None)
+    q = torch.randn(1, 2, 2, 8)
+    offsets = torch.tensor([0, 2], dtype=torch.int32)
+
+    def run():
+        if mode == "dense":
+            return dense(q, q, q, is_causal=True)
+        if mode == "varlen":
+            return dense(q[0], q[0], q[0], cu_seqlens_q=offsets, is_causal=True)[None]
+        kc, vc = torch.zeros_like(q), torch.zeros_like(q)
+        out = dense(
+            q,
+            q,
+            q,
+            k_cache=kc,
+            v_cache=vc,
+            cache_seqlens=torch.zeros(1, dtype=torch.int32),
+            page_table=torch.zeros(1, 1, dtype=torch.int32),
+            is_causal=True,
+        )
+        torch.testing.assert_close(kc, q)
+        torch.testing.assert_close(vc, q)
+        return out
+
+    with op_backend(attention="torch"):
+        expected = run()
+    # An unavailable process preference falls back; a scoped choice is strict.
+    set_op("attention", "cuda")
+    torch.testing.assert_close(run(), expected)
+    with op_backend(attention="cuda"):
+        with pytest.raises(ExplicitSelectionError):
+            run()
+    with op_backend(attention="auto"):
+        torch.testing.assert_close(run(), expected)

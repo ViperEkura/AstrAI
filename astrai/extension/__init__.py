@@ -11,11 +11,6 @@ from astrai.extension.backend import (
     syrk_out,
 )
 from astrai.extension.kernel import (
-    TensorLayout,
-    attn_decode,
-    attn_paged_decode,
-    attn_paged_prefill,
-    attn_prefill,
     cross_entropy,
     linear_cross_entropy,
 )
@@ -71,14 +66,9 @@ from astrai.extension.runtime.operation import (
 __all__ = [
     "cross_entropy",
     "linear_cross_entropy",
-    "TensorLayout",
     "AttentionDispatcher",
     "AttentionSpec",
     "attention",
-    "attn_decode",
-    "attn_paged_decode",
-    "attn_prefill",
-    "attn_paged_prefill",
     "is_available",
     "KERNEL_NAMES",
     "apply_rotary_emb",

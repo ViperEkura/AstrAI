@@ -20,8 +20,9 @@ static SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
     TORCH_CHECK(has_o == has_ml, "split buffers must be provided together");
     SplitWorkspace workspace;
     p.split_stride = p.num_splits;
-    const int64_t o_needed = (int64_t)p.batch * p.q_head * p.split_stride * p.head_dim;
-    const int64_t ml_needed = (int64_t)p.batch * p.q_head * p.split_stride * 2;
+    const int64_t rows = q.size(0) * p.q_head;
+    const int64_t o_needed = rows * p.split_stride * p.head_dim;
+    const int64_t ml_needed = rows * p.split_stride * 2;
     if (has_o) {
         for (const auto* buffer_ptr : {&*o_part_buf, &*ml_part_buf}) {
             const auto& buffer = *buffer_ptr;
@@ -35,16 +36,17 @@ static SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
         } else {
             // Older callers reserve 32 slots per row. Preserve their decode schedule
             // by allocating the additional scratch when the graph needs more slots.
-            const int64_t rows = (int64_t)p.batch * p.q_head;
-            TORCH_CHECK(p.num_splits > 32 && o_part_buf->numel() >= rows * 32 * p.head_dim &&
-                            ml_part_buf->numel() >= rows * 32 * 2,
+            const int64_t decode_rows = int64_t(p.batch) * p.q_head;
+            TORCH_CHECK((p.q_len > 1 || p.num_splits > 32) &&
+                            o_part_buf->numel() >= decode_rows * 32 * p.head_dim &&
+                            ml_part_buf->numel() >= decode_rows * 32 * 2,
                         "split workspace too small");
         }
     }
     if (!p.o_part && !direct_output) {
         const auto options = q.options().dtype(torch::kFloat32);
-        workspace.o_part = torch::empty({p.batch, p.q_head, p.split_stride, p.head_dim}, options);
-        workspace.ml_part = torch::empty({p.batch, p.q_head, p.split_stride, 2}, options);
+        workspace.o_part = torch::empty({rows, p.split_stride, p.head_dim}, options);
+        workspace.ml_part = torch::empty({rows, p.split_stride, 2}, options);
     }
     if (workspace.o_part.defined()) {
         p.o_part = workspace.o_part.data_ptr<float>();

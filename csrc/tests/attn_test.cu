@@ -20,10 +20,14 @@ static int run_split_tests() {
     struct Case {
         int capacity, splits;
     };
-    const Case cases[] = {{1, 1}, {16, 1}, {17, 2}, {1023, 64}, {1024, 64}, {16384, 64}};
+    const Case cases[] = {{1, 1}, {128, 1}, {129, 2}, {2048, 16}, {8192, 64}, {16384, 128}};
     int fail = 0;
     for (const auto& c : cases) {
-        if (decode_num_splits(c.capacity, 16) != c.splits) {
+        AttentionParams p{};
+        p.head_dim = 128;
+        p.kv_len = c.capacity;
+        configure_kv_splits(p, 1);
+        if (p.num_splits != c.splits) {
             printf("FAILED split policy: capacity=%d\n", c.capacity);
             ++fail;
         }

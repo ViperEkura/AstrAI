@@ -135,7 +135,7 @@ def test_multiquery_cache_matches_token_decode(dtype):
     if not torch.cuda.is_available() or not is_available("attention"):
         pytest.skip("native CUDA attention required")
 
-    # 17 tokens x 4 Q heads per KV head spans a full 64-row Q tile and a tail.
+    # A chunk spans multiple physical pages with distinct request histories.
     batch, tokens, page = 2, 17, 16
     torch.manual_seed(137)
     q, k, v = [
@@ -219,3 +219,78 @@ def test_decode_bitwise_across_graphs(dtype):
                 assert torch.equal(value, expected[length])
             else:
                 expected[length] = value
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_multiquery_split_graph_replay(dtype):
+    if not torch.cuda.is_available() or not is_available("attention"):
+        pytest.skip("native CUDA attention required")
+    torch.manual_seed(127)
+    page, tokens, heads, kv_heads, dim = 16, 65, 4, 2, 64
+    device = "cuda"
+    q, k, v = [
+        torch.randn(1, tokens, h, dim, device=device, dtype=dtype)
+        for h in (heads, kv_heads, kv_heads)
+    ]
+    n = 160
+    kc, vc = [
+        torch.randn(2 * n, page, kv_heads, dim, device=device, dtype=dtype)
+        for _ in range(2)
+    ]
+    pages = torch.randperm(n, device=device, dtype=torch.int32)
+    mask = torch.ones(1, 1, tokens, n * page, device=device, dtype=torch.bool)
+    mask[..., 0, :] = False
+    native = get_module("attention").attention_with_kvcache
+    expected = {}
+    for batch, width in [(1, 8), (1, n), (2, n)]:
+        table = pages[:width].repeat(batch, 1)
+        if batch == 2:
+            table[0] += n
+        past = torch.zeros(batch, device=device, dtype=torch.int32)
+        args = [t.repeat(batch, 1, 1, 1) for t in (q, k, v)]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = native(
+                args[0],
+                kc,
+                vc,
+                args[1],
+                args[2],
+                past,
+                table,
+                None,
+                mask[..., : width * page],
+                True,
+            )
+        for length in [15, 57, 401, 2031]:
+            if length + tokens > width * page:
+                continue
+            past[-1] = length
+            graph.replay()
+            actual = out[-1].clone()
+            assert torch.count_nonzero(actual[0]).item() == 0
+            if length in expected:
+                assert torch.equal(
+                    actual.view(torch.int16), expected[length].view(torch.int16)
+                )
+            else:
+                expected[length] = actual
+                logical = pages[: (length + tokens + page - 1) // page].long()
+                kk, vv = [
+                    x[logical]
+                    .flatten(0, 1)[: length + tokens]
+                    .repeat_interleave(heads // kv_heads, dim=1)
+                    for x in (kc, vc)
+                ]
+                visible = torch.arange(length + tokens, device=device)[None, :] <= (
+                    length + torch.arange(tokens, device=device)[:, None]
+                )
+                visible[0] = False
+                ref = torch.nn.functional.scaled_dot_product_attention(
+                    q[0].transpose(0, 1).float(),
+                    kk.transpose(0, 1).float(),
+                    vv.transpose(0, 1).float(),
+                    attn_mask=visible,
+                ).transpose(0, 1)
+                torch.testing.assert_close(actual.float(), ref, rtol=0.035, atol=0.012)

@@ -36,7 +36,7 @@ struct OutputEpilogue {
 };
 
 // Split-KV keeps FP32 unnormalized accumulators until the combine pass.
-template <typename Traits>
+template <typename Traits, bool MultiQ = false>
 struct SplitEpilogue {
     static DEVICE_FORCEINLINE void store(const AttentionParams& p,
                                          const AttentionTile<Traits>& tile) {
@@ -46,8 +46,10 @@ struct SplitEpilogue {
             if (!tile.query.row[row].valid)
                 continue;
             const int head = tile.query.row[row].head;
-            const size_t slot =
-                (size_t(tile.query.batch) * p.q_head + head) * p.split_stride + blockIdx.y;
+            const size_t token =
+                MultiQ ? size_t(tile.query.batch) * p.q_len + tile.query.row[row].token
+                       : size_t(tile.query.batch);
+            const size_t slot = (token * p.q_head + head) * p.split_stride + blockIdx.y;
             float* output = p.o_part + slot * Traits::HEAD_DIM;
 #pragma unroll
             for (int i = 0; i < Traits::DN8; ++i) {
@@ -66,18 +68,21 @@ struct SplitEpilogue {
  * Split-combine: merges the per-split partials (o_part/ml_part) into the
  * final normalised O (KV selects the O addressing and element type).
  */
-template <typename KV, int TileK, bool FixedSplits = false>
+template <typename KV, int D, bool FixedSplits = false, bool MultiQ = false>
 __global__ void split_kv_combine(const AttentionParams p) {
     using T = typename KV::Elem;
 
     const int bh = blockIdx.x;
     const int d = threadIdx.x;
-    const int batch = bh / p.q_head;
+    const int token = bh / p.q_head;
+    const int batch = MultiQ ? token / p.q_len : token;
     const int q_head = bh % p.q_head;
 
+    const int out_offset =
+        MultiQ ? token * p.q_l_stride + q_head * p.q_h_stride : KV::q_base(p, batch, q_head);
     const size_t split_base = (size_t)bh * p.split_stride;
     const float* mlp = p.ml_part + split_base * 2;
-    const float* op = p.o_part + split_base * p.head_dim;
+    const float* op = p.o_part + split_base * D;
     const float scale_log2 = p.scale * LOG2E;
     if constexpr (FixedSplits) {
         const int length = KV::kv_len(p, batch);
@@ -90,19 +95,24 @@ __global__ void split_kv_combine(const AttentionParams p) {
                 continue;
             float alpha, beta;
             merge_softmax(total, part, alpha, beta, scale_log2);
-            acc = merge_output(acc, op[s * p.head_dim + d], alpha, beta);
+            acc = merge_output(acc, op[s * D + d], alpha, beta);
         }
         const float inv = total.l > 1e-20f ? 1.0f / total.l : 0.0f;
-        const int o_off = KV::q_base(p, batch, q_head) + d;
+        const int o_off = out_offset + d;
         static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
         return;
     }
     const int length = KV::kv_len(p, batch);
-    const int active_splits = min(MAX_SPLITS, (length - 1) / TileK + 1);
+    const int active_splits = KVPartition::from(p, length).count;
 
-    // Avoid warp reductions when merging only one or two splits.
+    if (active_splits == 1) {
+        const float inv = mlp[1] > 1e-20f ? 1.0f / mlp[1] : 0.0f;
+        static_cast<T*>(p.o_ptr)[out_offset + d] = ElemTrait<T>::from_float(op[d] * inv);
+        return;
+    }
+    // Avoid warp reductions when merging two splits.
     if (active_splits <= 2) {
-        if (d >= p.head_dim)
+        if (d >= D)
             return;
         SoftmaxState st;
         float acc = 0.0f;
@@ -113,40 +123,46 @@ __global__ void split_kv_combine(const AttentionParams p) {
             const float li = mlp[s * 2 + 1];
             float corr, e;
             softmax_step(st, mi, li, corr, e, scale_log2);
-            acc = fmaf(acc, corr, op[s * p.head_dim + d] * e);
+            acc = fmaf(acc, corr, op[s * D + d] * e);
         }
         const float inv = st.l > 1e-20f ? 1.0f / st.l : 0.0f;
-        const int o_off = KV::q_base(p, batch, q_head) + d;
+        const int o_off = out_offset + d;
         static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
         return;
     }
 
     // Each warp reduces the split weights locally, avoiding shared memory and a block barrier.
     const int lane = threadIdx.x % 32;
-    const bool valid = lane < active_splits;
-    const float mi = valid ? mlp[lane * 2] : -FLT_MAX;
-    const float li = valid ? mlp[lane * 2 + 1] : 0.0f;
-    const int upper = lane + 32;
-    const float mj = upper < active_splits ? mlp[upper * 2] : -FLT_MAX;
-    float max_m = fmaxf(mi, mj);
+    constexpr int groups = MAX_SPLITS / 32;
+    float maxima[groups], sums[groups], weights[groups];
+    float max_m = -FLT_MAX;
 #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        max_m = fmaxf(max_m, __shfl_xor_sync(0xFFFFFFFF, max_m, offset));
-    const float weight = mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
-    const float upper_weight = mj > -FLT_MAX ? exp2f((mj - max_m) * scale_log2) : 0.0f;
-    float sum_l = li * weight;
-    if (upper < active_splits)
-        sum_l += mlp[upper * 2 + 1] * upper_weight;
+    for (int i = 0; i < groups; ++i) {
+        const int split = 32 * i + lane;
+        maxima[i] = split < active_splits ? mlp[2 * split] : -FLT_MAX;
+        sums[i] = split < active_splits ? mlp[2 * split + 1] : 0.0f;
+        max_m = fmaxf(max_m, maxima[i]);
+    }
 #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2)
-        sum_l += __shfl_xor_sync(0xFFFFFFFF, sum_l, offset);
+    for (int offset = 16; offset; offset /= 2)
+        max_m = fmaxf(max_m, __shfl_xor_sync(0xffffffff, max_m, offset));
+    float sum_l = 0.0f;
+#pragma unroll
+    for (int i = 0; i < groups; ++i) {
+        weights[i] = sums[i] > 0 ? exp2f((maxima[i] - max_m) * scale_log2) : 0.0f;
+        sum_l += sums[i] * weights[i];
+    }
+#pragma unroll
+    for (int offset = 16; offset; offset /= 2)
+        sum_l += __shfl_xor_sync(0xffffffff, sum_l, offset);
     const float inv_sum = sum_l > 1e-20f ? 1.0f / sum_l : 0.0f;
     float acc = 0.0f;
-    for (int s = 0; s < min(active_splits, 32); s++)
-        acc = fmaf(op[s * p.head_dim + d], __shfl_sync(0xFFFFFFFF, weight, s), acc);
-    for (int s = 32; s < active_splits; ++s)
-        acc = fmaf(op[s * p.head_dim + d], __shfl_sync(0xFFFFFFFF, upper_weight, s - 32), acc);
-    const int o_off = KV::q_base(p, batch, q_head) + d;
+#pragma unroll
+    for (int i = 0; i < groups; ++i) {
+        for (int s = 32 * i; s < min(active_splits, 32 * (i + 1)); ++s)
+            acc = fmaf(op[s * D + d], __shfl_sync(0xffffffff, weights[i], s % 32), acc);
+    }
+    const int o_off = out_offset + d;
     static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);
 }
 

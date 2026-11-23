@@ -8,6 +8,54 @@
 
 namespace astrai::attention {
 
+// FA2 partitions contiguous logical KV blocks. Use the live request length when
+// choosing boundaries so another graph capacity or batch slot cannot change a row.
+struct KVPartition {
+    int blocks_per_split;
+    int count;
+
+    static DEVICE_FORCEINLINE KVPartition from(const AttentionParams& p, int length) {
+        const int block_n = p.head_dim <= 64 ? 256 : (p.head_dim <= 128 ? 128 : 64);
+        const int blocks = 1 + (length - 1) / block_n;
+        const int limit = min(p.num_splits, blocks);
+        if (limit == 1)
+            return {blocks, 1};
+        const int lane = threadIdx.x % 32;
+        constexpr int groups = MAX_SPLITS / 32;
+        float efficiency[groups];
+        float best = 0;
+#pragma unroll
+        for (int i = 0; i < groups; ++i) {
+            const int n = 1 + lane + 32 * i;
+            const bool eligible =
+                n <= limit && (n == 1 || (blocks - 1) / n != (blocks - 1) / (n - 1));
+            const float waves = n * p.waves_per_split;
+            efficiency[i] = eligible ? waves / ceilf(waves) : 0;
+            best = fmaxf(best, efficiency[i]);
+        }
+#pragma unroll
+        for (int step = 16; step; step /= 2)
+            best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, step));
+        int selected = MAX_SPLITS;
+#pragma unroll
+        for (int i = 0; i < groups; ++i) {
+            const unsigned good = __ballot_sync(0xffffffff, efficiency[i] >= 0.85f * best);
+            if (good) {
+                selected = 32 * i + __ffs(good);
+                break;
+            }
+        }
+        const int width = 1 + (blocks - 1) / selected;
+        return {width, 1 + (blocks - 1) / width};
+    }
+
+    template <int TileK>
+    DEVICE_FORCEINLINE int tile_width(const AttentionParams& p) const {
+        const int block_n = p.head_dim <= 64 ? 256 : (p.head_dim <= 128 ? 128 : 64);
+        return blocks_per_split * (block_n / TileK);
+    }
+};
+
 // Each lane holds two rows of an m16n8 accumulator. Coordinates are local to the request.
 struct QueryRows {
     struct Row {

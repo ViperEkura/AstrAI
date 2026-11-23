@@ -20,7 +20,8 @@ template <typename Tile,
           bool IsCausal,
           bool HasMask,
           bool MaskCoversShape = false,
-          bool FixedSplits = false>
+          bool FixedSplits = false,
+          bool SplitKV = false>
 struct PrefillMainloop {
     using Traits = Tile;
     static DEVICE_FORCEINLINE bool
@@ -33,14 +34,24 @@ struct PrefillMainloop {
         const int lane = threadIdx.x % 32;
         constexpr int BLOCK_M = Traits::BR * Traits::WARPS; // packed rows per block
 
-        const int G = p.q_head / p.kv_head;
-        const int kv_head = blockIdx.y;
+        const int group = p.q_head / p.kv_head;
+        const int G = SplitKV ? 1 : group;
+        const bool flat_z = int64_t(p.batch) * p.q_head <= 65535;
+        const int head =
+            SplitKV ? (flat_z ? blockIdx.z % p.q_head : blockIdx.x % p.q_head) : blockIdx.y;
+        const int kv_head = SplitKV ? head / group : head;
         // Fold scale * log2(e) into the softmax exponent.
         const float scale_log2 = p.scale * LOG2E;
 
         const int q_block = QSchedule::template order_work<IsCausal>(p, blockIdx.x, gridDim.x);
         int batch, packed0;
-        QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
+        if constexpr (SplitKV) {
+            batch = flat_z ? blockIdx.z / p.q_head : blockIdx.z;
+            const int q_tile = flat_z ? blockIdx.x : blockIdx.x / p.q_head;
+            packed0 = q_tile * BLOCK_M;
+        } else {
+            QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
+        }
 
         // The storage and query policies supply request-local lengths.
         const int seq_len = KV::kv_len(p, batch);
@@ -52,7 +63,7 @@ struct PrefillMainloop {
         }
         const int warp_begin = packed0 + warp * Traits::BR;
         tile.query =
-            QueryRows::prefill<Layout, QSchedule>(p, batch, warp_begin, kv_head, G, q_len, lane);
+            QueryRows::prefill<Layout, QSchedule>(p, batch, warp_begin, head, G, q_len, lane);
         typename Traits::QueryFragment query;
         Mma::load_query(p, tile.query, lane, query);
 
@@ -114,7 +125,16 @@ struct PrefillMainloop {
                 return true;
             }
         }
-        run_tiles(0, tiles, tile.accum);
+        if constexpr (SplitKV) {
+            const auto part = KVPartition::from(p, seq_len);
+            if (blockIdx.y >= part.count)
+                return false;
+            const int width = part.template tile_width<Traits::BC>(p);
+            const int first = blockIdx.y * width;
+            run_tiles(first, first + min(width, max(0, tiles - first)), tile.accum);
+        } else {
+            run_tiles(0, tiles, tile.accum);
+        }
         if constexpr (!FixedSplits)
             tile.accum.finish_sum();
         return true;
@@ -132,9 +152,11 @@ struct DecodeMainloop {
         using Layout = typename Traits::FragmentLayout;
 
         const int lane = threadIdx.x;
-        const int pass = blockIdx.x / p.kv_head;
-        const int kv_head = blockIdx.x % p.kv_head;
-        const int batch = blockIdx.z;
+        // Large batches use the legacy axis packing to fit the CUDA grid.z limit.
+        const bool flat_z = int64_t(p.batch) * p.kv_head <= 65535;
+        const int pass = flat_z ? blockIdx.x : blockIdx.x / p.kv_head;
+        const int kv_head = flat_z ? blockIdx.z % p.kv_head : blockIdx.x % p.kv_head;
+        const int batch = flat_z ? blockIdx.z / p.kv_head : blockIdx.z;
         const int split = blockIdx.y;
 
         constexpr int MAX_G = Traits::BR;
@@ -162,15 +184,20 @@ struct DecodeMainloop {
                                                   lane};
 
         const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
-        // A KV tile belongs to the same split across batch shapes and graph capacities.
-        const int chunk = FixedSplits ? p.kv_split_size / Traits::BC : 1;
+        int chunk;
+        if constexpr (FixedSplits) {
+            chunk = p.kv_split_size / Traits::BC;
+        } else {
+            const auto part = KVPartition::from(p, seq_len);
+            if (split >= part.count)
+                return false;
+            chunk = part.template tile_width<Traits::BC>(p);
+        }
         const int first = split * chunk;
         if (first >= tiles_total)
             return false;
-        const int stride = FixedSplits ? 1 : MAX_SPLITS;
-        const int ntiles = FixedSplits ? min(chunk, tiles_total - first)
-                                       : 1 + (tiles_total - first - 1) / stride;
-        auto tile_index = [&](int i) { return first + i * stride; };
+        const int ntiles = min(chunk, tiles_total - first);
+        auto tile_index = [&](int i) { return first + i; };
 
         // Fetch one page per lane ahead of the K/V copies, then share it across columns.
         auto prefetch_tokens = [&](int ti) {

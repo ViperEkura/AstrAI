@@ -6,7 +6,7 @@ namespace astrai {
 namespace attention {
 
 // Standard workspace capacity: decode splits per (batch, q_head).
-constexpr int MAX_SPLITS = 64;
+constexpr int MAX_SPLITS = 128;
 
 /* Converts the softmax scale for exp2: scale_log2 = scale * log2(e). */
 constexpr float LOG2E = 1.44269504088896340736f;
@@ -75,6 +75,7 @@ struct AttentionParams {
     int kv_split_size = 0; // Fixed logical KV segment size, in tokens. Zero selects adaptive.
     int split_stride = MAX_SPLITS; // Partial workspace slots per output row.
     int num_splits = 0;
+    float waves_per_split = 0.0f;
     float scale;
     bool is_causal = false;
 };

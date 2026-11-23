@@ -115,23 +115,26 @@ its launcher with `bf16` first and `fp16` otherwise. Attention does not use type
 tags, recursive visitors or error-formatting callbacks.
 
 Dense and varlen use `launch_attention_split_q` with different addressing.
-Regular multi-token cache calls tile query positions and their grouped query heads
-with grid axes (Q tile, KV head, request). Unequal request lengths use packed query
-offsets. Both paths append new K/V before computing attention. Single-token decode
-queries use `launch_attention_split_kv` with fused append. The split-KV
-launcher selects fixed/adaptive splitting and direct/combined output itself.
-Head dimension, causality, mask coverage and aligned loads retain their existing
-specializations.
+Ordinary paged attention assigns a Q tile, a contiguous KV interval and a
+(request, head) pair to each CTA. For a single decode token, grouped Q heads
+share KV loads and the kernel appends K/V in place. Regular multi-token queries
+append the chunk first and tile 64 query positions per Q head. Ragged queries,
+explicit rollout splits, and long prefills with sufficient Q parallelism use the
+existing prefill schedule.
 
-In ordinary decode, split `s` processes 16-token KV tiles numbered
-`s, s + 64, s + 128, ...` within each request. Page-table capacity bounds the
-launch grid. On replay, the live sequence length determines which splits have
-work. The tile assignment and reduction order are independent of batch size,
-batch slot and graph capacity. Rollout's fixed-size splits remain contiguous.
+The split heuristic uses the FlashAttention-2 wave-efficiency rule: select the
+smallest eligible split count within 85% of the best estimated efficiency, up
+to 128. The grid reserves slots from the page-table capacity. Inside the graph,
+each request uses its live KV length and its own Q tile count to choose active
+contiguous ranges. This preserves the partition when the request moves between
+graph capacities and batch slots. The logical KV block size is 256, 128 or 64
+tokens for head dimensions up to 64, up to 128 or above 128, respectively.
+The native MMA kernel traverses smaller tiles within each interval.
 
-The standard workspace reserves 64 partial results per query head and batch
-row. The native caller validates reusable buffers and allocates scratch when
-a legacy 32-slot buffer cannot hold all the partials for the launch.
+Split partials are FP32 and indexed by (request, query position, Q head, split).
+The standard decode workspace reserves 128 slots per head. The native entry
+can allocate temporary partials for callers using a smaller decode workspace.
+Rollout retains its configured fixed KV intervals and its reduction order.
 
 Paged decode selects aligned or unaligned new-token loads from host pointer
 and stride metadata. The aligned kernel copies new K/V fragments in 16-byte
@@ -141,7 +144,7 @@ per fragment. Only the
 first GQA pass writes the cache; every pass reads new K/V directly, so no
 cross-block write/read dependency is introduced.
 
-Split merges with at most two parts retain the online recurrence. Larger
+A single partial normalizes directly, and two partials use the online recurrence. Larger
 merges compute the common maximum, denominator and split weights independently
 in each warp. Output dimensions read the weights through warp shuffles for FP32
 accumulation, avoiding shared memory and block synchronization. Empty splits

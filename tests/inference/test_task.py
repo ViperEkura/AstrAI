@@ -185,12 +185,14 @@ def test_scheduler_admits_waiting_requests_in_order():
 def test_scheduler_preserves_waiting_order_under_cache_pressure():
     scheduler = make_scheduler()
     ids = [scheduler.add_request(text) for text in ("a", "b")]
-    allocate = scheduler.kv_manager.admit
-    scheduler.kv_manager.admit = Mock(return_value=False)
+    allocate = scheduler.kv_manager.alloc
+    scheduler.kv_manager.alloc = Mock(
+        side_effect=lambda requests: [False] * len(requests)
+    )
     scheduler.admit_requests()
     assert not scheduler.running
     assert [r.request_id for r in scheduler.waiting] == ids
-    scheduler.kv_manager.admit = allocate
+    scheduler.kv_manager.alloc = allocate
     scheduler.admit_requests()
     assert [r.request_id for r in scheduler.running] == ids
     assert not scheduler.waiting

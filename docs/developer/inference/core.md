@@ -40,9 +40,9 @@ classDiagram
         execute_score()
     }
     class KVCacheManager {
-        admit() / reserve_decode()
-        publish_prefix(materialized_end)
-        release() / clear_prefix_cache()
+        alloc(requests, ends)
+        commit(requests, ends)
+        free(requests)
     }
     class PolicyVersionGuard {
         RLock
@@ -55,7 +55,24 @@ classDiagram
     EngineCore *-- PolicyVersionGuard
     Scheduler *-- StepPlanner
     Scheduler *-- KVCacheManager
-    GPUModelRunner --> KVCacheManager : shared bind dependency
+    KVCacheManager --> BlockPool : owns reservations
+    class Request {
+        cache_slot
+        cached_tokens
+        execution(phase, position, num_tokens)
+    }
+    class ExecutionRequest {
+        cache_slot
+        position
+        num_tokens
+    }
+    class InferenceWorkspace {
+        bind(pool, entries)
+    }
+    Scheduler --> Request : update progress
+    Request ..> ExecutionRequest : snapshot
+    GPUModelRunner --> InferenceWorkspace : bind execution entries
+    InferenceWorkspace --> BlockPool : gather physical page rows
 ```
 
 The scheduler owns one request registry, waiting/running queues and terminal
@@ -116,18 +133,14 @@ version. Each workspace gathers the rows for its current batch when the ordered
 slots or the table version change. Across a page crossing, the destination
 address stays stable for CUDA Graph replay.
 
-The scheduler admits and releases requests by ID. The planner reserves positions
-with `reserve_decode(request_ids, positions)`, which returns one success flag per
-request. Under pressure, a failed reservation leaves that request's pages intact.
-The runner passes the positions in its execution plan to `bind` and receives a
-model cache view. RoPE and attention read the same past-length tensor for decode.
+The manager has three batched request lifecycle operations. All ends count tokens
+from the beginning of the request and are exclusive.
 
-Prefix publication requires
-`publish_prefix(..., materialized_end=exclusive_token_end)`. The boundary
-must come from completed execution, not from prompt length, allocated page
-count, or a cursor already advanced for a later in-flight step. Only complete
-pages below that boundary can be published. The sampled token is not yet in
-KV until a subsequent model execution consumes it.
+| Call | Contract |
+| --- | --- |
+| `alloc(requests, ends=None)` | Reserve through each end, defaulting to its prompt length. Return one success flag per input, in order. New requests receive their cache slot and cached prompt length. Under pressure, a failed request retains its existing reservation. |
+| `commit(requests, ends)` | After the execution fence, index newly completed whole pages. Repeated or older ends are harmless. The sampled token becomes eligible after a subsequent forward consumes it. |
+| `free(requests)` | After all in-flight work retires, release request slots and page references. Stale request identities cannot release a newer incarnation. |
 
 Radix re-recording must preserve valid descendants, and removal of an
 ancestor must not leave descendants advertised by the reverse index. Physical
@@ -140,13 +153,12 @@ recompute preemption are not introduced by this ownership refactor.
 
 ### Cache binding boundary
 
-Logical ownership is separate from the current object dependencies.
-`GPUModelRunner` receives the scheduler's `KVCacheManager` and calls `bind()`
-for prefill, decode and scoring. The manager checks the planned positions against each request's reservation
-and publishes pending physical page IDs. The workspace gathers rows when the
-ordered slots or the source page-table version changes. Decode passes the
-bound past lengths to both attention and RoPE. A request can have reserved
-space beyond the position used by the current step.
+`Request.execution` snapshots the slot, position and token count in an immutable
+`ExecutionRequest`. The runner passes the ordered entries and pool to
+`InferenceWorkspace.bind`. The workspace gathers page rows when the slot order or
+the table version changes. Decode uses one tensor for RoPE positions and attention
+past lengths. Prefill builds query offsets from the per-request token counts.
+The same cache view is reused across model layers.
 
 ## Policy versioning
 

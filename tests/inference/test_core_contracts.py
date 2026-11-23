@@ -208,13 +208,13 @@ def test_stop_drains_every_group_before_free_and_never_duplicates_terminal(sched
             synchronize=lambda rid=entry.request_id: calls.append(("fence", rid))
         )
         sched._pending.append(_pending(plan.select([entry]), fence=fence))
-    original = sched.scheduler.kv_manager.release
+    original = sched.scheduler.kv_manager.free
 
     def free(rid):
-        calls.append(("free", rid))
+        calls.extend(("free", r.request_id) for r in rid)
         original(rid)
 
-    with patch.object(sched.scheduler.kv_manager, "release", side_effect=free):
+    with patch.object(sched.scheduler.kv_manager, "free", side_effect=free):
         assert sched.stop()
         assert sched.stop()
     assert calls[:2] == [("fence", "a"), ("fence", "b")]
@@ -232,14 +232,14 @@ def test_bad_pending_fences_then_errors_and_frees(scheduler):
     bad = PendingExecution(plan, tokens=torch.tensor([1]))  # no row identity
     sched._pending.append(bad)
     calls = []
-    free = sched.scheduler.kv_manager.release
+    free = sched.scheduler.kv_manager.free
     with (
         patch.object(
             sched.model_runner, "synchronize", side_effect=lambda: calls.append("fence")
         ),
         patch.object(
             sched.scheduler.kv_manager,
-            "release",
+            "free",
             side_effect=lambda rid: (calls.append("free"), free(rid)),
         ),
     ):
@@ -282,10 +282,10 @@ def test_chunk_cache_publication_uses_confirmed_not_optimistic_watermark(schedul
     calls = []
     fence = SimpleNamespace(synchronize=lambda: calls.append("completed"))
     p = _pending(first, fence=fence)
-    with patch.object(sched.scheduler.kv_manager, "publish_prefix") as record:
+    with patch.object(sched.scheduler.kv_manager, "commit") as record:
         sched.scheduler.update_from_output(p.commit())
         assert calls == ["completed"]
-        assert record.call_args.kwargs["materialized_end"] == 1
+        assert record.call_args.args == ([request], [1])
     assert request.num_materialized_tokens == 1 and events == []
     sched.scheduler.update_from_output(_output(second))
 

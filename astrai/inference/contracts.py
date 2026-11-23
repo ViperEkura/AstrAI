@@ -60,6 +60,7 @@ class ExecutionRequest:
     # Only frequency-penalty execution needs a host output-history snapshot.
     output_ids: Tuple[int, ...] = ()
     cont_len: int = 0
+    cache_slot: int = -1
 
     @property
     def request_id(self) -> str:

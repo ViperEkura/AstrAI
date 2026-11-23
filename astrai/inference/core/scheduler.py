@@ -372,21 +372,17 @@ class Scheduler:
     def release_finished(self, safe_to_release=True):
         if not safe_to_release:
             return
-        for rid, request in list(self._states.items()):
-            if not request.terminal_emitted or self._pending_order.get(
-                request.identity
-            ):
-                continue
-            if (
-                request.status == RequestStatus.FINISHED
-                and request.num_materialized_tokens
-            ):
-                self._kv_manager.publish_prefix(
-                    rid,
-                    request.prompt_ids + request.output_ids,
-                    materialized_end=request.num_materialized_tokens,
-                )
-            self._kv_manager.release(rid)
+        finished = [
+            request
+            for request in self._states.values()
+            if request.terminal_emitted
+            and not self._pending_order.get(request.identity)
+        ]
+        if not finished:
+            return
+        self._kv_manager.free(finished)
+        for request in finished:
+            rid = request.request_id
             self._metrics.mark_finished(
                 rid, request.input_tokens, request.output_tokens
             )
@@ -403,6 +399,7 @@ class Scheduler:
         if available <= 0:
             return
         failed = []
+        candidates = []
         for _ in range(min(available, len(self.waiting))):
             request = self.waiting.popleft()
             if request.terminal_emitted:
@@ -413,7 +410,11 @@ class Scheduler:
                     FINISH_REJECTED,
                     error_reason="kv_cache_allocation_failed",
                 )
-            elif self._kv_manager.admit(request.request_id, request.prompt_ids):
+            else:
+                candidates.append(request)
+        allocated = self._kv_manager.alloc(candidates) if candidates else ()
+        for request, ok in zip(candidates, allocated):
+            if ok:
                 if not request.terminal_emitted:
                     request.status = RequestStatus.RUNNING
                     self.running.append(request)
@@ -475,6 +476,7 @@ class Scheduler:
                 seen.add(identity)
                 identities.append(identity)
         events, produced = [], []
+        committed = {}
         for identity in identities:
             order = self._pending_order.get(identity)
             while order:
@@ -510,13 +512,7 @@ class Scheduler:
                 )
                 if request.terminal_emitted:
                     continue
-                if entry.phase == "prefill":
-                    self._kv_manager.publish_prefix(
-                        request.request_id,
-                        request.prompt_ids,
-                        start=entry.position,
-                        materialized_end=result.materialized_end,
-                    )
+                committed[request] = result.materialized_end
                 if result.token_id is not None:
                     request.output_ids.append(result.token_id)
                     request.output_tokens += 1
@@ -535,6 +531,8 @@ class Scheduler:
                         self.finish(request, self.finish_reason(request), events=events)
             if not order:
                 self._pending_order.pop(identity, None)
+        if committed:
+            self._kv_manager.commit(list(committed), list(committed.values()))
         self._emit_events(events)
         return produced
 
@@ -573,7 +571,7 @@ class Scheduler:
     def reserve_tokenized_request(self, request, register_metrics=False):
         if request.request_id in self._states:
             raise ValueError(f"duplicate live request id: {request.request_id}")
-        if not self._kv_manager.admit(request.request_id, request.prompt_ids):
+        if not self._kv_manager.alloc([request])[0]:
             return False
         request.emit_events = False
         self.remember(request)
@@ -582,5 +580,5 @@ class Scheduler:
         return True
 
     def release_tokenized_request(self, request):
-        self._kv_manager.release(request.request_id)
+        self._kv_manager.free([request])
         self._states.pop(request.request_id, None)

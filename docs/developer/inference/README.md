@@ -51,12 +51,9 @@ classDiagram
     GPUModelRunner --> PendingExecution : return handles
     GPUModelRunner *-- InferenceWorkspace : device buffers
     GPUModelRunner *-- CUDAGraphRunner : capture and replay
-    GPUModelRunner ..> KVCacheManager : shared cache binding
+    KVCacheManager --> BlockPool : reserve physical pages
+    InferenceWorkspace --> BlockPool : gather execution rows
 ```
-
-Composition arrows mark owned collaborators; other arrows mark calls or
-dependencies. The dotted Runner-to-Core edge records the existing shared KV
-binding dependency. It does not introduce another layer.
 
 | Layer | Owns | Why it is separate |
 | --- | --- | --- |
@@ -66,10 +63,8 @@ binding dependency. It does not introduce another layer.
 
 The source import direction is **frontend → core → worker → model/cache ABI**;
 all layers can use `contracts.py`. `tests/inference/test_layering.py` rejects
-reverse runtime imports. This is an import rule, not complete object isolation:
-the runner receives a shared `KVCacheManager` and calls `bind()` to create model
-cache views. The manager resolves request slots and reservations, then the workspace binds
-fixed-address tensors for the model. See [the cache boundary](core.md#cache-binding-boundary).
+reverse runtime imports. Execution snapshots carry cache slots. The workspace
+binds them to model tensors using the shared pool. See [cache binding](core.md#cache-binding-boundary).
 
 ## Design patterns in use
 

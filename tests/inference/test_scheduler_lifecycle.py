@@ -145,7 +145,7 @@ def test_cancel_during_kv_allocation_releases_metrics_and_kv(cpu_device):
     scheduler, _tok, _model = make_real_scheduler(cpu_device)
     allocation_started = threading.Event()
     continue_allocation = threading.Event()
-    original_alloc = scheduler.scheduler.kv_manager.admit
+    original_alloc = scheduler.scheduler.kv_manager.alloc
 
     def blocking_alloc(*args, **kwargs):
         allocation_started.set()
@@ -155,7 +155,7 @@ def test_cancel_during_kv_allocation_releases_metrics_and_kv(cpu_device):
     try:
         with patch.object(
             scheduler.scheduler.kv_manager,
-            "admit",
+            "alloc",
             side_effect=blocking_alloc,
         ):
             scheduler.start()
@@ -382,7 +382,9 @@ def test_run_batch_details_report_non_positive_max_tokens(cpu_device):
 def test_run_batch_details_report_allocation_failure(cpu_device):
     scheduler, _tok, _model = make_real_scheduler(cpu_device)
     try:
-        with patch.object(scheduler.scheduler.kv_manager, "admit", return_value=False):
+        with patch.object(
+            scheduler.scheduler.kv_manager, "alloc", return_value=[False]
+        ):
             result = run_batch(
                 scheduler, [[10, 20]], max_tokens=2, return_details=True
             )[0]

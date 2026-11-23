@@ -64,9 +64,9 @@ def test_submit_decode_returns_pending_without_touching_tasks(cpu_device):
             )
         ]
         request = requests[0]
-        assert scheduler.scheduler.kv_manager.admit(
-            request.request_id, request.prompt_ids
-        ), "KV allocation failed for a small request in an empty test pool"
+        assert scheduler.scheduler.kv_manager.alloc([request])[0], (
+            "KV allocation failed for a small request in an empty test pool"
+        )
         request.input_tokens = len(request.prompt_ids)
         # Prefill through the real stepper path so KV state is complete.
         with use_op_selection(scheduler.op_selection):
@@ -84,7 +84,7 @@ def test_submit_decode_returns_pending_without_touching_tasks(cpu_device):
             assert len(request.output_ids) == n_prefilled + 1
             assert request.output_tokens == n_prefilled + 1
         finally:
-            scheduler.scheduler.kv_manager.release(request.request_id)
+            scheduler.scheduler.kv_manager.free([request])
     finally:
         scheduler.stop()
 

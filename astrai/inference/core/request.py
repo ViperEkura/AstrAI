@@ -110,6 +110,8 @@ class Request:
         self.status = RequestStatus.PENDING
         self.output_ids: List[int] = []
         self.output_logprobs: List[float] = []
+        self.cache_slot = -1
+        self.cached_tokens = 0
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.num_computed_tokens: int = 0
@@ -123,6 +125,7 @@ class Request:
         """Detach all mutable request state at the core/worker boundary."""
         return ExecutionRequest(
             identity=self.identity,
+            cache_slot=self.cache_slot,
             prompt_ids=self._prompt_snapshot,
             input_token_id=self.output_ids[-1]
             if self.output_ids

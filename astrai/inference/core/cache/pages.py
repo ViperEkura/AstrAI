@@ -6,6 +6,8 @@ from typing import Callable, Dict, List, Optional, OrderedDict, Tuple
 
 import torch
 
+from astrai.inference.contracts import RequestIdentity
+
 
 class RequestPageTable:
     """Physical page IDs indexed by request slot and logical page."""
@@ -72,7 +74,8 @@ class RequestCacheState:
 
     req_idx: int
     length: int = 0
-    cached: int = 0
+    owner: Optional[RequestIdentity] = None
+    published: int = 0
     pages: List[int] = field(default_factory=list)
     _flushed: int = 0
 

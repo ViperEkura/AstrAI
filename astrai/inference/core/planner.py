@@ -27,7 +27,7 @@ class StepPlanner:
                 start = min(
                     max(
                         request.num_computed_tokens,
-                        self.kv_manager.cached_tokens(request.request_id),
+                        request.cached_tokens,
                     ),
                     len(request.prompt_ids) - 1,
                 )
@@ -48,9 +48,7 @@ class StepPlanner:
 
         failed = []
         if decode:
-            extended = self.kv_manager.reserve_decode(
-                [r.request_id for r in decode], [r.next_pos for r in decode]
-            )
+            extended = self.kv_manager.alloc(decode, [r.next_pos + 1 for r in decode])
             for request, ok in zip(decode, extended):
                 if ok:
                     entries.append(request.execution("decode", request.next_pos, 1))

@@ -6,13 +6,17 @@ the hot loop — a prerequisite for CUDA-graph capture.
 """
 
 from itertools import accumulate
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 from torch import Tensor
 
 from astrai.config.inference_config import InferenceConfig
-from astrai.model.kv_cache import DecodeKVCache, KVCache, KVStorage, PrefillKVCache
+from astrai.inference.contracts import ExecutionRequest
+from astrai.model.kv_cache import DecodeKVCache, KVCache, PrefillKVCache
+
+if TYPE_CHECKING:
+    from astrai.inference.core.cache import BlockPool
 
 _CONFIG = InferenceConfig()
 MAX_SPLITS = _CONFIG.max_splits
@@ -122,18 +126,14 @@ class InferenceWorkspace:
                 device=device,
             )
 
-    def bind(
-        self,
-        storage: KVStorage,
-        table: Tensor,
-        version: int,
-        rows: Tuple[int, ...],
-        positions: Optional[List[int]],
-        start: Optional[int],
-        ends: Optional[List[int]],
-    ) -> KVCache:
-        """Bind request pages and this step's window to fixed-address model inputs."""
-        b = len(rows)
+    def bind(self, pool: "BlockPool", entries: Sequence[ExecutionRequest]) -> KVCache:
+        """Bind a homogeneous execution batch to graph-stable tensor views."""
+        b = len(entries)
+        rows = tuple(entry.cache_slot for entry in entries)
+        if not rows or min(rows) < 0:
+            raise ValueError("batch contains an unallocated cache slot")
+        storage = pool._storage
+        table, version = pool.req_pool.page_table, pool.req_pool.version
         changed = self._source_table is not table or self._rows != rows
         if self.page_table is None or self.page_table.size(1) != table.size(1):
             with torch.inference_mode(False):
@@ -147,7 +147,8 @@ class InferenceWorkspace:
                 table, 0, self.req_pool_indices[:b], out=self.page_table[:b]
             )
         self._source_table, self._rows, self._page_version = table, rows, version
-        if positions is not None:
+        if entries[0].phase == "decode":
+            positions = tuple(entry.position for entry in entries)
             reuse = not changed and self._decode is not None
             if not reuse:
                 self._decode = DecodeKVCache(
@@ -169,15 +170,21 @@ class InferenceWorkspace:
                 past.copy_(
                     torch.as_tensor(positions, dtype=torch.int32, device=self.device)
                 )
-            self._positions = tuple(positions)
+            self._positions = positions
             return self._decode
         pages, past = self.page_table[:b], self.cache_seqlens[:b]
         self._decode = None
-        past.fill_(start)
+        positions = [entry.position for entry in entries]
+        if positions.count(positions[0]) == b:
+            past.fill_(positions[0])
+        else:
+            past.copy_(
+                torch.as_tensor(positions, dtype=torch.int32, device=self.device)
+            )
         offsets = self.cu_seqlens_q[: b + 1]
         offsets.copy_(
             torch.tensor(
-                [0, *accumulate(end - start for end in ends)],
+                [0, *accumulate(entry.num_tokens for entry in entries)],
                 device=self.device,
                 dtype=torch.int32,
             )

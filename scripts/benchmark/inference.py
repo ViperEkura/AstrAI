@@ -9,6 +9,7 @@ import torch
 from astrai.config import BaseModelConfig, ConfigFactory
 from astrai.extension.runtime.context import op_backend
 from astrai.inference.core.cache import BlockPool, KVCacheManager
+from astrai.inference.core.request import Request
 from astrai.inference.frontend.engine import InferenceEngine
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.workspace import InferenceWorkspace
@@ -143,18 +144,20 @@ class GenerationBenchmark:
         )
         chunk_size = prefill_chunk_size or prompt_len
 
-        request_ids = [f"bench_{i}" for i in range(batch_size)]
-        for tid in request_ids:
-            task_cache.admit(tid, list(range(prompt_len)))
+        requests = [
+            Request(f"bench_{i}", list(range(prompt_len))) for i in range(batch_size)
+        ]
+        assert all(task_cache.alloc(requests))
 
         with torch.inference_mode(), op_backend(attention=self.backend):
             for start_pos in range(0, prompt_len, chunk_size):
                 end_pos = min(start_pos + chunk_size, prompt_len)
-                kv_cache = task_cache.bind(
-                    request_ids,
-                    workspace,
-                    start_pos=start_pos,
-                    seq_ends=[end_pos] * batch_size,
+                kv_cache = workspace.bind(
+                    pool,
+                    [
+                        r.execution("prefill", start_pos, end_pos - start_pos)
+                        for r in requests
+                    ],
                 )
                 self.model(
                     token_ids[:, start_pos:end_pos].reshape(-1),
@@ -165,22 +168,24 @@ class GenerationBenchmark:
                     skip_lm_head=skip_lm_head,
                 )
         torch.cuda.synchronize()
-        return request_ids
+        return requests
 
     def _run_decode_step(
         self,
         pool: BlockPool,
         task_cache: KVCacheManager,
-        request_ids: List,
+        requests: List,
         seq_len: int,
         workspace: InferenceWorkspace,
     ):
-        batch_size = len(request_ids)
+        batch_size = len(requests)
         input_ids = torch.randint(
             0, self.config.vocab_size, (batch_size,), device=self.device
         )
-        assert all(task_cache.reserve_decode(request_ids, [seq_len] * len(request_ids)))
-        kv_cache = task_cache.bind(request_ids, workspace)
+        assert all(task_cache.alloc(requests, [seq_len + 1] * len(requests)))
+        kv_cache = workspace.bind(
+            pool, [r.execution("decode", seq_len, 1) for r in requests]
+        )
         with torch.inference_mode(), op_backend(attention=self.backend):
             self.model(
                 input_ids,
@@ -197,9 +202,11 @@ class GenerationBenchmark:
         pool = self._make_pool(batch_size, prompt_length)
         workspace = self._make_workspace(pool, self.config)
         task_cache = self._make_task_cache(pool)
-        request_ids = [f"bench_prefill_{i}" for i in range(batch_size)]
-        for tid in request_ids:
-            task_cache.admit(tid, list(range(prompt_length)))
+        requests = [
+            Request(f"bench_prefill_{i}", list(range(prompt_length)))
+            for i in range(batch_size)
+        ]
+        assert all(task_cache.alloc(requests))
 
         input_ids = torch.randint(
             0,
@@ -210,7 +217,9 @@ class GenerationBenchmark:
         position_ids = torch.arange(
             prompt_length, dtype=torch.long, device=self.device
         ).repeat(batch_size)
-        kv_cache = task_cache.bind(request_ids, workspace, start_pos=0)
+        kv_cache = workspace.bind(
+            pool, [r.execution("prefill", 0, prompt_length) for r in requests]
+        )
 
         for _ in range(3):
             with torch.inference_mode(), op_backend(attention=self.backend):
@@ -348,7 +357,7 @@ class GenerationBenchmark:
         workspace = self._make_workspace(pool, self.config)
         task_cache = self._make_task_cache(pool)
         warmup_len = kv_len - 3
-        request_ids = self._run_prefill(
+        requests = self._run_prefill(
             pool,
             task_cache,
             batch_size,
@@ -371,9 +380,11 @@ class GenerationBenchmark:
             input_ids_buf.copy_(
                 torch.randint(0, self.config.vocab_size, (b,), device=self.device)
             )
-            if not all(task_cache.reserve_decode(request_ids, [seq_len] * b)):
+            if not all(task_cache.alloc(requests, [seq_len + 1] * b)):
                 raise RuntimeError("failed to extend KV slots for fixed-KV benchmark")
-            kv_cache = task_cache.bind(request_ids, workspace)
+            kv_cache = workspace.bind(
+                pool, [r.execution("decode", seq_len, 1) for r in requests]
+            )
             with torch.inference_mode(), op_backend(attention=self.backend):
                 if start_event is not None:
                     start_event.record()
@@ -431,7 +442,7 @@ class GenerationBenchmark:
         pool = self._make_pool(batch_size, max_seq_len)
         workspace = self._make_workspace(pool, self.config)
         task_cache = self._make_task_cache(pool)
-        request_ids = self._run_prefill(
+        requests = self._run_prefill(
             pool, task_cache, batch_size, prompt_length, workspace
         )
 
@@ -445,10 +456,10 @@ class GenerationBenchmark:
             input_ids_buf.copy_(
                 torch.randint(0, self.config.vocab_size, (b,), device=self.device)
             )
-            assert all(
-                task_cache.reserve_decode(request_ids, [seq_len] * len(request_ids))
+            assert all(task_cache.alloc(requests, [seq_len + 1] * len(requests)))
+            kv_cache = workspace.bind(
+                pool, [r.execution("decode", seq_len, 1) for r in requests]
             )
-            kv_cache = task_cache.bind(request_ids, workspace)
 
             with torch.inference_mode(), op_backend(attention=self.backend):
                 return gctx.forward(
@@ -495,20 +506,20 @@ class GenerationBenchmark:
         pool = self._make_pool(batch_size, max_seq_len)
         workspace = self._make_workspace(pool, self.config)
         task_cache = self._make_task_cache(pool)
-        request_ids = self._run_prefill(
+        requests = self._run_prefill(
             pool, task_cache, batch_size, prompt_length, workspace
         )
 
         for i in range(5):
             self._run_decode_step(
-                pool, task_cache, request_ids, prompt_length + i, workspace
+                pool, task_cache, requests, prompt_length + i, workspace
             )
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
         for i in range(gen_length * num_trials):
             self._run_decode_step(
-                pool, task_cache, request_ids, prompt_length + 5 + i, workspace
+                pool, task_cache, requests, prompt_length + 5 + i, workspace
             )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0

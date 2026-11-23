@@ -10,6 +10,7 @@ from typing import Callable, List, Optional, TypeVar
 
 import torch
 
+from astrai.config.inference_config import InferenceConfig
 from astrai.extension.runtime.context import use_op_selection
 from astrai.inference.contracts import LogprobRequest
 from astrai.inference.core.cache import BlockPool
@@ -103,11 +104,13 @@ class EngineCore:
         with use_op_selection(self.op_selection):
             self.model_runner = GPUModelRunner(
                 model=model,
-                cache_mgr=self.scheduler.kv_manager,
+                pool=cache,
                 device=self.device,
                 dtype=self.dtype,
                 enable_cuda_graph=enable_cuda_graph,
             )
+            if self.model_runner.cuda_graph_enabled:
+                self._warmup_cuda_graphs()
         self._policy_guard = PolicyVersionGuard(
             policy_version,
             ensure_ready=self.ensure_weight_update_ready,
@@ -120,6 +123,49 @@ class EngineCore:
         self._pending = deque()
         self._closing = False
         self._shutdown_failed = False
+
+    @torch.inference_mode()
+    def _warmup_cuda_graphs(self):
+        runner = self.model_runner
+        cache = self.scheduler.kv_manager
+        workspace = runner._workspace
+        length = InferenceConfig().prefill_warmup_len
+        prompt = Request("_warmup_prefill", list(range(length)))
+        if cache.alloc([prompt])[0]:
+            try:
+                kv = workspace.bind(
+                    cache.pool, [prompt.execution("prefill", 0, length)]
+                )
+                ids = torch.arange(length, device=self.device)
+                runner.model(
+                    ids, kv_cache=kv, position_ids=ids, logits_positions=ids[-1:]
+                )
+            finally:
+                cache.free([prompt])
+
+        maximum = workspace.max_batch_size
+        sizes = {1 << i for i in range(maximum.bit_length())}
+        for size in sorted(sizes | {maximum}):
+            requests = [Request(f"_warmup_{i}", [0]) for i in range(size)]
+            try:
+                if not all(cache.alloc(requests)):
+                    continue
+                for step in range(2):
+                    if not all(cache.alloc(requests, [step + 1] * size)):
+                        break
+                    kv = workspace.bind(
+                        cache.pool, [r.execution("decode", step, 1) for r in requests]
+                    )
+                    runner._graph_ctx.forward(
+                        runner.model,
+                        key=(size,),
+                        input_ids=workspace.fill_input_ids([step] * size),
+                        kv_cache=kv,
+                        position_ids=kv.cache_seqlens,
+                    )
+            finally:
+                torch.cuda.synchronize(self.device)
+                cache.free(requests)
 
     @property
     def model(self):

@@ -169,6 +169,27 @@ std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
     return per_cta * w_eff;
 }
 
+// For otherwise identical crosswise recipes the traffic model ties pipeline
+// depths. With at most one CTA per SM, a deeper ring cannot displace another
+// active CTA. Short reductions do not amortize its prologue.
+bool prefer_deeper_prefetch(const GemmRecipe& candidate,
+                            const GemmRecipe& current,
+                            const PlanQuery& q) {
+    constexpr int kMinPrefetchTiles = 16;
+    if (q.crosswise == 0 || q.perf_class != (int)GemmPerfClass::kW16A16 || q.batch != 1 ||
+        candidate.cta != current.cta || candidate.k_tile != current.k_tile ||
+        candidate.k_stages <= current.k_stages || q.k < kMinPrefetchTiles * candidate.k_tile)
+        return false;
+    // Two crosswise operands with a partial BF16 copy vector on either axis
+    // showed no consistent benefit from the extra stage.
+    constexpr int kVectorElements = 16 / sizeof(uint16_t);
+    if (q.crosswise == 2 && (q.m % kVectorElements || q.n % kVectorElements))
+        return false;
+    const int64_t m_tiles = (q.m + candidate.bm - 1) / candidate.bm;
+    const int64_t n_tiles = (q.n + candidate.bn - 1) / candidate.bn;
+    return m_tiles * n_tiles <= q.dev.sms;
+}
+
 // geom_cta: rank five work proxies in log space. Smaller is better.
 // This is a heuristic ordering, not a prediction of execution time.
 double heuristic_cost(const GemmRecipe& named, const PlanQuery& q, int fallback_resident) {
@@ -244,7 +265,8 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = fals
                 short_k_best = recipe;
                 short_k_cost = cost;
             }
-            if (!best || cost < best_cost) {
+            if (!best || cost < best_cost ||
+                (!heuristic && cost == best_cost && prefer_deeper_prefetch(recipe, *best, q))) {
                 best = recipe;
                 best_cost = cost;
             }

@@ -104,42 +104,17 @@ Stopping similarly drains or safely retires in-flight work before clearing
 request/KV state. A timed-out join retains the live thread and its state;
 a second loop must not be started over it.
 
-## KV allocation strategy
+## KV page allocation
 
-`KVCacheManager` owns request allocation state. `BlockPool` owns the physical
-storage, token mapping and allocation strategy:
+`BlockPool` owns the KV tensors and the request page table. A contiguous pool
+fills each slot's fixed page IDs at construction. For a paged pool,
+`KVCacheManager` reserves and releases physical pages using the pool's allocator.
+When pages hold multiple tokens, a radix index tracks reusable full prefixes.
 
-- **ContiguousStrategy:** static request partitions, no prefix reuse.
-- **PagedStrategy:** logical pages from a bitmap/LRU allocator; radix prefix
-  indexing is enabled for page sizes greater than one.
-
-This is the Strategy pattern with two real implementations. The scheduler
-uses the same allocation operations; `BlockPool` selects the policy at
-construction. Contiguous allocation has simpler fixed partitions; paging adds
-reuse and flexible capacity at the cost of page/index bookkeeping.
-
-```mermaid
-classDiagram
-    class KVCacheManager
-    class BlockPool
-    class AllocationStrategy
-    class ContiguousStrategy
-    class PagedStrategy
-    class Allocator
-    class RadixCache
-    KVCacheManager --> BlockPool
-    BlockPool *-- AllocationStrategy
-    AllocationStrategy <|-- ContiguousStrategy
-    AllocationStrategy <|-- PagedStrategy
-    PagedStrategy --> Allocator : page references
-    PagedStrategy --> RadixCache : optional prefix index
-```
-
-A decode token advances its past length. With a physical page table, the
-mapping only changes when a page is allocated or the request batch changes.
-The strategy reports whether it published new page IDs; steady decode reuses
-the workspace table otherwise. A page crossing refreshes the table in place,
-preserving the addresses captured by CUDA Graphs.
+The request page table publishes newly allocated page IDs and increments its
+version. Each workspace gathers the rows for its current batch when the ordered
+slots or the table version change. Across a page crossing, the destination
+address stays stable for CUDA Graph replay.
 
 Prefix publication requires
 `record_block_hashes(..., materialized_end=exclusive_token_end)`. The boundary
@@ -152,7 +127,7 @@ Radix re-recording must preserve valid descendants, and removal of an
 ancestor must not leave descendants advertised by the reverse index. Physical
 allocator references and prefix-index reachability are separate invariants.
 
-Both cache strategies preallocate a GPU arena. Paged allocation currently
+Both layouts preallocate a GPU arena. Paged allocation currently
 reserves prompt pages at admission; chunking limits computation, not that
 initial reservation. Global token budgets, progressive prompt allocation and
 recompute preemption are not introduced by this ownership refactor.

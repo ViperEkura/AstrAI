@@ -4,11 +4,8 @@ from typing import Dict, List, Optional
 
 import torch
 
-from astrai.inference.core.cache.strategy import (
-    AllocationStrategy,
+from astrai.inference.core.cache.pages import (
     Allocator,
-    ContiguousStrategy,
-    PagedStrategy,
     RadixCache,
     RequestCacheState,
     RequestPageTable,
@@ -18,7 +15,7 @@ from astrai.model.kv_cache import KVCache, KVStorage
 
 
 class BlockPool:
-    """Physical KV cache: buffers + request page table + allocation strategy.
+    """KV buffers, request page table and optional dynamic page allocator.
 
     Does not know about requests — request lifecycle is managed by
     :class:`KVCacheManager`, which holds a reference to this pool.
@@ -58,52 +55,31 @@ class BlockPool:
         self._storage = KVStorage(
             self.n_tokens, n_layers, page_size, n_kv_heads, head_dim, device, dtype
         )
-        self._req_pool = RequestPageTable(max_batch_size, pages_per_req, device)
+        self.req_pool = RequestPageTable(max_batch_size, pages_per_req, device)
 
+        self.allocator = None
+        self.prefix = None
         if self.contiguous:
-            self._req_pool.page_table.copy_(
+            self.req_pool.page_table.copy_(
                 torch.arange(
                     max_batch_size * pages_per_req, dtype=torch.int32, device=device
                 ).view(max_batch_size, pages_per_req)
             )
-            self._strategy: AllocationStrategy = ContiguousStrategy()
         else:
-            n_pages = self.n_tokens // page_size
-            alloc = Allocator(n_pages)
-            prefix = RadixCache(page_size) if page_size > 1 else None
-            if prefix is not None:
-                alloc.on_evict = prefix.evict
-            self._strategy = PagedStrategy(
-                alloc, prefix, page_size, self._req_pool, device
-            )
-
-    @property
-    def strategy(self) -> AllocationStrategy:
-        return self._strategy
-
-    @property
-    def req_pool(self) -> RequestPageTable:
-        return self._req_pool
+            self.allocator = Allocator(self.n_tokens // page_size)
+            if page_size > 1:
+                self.prefix = RadixCache(page_size)
+                self.allocator.on_evict = self.prefix.evict
 
 
 class KVCacheManager:
-    """Request ↔ KV slot lifecycle manager.
-
-    Sole owner of ``request_id → RequestCacheState``.  Delegates physical slot
-    allocation to the strategy (via ``pool.strategy``) and binds each batch to its execution workspace.
-
-    Usage::
-
-        pool = BlockPool(...)
-        mgr = KVCacheManager(pool)
-        mgr.alloc_slots("req_1", [101, 202, 303])
-        ...
-        kv = mgr.bind(["req_1"], workspace)
-    """
+    """Own request slots, page reservations and prefix publication."""
 
     def __init__(self, pool: BlockPool):
         self._pool = pool
-        self._strategy = pool.strategy
+        self._alloc = pool.allocator
+        self._prefix = pool.prefix
+        self._page_size = pool.page_size
         self._req_pool = pool.req_pool
         self._max_seq_len = pool.max_seq_len
         self._states: Dict[str, RequestCacheState] = {}
@@ -115,11 +91,23 @@ class KVCacheManager:
         if req_slots is None:
             return False
         state = RequestCacheState(req_idx=req_slots[0])
+        if self._alloc is not None:
+            if self._prefix is not None:
+                state.pages = self._prefix.lookup(prompt_ids)
+                state.cached = len(state.pages) * self._page_size
+                for page in state.pages:
+                    self._alloc.inc_ref(page)
+            total = (len(prompt_ids) + self._page_size - 1) // self._page_size
+            pages = self._alloc.alloc_many(total - len(state.pages))
+            if pages is None:
+                self._alloc.free_many(
+                    state.pages, self._prefix.has_page if self._prefix else None
+                )
+                self._req_pool.free(req_slots)
+                return False
+            state.pages.extend(pages)
+            self._req_pool.flush_pages([state])
         self._states[request_id] = state
-        if not self._strategy.alloc(state, prompt_ids):
-            self._rollback(state, request_id)
-            return False
-        self._strategy.flush_pages([state])
         state.length = len(prompt_ids)
         return True
 
@@ -127,48 +115,52 @@ class KVCacheManager:
         state = self._states.pop(request_id, None)
         if state is None:
             return
-        self._strategy.free(state)
+        if self._alloc is not None:
+            self._alloc.free_many(
+                state.pages, self._prefix.has_page if self._prefix else None
+            )
         self._req_pool.free([state.req_idx])
 
     def extend_slots(self, request_id: str, pos: int) -> bool:
         state = self._states.get(request_id)
         if state is None or pos >= self._max_seq_len:
             return False
-        if not self._strategy.extend(state, pos):
-            return False
+        if self._alloc is not None and pos // self._page_size >= len(state.pages):
+            page = self._alloc.alloc()
+            if page < 0:
+                return False
+            state.pages.append(page)
         state.length = pos + 1
         return True
 
     def extend_slots_batch(
         self, request_ids: List[str], positions: List[int]
     ) -> List[bool]:
-        """``extend_slots`` for a whole decode step, one strategy call.
-
-        The decode-steady hot path extends every active request by exactly
-        one position; a single batched strategy call replaces one
-        allocation round-trip per request (see
-        ``PagedStrategy.extend_batch``).  Per-request semantics are
-        unchanged: a missing state or an out-of-cap position fails that
-        request alone.
-        """
-        results = [False] * len(request_ids)
-        live_idx: List[int] = []
-        live_states: List[RequestCacheState] = []
-        live_pos: List[int] = []
-        for i, tid in enumerate(request_ids):
-            state = self._states.get(tid)
-            if state is not None and positions[i] < self._max_seq_len:
-                live_idx.append(i)
-                live_states.append(state)
-                live_pos.append(positions[i])
-        if not live_idx:
-            return results
-        extended = self._strategy.extend_batch(live_states, live_pos)
-        for i, state, pos, ok in zip(live_idx, live_states, live_pos, extended):
-            if ok:
+        """Reserve new pages in batch, preserving request order under pool pressure."""
+        states = [self._states.get(key) for key in request_ids]
+        ok = [
+            s is not None and pos < self._max_seq_len
+            for s, pos in zip(states, positions)
+        ]
+        if self._alloc is not None:
+            need = [
+                s
+                for s, pos, valid in zip(states, positions, ok)
+                if valid and pos // self._page_size >= len(s.pages)
+            ]
+            if need:
+                pages = self._alloc.alloc_many(len(need))
+                if pages is None:
+                    return [
+                        self.extend_slots(key, pos)
+                        for key, pos in zip(request_ids, positions)
+                    ]
+                for state, page in zip(need, pages):
+                    state.pages.append(page)
+        for state, pos, valid in zip(states, positions, ok):
+            if valid:
                 state.length = pos + 1
-                results[i] = True
-        return results
+        return ok
 
     @property
     def request_count(self) -> int:
@@ -195,19 +187,21 @@ class KVCacheManager:
         explicitly passes ``len(prompt_ids)``; a chunk passes its actual end.
         """
         state = self._states.get(request_id)
-        if state is not None:
-            self._strategy.record_hashes(
-                state,
-                prompt_ids,
-                start_logical_page,
-                materialized_end=materialized_end,
-            )
+        if state is None or self._alloc is None:
+            return
+        if materialized_end < 0 or start_logical_page < 0:
+            raise ValueError("materialized_end and start must be nonnegative")
+        if self._prefix is not None:
+            full = min(materialized_end, len(prompt_ids)) // self._page_size
+            for i in range(start_logical_page, min(full, len(state.pages))):
+                revoked = self._prefix.record(state.pages[i], prompt_ids, i)
+                self._alloc.discard_cached(revoked)
 
     def invalidate_cache(self) -> int:
         """Drop reusable KV entries once all request-owned entries are released."""
         if self._states:
             raise RuntimeError("Cannot invalidate KV cache while requests are active")
-        return self._strategy.invalidate_cache()
+        return self._alloc.clear_cached() if self._prefix is not None else 0
 
     def can_ever_fit(self, n_tokens: int) -> bool:
         """Whether a request of ``n_tokens`` could ever be admitted.
@@ -215,7 +209,9 @@ class KVCacheManager:
         The admission-time livelock guard: requests that can never fit are
         rejected outright by the scheduler instead of retrying forever.
         """
-        return self._strategy.can_ever_fit(n_tokens)
+        return self._alloc is None or self._alloc.can_ever_satisfy(
+            (n_tokens + self._page_size - 1) // self._page_size
+        )
 
     # -- bind (assemble KVCache for the model forward) --
 
@@ -258,7 +254,8 @@ class KVCacheManager:
                 not start_pos < end <= s.length for end, s in zip(seq_ends, states)
             ):
                 raise ValueError("chunk must fit the reserved request interval")
-        self._strategy.flush_pages(states)
+        if self._alloc is not None:
+            self._req_pool.flush_pages(states)
         return workspace.bind(
             self._pool._storage,
             self._req_pool.page_table,
@@ -268,10 +265,3 @@ class KVCacheManager:
             start_pos,
             seq_ends,
         )
-
-    # -- internals --
-
-    def _rollback(self, state: RequestCacheState, request_id: str):
-        self._strategy.free(state)
-        self._req_pool.free([state.req_idx])
-        self._states.pop(request_id, None)

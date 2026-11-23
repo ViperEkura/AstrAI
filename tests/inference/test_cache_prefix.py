@@ -70,7 +70,7 @@ def test_record_block_hashes_requires_explicit_materialized_end():
 
     with pytest.raises(TypeError, match="materialized_end"):
         task_cache.record_block_hashes("writer", prompt)
-    assert pool.strategy._prefix.lookup(prompt) == []
+    assert pool.prefix.lookup(prompt) == []
 
 
 @pytest.mark.parametrize("allocated, ids_len, end", [(8, 6, 8), (4, 8, 8)])
@@ -81,9 +81,7 @@ def test_record_block_hashes_is_bounded_by_token_ids_and_allocated_pages(
     task_cache = KVCacheManager(pool)
     assert task_cache.alloc_slots("writer", list(range(allocated)))
     task_cache.record_block_hashes("writer", list(range(ids_len)), materialized_end=end)
-    assert pool.strategy._prefix.lookup(list(range(8))) == [
-        task_cache._states["writer"].pages[0]
-    ]
+    assert pool.prefix.lookup(list(range(8))) == [task_cache._states["writer"].pages[0]]
 
 
 @pytest.mark.parametrize("start, end", [(-1, 4), (0, -1)])
@@ -94,7 +92,7 @@ def test_record_block_hashes_rejects_negative_watermark_or_page(start, end):
     assert task_cache.alloc_slots("writer", prompt)
     with pytest.raises(ValueError, match="nonnegative"):
         task_cache.record_block_hashes("writer", prompt, start, materialized_end=end)
-    assert pool.strategy._prefix.lookup(prompt) == []
+    assert pool.prefix.lookup(prompt) == []
 
 
 def test_chunked_prefix_only_reuses_fully_written_kv(kv_device):
@@ -140,11 +138,11 @@ def test_chunked_prefix_only_reuses_fully_written_kv(kv_device):
         assert torch.isnan(kv.k_buffer[0].flatten(0, 1)[unwritten]).all().item()
         assert torch.isnan(kv.v_buffer[0].flatten(0, 1)[unwritten]).all().item()
         task_cache.free_slots("reader")
-        assert_allocator_cache_consistent(pool.strategy._alloc, pool.strategy._prefix)
+        assert_allocator_cache_consistent(pool.allocator, pool.prefix)
 
     task_cache.free_slots("writer")
     assert task_cache.invalidate_cache() == 2
-    assert_allocator_cache_consistent(pool.strategy._alloc, pool.strategy._prefix)
+    assert_allocator_cache_consistent(pool.allocator, pool.prefix)
 
 
 @pytest.mark.parametrize("release_first", [False, True])
@@ -164,8 +162,8 @@ def test_prefix_replacement_keeps_allocator_identity_consistent(release_first):
     # Replacing the first page leaves the already-materialized descendant
     # reusable, but drops the old first page's cached allocator identity.
     task_cache.record_block_hashes("second", prompt, materialized_end=4)
-    prefix = pool.strategy._prefix
-    alloc = pool.strategy._alloc
+    prefix = pool.prefix
+    alloc = pool.allocator
     assert prefix.lookup(prompt) == [second_pages[0], first_pages[1]]
     assert not prefix.has_page(first_pages[0])
     assert alloc.ref_count(first_pages[0]) == (0 if release_first else 1)

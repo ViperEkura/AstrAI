@@ -70,3 +70,81 @@ def _compare(rank, rendezvous):
 
 def test_pipeline_matches_full_model(tmp_path):
     mp.spawn(_compare, args=((tmp_path / "rdzv").as_uri(),), nprocs=4, join=True)
+
+
+def test_train_cli_resumes_pipeline_window(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    import numpy as np
+    import yaml
+    from safetensors.torch import load_file
+
+    cfg = AutoRegressiveLMConfig.from_dict(
+        dict(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            max_position_embeddings=16,
+            rms_norm_eps=1e-5,
+            tie_word_embeddings=False,
+            attention=dict(default_type="gqa", num_heads=2, num_kv_heads=1),
+        )
+    )
+    initial, data = tmp_path / "initial", tmp_path / "data"
+    AutoRegressiveLM(cfg).save_pretrained(initial)
+    data.mkdir()
+    seq = np.arange(41, dtype=np.int32)
+    seq.tofile(data / "sequence.bin")
+    (data / "meta.json").write_text(
+        json.dumps({"sequence": {"shape": [41], "dtype": "int32"}})
+    )
+    config = {
+        "data": {
+            "train_type": "seq",
+            "data_root_path": str(data),
+            "window_size": 8,
+            "num_workers": 0,
+        },
+        "model": {"param_path": str(initial)},
+        "parallel": {
+            "pp_size": 2,
+            "dp_size": 1,
+            "dp_mode": "none",
+            "backend": "gloo",
+            "device_type": "cpu",
+        },
+        "training": {
+            "grad_accum_steps": 4,
+            "batch_per_device": 1,
+            "n_epoch": 1,
+            "epoch_tail_policy": "flush",
+        },
+        "precision": {"compute_dtype": "float32"},
+        "ckpt": {"ckpt_interval": 1, "ckpt_dir": str(tmp_path / "first")},
+    }
+
+    def run(*args):
+        path = tmp_path / "train.yaml"
+        path.write_text(yaml.safe_dump(config))
+        subprocess.run(
+            [sys.executable, "-m", "scripts.tools.train", "--config", str(path), *args],
+            check=True,
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+
+    run()
+    config["model"]["param_path"] = str(tmp_path / "first" / "epoch_0_step_1")
+    config["ckpt"]["ckpt_dir"] = str(tmp_path / "resume")
+    run("--resume")
+    paths = [tmp_path / p / "epoch_0_step_2" for p in ("first", "resume")]
+    for path in paths:
+        assert json.loads((path / "meta.json").read_text())["consumed_samples"] == 5
+    a, b = [load_file(path / "model.safetensors") for path in paths]
+    assert a.keys() == b.keys()
+    for name in a:
+        torch.testing.assert_close(a[name], b[name], rtol=0, atol=0)

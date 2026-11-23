@@ -102,9 +102,12 @@ class TrainContextBuilder:
             cp_size=self.config.cp_size,
             tp_size=self.config.tp_size,
             device_type=self.config.device_type,
+            pp_size=self.config.pp_size,
         )
         if self.config.optimizer.params.get("shard_state", False) and (
-            not self._topology.is_trivial or self.config.dp_mode == "fsdp"
+            self._topology.cp_size > 1
+            or self._topology.tp_size > 1
+            or self.config.dp_mode == "fsdp"
         ):
             raise NotImplementedError(
                 "Optimizer state ownership requires replicated none/DDP parameters"
@@ -156,6 +159,10 @@ class TrainContextBuilder:
 
     def _create_executor(self) -> BaseExecutor:
         cfg = self.config
+        if cfg.pp_size > 1:
+            from astrai.parallel.pipeline import PipelineExecutor
+
+            return PipelineExecutor(cfg, self._topology)
         kwargs = dict(cfg.executor_kwargs)
         if cfg.dp_mode in ("none", "ddp"):
             kwargs["grad_accum_dtype"] = cfg.precision.gradient_dtype
@@ -218,7 +225,8 @@ class TrainContextBuilder:
         device = get_current_device()
 
         def before_wrap(model):
-            model = model.to(device=device)
+            if cfg.pp_size == 1:
+                model = model.to(device=device)
             if cfg.lora is not None:
                 inject_lora(
                     model,

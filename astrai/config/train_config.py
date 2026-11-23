@@ -136,7 +136,7 @@ class TrainConfig(BaseConfig):
         num_workers (int): Number of workers for dataloader. Defaults to 0.
         prefetch_factor (Optional[int]): Prefetch factor for dataloader. Defaults to None.
         pin_memory (bool): Pin memory for dataloader. Defaults to False.
-        dp_size (int): Data-parallel replicas; total training processes (``nprocs``) are derived as ``dp_size * cp_size * tp_size``. Defaults to 1.
+        dp_size (int): Data-parallel replicas; total training processes (``nprocs``) are derived as ``dp_size * cp_size * tp_size * pp_size``. Defaults to 1.
         cp_size (int): Context-parallel group size: shards the sequence across contiguous ranks (seq pretraining, torch-native attention only). Defaults to 1.
         tp_size (int): Tensor-parallel group size: shards Linear projections over features (attention heads / ffn channels) using the default plan over the standard module layout. Defaults to 1.
         dp_mode (str): Data-parallel gradient-sync strategy: none, ddp, fsdp. Defaults to "none".
@@ -218,6 +218,9 @@ class TrainConfig(BaseConfig):
     pin_memory: bool = False
 
     dp_size: int = 1
+    pp_size: int = 1
+    pp_split_points: List[int] = field(default_factory=list)
+    pp_checkpoint_counts: List[int] = field(default_factory=list)
     cp_size: int = 1
     tp_size: int = 1
     dp_mode: str = "none"
@@ -340,14 +343,45 @@ class TrainConfig(BaseConfig):
 
     @property
     def nprocs(self) -> int:
-        """Total training processes: dp_size x cp_size x tp_size.
+        """Total training processes: dp_size x cp_size x tp_size x pp_size.
 
         The world size follows from the parallelism degrees the user
         configures, not the other way around — the sampler shards data over
         dp replicas only, so every batch-scaling formula wants dp_size, and
         divisibility by cp_size holds by construction.
         """
-        return self.dp_size * self.cp_size * self.tp_size
+        return self.dp_size * self.cp_size * self.tp_size * self.pp_size
+
+    @model_validator(mode="after")
+    def _validate_pipeline(self):
+        if self.pp_size < 1:
+            raise ValueError("pp_size must be positive")
+        if self.pp_size == 1:
+            if self.pp_split_points or self.pp_checkpoint_counts:
+                raise ValueError("pipeline layer settings require pp_size > 1")
+            return self
+        if (
+            self.strategy != "seq"
+            or self.cp_size != 1
+            or self.tp_size != 1
+            or self.dp_mode == "fsdp"
+        ):
+            raise ValueError(
+                "pipeline pretraining supports SEQ with none/DDP and CP=TP=1"
+            )
+        if self.grad_accum_steps < self.pp_size:
+            raise ValueError("fixed-shape 1F1B requires grad_accum_steps >= pp_size")
+        if self.pp_split_points and len(self.pp_split_points) != self.pp_size - 1:
+            raise ValueError(
+                "pp_split_points needs one boundary between adjacent stages"
+            )
+        if self.pp_checkpoint_counts and len(self.pp_checkpoint_counts) != self.pp_size:
+            raise ValueError("pp_checkpoint_counts needs one count per pipeline stage")
+        if self.compile_mode or "grad_snr" in self.metrics:
+            raise ValueError(
+                "pipeline training currently requires eager execution without grad_snr"
+            )
+        return self
 
     @field_validator("cp_size")
     def _validate_cp_size(cls, v: int) -> int:

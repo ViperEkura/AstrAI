@@ -144,6 +144,9 @@ class CheckpointCallback(TrainCallback):
             rl_update_epochs=cfg.rl_update_epochs,
             rl_minibatch_prompts=cfg.rl_minibatch_prompts,
         )
+        if cfg.pp_size > 1:
+            meta["pp_size"] = cfg.pp_size
+            meta["pp_split_points"] = list(context.executor.boundaries[1:-1])
         if context.pretrained_metadata:
             meta["pretrained"] = context.pretrained_metadata
         policy_version = (

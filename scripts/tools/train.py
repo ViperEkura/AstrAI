@@ -87,6 +87,12 @@ _SPECS = [
         "Training",
         help="Gradient accumulation steps.",
     ),
+    OptSpec(
+        "epoch_tail_policy",
+        "Training",
+        choices=["drop", "flush"],
+        help="How to handle an incomplete optimizer window at epoch end.",
+    ),
     OptSpec("max_grad_norm", "Training", help="Max gradient norm for clipping."),
     OptSpec(
         "warmup_ratio",
@@ -441,7 +447,22 @@ _SPECS = [
     OptSpec(
         "dp_size",
         "Distributed",
-        help="Data-parallel replicas; total GPUs/processes = dp_size x cp_size.",
+        help="Data-parallel replicas; total processes = dp_size x cp_size x tp_size x pp_size.",
+    ),
+    OptSpec("pp_size", "Distributed", help="Pipeline stages per data replica."),
+    OptSpec(
+        "pp_split_points",
+        "Distributed",
+        type=int,
+        multiple=True,
+        help="First decoder layer of each subsequent stage.",
+    ),
+    OptSpec(
+        "pp_checkpoint_counts",
+        "Distributed",
+        type=int,
+        multiple=True,
+        help="Number of leading blocks to recompute per stage.",
     ),
     OptSpec(
         "cp_size",
@@ -693,6 +714,14 @@ def print_dry_run(config: TrainConfig, param_path: str, resume: bool) -> None:
         ("Load state dict", config.state_dict_load_options(resume)),
         ("Resume", resume),
     ]
+    if config.pp_size > 1:
+        rows.extend(
+            [
+                ("PP stages", config.pp_size),
+                ("PP split points", config.pp_split_points),
+                ("PP checkpoint counts", config.pp_checkpoint_counts),
+            ]
+        )
     if config.callbacks:
         rows.append(("Callbacks", [asdict(spec) for spec in config.callbacks]))
     click.secho("\n=== Training Plan (dry-run) ===", fg="cyan", bold=True)

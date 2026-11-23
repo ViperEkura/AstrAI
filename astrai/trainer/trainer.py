@@ -300,6 +300,26 @@ class Trainer:
         rollout_metrics: Optional[Dict[str, float]] = None,
     ) -> None:
         """Reduce true objective numerators before committing one update."""
+        if context.config.pp_size > 1:
+            self._call_callbacks("on_batch_begin", context)
+            context.loss = context.executor.backward_window(
+                context.model, chunks, window_samples
+            )
+            context.metrics = {"loss": context.loss, "task_loss": context.loss}
+            self._call_callbacks("on_batch_end", context)
+        else:
+            self._backward_chunks(context, chunks)
+        if final_update:
+            context.pending_samples = window_samples
+        records = self._commit_global_update(
+            context, new_data=final_update, rollout_metrics=rollout_metrics
+        )
+        if final_update:
+            context.epoch_sample_offset = window_end
+            context.checkpoint_safe = True
+        self._after_commit(context, records, agree_stop=final_update)
+
+    def _backward_chunks(self, context: TrainContext, chunks) -> None:
         local_count = 0.0
         local_loss = 0.0
         local_metrics: Dict[str, float] = {}
@@ -348,15 +368,6 @@ class Trainer:
             for index, name in enumerate(local_metrics)
         }
         context.metrics["loss"] = context.loss
-        if final_update:
-            context.pending_samples = window_samples
-        records = self._commit_global_update(
-            context, new_data=final_update, rollout_metrics=rollout_metrics
-        )
-        if final_update:
-            context.epoch_sample_offset = window_end
-            context.checkpoint_safe = True
-        self._after_commit(context, records, agree_stop=final_update)
 
     def _train_global_epoch(self, context: TrainContext, epoch: int) -> None:
         if context.epoch < epoch and context.epoch_sample_offset == context.dataset_len:

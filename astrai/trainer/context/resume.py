@@ -202,6 +202,8 @@ class ResumeLoader:
             )
         state.epoch = checkpoint.epoch
         meta = checkpoint.meta
+        if meta.get("pp_size", 1) != self.config.pp_size:
+            raise ValueError("Cannot resume: pipeline size changed")
         if meta.get("resume_contract_version") != 1:
             raise ValueError(
                 f"Unsupported resume contract version "

@@ -24,7 +24,8 @@ struct Fp8Meta {
      */
     std::shared_ptr<ScaleRing> x;
     ScaleRing g;
-    WeightCast cast;
+    int64_t weight_version = -1; // fold weight amax once per update
+    at::ScalarType weight_format = at::ScalarType::Undefined;
     /*
      * Weak on purpose: it keeps a dead TensorImpl's address from being recycled
      * (so the pointer comparison stays an identity) and its expiry *is* the
@@ -101,7 +102,6 @@ struct State {
      * queued: a model-shape change across the checkpoint just re-seeds.
      */
     std::vector<MetaSnapshot> pending;
-    std::atomic<int64_t> generation{0}; // bumped by restore / reset / recipe rebuild
 };
 
 State& state();

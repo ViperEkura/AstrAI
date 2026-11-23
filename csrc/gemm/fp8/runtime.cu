@@ -53,11 +53,7 @@ void drop_meta(State& st, const std::shared_ptr<Fp8Meta>& meta) {
 }
 
 /*
- * Re-point a slot's meta at a new weight tensor, keeping the rings: TP/FSDP swap
- * the Parameter, not the module. The cast cache must still go — it keys on the
- * version counter, and a fresh parameter starts at a version its predecessor may
- * have been cast at. A kept ring means the first fold after the swap still uses
- * the previous scale (a wild magnitude change clips for one step).
+ * Keep the delayed scales when a module replaces its parameter.
  */
 void rebind_meta_locked(const std::shared_ptr<Fp8Meta>& meta, const Tensor& w) {
     State& st = state();
@@ -69,7 +65,7 @@ void rebind_meta_locked(const std::shared_ptr<Fp8Meta>& meta, const Tensor& w) {
     meta->anchor = c10::weak_intrusive_ptr<c10::TensorImpl>(w.getIntrusivePtr());
     meta->shape.assign(w.sizes().begin(), w.sizes().end());
     meta->dtype = w.scalar_type();
-    meta->cast = WeightCast{};
+    meta->weight_version = -1;
     st.by_key.emplace(meta->key, meta);
 }
 
@@ -89,6 +85,7 @@ void restore_pending_locked(const std::shared_ptr<Fp8Meta>& meta) {
     auto& pending = state().pending;
     const auto restore = [&](size_t i) {
         const auto& entry = pending[i];
+        meta->weight_version = -1;
         restore_ring(meta->w, entry.w);
         restore_ring(*meta->x, entry.x);
         restore_ring(meta->g, entry.g);
@@ -116,10 +113,10 @@ void restore_pending_locked(const std::shared_ptr<Fp8Meta>& meta) {
 /*
  * Find or create a weight's rings. A slot survives a replaced weight tensor —
  * only the identity is re-pointed (rebind_meta_locked). A recipe change, or a
- * failed ownership check on the address path, rebuilds with a generation bump
- * that invalidates the cast caches; fresh rings re-seed on the next forward.
- * Without a slot the address-keyed path runs unchanged (bare calls, benches, and
- * the backward pass, which reaches its meta through the weight forward saved).
+ * failed ownership check on the address path, rebuilds the rings for the next
+ * forward. Without a slot the address-keyed path runs unchanged (bare calls,
+ * benches, and the backward pass, which reaches its meta through the weight
+ * forward saved).
  */
 std::shared_ptr<Fp8Meta>
 get_meta(const Tensor& w, int64_t history_len, int64_t margin, int64_t slot) {
@@ -151,7 +148,6 @@ get_meta(const Tensor& w, int64_t history_len, int64_t margin, int64_t slot) {
                 return meta;
             }
             drop_meta(st, meta);
-            st.generation.fetch_add(1, std::memory_order_relaxed);
         }
     }
     const std::string key = meta_key(w);
@@ -171,7 +167,6 @@ get_meta(const Tensor& w, int64_t history_len, int64_t margin, int64_t slot) {
             return meta;
         }
         drop_meta(st, meta);
-        st.generation.fetch_add(1, std::memory_order_relaxed);
     }
     const auto opts = torch::TensorOptions().dtype(at::kFloat).device(w.device());
     auto meta = std::make_shared<Fp8Meta>(w);
@@ -311,7 +306,7 @@ void fp8_load_state_dict(py::dict sd) {
     State& st = state();
     std::lock_guard<std::mutex> lock(st.mu);
     st.pending = std::move(pending);
-    st.generation.fetch_add(1, std::memory_order_relaxed);
+    st.act_cache.clear();
     for (auto& meta : st.order)
         restore_pending_locked(meta);
 }
@@ -344,7 +339,6 @@ void fp8_reset() {
     st.by_slot.clear();
     st.order.clear();
     st.pending.clear();
-    st.generation.fetch_add(1, std::memory_order_relaxed);
     st.act_cache.clear();
 }
 
@@ -374,8 +368,6 @@ py::dict fp8_debug_meta(const Tensor& w, int64_t history_len, int64_t margin, in
     out["w"] = ring(meta->w);
     out["x"] = ring(*meta->x);
     out["g"] = ring(meta->g);
-    out["cast_version"] = meta->cast.version;
-    out["has_cast"] = meta->cast.out.defined();
     out["slot"] = meta->slot;
     out["slot_name"] = meta->slot_name;
     out["role"] = meta->role;

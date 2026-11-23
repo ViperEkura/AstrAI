@@ -515,6 +515,8 @@ class PrecisionOptimizer(Optimizer):
                 )
         for work in pending:
             work.wait()
+        # Collectives write through detached storage on every rank.
+        torch.autograd.graph.increment_version(self._all_model_params)
 
     @contextmanager
     def checkpoint_context(self):

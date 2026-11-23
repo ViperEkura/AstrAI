@@ -6,7 +6,8 @@
 namespace astrai::attention {
 
 // Prefill retains packed stores; decode retains scalar stores and its register footprint.
-template <typename Traits, bool Vectorized = false> struct OutputEpilogue {
+template <typename Traits, bool Vectorized = false>
+struct OutputEpilogue {
     static DEVICE_FORCEINLINE void store(const AttentionParams& p,
                                          const AttentionTile<Traits>& tile) {
         using T = typename Traits::Elem;
@@ -35,7 +36,8 @@ template <typename Traits, bool Vectorized = false> struct OutputEpilogue {
 };
 
 // Split-KV keeps FP32 unnormalized accumulators until the combine pass.
-template <typename Traits> struct SplitEpilogue {
+template <typename Traits>
+struct SplitEpilogue {
     static DEVICE_FORCEINLINE void store(const AttentionParams& p,
                                          const AttentionTile<Traits>& tile) {
         const int column = Traits::FragmentLayout::column(threadIdx.x % 32);

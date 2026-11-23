@@ -13,13 +13,13 @@ struct SplitWorkspace {
 static SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& o_part_buf,
                                             const c10::optional<torch::Tensor>& ml_part_buf,
                                             AttentionParams& p,
-                                            const detail::DecodeLaunchPlan& plan,
+                                            bool direct_output,
                                             const torch::Tensor& q) {
     const bool has_o = o_part_buf.has_value() && o_part_buf->defined();
     const bool has_ml = ml_part_buf.has_value() && ml_part_buf->defined();
     TORCH_CHECK(has_o == has_ml, "split buffers must be provided together");
     SplitWorkspace workspace;
-    p.split_stride = std::max(MAX_SPLITS, static_cast<int>(plan.grid.z));
+    p.split_stride = std::max(MAX_SPLITS, p.num_splits);
     const int64_t o_needed = (int64_t)p.batch * p.q_head * p.split_stride * p.head_dim;
     const int64_t ml_needed = (int64_t)p.batch * p.q_head * p.split_stride * 2;
     // The standard reusable workspace has MAX_SPLITS slots. Longer fixed
@@ -36,7 +36,7 @@ static SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
         // The optional function arguments already retain these caller buffers.
         p.o_part = o_part_buf->data_ptr<float>();
         p.ml_part = ml_part_buf->data_ptr<float>();
-    } else if (!plan.direct_output) {
+    } else if (!direct_output) {
         const auto options = q.options().dtype(torch::kFloat32);
         workspace.o_part = torch::empty({p.batch, p.q_head, p.split_stride, p.head_dim}, options);
         workspace.ml_part = torch::empty({p.batch, p.q_head, p.split_stride, 2}, options);
@@ -149,18 +149,13 @@ torch::Tensor attention_with_kvcache(torch::Tensor q,
         out = torch::empty_strided(q.sizes(), q.strides(), q.options());
     p.o_ptr = out.data_ptr();
     auto stream = at::cuda::getCurrentCUDAStream();
-    visit_dtype<AttentionTypes>(
-        q.scalar_type(),
-        [&](auto tag) {
-            using T = typename decltype(tag)::Type;
-            launch_attention_with_kvcache<T>(p, stream, [&](auto kernel, auto plan) {
-                auto workspace = resolve_split_buffers(op, ml, p, plan, q);
-                kernel.launch(p, plan, stream);
-            });
-        },
-        [](at::ScalarType d) {
-            return unsupported_dtype_message<AttentionTypes>("cache attention", d);
-        });
+    auto allocate = [&](bool direct_output) {
+        return resolve_split_buffers(op, ml, p, direct_output, q);
+    };
+    if (q.scalar_type() == at::kBFloat16)
+        launch_attention_with_kvcache<bf16>(p, stream, allocate);
+    else
+        launch_attention_with_kvcache<fp16>(p, stream, allocate);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return shape.size() == 4 ? out.view(shape) : out;
 }

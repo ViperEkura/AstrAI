@@ -3,7 +3,7 @@
 The kernels are dtype-agnostic at the ABI (void* pointers, the element type
 being a compile-time kernel parameter) and instantiated per element type; each
 entry switches on q's ``at::ScalarType`` over the family's instantiation list
-(``AttentionTypes``) and refuses anything else.  These tests pin the two
+(BF16/FP16) and refuses anything else.  These tests pin the two
 halves of that contract: the instantiated type runs, and any other precision
 fails loudly instead of being reinterpreted as the instantiated one — the
 failure mode that matters, since a void* carries no type of its own.

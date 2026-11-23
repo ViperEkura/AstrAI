@@ -101,34 +101,34 @@ specializations and does not depend on a GPU architecture.
 
 ## Native launch dispatch
 
-Attention follows the same typed query, plan, and launch structure as GEMM,
-with three operation launchers and their private shared dispatch in
-`launcher/attention.cuh`. The device-only `kernel/attention/` directory owns
-mainloops, addressing, masks and epilogues:
+The three operation launchers in `launcher/attention.cuh` select template
+specializations and launch directly. There are no kernel wrapper classes,
+query objects, launch plans, typed visitors or nested `detail` namespace.
+This follows the direct templated launch structure of
+[FlashAttention](https://github.com/Dao-AILab/flash-attention/blob/main/csrc/flash_attn/src/flash_fwd_launch_template.h);
+AstrAI retains its own tile recipes and memory policies.
 
-1. `with_prefill_kernel` / `with_decode_kernel` select the head dimension
-   and mask specialization once. Prefill also selects causality. Paged
-   prefill selects a mask-coverage specialization: full masks omit redundant
-   extent checks, while partial masks retain them. Cache capacity and total
-   query rows provide conservative bounds without device reads. Dense prefill
-   retains the checked mask kernel for stable compiler code generation.
-2. The selected kernel type builds a plan from host metadata. Decode uses a
-   `DecodePlanQuery` containing grid dimensions, KV tile count and cached
-   occupancy. `make_decode_plan` is a pure split policy.
-3. The torch entry validates or allocates scratch using that plan, then the
-   same kernel type launches it. Native harnesses use the same visitor and
-   planner without depending on torch.
+Each native entry checks BF16/FP16 support before dispatch, then directly calls
+its launcher with `bf16` first and `fp16` otherwise. Attention does not use type lists, dtype
+tags, recursive visitors or error-formatting callbacks.
 
-Plans contain launch geometry and output mode, never tensor addresses or
-device sequence lengths. Every call plans from its current shape; residual
-split fields in `AttentionParams` do not bypass planning. Paged decode uses
-the host cache capacity, so device lengths can change during graph replay.
-The existing tile recipes, occupancy reference and split limits are retained.
-The private tiled and split-KV helpers share that selection with the three
-operation launchers; they are not separate operator entry points. The Torch cache entry retains scratch tensors through
-launch; no call-wrapper object or Dispatch/Entry class is needed.
-Scratch still uses the kernel's `MAX_SPLITS` stride, and caller-supplied
-buffers are validated even when direct output needs no scratch.
+Dense and varlen use `launch_attention_split_q` with different addressing.
+Cache appends K/V before tiled attention for packed queries; single-token
+queries use `launch_attention_split_kv` with fused append. The split-KV
+launcher selects fixed/adaptive splitting and direct/combined output itself.
+Head dimension, causality, mask coverage and aligned loads retain their existing
+specializations.
+
+Decode computes its split count from the current cache capacity and cached
+kernel occupancy. The only allocation callback belongs to the native caller:
+it validates reusable scratch or creates tensors after the split count is
+known, returning owners held through launch. It does not select or launch
+kernels. Caller scratch is validated even for direct output. This keeps Torch
+allocation outside the launcher without reserving unnecessary buffers.
+
+CUDA Graph replay continues to read device sequence lengths and page tables
+at stable addresses. Tile shapes, split limits and the occupancy reference
+are unchanged; no device synchronization or extra metadata kernel is added.
 
 Paged decode selects aligned or unaligned new-token loads from host pointer
 and stride metadata. The aligned kernel copies new K/V fragments in 16-byte

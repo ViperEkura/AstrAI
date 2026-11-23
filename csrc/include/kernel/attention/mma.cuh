@@ -13,7 +13,8 @@
 namespace astrai {
 namespace attention {
 
-template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> struct KernelTraits {
+template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16>
+struct KernelTraits {
     using Elem = T_;
     using Atom = MmaOp<Elem, Elem, typename MmaShapeFor<Elem>::type>;
     using FragmentLayout = typename Atom::Layout;
@@ -53,14 +54,15 @@ template <int HEAD_DIM_, int BC_, int WARPS_, int STAGES_, typename T_ = bf16> s
 };
 
 /* Typed tile operations compose the shared warp atom without owning storage or masks. */
-template <typename Traits> struct AttentionMma {
+template <typename Traits>
+struct AttentionMma {
     using T = typename Traits::Elem;
     using Atom = typename Traits::Atom;
     using QueryFragment = typename Traits::QueryFragment;
     using ScoreFragment = typename Traits::ScoreFragment;
     using OutputFragment = typename Traits::OutputFragment;
-    static DEVICE_FORCEINLINE void load_query(const AttentionParams& p, const QueryRows& q,
-                                              int lane, QueryFragment& frag) {
+    static DEVICE_FORCEINLINE void
+    load_query(const AttentionParams& p, const QueryRows& q, int lane, QueryFragment& frag) {
         const int column = Traits::FragmentLayout::column(lane);
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -84,8 +86,8 @@ template <typename Traits> struct AttentionMma {
         astrai::ldmatrix_x4_lane<Transpose>(b, __cvta_generic_to_shared(tile + offset));
     }
 
-    static DEVICE_FORCEINLINE void scores(const QueryFragment& query, const T* keys,
-                                         int lane, ScoreFragment& scores) {
+    static DEVICE_FORCEINLINE void
+    scores(const QueryFragment& query, const T* keys, int lane, ScoreFragment& scores) {
         constexpr int N = Atom::Shape::kN;
 #pragma unroll
         for (int n = 0; n < Traits::NC8; n += 2) {

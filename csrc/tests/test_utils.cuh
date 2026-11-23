@@ -32,7 +32,8 @@ struct BenchResult {
     double tflops;
 };
 
-template <typename Fn> BenchResult bench_kernel(Fn launch, int warmup, int iters, double flops) {
+template <typename Fn>
+BenchResult bench_kernel(Fn launch, int warmup, int iters, double flops) {
     for (int i = 0; i < warmup; i++)
         launch();
     cudaDeviceSynchronize();
@@ -80,17 +81,22 @@ inline void print_test_row(const char* cfg, float max_abs_err, float max_rel_err
     printf("%-46s | %11.3e | %11.3e | %s\n", cfg, max_abs_err, max_rel_err, pass ? "PASS" : "FAIL");
 }
 
-template <int... Ds> struct _HeadSwitch;
+template <int... Ds>
+struct _HeadSwitch;
 
-template <int D> struct _HeadSwitch<D> {
-    template <typename Fn> static void call(int hd, Fn&& fn) {
+template <int D>
+struct _HeadSwitch<D> {
+    template <typename Fn>
+    static void call(int hd, Fn&& fn) {
         if (hd == D)
             fn.template operator()<D>();
     }
 };
 
-template <int D, int... Rest> struct _HeadSwitch<D, Rest...> {
-    template <typename Fn> static void call(int hd, Fn&& fn) {
+template <int D, int... Rest>
+struct _HeadSwitch<D, Rest...> {
+    template <typename Fn>
+    static void call(int hd, Fn&& fn) {
         if (hd == D)
             fn.template operator()<D>();
         else
@@ -99,12 +105,14 @@ template <int D, int... Rest> struct _HeadSwitch<D, Rest...> {
 };
 
 // Default set: 32, 64, 128, 256
-template <typename Fn> void dispatch_by_head_dim(int head_dim, Fn&& fn) {
+template <typename Fn>
+void dispatch_by_head_dim(int head_dim, Fn&& fn) {
     _HeadSwitch<32, 64, 128, 256>::call(head_dim, fn);
 }
 
 // Set default strides for contiguous b h l d layout on AttentionParams.
-template <typename P> inline void set_default_strides(P& p) {
+template <typename P>
+inline void set_default_strides(P& p) {
     p.q_b_stride = p.q_head * p.q_len * p.head_dim;
     p.q_h_stride = p.q_len * p.head_dim;
     p.q_l_stride = p.head_dim;

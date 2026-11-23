@@ -8,7 +8,7 @@
 #include <torch/extension.h>
 
 #include <api/native/attention.h>
-#include <api/torch/dispatch.cuh>
+#include <datatype/element.cuh>
 #include <launcher/attention.cuh>
 
 namespace astrai {
@@ -32,9 +32,6 @@ inline void check_int32_offset(const torch::Tensor& tensor, const char* name, in
     }
 }
 
-/* Supported kernel element types, shared by the three Torch entries. */
-using AttentionTypes = TypeList<bf16, fp16>;
-
 /* Kernels use one dtype for Q/K/V/O, dispatched from Q's scalar type. */
 inline void
 check_qkv_dtype(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v) {
@@ -45,11 +42,8 @@ check_qkv_dtype(const torch::Tensor& q, const torch::Tensor& k, const torch::Ten
                 "), got ", k.scalar_type());
     TORCH_CHECK(v.scalar_type() == q.scalar_type(), "V dtype must match Q (", q.scalar_type(),
                 "), got ", v.scalar_type());
-    visit_dtype<AttentionTypes>(
-        q.scalar_type(), [](auto) {},
-        [](at::ScalarType dtype) {
-            return unsupported_dtype_message<AttentionTypes>("attention", dtype);
-        });
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 || q.scalar_type() == at::kHalf,
+                "attention has no kernel for ", q.scalar_type(), " (instantiated: BFloat16, Half)");
 }
 
 // K and V use one stride tuple in the kernel. MLA can project V as an interleaved view.
@@ -70,7 +64,9 @@ inline void finish_pack(c10::optional<double> scale, AttentionParams& p) {
                 "attention batch, heads, and query length must be positive");
     TORCH_CHECK(static_cast<int64_t>(p.batch) * p.q_head <= std::numeric_limits<int>::max(),
                 "attention batch * q_head exceeds int32 range");
-    detail::with_head_dim(p.head_dim, [](auto) {});
+    TORCH_CHECK(p.head_dim == 32 || p.head_dim == 64 || p.head_dim == 128 || p.head_dim == 256,
+                "attention head_dim ", p.head_dim,
+                " has no kernel instantiation (instantiated: 32 64 128 256)");
     p.scale = (float)value;
     p.o_ptr = nullptr;
     p.o_part = nullptr;

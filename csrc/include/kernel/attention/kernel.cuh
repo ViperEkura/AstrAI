@@ -64,7 +64,8 @@ struct QueryRows {
 };
 
 // Bottom-right causality aligns the last query with the last key.
-template <bool Causal> struct VisibleKeys {
+template <bool Causal>
+struct VisibleKeys {
     int kv_len, q_len;
     DEVICE_FORCEINLINE int count(int token) const {
         if constexpr (Causal) {
@@ -75,7 +76,8 @@ template <bool Causal> struct VisibleKeys {
     }
 };
 
-template <class Layout, bool HasMask, bool MaskCoversShape = false> struct AttentionMask {
+template <class Layout, bool HasMask, bool MaskCoversShape = false>
+struct AttentionMask {
     const bool* mask;
     int base[2], end[2], columns[2];
 
@@ -100,7 +102,8 @@ template <class Layout, bool HasMask, bool MaskCoversShape = false> struct Atten
         }
     }
 
-    template <int N> DEVICE_FORCEINLINE void apply(float (&scores)[N][4], int kv0) const {
+    template <int N>
+    DEVICE_FORCEINLINE void apply(float (&scores)[N][4], int kv0) const {
 #pragma unroll
         for (int n = 0; n < N; ++n) {
 #pragma unroll
@@ -114,12 +117,14 @@ template <class Layout, bool HasMask, bool MaskCoversShape = false> struct Atten
     }
 };
 
-template <typename Traits> struct AttentionStorage {
+template <typename Traits>
+struct AttentionStorage {
     alignas(16) typename Traits::Elem k[Traits::STAGES * Traits::BC * Traits::LD];
     alignas(16) typename Traits::Elem v[Traits::STAGES * Traits::BC * Traits::LD];
 };
 
-template <typename Traits> struct AttentionTile {
+template <typename Traits>
+struct AttentionTile {
     QueryRows query;
     AttentionAccumulator<Traits> accum;
 };
@@ -134,7 +139,8 @@ __global__ void attention_kernel(const AttentionParams p) {
         Epilogue::store(p, tile);
 }
 
-template <typename T> __global__ void append_kv(AttentionParams p) {
+template <typename T>
+__global__ void append_kv(AttentionParams p) {
     const int token = blockIdx.x;
     int lo = 0, hi = p.batch;
     while (lo + 1 < hi) {

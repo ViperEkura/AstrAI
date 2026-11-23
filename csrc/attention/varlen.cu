@@ -47,7 +47,9 @@ static AttentionParams pack_varlen(const torch::Tensor& q,
     p.is_causal = causal;
     p.scale = scale;
     TORCH_CHECK(std::isfinite(p.scale) && p.scale > 0, "native scale must be positive and finite");
-    detail::with_head_dim(p.head_dim, [](auto) {});
+    TORCH_CHECK(p.head_dim == 32 || p.head_dim == 64 || p.head_dim == 128 || p.head_dim == 256,
+                "attention head_dim ", p.head_dim,
+                " has no kernel instantiation (instantiated: 32 64 128 256)");
     return p;
 }
 
@@ -73,16 +75,12 @@ torch::Tensor attention_varlen(torch::Tensor q,
     auto out = torch::empty_like(q);
     auto stream = at::cuda::getCurrentCUDAStream();
     p.o_ptr = out.data_ptr();
-    if (p.q_len)
-        visit_dtype<AttentionTypes>(
-            q.scalar_type(),
-            [&](auto tag) {
-                using T = typename decltype(tag)::Type;
-                launch_attention_varlen<T>(p, stream);
-            },
-            [](at::ScalarType d) {
-                return unsupported_dtype_message<AttentionTypes>("varlen", d);
-            });
+    if (p.q_len) {
+        if (q.scalar_type() == at::kBFloat16)
+            launch_attention_varlen<bf16>(p, stream);
+        else
+            launch_attention_varlen<fp16>(p, stream);
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }

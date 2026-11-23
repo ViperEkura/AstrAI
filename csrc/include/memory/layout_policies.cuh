@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cfloat>
 #include <api/native/attention.h>
+#include <cfloat>
 #include <cuda_bf16.h>
 #include <datatype/element.cuh>
 #include <memory/pipeline.cuh>
@@ -17,7 +17,8 @@ namespace astrai {
 namespace attention {
 
 /* One shared-memory layout is used by both the tile producer and MMA consumer. */
-template <int LeadingDim> struct SharedTileLayout {
+template <int LeadingDim>
+struct SharedTileLayout {
     static_assert(LeadingDim >= 16 && (LeadingDim & (LeadingDim - 1)) == 0,
                   "shared attention tiles require a power-of-two leading dimension");
     static constexpr int kMask = LeadingDim >= 64 ? 7 : LeadingDim / 8 - 1;
@@ -26,7 +27,8 @@ template <int LeadingDim> struct SharedTileLayout {
     }
 };
 
-template <typename Traits> struct KVTileLoader {
+template <typename Traits>
+struct KVTileLoader {
     // Keep the uncommon scalar path out of the unrolled asynchronous loader.
     static __device__ __noinline__ void load_unaligned(typename Traits::Elem* dst_k,
                                                        typename Traits::Elem* dst_v,
@@ -131,8 +133,8 @@ struct KVAddr {
 
 // An extra tile per segment makes this device-only schedule independent of
 // max_seqlen. Prefix differences own enough tiles even for unaligned starts.
-static DEVICE_FORCEINLINE int segment_for_tile(const int* offsets, int batch, int group,
-                                              int tile_size, int tile) {
+static DEVICE_FORCEINLINE int
+segment_for_tile(const int* offsets, int batch, int group, int tile_size, int tile) {
     int lo = 0, hi = batch;
     while (lo + 1 < hi) {
         int mid = lo + (hi - lo) / 2;
@@ -161,8 +163,8 @@ struct VarlenQSchedule {
     static HOST_FORCEINLINE int packed_grid_x(const AttentionParams& p, int, int rows) {
         return int((int64_t)p.q_len * (p.q_head / p.kv_head) / rows) + p.batch;
     }
-    static DEVICE_FORCEINLINE void map_packed_block(const AttentionParams& p, int rows,
-                                                   int tile, int& batch, int& packed0) {
+    static DEVICE_FORCEINLINE void
+    map_packed_block(const AttentionParams& p, int rows, int tile, int& batch, int& packed0) {
         const int group = p.q_head / p.kv_head;
         batch = segment_for_tile(p.cu_seqlens_q, p.batch, group, rows, tile);
         const int first = int((int64_t)p.cu_seqlens_q[batch] * group / rows) + batch;
@@ -171,7 +173,8 @@ struct VarlenQSchedule {
 };
 
 // Contiguous K/V
-template <typename T> struct ContigKV {
+template <typename T>
+struct ContigKV {
     using Elem = T;
     static constexpr bool kPaged = false;
     struct Context {
@@ -234,7 +237,8 @@ template <typename T> struct ContigKV {
     }
 };
 
-template <typename T> struct VarlenKV : ContigKV<T> {
+template <typename T>
+struct VarlenKV : ContigKV<T> {
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
         return p.cu_seqlens_k[batch + 1] - p.cu_seqlens_k[batch];
     }
@@ -246,7 +250,8 @@ template <typename T> struct VarlenKV : ContigKV<T> {
 };
 
 // Paged K/V backed by an SGLang-style flat pool
-template <typename T, bool AlignedNewKV = true> struct PagedKV {
+template <typename T, bool AlignedNewKV = true>
+struct PagedKV {
     using Elem = T;
     static constexpr bool kPaged = true;
     struct Context {
@@ -307,17 +312,20 @@ template <typename T, bool AlignedNewKV = true> struct PagedKV {
     template <int HEAD_DIM>
     static DEVICE_FORCEINLINE Context make_ctx(const AttentionParams& p, int batch, int kv_head) {
         const int shift = (p.page_size & (p.page_size - 1)) == 0 ? __ffs(p.page_size) - 1 : -1;
-        return {p.page_table + (int64_t)batch * p.table_stride,
-                (int64_t)p.kv_head * HEAD_DIM, (int64_t)kv_head * HEAD_DIM, shift};
+        return {p.page_table + (int64_t)batch * p.table_stride, (int64_t)p.kv_head * HEAD_DIM,
+                (int64_t)kv_head * HEAD_DIM, shift};
     }
     static DEVICE_FORCEINLINE int
     resolve_token(const AttentionParams& p, const Context& c, int kc, bool valid) {
-        if (!valid) return -1;
-        if (kc < 0 || kc >= p.kv_len) return -1;
+        if (!valid)
+            return -1;
+        if (kc < 0 || kc >= p.kv_len)
+            return -1;
         // Cache the power-of-two divisor once per request, outside the KV tile loop.
         const int block = c.page_shift >= 0 ? kc >> c.page_shift : kc / p.page_size;
         const int page = c.pages[block];
-        if (page < 0 || page >= p.num_pages) __trap();
+        if (page < 0 || page >= p.num_pages)
+            __trap();
         return page * p.page_size + (kc - block * p.page_size);
     }
     static DEVICE_FORCEINLINE KVAddr kv_addr_from_token(const AttentionParams& p,

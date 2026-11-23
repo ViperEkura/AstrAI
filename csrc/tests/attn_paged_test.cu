@@ -16,7 +16,10 @@ using namespace astrai::attention;
 // Element type is the dispatcher's parameter; head_dim resolves inside.
 using bf16 = astrai::bf16;
 
-
+static void launch_paged_decode(AttentionParams& p) {
+    auto allocate = [](bool) { return 0; };
+    launch_attention_split_kv<PagedKV<bf16>>(p, 0, allocate);
+}
 
 /*
  * ---- CPU reference: paged decode with variable seq_lens ----
@@ -278,7 +281,8 @@ struct PagedRig {
             h_kvi[b + 1] = h_kvi[b] + kv_lens[b];
         cudaMemcpy(d_rtt, h_rtt.data(), h_rtt.size() * sizeof(int), cudaMemcpyHostToDevice);
         std::vector<int> past(B);
-        for (int b = 0; b < B; ++b) past[b] = kv_lens[b] - q_lens[b];
+        for (int b = 0; b < B; ++b)
+            past[b] = kv_lens[b] - q_lens[b];
         cudaMemcpy(d_past, past.data(), B * sizeof(int), cudaMemcpyHostToDevice);
         if (d_qoi) {
             h_qoi.assign(B + 1, 0);
@@ -379,7 +383,7 @@ static int run_decode_test(int B,
 
     AttentionParams p = rig.base_params();
     p.is_causal = causal;
-    detail::launch_decode<PagedKV<bf16>>(p, 0);
+    launch_paged_decode(p);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -433,7 +437,7 @@ static int run_decode_mask_test(int B, int Hq, int Hkv, int max_seq, int seed) {
     p.mask_b_stride = rig.max_sl;
     p.mask_h_stride = 0;
     p.mask_q_stride = 0;
-    detail::launch_decode<PagedKV<bf16>>(p, 0);
+    launch_paged_decode(p);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -473,10 +477,9 @@ static int run_prefill_test(int B,
                           rig.h_qoi.data(), nullptr, 0, 0, B, Hq, Hkv, HEAD_DIM, rig.max_ctx,
                           causal, ref);
 
-
     AttentionParams p = rig.base_params();
     p.is_causal = causal;
-    detail::launch_prefill<VarlenQSchedule, PagedKV<bf16>>(p, 0);
+    launch_attention_split_q<VarlenQSchedule, PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -490,7 +493,8 @@ static int run_prefill_test(int B,
 /*
  * PREFILL WITH MASK TEST (regression: 4D causal mask on single request)
  */
-template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
+template <int HEAD_DIM>
+static int run_prefill_mask_test(int Hq, int Hkv, int q_len, int seed) {
     srand(seed);
     std::vector<int> ql = {q_len}, kl = {q_len};
     PagedRig rig(1, Hq, Hkv, HEAD_DIM, ql, kl,
@@ -517,7 +521,6 @@ template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_
                           rig.h_qoi.data(), rig.h_mask, q_len, q_len, 1, Hq, Hkv, HEAD_DIM,
                           rig.max_ctx, 0, ref);
 
-
     AttentionParams p = rig.base_params();
     p.is_causal = false;
     p.mask = rig.d_mask;
@@ -526,7 +529,7 @@ template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_
     p.mask_b_stride = 0;
     p.mask_h_stride = 0;
     p.mask_q_stride = q_len;
-    detail::launch_prefill<VarlenQSchedule, PagedKV<bf16>>(p, 0);
+    launch_attention_split_q<VarlenQSchedule, PagedKV<bf16>>(p, 0);
     cudaDeviceSynchronize();
 
     int fail = rig.check(cfg, ref);
@@ -540,7 +543,8 @@ template <int HEAD_DIM> static int run_prefill_mask_test(int Hq, int Hkv, int q_
 /*
  * BENCH
  */
-template <int HEAD_DIM> static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
+template <int HEAD_DIM>
+static void bench_decode(int B, int Hq, int Hkv, int seq_len) {
     PagedRig rig(B, Hq, Hkv, HEAD_DIM, std::vector<int>(B, 1), std::vector<int>(B, seq_len),
                  /*ragged=*/false,
                  /*split_partials=*/true,
@@ -551,7 +555,7 @@ template <int HEAD_DIM> static void bench_decode(int B, int Hq, int Hkv, int seq
 
     AttentionParams p = rig.base_params();
     p.is_causal = true;
-    auto launch = [&]() { detail::launch_decode<PagedKV<bf16>>(p, 0); };
+    auto launch = [&]() { launch_paged_decode(p); };
     /*
      * Decode: q_len=1, query is the last token → attends to all [0, seq_len).
      * FLOPs = 2 * (QK^T + PV) = 4 * B * Hq * seq_len * D.
@@ -578,7 +582,7 @@ static void bench_prefill(int B, int Hq, int Hkv, int q_len, int kv_len, int cau
     AttentionParams p = rig.base_params();
     p.is_causal = causal;
 
-    auto launch = [&]() { detail::launch_prefill<VarlenQSchedule, PagedKV<bf16>>(p, 0); };
+    auto launch = [&]() { launch_attention_split_q<VarlenQSchedule, PagedKV<bf16>>(p, 0); };
     /*
      * FLOPs = 2 * (QK^T + PV) = 4 * effective_qk_pairs * Hq * D.
      * Non-causal: effective = q_len * kv_len.

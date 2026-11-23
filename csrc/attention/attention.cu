@@ -82,15 +82,10 @@ torch::Tensor attention(torch::Tensor q,
     p.o_ptr = O.data_ptr();
     set_kv_split_size(p, kv_split_size);
 
-    visit_dtype<AttentionTypes>(
-        q.scalar_type(),
-        [&](auto tag) {
-            using T = typename decltype(tag)::Type;
-            launch_attention<T>(p, stream);
-        },
-        [](at::ScalarType dtype) {
-            return unsupported_dtype_message<AttentionTypes>("attention", dtype);
-        });
+    if (q.scalar_type() == at::kBFloat16)
+        launch_attention<bf16>(p, stream);
+    else
+        launch_attention<fp16>(p, stream);
     C10_CUDA_CHECK(cudaGetLastError());
     return O;
 }

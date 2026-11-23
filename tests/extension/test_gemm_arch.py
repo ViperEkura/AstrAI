@@ -216,3 +216,31 @@ def test_operand_device_guard_covers_packing_and_restores_current_device():
     torch.testing.assert_close(
         output, (a.float() @ b.float().T).to(torch.bfloat16), atol=0, rtol=0
     )
+
+
+@pytest.mark.cuda
+@skip_no_kernel
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
+)
+@pytest.mark.parametrize(
+    "k,padding,offset",
+    [(512, 8, 0), (512, 8, 1), (512, 7, 0), (512, 16, 0), (511, 9, 0), (513, 15, 8)],
+)
+def test_stage_copy_alignment(dtype, trans_b, k, padding, offset):
+    if dtype != torch.bfloat16 and not kernel.gemm.capabilities()["fp8"]:
+        pytest.skip("no compiled FP8 MMA for this device")
+    # Padding by 8 elements adds 16 bytes for BF16 and 8 bytes for FP8.
+    m, n = 128, 256
+
+    def operand(rows, cols):
+        storage = torch.randint(-3, 4, (rows, cols + padding), device="cuda").to(dtype)
+        return storage[:, offset : offset + cols]
+
+    a = operand(m, k)
+    b = operand(n, k) if trans_b else operand(k, n)
+    with plan.override(tma=False, mx=False):
+        actual = kernel.gemm.quant_gemm(a, b, trans_b=trans_b)
+    expected = a.float() @ (b.float().T if trans_b else b.float())
+    torch.testing.assert_close(actual, expected.bfloat16(), atol=0, rtol=0)

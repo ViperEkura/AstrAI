@@ -10,9 +10,7 @@
 
 #include <api/native/gemm.h>
 #include <datatype/dequant.cuh>
-#include <memory/load_async.cuh>
-#include <memory/load_crosswise.cuh>
-#include <memory/load_crosswise_packed.cuh>
+#include <kernel/gemm/operand.cuh>
 #include <memory/pipeline.cuh>
 #include <memory/tma.cuh>
 #include <mma/ldmatrix.cuh>
@@ -38,12 +36,10 @@ template <bool kRank3A = false, bool kRank3B = false> struct GemmTmaContext {
 
 template <typename Policy> struct GemmCollectiveMainloop {
     using Traits = typename Policy::Traits;
-    using LayoutA = typename Policy::LayoutTagA;
-    using LayoutB = typename Policy::LayoutTagB;
-    using Smem = GemmSmem<Traits, LayoutA, LayoutB>;
+    using Operands = GemmOperands<Policy>;
+    using A = typename Operands::A;
+    using B = typename Operands::B;
     static constexpr bool kUseTma = Policy::kUseTma;
-    static_assert(!kUseTma || (!Smem::kDirectA && !Smem::kDirectB),
-                  "TMA staging is congruous-only");
     /*
      * The mma runs on the promoted MmaT (policy/gemm/traits.cuh); a lone int8/fp8 side
      * expands in-register between smem read and mma (kDequant* marks the
@@ -53,7 +49,6 @@ template <typename Policy> struct GemmCollectiveMainloop {
     using ElemB = typename Traits::ElemB;
     using MmaT = typename Traits::MmaT;
     using MmaOp = typename Traits::MmaOp;
-    using AccT = typename Traits::AccT;
     static constexpr bool kDequantA = Traits::kDequantA;
     static constexpr bool kDequantB = Traits::kDequantB;
     using DequantA = quant::DequantPair<ElemA, MmaT>;
@@ -62,100 +57,17 @@ template <typename Policy> struct GemmCollectiveMainloop {
     static constexpr int kBlockN = Traits::kBlockN;
     static constexpr int kTile = Traits::kTile;
     static constexpr int kStages = Traits::kStages;
-    static constexpr int kCtaThreads = Traits::kCtaThreads;
-    static constexpr bool kDirectA = Smem::kDirectA;
-    static constexpr bool kDirectB = Smem::kDirectB;
-    /*
-     * Crosswise staging splits by width: 16-bit cp.async into the transposed
-     * [kTile][rows] tile (ldmatrix.trans, pipelineable); 8-bit keeps the
-     * synchronous LDG+PRMT path into the canonical tile (no trans ldmatrix).
-     */
-    static constexpr bool kSyncA = kDirectA && sizeof(ElemA) == 1;
-    static constexpr bool kTransA = kDirectA && sizeof(ElemA) == 2;
-    static constexpr bool kSyncB = kDirectB && sizeof(ElemB) == 1;
-    static constexpr bool kTransB = kDirectB && sizeof(ElemB) == 2;
-    /*
-     * Dequant inserts are int8-storage only; a dequantized side never rides
-     * the 16-bit-only trans staging — kTrans* is already false there.
-     */
-    static_assert(!kDequantA || sizeof(ElemA) == 1, "in-register dequant targets 1-byte storage");
-    static_assert(!kDequantB || sizeof(ElemB) == 1, "in-register dequant targets 1-byte storage");
-    static_assert(kStages >= 1 && kStages <= 8, "FP8 GEMM k_stages must be in [1, 8]");
-    /*
-     * CTA = (BlockM/WarpM) x (BlockN/WarpN) warps, each warp computing
-     * kMt x kNt m16n8k{kMmaK} MMAs. Rings rotate kStages+1 buffers (see
-     * GemmSmem) — one __syncthreads per k-tile.
-     */
-    static constexpr int kMt = Traits::kMt;             // 16-row MMA tiles per warp
-    static constexpr int kNt = Traits::kNt;             // 8-col MMA tiles per warp
-    static constexpr int kSegs = kTile / Traits::kMmaK; // mma-sized k segments
-    static constexpr int kARing = Smem::kRingDepth;
-    static constexpr int kBRing = Smem::kRingDepth;
-
-    /* Staging layout types also define the fragment address calculations. */
-    static constexpr int kChunksA = kTile / (16 / (int)sizeof(ElemA));
-    static constexpr int kChunksB = kTile / (16 / (int)sizeof(ElemB));
-    static constexpr int kChunksAT = kBlockM / (16 / (int)sizeof(ElemA));
-    static constexpr int kChunksBT = kBlockN / (16 / (int)sizeof(ElemB));
-    using SmemLayoutA =
-        decltype(composition(Swizzle<log2_const<kChunksA>::value, 3>{},
-                             Layout<Shape<kBlockM, kChunksA>, Stride<kChunksA, 1>>{}));
-    using SmemLayoutB =
-        decltype(composition(Swizzle<log2_const<kChunksB>::value, 3>{},
-                             Layout<Shape<kBlockN, kChunksB>, Stride<kChunksB, 1>>{}));
-    using SmemLayoutATrans = decltype(composition(
-        Swizzle < log2_const<kChunksAT<8 ? kChunksAT : 8>::value, log2_const<kChunksAT>::value>{},
-        Layout<Shape<kTile, kChunksAT>, Stride<kChunksAT, 1>>{}));
-    using SmemLayoutBTrans = decltype(composition(
-        Swizzle < log2_const<kChunksBT<8 ? kChunksBT : 8>::value, log2_const<kChunksBT>::value>{},
-        Layout<Shape<kTile, kChunksBT>, Stride<kChunksBT, 1>>{}));
-
-    /* Packed crosswise bytes use the 16-bit transposed fragment mapping. */
-    static constexpr int kPackChunksA = kBlockM / 8; // 16B chunks per row
-    static constexpr int kPackChunksB = kBlockN / 8;
-    using SmemLayoutAPack =
-        decltype(composition(Swizzle < log2_const<kPackChunksA<8 ? kPackChunksA : 8>::value,
-                                                  log2_const<kPackChunksA>::value>{},
-                             Layout<Shape<kTile / 2, kPackChunksA>, Stride<kPackChunksA, 1>>{}));
-    using SmemLayoutBPack =
-        decltype(composition(Swizzle < log2_const<kPackChunksB<8 ? kPackChunksB : 8>::value,
-                                                  log2_const<kPackChunksB>::value>{},
-                             Layout<Shape<kTile / 2, kPackChunksB>, Stride<kPackChunksB, 1>>{}));
-
-    /*
-     * Packed staging needs: a 1-byte crosswise operand the dequant readers do
-     * not own (they read the canonical tile), even kTile, power-of-two chunks
-     * >= 8 (the swizzle row budget: 8 rows per ldmatrix matrix).
-     */
-    static constexpr bool kPackOkA = sizeof(ElemA) == 1 && (kTile % 2 == 0) && kPackChunksA >= 8 &&
-                                     (kPackChunksA & (kPackChunksA - 1)) == 0;
-    static constexpr bool kPackOkB = sizeof(ElemB) == 1 && (kTile % 2 == 0) && kPackChunksB >= 8 &&
-                                     (kPackChunksB & (kPackChunksB - 1)) == 0;
-    static constexpr bool kPackA = kDirectA && !kDequantA && kPackOkA;
-    static constexpr bool kPackB = kDirectB && !kDequantB && kPackOkB;
-
-    /* Ring types bind the staging layout, element type, and pointer. */
-    using StagedLayoutA =
-        std::conditional_t<kPackA,
-                           SmemLayoutAPack,
-                           std::conditional_t<kTransA, SmemLayoutATrans, SmemLayoutA>>;
-    using StagedLayoutB =
-        std::conditional_t<kPackB,
-                           SmemLayoutBPack,
-                           std::conditional_t<kTransB, SmemLayoutBTrans, SmemLayoutB>>;
-    using RingA = Tensor<PtrEngine<ElemA>, RingLayout<StagedLayoutA, kARing>>;
-    using RingB = Tensor<PtrEngine<ElemB>, RingLayout<StagedLayoutB, kBRing>>;
-    using TileA = Tensor<PtrEngine<ElemA>, StagedLayoutA>;
-    using TileB = Tensor<PtrEngine<ElemB>, StagedLayoutB>;
-
+    static constexpr int kMt = Traits::kMt;
+    static constexpr int kNt = Traits::kNt;
+    static constexpr int kSegs = kTile / Traits::kMmaK;
+    static_assert(kStages >= 1 && kStages <= 8);
     /*
      * The epilogue scatters the output tile into the reclaimed operand rings
      * — the tile must fit them; both orchestrators static_assert this (the
      * launchers' reclaim_fits prices the same rule).
      */
     static constexpr bool kOutputReclaimsRings =
-        kBlockM * kBlockN * sizeof(typename Policy::OutT) <=
-        RingA::Layout::kTotalBytes + RingB::Layout::kTotalBytes;
+        kBlockM * kBlockN * sizeof(typename Policy::OutT) <= A::kBytes + B::kBytes;
 
     /*
      * The warp's accumulator: typed C cells on a (mt, nt) grid — semantic
@@ -163,12 +75,8 @@ template <typename Policy> struct GemmCollectiveMainloop {
      */
     using AccTensor = typename Traits::AccTensor;
 
-    // Per-stage byte strides.
-    static constexpr int kAStageBytes = RingA::Layout::kStageBytes;
-    static constexpr int kBStageBytes = RingB::Layout::kStageBytes;
-
-    const RingA ring_a; // A's stage ring; B carves right past its end
-    const RingB ring_b;
+    const typename A::Ring ring_a; // A's stage ring; B carves right past its end
+    const typename B::Ring ring_b;
     const ElemA* const a;
     const ElemB* const b;
     const int64_t m, n, k, a_ld, b_ld;
@@ -191,52 +99,22 @@ template <typename Policy> struct GemmCollectiveMainloop {
                                       int64_t b_ld,
                                       int tid,
                                       int2 block)
-        : ring_a(astrai::make_ring<ElemA, StagedLayoutA, kARing>(smem)),
-          ring_b(
-              astrai::make_ring<ElemB, StagedLayoutB, kBRing>(smem + RingA::Layout::kTotalBytes)),
+        : ring_a(astrai::make_ring<ElemA, typename A::SharedLayout, A::kDepth>(smem)),
+          ring_b(astrai::make_ring<ElemB, typename B::SharedLayout, B::kDepth>(smem + A::kBytes)),
           a(a), b(b), m(m), n(n), k(k), a_ld(a_ld), b_ld(b_ld), tid(tid), block_m(block.x),
           block_n(block.y), warp_m((tid >> 5) / Traits::kWarpsN),
           warp_n((tid >> 5) % Traits::kWarpsN), a_row0(warp_m * Traits::kWarpM),
           b_row0(warp_n * Traits::kWarpN), tile_count((k + kTile - 1) / kTile),
-          use_interior_copy(!kSyncA && !kSyncB && ((int64_t)block.x * kBlockM + kBlockM <= m) &&
-                            ((int64_t)block.y * kBlockN + kBlockN <= n) &&
-                            ((reinterpret_cast<uintptr_t>(a) | (uint64_t)a_ld) & 15) == 0 &&
-                            ((reinterpret_cast<uintptr_t>(b) | (uint64_t)b_ld) & 15) == 0 &&
-                            (k % kTile) == 0) {}
+          use_interior_copy(!A::kRegisterLoad && !B::kRegisterLoad &&
+                            ((int64_t)block.x * kBlockM + kBlockM <= m) &&
+                            ((int64_t)block.y * kBlockN + kBlockN <= n) && A::aligned(a, a_ld) &&
+                            B::aligned(b, b_ld) && (k % kTile) == 0) {}
 
-    /* cp.async handles aligned operands; crosswise bytes use direct LDG and register packing. */
-    template <bool kInterior = false, bool kSyncPhase = false>
-    DEVICE_FORCEINLINE void load_stage(TileA a_tile, TileB b_tile, int64_t k_base) const {
-        if constexpr (kSyncPhase) {
-            /*
-             * 8-bit crosswise: the k-pair packed grid when the tile admits it,
-             * the canonical-tile register carry otherwise.
-             */
-            if constexpr (kPackA)
-                load_crosswise_paired<StagedLayoutA, ElemA, kCtaThreads>(a_tile, a, m, k, a_ld, tid,
-                                                                         k_base, block_m * kBlockM);
-            else if constexpr (kSyncA)
-                load_crosswise_direct<StagedLayoutA, ElemA, kCtaThreads>(a_tile, a, m, k, a_ld, tid,
-                                                                         k_base, block_m * kBlockM);
-            if constexpr (kPackB)
-                load_crosswise_paired<StagedLayoutB, ElemB, kCtaThreads>(b_tile, b, n, k, b_ld, tid,
-                                                                         k_base, block_n * kBlockN);
-            else if constexpr (kSyncB)
-                load_crosswise_direct<StagedLayoutB, ElemB, kCtaThreads>(b_tile, b, n, k, b_ld, tid,
-                                                                         k_base, block_n * kBlockN);
-        } else {
-            /*
-             * Everything but the 8-bit crosswise (kSync) staging rides
-             * cp.async: congruous goes canonical, 16-bit crosswise goes
-             * transposed.
-             */
-            if constexpr (!kSyncA)
-                load_operand_tile<StagedLayoutA, ElemA, kCtaThreads, kTransA, kInterior>(
-                    a_tile, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
-            if constexpr (!kSyncB)
-                load_operand_tile<StagedLayoutB, ElemB, kCtaThreads, kTransB, kInterior>(
-                    b_tile, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
-        }
+    template <bool Interior = false>
+    DEVICE_FORCEINLINE void
+    copy_async(typename A::Tile tile_a, typename B::Tile tile_b, int64_t k_base) const {
+        A::template copy_async<Interior>(tile_a, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+        B::template copy_async<Interior>(tile_b, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
     }
 
     /*
@@ -247,11 +125,11 @@ template <typename Policy> struct GemmCollectiveMainloop {
     template <bool kRank3A, bool kRank3B>
     DEVICE_FORCEINLINE void tma_issue_stage(const GemmTmaContext<kRank3A, kRank3B>& tma,
                                             int tile) const {
-        const int slot = tile % kARing;
-        if (tile >= kARing)
-            astrai::mbarrier_wait_parity(tma.empty(slot), (uint32_t)(((tile / kARing) - 1) & 1));
+        const int slot = tile % A::kDepth;
+        if (tile >= A::kDepth)
+            astrai::mbarrier_wait_parity(tma.empty(slot), (uint32_t)(((tile / A::kDepth) - 1) & 1));
         uint64_t* bar = tma.full(slot);
-        mbarrier_arrive_expect_tx(bar, (uint32_t)((uint64_t)kAStageBytes + kBStageBytes));
+        mbarrier_arrive_expect_tx(bar, (uint32_t)((uint64_t)A::kStageBytes + B::kStageBytes));
         const int x = (int)((int64_t)tile * kTile);
         astrai::tma_load<kRank3A>(tma.map_a, bar, astrai::stage_of(ring_a, tile).engine.ptr,
                                   x * (int)sizeof(ElemA), (int)(block_m * kBlockM), tma.z);
@@ -276,14 +154,15 @@ template <typename Policy> struct GemmCollectiveMainloop {
 #pragma unroll
         for (int stage = 0; stage < kStages; ++stage) {
             if (stage < tile_count) {
+                const auto tile_a = stage_of(ring_a, stage);
+                const auto tile_b = stage_of(ring_b, stage);
+                const int64_t k_base = (int64_t)stage * kTile;
                 if (use_interior_copy)
-                    load_stage<true>(astrai::stage_of(ring_a, stage),
-                                     astrai::stage_of(ring_b, stage), (int64_t)stage * kTile);
+                    copy_async<true>(tile_a, tile_b, k_base);
                 else
-                    load_stage(astrai::stage_of(ring_a, stage), astrai::stage_of(ring_b, stage),
-                               (int64_t)stage * kTile);
-                load_stage<false, true>(astrai::stage_of(ring_a, stage),
-                                        astrai::stage_of(ring_b, stage), (int64_t)stage * kTile);
+                    copy_async(tile_a, tile_b, k_base);
+                A::prime_registers(tile_a, a, m, k, a_ld, tid, k_base, block_m * kBlockM);
+                B::prime_registers(tile_b, b, n, k, b_ld, tid, k_base, block_n * kBlockN);
             }
             pipe.producer_commit();
         }
@@ -296,31 +175,23 @@ template <typename Policy> struct GemmCollectiveMainloop {
         const astrai::PipelineSync<kStages> pipe;
         const int lane = tid & 31;
         /* Carry staged load and read pointers across k tiles. */
-        PrefetchCarry<!kSyncA && !kTma, RingA, kCtaThreads, kTransA> carry_a(
-            ring_a, a, a_ld, block_m * kBlockM, tid, kStages);
-        PrefetchCarry<!kSyncB && !kTma, RingB, kCtaThreads, kTransB> carry_b(
-            ring_b, b, b_ld, block_n * kBlockN, tid, kStages);
-        /*
-         * The 8-bit crosswise operands' register carry: issue() runs the global
-         * runs before the MMA phase, commit() the byte-perm and STS after it.
-         * Packed-grid operands ride the same seam with the two-run sibling.
-         */
-        std::conditional_t<kPackA, PairPackCarry<StagedLayoutA, ElemA, kCtaThreads, true>,
-                           CrosswiseCarry<StagedLayoutA, ElemA, kCtaThreads, kSyncA>>
-            sync_a;
-        std::conditional_t<kPackB, PairPackCarry<StagedLayoutB, ElemB, kCtaThreads, true>,
-                           CrosswiseCarry<StagedLayoutB, ElemB, kCtaThreads, kSyncB>>
-            sync_b;
-        const unsigned a_rd0 = __cvta_generic_to_shared(ring_a.engine.ptr) +
-                               (kPackA ? a_pack_lane_off(lane)
-                                       : (kTransA ? a_trans_lane_off(lane) : a_lane_off(lane)));
+        typename A::template Prefetch<!kTma> carry_a(ring_a, a, a_ld, block_m * kBlockM, tid,
+                                                     kStages);
+        typename B::template Prefetch<!kTma> carry_b(ring_b, b, b_ld, block_n * kBlockN, tid,
+                                                     kStages);
+        typename A::RegisterCarry sync_a;
+        typename B::RegisterCarry sync_b;
+        const unsigned a_rd0 =
+            __cvta_generic_to_shared(ring_a.engine.ptr) +
+            (A::kPacked ? a_pack_lane_off(lane)
+                        : (A::kTranspose ? a_trans_lane_off(lane) : a_lane_off(lane)));
         const unsigned b_rd0 =
             __cvta_generic_to_shared(ring_b.engine.ptr) +
-            (kPackB ? b_pack_lane_off(lane)
-                    : (kTransB ? b_trans_lane_off(lane)
-                               : (kPairB ? b4_lane_off(lane) : b_lane_off(lane))));
-        const unsigned a_rd_end = a_rd0 + (unsigned)(kARing * kAStageBytes);
-        const unsigned b_rd_end = b_rd0 + (unsigned)(kBRing * kBStageBytes);
+            (B::kPacked ? b_pack_lane_off(lane)
+                        : (B::kTranspose ? b_trans_lane_off(lane)
+                                         : (kPairB ? b4_lane_off(lane) : b_lane_off(lane))));
+        const unsigned a_rd_end = a_rd0 + (unsigned)(A::kDepth * A::kStageBytes);
+        const unsigned b_rd_end = b_rd0 + (unsigned)(B::kDepth * B::kStageBytes);
         unsigned a_rd = a_rd0, b_rd = b_rd0;
         for (int64_t tile_index = 0; tile_index < tile_count; ++tile_index) {
             /*
@@ -330,8 +201,8 @@ template <typename Policy> struct GemmCollectiveMainloop {
             const bool prefetch = tile_index + kStages < tile_count;
             /* TMA waits full slots; cp.async joins the CTA before slot reuse. */
             if constexpr (kTma) {
-                astrai::mbarrier_wait_parity(tma.full((int)(tile_index % kARing)),
-                                             static_cast<uint32_t>((tile_index / kARing) & 1));
+                astrai::mbarrier_wait_parity(tma.full((int)(tile_index % A::kDepth)),
+                                             static_cast<uint32_t>((tile_index / A::kDepth) & 1));
             } else {
                 pipe.consumer_wait();
             }
@@ -346,10 +217,10 @@ template <typename Policy> struct GemmCollectiveMainloop {
                 if (prefetch && tid == 0)
                     tma_issue_stage(tma, (int)(tile_index + kStages));
             } else if (prefetch) {
-                if constexpr (kSyncA)
+                if constexpr (A::kRegisterLoad)
                     sync_a.issue(a, m, k, a_ld, tid, (tile_index + kStages) * kTile,
                                  block_m * kBlockM);
-                if constexpr (kSyncB)
+                if constexpr (B::kRegisterLoad)
                     sync_b.issue(b, n, k, b_ld, tid, (tile_index + kStages) * kTile,
                                  block_n * kBlockN);
             }
@@ -365,10 +236,10 @@ template <typename Policy> struct GemmCollectiveMainloop {
             unsigned a_seg[kSegs], b_seg[kSegs];
 #pragma unroll
             for (int s = 0; s < kSegs; ++s) {
-                a_seg[s] = (kTransA || kPackA) ? (a_addr + (unsigned)(s * kTransSegA))
-                                               : (a_addr ^ (unsigned)(s * kSegXorA));
-                b_seg[s] = (kTransB || kPackB) ? (b_addr + (unsigned)(s * kTransSegB))
-                                               : (b_addr ^ (unsigned)(s * kSegXorB));
+                a_seg[s] = (A::kTranspose || A::kPacked) ? (a_addr + (unsigned)(s * kTransSegA))
+                                                         : (a_addr ^ (unsigned)(s * kSegXorA));
+                b_seg[s] = (B::kTranspose || B::kPacked) ? (b_addr + (unsigned)(s * kTransSegB))
+                                                         : (b_addr ^ (unsigned)(s * kSegXorB));
             }
 
             /* Prefetch B fragments by K segment and pair adjacent N cells where valid. */
@@ -393,7 +264,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
 #pragma unroll
                     for (int mt = 0; mt < kMt; ++mt)
                         load_a_frags_at(a_frag[mt], a_tile, k_seg, mt, lane);
-                } else if constexpr (kTransA || kPackA) {
+                } else if constexpr (A::kTranspose || A::kPacked) {
                     astrai::ldmatrix_x4_lane<true>(a_frag[0], a_seg[k_seg]);
                 } else {
                     astrai::ldmatrix_x4_lane(a_frag[0], a_seg[k_seg]);
@@ -403,9 +274,10 @@ template <typename Policy> struct GemmCollectiveMainloop {
                     if constexpr (!kDequantA) {
                         if (mt + 1 < kMt) {
                             const unsigned a_next =
-                                (kTransA || kPackA) ? (a_seg[k_seg] ^ (unsigned)((mt + 1) * kMtXor))
-                                                    : (a_seg[k_seg] + (mt + 1) * kMtStep);
-                            if constexpr (kTransA || kPackA)
+                                (A::kTranspose || A::kPacked)
+                                    ? (a_seg[k_seg] ^ (unsigned)((mt + 1) * kMtXor))
+                                    : (a_seg[k_seg] + (mt + 1) * kMtStep);
+                            if constexpr (A::kTranspose || A::kPacked)
                                 astrai::ldmatrix_x4_lane<true>(a_frag[mt + 1], a_next);
                             else
                                 astrai::ldmatrix_x4_lane(a_frag[mt + 1], a_next);
@@ -438,13 +310,13 @@ template <typename Policy> struct GemmCollectiveMainloop {
              */
             if constexpr (!kInterior && !kTma) {
                 if (prefetch) {
-                    load_stage(astrai::stage_of(ring_a, tile_index + kStages),
+                    copy_async(astrai::stage_of(ring_a, tile_index + kStages),
                                astrai::stage_of(ring_b, tile_index + kStages),
                                (tile_index + kStages) * kTile);
-                    if constexpr (kSyncA)
+                    if constexpr (A::kRegisterLoad)
                         sync_a.commit(astrai::stage_of(ring_a, tile_index + kStages), a, m, k, a_ld,
                                       tid, (tile_index + kStages) * kTile, block_m * kBlockM);
-                    if constexpr (kSyncB)
+                    if constexpr (B::kRegisterLoad)
                         sync_b.commit(astrai::stage_of(ring_b, tile_index + kStages), b, n, k, b_ld,
                                       tid, (tile_index + kStages) * kTile, block_n * kBlockN);
                 }
@@ -460,11 +332,11 @@ template <typename Policy> struct GemmCollectiveMainloop {
              * barrier trips once every thread arrives, gating the overwrite.
              */
             if constexpr (kTma)
-                astrai::mbarrier_arrive(tma.empty((int)(tile_index % kARing)));
-            a_rd += (unsigned)kAStageBytes;
+                astrai::mbarrier_arrive(tma.empty((int)(tile_index % A::kDepth)));
+            a_rd += (unsigned)A::kStageBytes;
             if (a_rd == a_rd_end)
                 a_rd = a_rd0;
-            b_rd += (unsigned)kBStageBytes;
+            b_rd += (unsigned)B::kStageBytes;
             if (b_rd == b_rd_end)
                 b_rd = b_rd0;
             if constexpr (kInterior && !kTma) {
@@ -527,23 +399,24 @@ template <typename Policy> struct GemmCollectiveMainloop {
          * Stage-relative, loop-invariant per-lane base; A's fragment row
          * carries the +8-row (rh8) and +1-chunk (rh16) halves.
          */
-        return canonical_lane_off<SmemLayoutA, ElemA>(a_row0 + ((lane >> 3) & 1) * 8 + (lane & 7),
-                                                      lane >> 4, lane);
+        return canonical_lane_off<typename A::Canonical, ElemA>(
+            a_row0 + ((lane >> 3) & 1) * 8 + (lane & 7), lane >> 4, lane);
     }
     DEVICE_FORCEINLINE unsigned b_lane_off(int lane) const {
         // ldmatrix (non-dequant) B addressing: byte offsets in ElemB units.
-        return canonical_lane_off<SmemLayoutB, ElemB>(b_row0 + (lane & 7), (lane >> 3) & 1, lane);
+        return canonical_lane_off<typename B::Canonical, ElemB>(b_row0 + (lane & 7),
+                                                                (lane >> 3) & 1, lane);
     }
     /* Paired B x4 needs a positive swizzle row shift; K=128 byte tiles use x2. */
     static constexpr unsigned kMtStep = 16u * kTile * sizeof(ElemA); // m-tile row step
     static constexpr unsigned kNtStep = 8u * kTile * sizeof(ElemB);  // n-tile row step
     static constexpr unsigned kSegXorA = (unsigned)Traits::kMmaK * sizeof(ElemA);
     static constexpr unsigned kSegXorB = (unsigned)Traits::kMmaK * sizeof(ElemB);
-    static constexpr bool kPairB = !kDequantB && !kPackB && SmemLayoutB::kRowShift > 0;
+    static constexpr bool kPairB = !kDequantB && !B::kPacked && B::Canonical::kRowShift > 0;
     static_assert(!kPairB || kTile * sizeof(ElemB) <= 64,
                   "paired B x4 is unsupported for the kTile=128 byte layout");
     static_assert(!kPairB || kNt % 2 == 0, "B pairing needs even kNt");
-    static_assert(!kPairB || !kTransB, "2-byte crosswise B never pairs (chunk budget)");
+    static_assert(!kPairB || !B::kTranspose, "2-byte crosswise B never pairs (chunk budget)");
     static constexpr unsigned kPairStep = 16u * kTile * sizeof(ElemB); // nt-pair row step
     DEVICE_FORCEINLINE unsigned b4_lane_off(int lane) const {
         return b_lane_off(lane) + (lane >> 4) * kPairStep / 2;
@@ -559,13 +432,13 @@ template <typename Policy> struct GemmCollectiveMainloop {
          * reg1, k+8 reg2): lanes 8-15 step the m+8 chunk, lanes 16-31 the
          * k+8 row half.
          */
-        return trans_lane_off<SmemLayoutATrans, ElemA>((lane & 7) + ((lane >> 4) << 3),
-                                                       a_row0 + (((lane >> 3) & 1) << 3), kBlockM);
+        return trans_lane_off<typename A::Transposed, ElemA>(
+            (lane & 7) + ((lane >> 4) << 3), a_row0 + (((lane >> 3) & 1) << 3), kBlockM);
     }
     DEVICE_FORCEINLINE unsigned b_trans_lane_off(int lane) const {
         // nt windows step by kNtXor at call sites (col stays at b_row0).
-        return trans_lane_off<SmemLayoutBTrans, ElemB>((lane & 7) + (((lane >> 3) & 1) << 3),
-                                                       b_row0, kBlockN);
+        return trans_lane_off<typename B::Transposed, ElemB>((lane & 7) + (((lane >> 3) & 1) << 3),
+                                                             b_row0, kBlockN);
     }
 
     /*
@@ -575,17 +448,20 @@ template <typename Policy> struct GemmCollectiveMainloop {
      * 16 packed rows = one mma k-segment.
      */
     DEVICE_FORCEINLINE unsigned a_pack_lane_off(int lane) const {
-        return trans_lane_off<SmemLayoutAPack, unsigned short>(
+        return trans_lane_off<typename A::Packed, unsigned short>(
             (lane & 7) + ((lane >> 4) << 3), a_row0 + (((lane >> 3) & 1) << 3), kBlockM);
     }
     DEVICE_FORCEINLINE unsigned b_pack_lane_off(int lane) const {
-        return trans_lane_off<SmemLayoutBPack, unsigned short>(
+        return trans_lane_off<typename B::Packed, unsigned short>(
             (lane & 7) + (((lane >> 3) & 1) << 3), b_row0, kBlockN);
     }
 
     /* Convert packed INT8 A pairs to BF16 in ldmatrix register order. */
-    DEVICE_FORCEINLINE void
-    load_a_frags_at(typename MmaOp::AFrag& frag, TileA stage, int k_seg, int mt, int lane) const {
+    DEVICE_FORCEINLINE void load_a_frags_at(typename MmaOp::AFrag& frag,
+                                            typename A::Tile stage,
+                                            int k_seg,
+                                            int mt,
+                                            int lane) const {
         const int q = lane >> 2, c2 = (lane & 3) * 2;
         const int row = a_row0 + mt * 16 + q;
         const ElemA* p0 = stage(row, k_seg * 16 + c2);
@@ -605,7 +481,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
                                          unsigned seg_base) const {
 #pragma unroll
         for (int p = 0; p < kNt / 2; ++p) {
-            if constexpr (kTransB || kPackB) {
+            if constexpr (B::kTranspose || B::kPacked) {
                 /*
                  * Trans/packed: each x2.trans reads 16 k rows at one n chunk;
                  * nt windows step one XORed chunk.
@@ -625,7 +501,7 @@ template <typename Policy> struct GemmCollectiveMainloop {
     /* Convert packed INT8 B pairs to BF16 in ldmatrix register order. */
     DEVICE_FORCEINLINE void load_b_frags_at(typename MmaOp::BFrag (&frag2)[kNt],
                                             BFragPair (&frag4)[kNt / 2],
-                                            TileB stage,
+                                            typename B::Tile stage,
                                             int k_seg,
                                             unsigned seg_base,
                                             int lane) const {

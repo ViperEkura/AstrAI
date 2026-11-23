@@ -65,7 +65,7 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
     def prefill(requests, *, plan, **kwargs):
         # Worker packing order deliberately differs from scheduler order.
         packed = sorted(requests, key=lambda r: r.request_id)
-        return packed, PendingExecution(
+        return PendingExecution(
             snapshot=plan,
             sampled_identities=tuple(r.identity for r in packed),
             tokens=torch.tensor([11, 12], dtype=torch.long),
@@ -112,9 +112,8 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
         )
     )
 
-    requests, pending = executor.execute_prefill([task_b, task_a], plan=plan)
+    pending = executor.execute_prefill([task_b, task_a], plan=plan)
 
-    assert requests == [task_a, task_b]
     assert [(r.identity, r.token_id) for r in pending.commit().results] == [
         (task_b.identity, 102),
         (task_a.identity, 101),

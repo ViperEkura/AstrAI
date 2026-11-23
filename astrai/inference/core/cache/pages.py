@@ -14,8 +14,6 @@ class RequestPageTable:
 
     def __init__(self, size: int, max_pages: int, device: torch.device):
         self.version = 0
-        self.size = size
-        self.max_pages = max_pages
         self.page_table = torch.zeros(
             (size, max_pages), dtype=torch.int32, device=device
         )
@@ -166,12 +164,12 @@ class Allocator:
             released += 1
         return released
 
-    def discard_cached(self, idxs: List[int]) -> int:
+    def discard_cached(self, idxs: List[int]) -> None:
         """Forget identities revoked by prefix replacement or relocation."""
         if not idxs:
-            return 0
+            return
         with self._lock:
-            return self._discard_cached(idxs)
+            self._discard_cached(idxs)
 
     def _evict_cached(self, idx: int) -> int:
         """Evict one LRU victim and reclaim its revoked descendants."""
@@ -254,7 +252,6 @@ class Allocator:
         """
         if not idxs:
             return
-        keep = keep_cached_for or (lambda idx: False)
         with self._lock:
             # Set-latch pass first (refs may drop to zero multiple times in
             # one batch; the freed bits are aggregated into ONE big-int
@@ -265,7 +262,7 @@ class Allocator:
             for idx in idxs:
                 self._refs[idx] -= 1
                 if self._refs[idx] == 0:
-                    if keep(idx):
+                    if keep_cached_for and keep_cached_for(idx):
                         self._lru[idx] = None
                     else:
                         freed_bits |= 1 << idx
@@ -288,11 +285,6 @@ class Allocator:
         """
         with self._lock:
             return n_pages <= self._n_pages
-
-    def reclaimable_pages(self) -> int:
-        """Pages currently cached-but-unreferenced (LRU entries)."""
-        with self._lock:
-            return len(self._lru)
 
     def inc_ref(self, idx: int):
         with self._lock:

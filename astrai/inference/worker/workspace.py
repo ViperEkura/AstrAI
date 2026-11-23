@@ -25,8 +25,7 @@ MAX_SPLITS = _CONFIG.max_splits
 class InferenceWorkspace:
     """Reusable fixed-shape per-step buffers for decode.
 
-    Families of buffers, all sized to ``max_batch_size`` / ``max_seq_len``
-    and sliced via views each step:
+    Buffers are sized for the maximum batch and sliced for each step:
 
     - ``input_ids``: per-step token IDs filled from host — values are
       staged through a pinned buffer and bulk-copied into the stable
@@ -45,18 +44,14 @@ class InferenceWorkspace:
     def __init__(
         self,
         max_batch_size: int,
-        max_seq_len: int,
         max_q_heads: int,
         head_dim: int,
         device: torch.device,
         dtype: torch.dtype,
     ):
         self.max_batch_size = max_batch_size
-        self.max_seq_len = max_seq_len
-        self.max_q_heads = max_q_heads
         self.head_dim = head_dim
         self.device = device
-        self.dtype = dtype
 
         # Invariant: all workspace buffers are plain (non-inference)
         # tensors.  The scheduler's loop thread mutates them in-place every

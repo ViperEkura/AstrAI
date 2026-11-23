@@ -28,7 +28,6 @@ def _mk_task_cache(pool: BlockPool) -> KVCacheManager:
 def _ws(pool: BlockPool) -> InferenceWorkspace:
     return InferenceWorkspace(
         pool.max_batch_size,
-        pool.max_seq_len,
         max_q_heads=2,
         head_dim=64,
         device=pool.device,

@@ -40,7 +40,6 @@ class BlockPool:
         self.max_seq_len = max_seq_len
         self.device = device
         self.dtype = dtype
-        self.n_layers = n_layers
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
 

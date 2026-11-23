@@ -115,7 +115,6 @@ class GenerationBenchmark:
     def _make_workspace(pool: BlockPool, config: BaseModelConfig) -> InferenceWorkspace:
         return InferenceWorkspace(
             pool.max_batch_size,
-            pool.max_seq_len,
             max_q_heads=config.num_attention_heads,
             head_dim=config.hidden_size // config.num_attention_heads,
             device=pool.device,

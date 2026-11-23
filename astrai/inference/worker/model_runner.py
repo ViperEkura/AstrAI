@@ -161,14 +161,13 @@ def _build_sampling_batch_info(
     top_ps_t = torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin).to(
         device, non_blocking=True
     )
-    info = SamplingBatchInfo(
+    return SamplingBatchInfo(
         temperatures=temperatures,
         top_ks=top_ks_t,
         top_ps=top_ps_t,
         freq_penalties=freq_penalties,
         meta=meta,
     )
-    return info
 
 
 class GPUModelRunner:
@@ -217,7 +216,6 @@ class GPUModelRunner:
         )
         self._workspace = InferenceWorkspace(
             max_batch_size=pool.max_batch_size,
-            max_seq_len=pool.max_seq_len,
             max_q_heads=max_q_heads,
             head_dim=head_dim,
             device=self.device,
@@ -237,7 +235,7 @@ class GPUModelRunner:
         return_logprobs: LogprobRequest = False,
         *,
         plan: SchedulerOutput,
-    ):
+    ) -> PendingExecution:
         """Pack scheduled prefill windows and sample rows that finish a prompt."""
         requests = sorted(requests, key=lambda entry: entry.request_id)
         num_tokens = [entry.num_tokens for entry in requests]
@@ -317,7 +315,7 @@ class GPUModelRunner:
         if torch.device(self.device).type == "cuda":
             pending.completion_event = torch.cuda.Event()
             pending.completion_event.record()
-        return requests, pending
+        return pending
 
     def execute_score(
         self,
@@ -595,16 +593,9 @@ class GPUModelRunner:
         """The in-flight submitted step, if any (not committed)."""
         return self._pending
 
-    def clear_pending(self) -> Optional[PendingExecution]:
-        """Detach the in-flight step without committing it.
-
-        The overlap scheduler's commit phase takes ownership this way: the
-        executor's ``_pending`` slot frees up for the *next* submit while
-        the scheduler still holds (and commits) the returned step.
-        """
-        pending = self._pending
+    def clear_pending(self) -> None:
+        """Forget the last submitted step after the engine has retired it."""
         self._pending = None
-        return pending
 
     def execute_model(self, plan: SchedulerOutput):
         """Yield every launched group's handle, including KV-only prefills.
@@ -622,7 +613,7 @@ class GPUModelRunner:
         for (phase, _), requests in groups.items():
             subplan = plan.select(requests)
             if phase == "prefill":
-                _, pending = self.execute_prefill(
+                pending = self.execute_prefill(
                     requests,
                     return_logprobs=plan.return_logprobs,
                     plan=subplan,

@@ -11,7 +11,6 @@ def make_cache_workspace(pool: BlockPool) -> InferenceWorkspace:
     """Workspace sized to the pool."""
     return InferenceWorkspace(
         pool.max_batch_size,
-        pool.max_seq_len,
         max_q_heads=2,
         head_dim=4,
         device=pool.device,

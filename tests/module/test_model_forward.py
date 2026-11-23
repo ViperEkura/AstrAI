@@ -71,7 +71,6 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
     cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         1,
-        config.max_position_embeddings,
         config.num_attention_heads,
         config.hidden_size // config.num_attention_heads,
         torch.device("cpu"),
@@ -114,7 +113,6 @@ def test_cached_prefill_key_mask_matches_dense_attention():
     cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         1,
-        config.max_position_embeddings,
         config.num_attention_heads,
         config.hidden_size // config.num_attention_heads,
         torch.device("cpu"),
@@ -160,7 +158,6 @@ def test_forward_logits_positions_projects_only_requested_rows():
     cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         2,
-        config.max_position_embeddings,
         config.num_attention_heads,
         config.hidden_size // config.num_attention_heads,
         torch.device("cpu"),

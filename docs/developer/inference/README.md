@@ -51,12 +51,9 @@ classDiagram
     GPUModelRunner --> PendingExecution : return handles
     GPUModelRunner *-- InferenceWorkspace : device buffers
     GPUModelRunner *-- CUDAGraphRunner : capture and replay
-    GPUModelRunner ..> KVCacheManager : shared cache binding
+    KVCacheManager --> BlockPool : reserve physical pages
+    InferenceWorkspace --> BlockPool : gather execution rows
 ```
-
-Composition arrows mark owned collaborators; other arrows mark calls or
-dependencies. The dotted Runner-to-Core edge records the existing shared KV
-binding dependency. It does not introduce another layer.
 
 | Layer | Owns | Why it is separate |
 | --- | --- | --- |
@@ -66,10 +63,8 @@ binding dependency. It does not introduce another layer.
 
 The source import direction is **frontend → core → worker → model/cache ABI**;
 all layers can use `contracts.py`. `tests/inference/test_layering.py` rejects
-reverse runtime imports. This is an import rule, not complete object isolation:
-the runner receives a shared `KVCacheManager` and calls `bind()` to create model
-cache views. That method still combines request lookup with device metadata
-assembly. See [the cache boundary](core.md#cache-binding-boundary).
+reverse runtime imports. Execution snapshots carry cache slots. The workspace
+binds them to model tensors using the shared pool. See [cache binding](core.md#cache-binding-boundary).
 
 ## Design patterns in use
 
@@ -80,7 +75,6 @@ base classes, registries or forwarding layers.
 | --- | --- | --- |
 | Facade | `InferenceEngine.generate`, `generate_events` and `score` | One text API hides registration and cleanup; scheduling stays in core |
 | Adapter | OpenAI/Anthropic network modules | Translate protocols around the same frontend; no per-protocol scheduler |
-| Strategy | `AllocationStrategy`: contiguous or paged | Real alternative allocation policies share one interface; they need not share prefix-cache behavior |
 | Event sink | `OutputEventSink` implemented by `RequestTracker` | Core emits token/terminal events without importing consumers; this is one sink, not a general event bus |
 | Immutable execution messages | `SchedulerOutput` and `ModelRunnerOutput` | Identity and version travel with delayed work; the worker cannot mutate a live `Request` through a plan |
 | Deferred result | `PendingExecution` | Submission and host materialization are separate; `commit()` resolves data, while the scheduler applies request state |
@@ -162,11 +156,6 @@ Both allocation policies preallocate GPU storage. `kv_tokens=None` selects
 contiguous allocation; a finite value selects paged allocation, with radix
 prefix reuse when `page_size > 1`. Paged admission currently reserves the
 prompt's pages. Progressive admission and recompute preemption are not present.
-
-The main remaining ownership issue is shared KV binding. A future change can
-make request-slot/length data explicit at that boundary and keep device metadata
-assembly with the worker, while preserving fixed addresses and overlap ordering.
-Adding an abstract manager alone would leave the same dependency in place.
 
 ## Layer details
 

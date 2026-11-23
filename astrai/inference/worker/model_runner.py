@@ -14,9 +14,7 @@ from astrai.extension.runtime.context import OpSelection, snapshot_op_selection
 from astrai.extension.runtime.loader import is_available
 
 if TYPE_CHECKING:
-    # Type-only dependency: the worker consumes the KV manager's ``bind``
-    # interface; importing it at runtime would create a core↔worker cycle.
-    from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
+    from astrai.inference.core.cache import BlockPool
 from astrai.inference.contracts import ExecutionRequest, LogprobRequest, SchedulerOutput
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.pending import (
@@ -163,95 +161,13 @@ def _build_sampling_batch_info(
     top_ps_t = torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin).to(
         device, non_blocking=True
     )
-    info = SamplingBatchInfo(
+    return SamplingBatchInfo(
         temperatures=temperatures,
         top_ks=top_ks_t,
         top_ps=top_ps_t,
         freq_penalties=freq_penalties,
         meta=meta,
     )
-    return info
-
-
-def _warmup_cuda_graphs(
-    model: AutoModel,
-    pool: "BlockPool",
-    cache_mgr: "KVCacheManager",
-    ws: InferenceWorkspace,
-    gctx: CUDAGraphRunner,
-    max_batch_size: int,
-    prompt_len: int = 1,
-    device: Optional[str] = None,
-):
-    dev = device or next(model.parameters()).device
-
-    # Prefill warmup: cuBLAS auto-tunes for the actual prompt-length tensor
-    # shapes on first call (F.linear is the dominant cost).  This also warms
-    # up the CUDA context (driver init) and compiles the graph-capture trace
-    # that follows.  Custom .so kernels do NOT need this — they are pre-built.
-    warmup_len = _config.prefill_warmup_len
-    tid = "_warmup_prefill"
-    if cache_mgr.alloc_slots(tid, list(range(warmup_len))):
-        with (
-            torch.inference_mode(),
-            timed("warmup prefill", logger),
-        ):
-            kv = cache_mgr.bind([tid], ws, start_pos=0)
-            ids_in = torch.arange(warmup_len, device=dev)
-            pos_in = ids_in
-            model(
-                ids_in,
-                kv_cache=kv,
-                position_ids=pos_in,
-                logits_positions=torch.tensor(
-                    [warmup_len - 1], dtype=torch.long, device=dev
-                ),
-            )
-        cache_mgr.free_slots(tid)
-
-    batch_sizes = [1]
-    n = 2
-    while n <= max_batch_size:
-        batch_sizes.append(n)
-        n *= 2
-    if max_batch_size not in batch_sizes:
-        batch_sizes.append(max_batch_size)
-
-    for b in batch_sizes:
-        request_ids = [f"_warmup_decode_{b}_{i}" for i in range(b)]
-        prompt_tokens = [list(range(prompt_len)) for _ in range(b)]
-        alloc_ok = True
-        for tid, pt in zip(request_ids, prompt_tokens):
-            if not cache_mgr.alloc_slots(tid, pt):
-                alloc_ok = False
-                break
-        if not alloc_ok:
-            for tid in request_ids:
-                cache_mgr.free_slots(tid)
-            continue
-
-        with (
-            torch.inference_mode(),
-            timed(f"warmup decode b={b}", logger),
-        ):
-            for step in range(2):
-                seq_pos = step
-                ws.position_ids[:b] = seq_pos
-                for tid in request_ids:
-                    cache_mgr.extend_slots(tid, seq_pos)
-                kv = cache_mgr.bind(request_ids, ws)
-                ids_buf = ws.fill_input_ids([step] * b)
-                gctx.forward(
-                    model,
-                    key=(b,),
-                    input_ids=ids_buf,
-                    kv_cache=kv,
-                    position_ids=ws.position_ids[:b],
-                )
-
-        for tid in request_ids:
-            cache_mgr.free_slots(tid)
-        torch.cuda.synchronize()
 
 
 class GPUModelRunner:
@@ -260,15 +176,13 @@ class GPUModelRunner:
     def __init__(
         self,
         model: AutoModel,
-        kv_cache: "BlockPool",
-        cache_mgr: "KVCacheManager",
+        pool: "BlockPool",
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         enable_cuda_graph: bool = True,
     ):
         self.model = model
-        self.kv_cache = kv_cache
-        self.kv_manager = cache_mgr
+        self.pool = pool
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
 
@@ -287,7 +201,7 @@ class GPUModelRunner:
         # Async result relay: pinned depth-2 slots on a dedicated copy
         # stream.  A submitted step's tokens land here without a blocking
         # tolist; commit waits on the posted event instead.  Inert on CPU.
-        self._result_ring = ResultRing(kv_cache.max_batch_size, self.device)
+        self._result_ring = ResultRing(pool.max_batch_size, self.device)
 
         # Pre-allocated fixed-shape buffers for the decode hot path
         # (input_ids, decode mask, KV bind metadata).  Eagerly sized at init
@@ -301,35 +215,15 @@ class GPUModelRunner:
             head_dim, self.dtype
         )
         self._workspace = InferenceWorkspace(
-            max_batch_size=kv_cache.max_batch_size,
-            max_seq_len=kv_cache.max_seq_len,
+            max_batch_size=pool.max_batch_size,
             max_q_heads=max_q_heads,
             head_dim=head_dim,
             device=self.device,
             dtype=self.dtype,
         )
 
-        # CUDA-graph capture: one graph per (batch_size,) key.
-        # Enabled at init-time via _warmup_cuda_graphs for CUDA attention
-        # on supported head_dims; left disabled otherwise.
         self._graph_ctx = CUDAGraphRunner()
-        if enable_cuda_graph:
-            self._try_enable_cuda_graph()
-
-    def _try_enable_cuda_graph(self):
-        if not self._graph_supported:
-            return
-
-        self._graph_ctx.set_enabled(True)
-        _warmup_cuda_graphs(
-            self.model,
-            self.kv_cache,
-            self.kv_manager,
-            self._workspace,
-            self._graph_ctx,
-            max_batch_size=self.kv_cache.max_batch_size,
-            device=self.device,
-        )
+        self._graph_ctx.set_enabled(enable_cuda_graph and self._graph_supported)
 
     @property
     def cuda_graph_enabled(self) -> bool:
@@ -338,28 +232,13 @@ class GPUModelRunner:
     def execute_prefill(
         self,
         requests: List[ExecutionRequest],
-        start_pos: int = 0,
         return_logprobs: LogprobRequest = False,
-        num_tokens: Optional[List[int]] = None,
         *,
         plan: SchedulerOutput,
-    ):
-        """Prefill (a chunk of) each request's prompt; sample only at chunk ends.
-
-        With ``num_tokens=None`` this is the historical whole-remaining-prompt
-        call.  The chunked-prefill path passes one window per request:
-        ``(start_pos, num_tokens[i])`` covers the tokens this step computes.
-        A request whose window does not reach its prompt end is a
-        **continuation chunk** — its forward runs purely to materialize KV,
-        ``logits_positions`` skips it, and no token is sampled for it (the
-        caller advances ``num_computed_tokens`` instead); the final chunk of
-        each request samples its next token from the window's last position.
-        """
-        # Sort for a deterministic packed order and carry the per-request
-        # windows along: num_tokens arrives in the CALLER's request order.
-        order = sorted(range(len(requests)), key=lambda i: requests[i].request_id)
-        requests = [requests[i] for i in order]
-        num_tokens = [num_tokens[i] for i in order] if num_tokens else None
+    ) -> PendingExecution:
+        """Pack scheduled prefill windows and sample rows that finish a prompt."""
+        requests = sorted(requests, key=lambda entry: entry.request_id)
+        num_tokens = [entry.num_tokens for entry in requests]
         batch_sz = len(requests)
 
         # Validate batch size bounds
@@ -369,44 +248,30 @@ class GPUModelRunner:
                 f"{self._workspace.max_batch_size}"
             )
 
-        prompt_lens = [len(t.prompt_ids) for t in requests]
-        if num_tokens is None:
-            num_tokens = [prompt_len - start_pos for prompt_len in prompt_lens]
-        if len(num_tokens) != batch_sz:
-            raise ValueError("num_tokens must supply one window length per request")
-
-        # Validate inputs before any resource allocation
-        for prompt_len, n in zip(prompt_lens, num_tokens):
-            if start_pos >= prompt_len or n <= 0 or start_pos + n > prompt_len:
-                raise ValueError(
-                    "prefill window must lie strictly inside the prompt: "
-                    f"start_pos={start_pos} n={n} prompt_len={prompt_len}"
-                )
-
-        # Only the requests whose window reaches the prompt end sample a
-        # token; continuation chunks run forward for KV materialization.
-        sample_mask = [
-            start_pos + n == prompt_len
-            for prompt_len, n in zip(prompt_lens, num_tokens)
-        ]
-
+        if any(
+            r.position < 0
+            or r.num_tokens <= 0
+            or r.materialized_end > len(r.prompt_ids)
+            for r in requests
+        ):
+            raise ValueError("prefill window must fit the prompt")
+        sample_mask = [r.samples for r in requests]
         input_ids = torch.tensor(
             [
                 token
-                for t, n in zip(requests, num_tokens)
-                for token in t.prompt_ids[start_pos : start_pos + n]
+                for r in requests
+                for token in r.prompt_ids[r.position : r.materialized_end]
             ],
             dtype=torch.long,
             device=self.device,
         )
 
-        request_ids = [t.request_id for t in requests]
         position_ids = torch.cat(
             [
                 torch.arange(
-                    start_pos, start_pos + n, dtype=torch.long, device=self.device
+                    r.position, r.materialized_end, dtype=torch.long, device=self.device
                 )
-                for n in num_tokens
+                for r in requests
             ]
         )
 
@@ -434,12 +299,7 @@ class GPUModelRunner:
             outputs = self.model(
                 input_ids,
                 position_ids=position_ids,
-                kv_cache=self.kv_manager.bind(
-                    request_ids,
-                    self._workspace,
-                    start_pos=start_pos,
-                    seq_ends=[start_pos + n for n in num_tokens],
-                ),
+                kv_cache=self._workspace.bind(self.pool, requests),
                 logits_positions=last_token_indices,
             )
             logits = outputs["logits"]
@@ -455,7 +315,7 @@ class GPUModelRunner:
         if torch.device(self.device).type == "cuda":
             pending.completion_event = torch.cuda.Event()
             pending.completion_event.record()
-        return requests, pending
+        return pending
 
     def execute_score(
         self,
@@ -516,15 +376,12 @@ class GPUModelRunner:
                 for prompt_len in prompt_lens
             ]
         )
-        request_ids = [t.request_id for t in requests]
 
         with torch.inference_mode():
             outputs = self.model(
                 input_ids,
                 position_ids=position_ids,
-                kv_cache=self.kv_manager.bind(
-                    request_ids, self._workspace, start_pos=0
-                ),
+                kv_cache=self._workspace.bind(self.pool, requests),
                 logits_positions=logits_positions,
             )
             logits = outputs["logits"]
@@ -579,9 +436,7 @@ class GPUModelRunner:
             )
 
         ws = self._workspace
-        request_ids = [t.request_id for t in requests]
         task_sig = tuple(t.identity for t in requests)
-        cur_positions = [t.position for t in requests]
 
         # ---- pre-replay: update input buffers in-place ----
 
@@ -610,26 +465,18 @@ class GPUModelRunner:
         else:
             input_ids = ws.fill_input_ids([t.input_token_id for t in requests])
 
-        kv_cache = self.kv_manager.bind(request_ids, ws)
-
-        # Reuse sampling state only if all conditions hold:
-        # 1. The cached decode state belongs to THIS request set (task_sig)
-        # 2. KV bind detected steady increment (same req_indices, seq_lens +1)
-        reuse_decode_state = cache_valid and self.kv_manager.bind_was_steady
-        if reuse_decode_state:
-            info = cached.sampling_info
-            ws.position_ids[:b] += 1
-        else:
-            info = _build_sampling_batch_info(requests, self.device)
-            ws.position_ids[:b].copy_(
-                torch.tensor(cur_positions, dtype=torch.long, device=self.device)
-            )
+        info = (
+            cached.sampling_info
+            if cache_valid
+            else _build_sampling_batch_info(requests, self.device)
+        )
         if info.meta.has_freq and pending_same_batch:
             # Frequency penalty subtracts per-token counts computed from the
             # host history (prompt tail + full output). With a pending step
             # in flight the histories are one step behind the device relay,
             # so the penalty would be computed against the wrong prefix.
             return None
+        kv_cache = ws.bind(self.pool, requests)
         self._decode_cache = DecodeSteadyState(task_sig, info)
 
         # ---- forward (graph replay or live run + capture) ----
@@ -650,13 +497,13 @@ class GPUModelRunner:
                     key=key,
                     input_ids=input_ids,
                     kv_cache=kv_cache,
-                    position_ids=ws.position_ids[:b],
+                    position_ids=kv_cache.cache_seqlens,
                 )
             else:
                 outputs = self.model(
                     input_ids,
                     kv_cache=kv_cache,
-                    position_ids=ws.position_ids[:b],
+                    position_ids=kv_cache.cache_seqlens,
                 )
             logits = outputs["logits"]
 
@@ -746,16 +593,9 @@ class GPUModelRunner:
         """The in-flight submitted step, if any (not committed)."""
         return self._pending
 
-    def clear_pending(self) -> Optional[PendingExecution]:
-        """Detach the in-flight step without committing it.
-
-        The overlap scheduler's commit phase takes ownership this way: the
-        executor's ``_pending`` slot frees up for the *next* submit while
-        the scheduler still holds (and commits) the returned step.
-        """
-        pending = self._pending
+    def clear_pending(self) -> None:
+        """Forget the last submitted step after the engine has retired it."""
         self._pending = None
-        return pending
 
     def execute_model(self, plan: SchedulerOutput):
         """Yield every launched group's handle, including KV-only prefills.
@@ -770,13 +610,11 @@ class GPUModelRunner:
                 request.position if request.phase == "prefill" else None,
             )
             groups.setdefault(key, []).append(request)
-        for (phase, start_pos), requests in groups.items():
+        for (phase, _), requests in groups.items():
             subplan = plan.select(requests)
             if phase == "prefill":
-                _, pending = self.execute_prefill(
+                pending = self.execute_prefill(
                     requests,
-                    start_pos=start_pos,
-                    num_tokens=[r.num_tokens for r in requests],
                     return_logprobs=plan.return_logprobs,
                     plan=subplan,
                 )

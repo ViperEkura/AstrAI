@@ -65,7 +65,7 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
     def prefill(requests, *, plan, **kwargs):
         # Worker packing order deliberately differs from scheduler order.
         packed = sorted(requests, key=lambda r: r.request_id)
-        return packed, PendingExecution(
+        return PendingExecution(
             snapshot=plan,
             sampled_identities=tuple(r.identity for r in packed),
             tokens=torch.tensor([11, 12], dtype=torch.long),
@@ -82,8 +82,8 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
     assert produced == [short, long]
     args, kwargs = scheduler.model_runner.execute_prefill.call_args
     assert [r.identity for r in args[0]] == [short.identity, long.identity]
-    assert kwargs["start_pos"] == 0
-    assert kwargs["num_tokens"] == [3, 5]
+    assert [r.position for r in args[0]] == [0, 0]
+    assert [r.num_tokens for r in args[0]] == [3, 5]
     assert kwargs["plan"].policy_version == scheduler.policy_version
     assert long.output_ids == [11]
     assert short.output_ids == [12]
@@ -92,8 +92,7 @@ def test_step_batches_ragged_prefill_with_shared_cache_start():
 def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
-    executor.kv_manager = MagicMock()
-    executor.kv_manager.bind.return_value = MagicMock()
+    executor.pool = MagicMock()
     executor._workspace = MagicMock()
     executor._workspace.max_batch_size = 16  # Add max_batch_size for validation
     all_logits = torch.arange(42, dtype=torch.float32).reshape(6, 7)
@@ -113,11 +112,8 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
         )
     )
 
-    requests, pending = executor.execute_prefill(
-        [task_b, task_a], start_pos=1, plan=plan
-    )
+    pending = executor.execute_prefill([task_b, task_a], plan=plan)
 
-    assert requests == [task_a, task_b]
     assert [(r.identity, r.token_id) for r in pending.commit().results] == [
         (task_b.identity, 102),
         (task_a.identity, 101),
@@ -126,9 +122,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
     assert model_args[0].tolist() == [11, 12, 21, 22, 23, 24]
     assert model_kwargs["position_ids"].tolist() == [1, 2, 1, 2, 3, 4]
     assert model_kwargs["logits_positions"].tolist() == [1, 5]
-    executor.kv_manager.bind.assert_called_once_with(
-        ["a", "b"], executor._workspace, start_pos=1, seq_ends=[3, 5]
-    )
+    executor._workspace.bind.assert_called_once_with(executor.pool, [task_a, task_b])
     sample_args, sample_kwargs = executor._submit_sample.call_args
     torch.testing.assert_close(sample_args[0], all_logits[[1, 5]])
     assert sample_args[1] == [task_a, task_b]
@@ -139,9 +133,7 @@ def test_execute_prefill_packs_ragged_prompts_and_selects_last_logits():
 def test_decode_does_not_reuse_previous_batch_state():
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
-    executor.kv_manager = MagicMock()
-    executor.kv_manager.bind_was_steady = True
-    executor.kv_manager.bind.return_value = MagicMock()
+    executor.pool = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
     executor._pending = None
@@ -149,7 +141,6 @@ def test_decode_does_not_reuse_previous_batch_state():
 
     workspace = MagicMock()
     workspace.max_batch_size = 16
-    workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids.return_value = torch.tensor([7], dtype=torch.long)
     executor._workspace = workspace
     executor.model = MagicMock(
@@ -178,7 +169,11 @@ def test_decode_does_not_reuse_previous_batch_state():
         assert pending is not None
         assert [r.token_id for r in pending.commit().results] == [3]
 
-    assert workspace.position_ids.tolist() == [8]
+    executor._workspace.bind.assert_called_once_with(executor.pool, [request])
+    assert (
+        executor.model.call_args.kwargs["position_ids"]
+        is workspace.bind.return_value.cache_seqlens
+    )
     assert executor._decode_cache.task_sig == (request.identity,)
     executor._submit_sample.assert_called_once()
     args, kwargs = executor._submit_sample.call_args
@@ -190,15 +185,12 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     """Steady-state decode copies cached device tokens, skipping the host."""
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
-    executor.kv_manager = MagicMock()
-    executor.kv_manager.bind_was_steady = True
-    executor.kv_manager.bind.return_value = MagicMock()
+    executor.pool = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
 
     workspace = MagicMock()
     workspace.max_batch_size = 16
-    workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids_from_device.return_value = torch.tensor(
         [9], dtype=torch.long
     )
@@ -234,7 +226,11 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
 
     workspace.fill_input_ids.assert_not_called()
     workspace.fill_input_ids_from_device.assert_called_once_with(tokens)
-    assert workspace.position_ids.tolist() == [3]
+    executor._workspace.bind.assert_called_once_with(executor.pool, [request])
+    assert (
+        executor.model.call_args.kwargs["position_ids"]
+        is workspace.bind.return_value.cache_seqlens
+    )
     assert executor._decode_cache.task_sig == (request.identity,)
     assert executor._decode_cache.last_tokens is tokens
 
@@ -420,9 +416,7 @@ def test_chunked_prefill_matches_whole_prompt_greedy_tokens(cpu_device):
     orig_prefill = ref_sched.model_runner.execute_prefill
 
     def counting_prefill(requests, **kw):
-        fwd_calls.append(
-            sum(kw.get("num_tokens") or [len(r.prompt_ids) for r in requests])
-        )
+        fwd_calls.append(sum(r.num_tokens for r in requests))
         return orig_prefill(requests, **kw)
 
     ref_sched.model_runner.execute_prefill = counting_prefill
@@ -477,7 +471,7 @@ def test_chunked_prefill_budget_caps_forward_tokens(cpu_device):
     orig = scheduler.model_runner.execute_prefill
 
     def spy(requests, **kw):
-        seen.append(sum(kw.get("num_tokens") or []))
+        seen.append(sum(r.num_tokens for r in requests))
         return orig(requests, **kw)
 
     scheduler.model_runner.execute_prefill = spy

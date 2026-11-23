@@ -13,8 +13,7 @@ def make_contract_scheduler():
     kv = MagicMock()
     scheduler.scheduler._kv_manager = kv
     scheduler.scheduler._planner.kv_manager = kv
-    kv.cached_tokens.return_value = 0
-    kv.extend_slots_batch.side_effect = lambda ids, positions: [True] * len(ids)
+    kv.alloc.side_effect = lambda requests, ends=None: [True] * len(requests)
     return scheduler
 
 

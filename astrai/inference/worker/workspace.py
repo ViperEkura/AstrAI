@@ -5,10 +5,18 @@ reads/writes fixed-address tensors with zero ``torch.empty`` calls during
 the hot loop — a prerequisite for CUDA-graph capture.
 """
 
+from itertools import accumulate
+from typing import TYPE_CHECKING, Sequence
+
 import torch
 from torch import Tensor
 
 from astrai.config.inference_config import InferenceConfig
+from astrai.inference.contracts import ExecutionRequest
+from astrai.model.kv_cache import DecodeKVCache, KVCache, PrefillKVCache
+
+if TYPE_CHECKING:
+    from astrai.inference.core.cache import BlockPool
 
 _CONFIG = InferenceConfig()
 MAX_SPLITS = _CONFIG.max_splits
@@ -17,14 +25,13 @@ MAX_SPLITS = _CONFIG.max_splits
 class InferenceWorkspace:
     """Reusable fixed-shape per-step buffers for decode.
 
-    Families of buffers, all sized to ``max_batch_size`` / ``max_seq_len``
-    and sliced via views each step:
+    Buffers are sized for the maximum batch and sliced for each step:
 
     - ``input_ids``: per-step token IDs filled from host — values are
       staged through a pinned buffer and bulk-copied into the stable
       device buffer (fixed address for CUDA-graph capture).
     - KV-cache bind metadata (request rows, page table, past lengths, query offsets), written by
-      ``BlockPool.bind_tasks`` when the model runner passes this workspace.
+      ``InferenceWorkspace.bind`` when the model runner passes this workspace.
     - ``decode_o_part`` / ``decode_ml_part``: split-KV partial result buffers
       (mirrors FlashInfer's workspace).  One global alloc, reused by every
       decode step across all layers.  Sliced views are passed to the CUDA
@@ -37,18 +44,14 @@ class InferenceWorkspace:
     def __init__(
         self,
         max_batch_size: int,
-        max_seq_len: int,
         max_q_heads: int,
         head_dim: int,
         device: torch.device,
         dtype: torch.dtype,
     ):
         self.max_batch_size = max_batch_size
-        self.max_seq_len = max_seq_len
-        self.max_q_heads = max_q_heads
         self.head_dim = head_dim
         self.device = device
-        self.dtype = dtype
 
         # Invariant: all workspace buffers are plain (non-inference)
         # tensors.  The scheduler's loop thread mutates them in-place every
@@ -74,7 +77,7 @@ class InferenceWorkspace:
             )
 
             # KV-cache bind metadata (fixed shape, written by
-            # ``BlockPool.bind_tasks`` when the model runner passes this
+            # ``InferenceWorkspace.bind`` when the model runner passes this
             # workspace).  Stable addresses make the decode forward
             # CUDA-graph capturable.
             self.req_pool_indices = torch.empty(
@@ -88,12 +91,11 @@ class InferenceWorkspace:
             )
             # The pool knows page size. Allocate this graph-stable table at first bind.
             self.page_table = None
-
-            # Per-step position IDs (must be at a fixed address for
-            # CUDA-graph capture).
-            self.position_ids = torch.empty(
-                (max_batch_size,), dtype=torch.long, device=device
-            )
+            self._source_table = None
+            self._page_version = -1
+            self._rows = ()
+            self._positions = ()
+            self._decode = None
 
             # Split-KV partial-result buffers for decode (persistent, one
             # global alloc per process — mirrors FlashInfer's workspace
@@ -118,6 +120,78 @@ class InferenceWorkspace:
                 dtype=dtype,
                 device=device,
             )
+
+    def bind(self, pool: "BlockPool", entries: Sequence[ExecutionRequest]) -> KVCache:
+        """Bind a homogeneous execution batch to graph-stable tensor views."""
+        b = len(entries)
+        rows = tuple(entry.cache_slot for entry in entries)
+        if not rows or min(rows) < 0:
+            raise ValueError("batch contains an unallocated cache slot")
+        storage = pool._storage
+        table, version = pool.req_pool.page_table, pool.req_pool.version
+        changed = self._source_table is not table or self._rows != rows
+        if self.page_table is None or self.page_table.size(1) != table.size(1):
+            with torch.inference_mode(False):
+                self.page_table = table.new_empty((self.max_batch_size, table.size(1)))
+        if changed:
+            self.req_pool_indices[:b].copy_(
+                torch.as_tensor(rows, dtype=torch.int32, device=self.device)
+            )
+        if changed or version != self._page_version:
+            torch.index_select(
+                table, 0, self.req_pool_indices[:b], out=self.page_table[:b]
+            )
+        self._source_table, self._rows, self._page_version = table, rows, version
+        if entries[0].phase == "decode":
+            positions = tuple(entry.position for entry in entries)
+            reuse = not changed and self._decode is not None
+            if not reuse:
+                self._decode = DecodeKVCache(
+                    storage.k_buffer,
+                    storage.v_buffer,
+                    self.page_table[:b],
+                    self.cache_seqlens[:b],
+                    self.decode_o_part,
+                    self.decode_ml_part,
+                    self.decode_out,
+                    layer_views=storage.layer_views,
+                )
+            past = self._decode.cache_seqlens
+            if reuse and all(
+                pos == prev + 1 for pos, prev in zip(positions, self._positions)
+            ):
+                past.add_(1)
+            else:
+                past.copy_(
+                    torch.as_tensor(positions, dtype=torch.int32, device=self.device)
+                )
+            self._positions = positions
+            return self._decode
+        pages, past = self.page_table[:b], self.cache_seqlens[:b]
+        self._decode = None
+        positions = [entry.position for entry in entries]
+        if positions.count(positions[0]) == b:
+            past.fill_(positions[0])
+        else:
+            past.copy_(
+                torch.as_tensor(positions, dtype=torch.int32, device=self.device)
+            )
+        offsets = self.cu_seqlens_q[: b + 1]
+        offsets.copy_(
+            torch.tensor(
+                [0, *accumulate(entry.num_tokens for entry in entries)],
+                device=self.device,
+                dtype=torch.int32,
+            )
+        )
+        return PrefillKVCache(
+            storage.k_buffer,
+            storage.v_buffer,
+            pages,
+            past,
+            offsets,
+            layer_views=storage.layer_views,
+        )
 
     def fill_input_ids(self, ids: "list[int]") -> Tensor:
         """Write ``ids`` into the device buffer and return ``[B]``.

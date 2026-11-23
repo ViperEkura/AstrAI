@@ -16,10 +16,9 @@ version and request windows. It contains execution data, not a reference to a
 live scheduler request. The returned results identify the requests to which
 rows belong; the core must not infer that correspondence from a mutable batch.
 
-Plans isolate request execution data, but not all cache access: the runner
-still calls the shared `KVCacheManager.bind()` and checks `bind_was_steady`.
-This [remaining boundary](core.md#cache-binding-boundary) must be visible in
-architecture diagrams even though the corresponding imports are type-only.
+Each execution entry carries its reserved request slot, position and token count.
+The workspace binds the ordered entries to model inputs using the shared block pool.
+See [cache binding](core.md#cache-binding-boundary).
 
 The core applies results to requests. Worker-side result materialization does
 not append output tokens, decide a request's final service state, emit terminal
@@ -53,14 +52,14 @@ classDiagram
         pinned input staging
     }
     class CUDAGraphRunner
-    class KVCacheManager
+    class BlockPool
 
     GPUModelRunner *-- InferenceWorkspace
     GPUModelRunner *-- CUDAGraphRunner
     GPUModelRunner *-- ResultRing
     GPUModelRunner *-- DecodeSteadyState
     GPUModelRunner --> PendingExecution
-    GPUModelRunner --> KVCacheManager : bind allocated slots to workspace
+    InferenceWorkspace --> BlockPool : gather allocated page rows
     ResultRing --> PendingExecution : output copy
 ```
 

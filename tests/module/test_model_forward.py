@@ -6,6 +6,7 @@ from torch import nn
 
 from astrai.config.model_config import AutoRegressiveLMConfig
 from astrai.inference.core.cache import BlockPool, KVCacheManager
+from astrai.inference.core.request import Request
 from astrai.inference.worker.workspace import InferenceWorkspace
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.strategy import (
@@ -13,6 +14,7 @@ from astrai.trainer.strategy import (
     SFTStrategy,
     _collect_moe_diagnostics,
 )
+from tests.support.cache import bind_cache
 from tests.support.models import TINY_CONFIG
 
 
@@ -69,17 +71,17 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
     cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         1,
-        config.max_position_embeddings,
         config.num_attention_heads,
         config.hidden_size // config.num_attention_heads,
         torch.device("cpu"),
         torch.float32,
     )
-    assert cache.alloc_slots("t", [1, 2, 3])
+    req_t = Request("t", [1, 2, 3])
+    assert cache.alloc([req_t])[0]
     packed = model(
         torch.tensor([1, 2, 3]),
         position_ids=torch.arange(3),
-        kv_cache=cache.bind(["t"], workspace, start_pos=0),
+        kv_cache=bind_cache(cache, workspace, [req_t], start_pos=0),
     )
     assert packed["logits"].shape == (3, config.vocab_size)
 
@@ -88,7 +90,7 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
     with pytest.raises(ValueError, match="inference input_ids"):
         model(
             torch.tensor([[1, 2, 3]]),
-            kv_cache=cache.bind(["t"], workspace, start_pos=0),
+            kv_cache=bind_cache(cache, workspace, [req_t], start_pos=0),
         )
 
 
@@ -111,13 +113,13 @@ def test_cached_prefill_key_mask_matches_dense_attention():
     cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         1,
-        config.max_position_embeddings,
         config.num_attention_heads,
         config.hidden_size // config.num_attention_heads,
         torch.device("cpu"),
         torch.float32,
     )
-    assert cache.alloc_slots("t", [1, 2, 3, 4])
+    req_t = Request("t", [1, 2, 3, 4])
+    assert cache.alloc([req_t])[0]
 
     with torch.inference_mode():
         dense = model(ids, input_mask=key_mask)["logits"][:, 2:]
@@ -125,19 +127,20 @@ def test_cached_prefill_key_mask_matches_dense_attention():
             ids[0, :2],
             input_mask=key_mask[:, :2],
             position_ids=torch.arange(2),
-            kv_cache=cache.bind(["t"], workspace, start_pos=0, seq_ends=[2]),
+            kv_cache=bind_cache(cache, workspace, [req_t], start_pos=0, seq_ends=[2]),
         )
         chunk = model(
             ids[0, 2:],
             input_mask=key_mask,
             position_ids=torch.arange(2, 4),
-            kv_cache=cache.bind(["t"], workspace, start_pos=2),
+            kv_cache=bind_cache(cache, workspace, [req_t], start_pos=2),
         )["logits"]
 
     torch.testing.assert_close(chunk, dense[0])
 
 
 def test_forward_logits_positions_projects_only_requested_rows():
+    requests_by_id = {}
     config = AutoRegressiveLMConfig(**TINY_CONFIG)
     model = AutoRegressiveLM(config).eval()
     prompts = [[1, 2, 3], [4, 5]]
@@ -155,20 +158,25 @@ def test_forward_logits_positions_projects_only_requested_rows():
     cache = KVCacheManager(pool)
     workspace = InferenceWorkspace(
         2,
-        config.max_position_embeddings,
         config.num_attention_heads,
         config.hidden_size // config.num_attention_heads,
         torch.device("cpu"),
         torch.float32,
     )
     for tid, ids in zip(("t1", "t2"), prompts):
-        assert cache.alloc_slots(tid, ids)
+        requests_by_id[tid] = Request(tid, ids)
+        assert cache.alloc([requests_by_id[tid]])[0]
     input_ids = torch.tensor(sum(prompts, []), dtype=torch.long)
     position_ids = torch.cat([torch.arange(len(p)) for p in prompts])
     with torch.inference_mode():
         kwargs = dict(
             position_ids=position_ids,
-            kv_cache=cache.bind(["t1", "t2"], workspace, start_pos=0),
+            kv_cache=bind_cache(
+                cache,
+                workspace,
+                [requests_by_id["t1"], requests_by_id["t2"]],
+                start_pos=0,
+            ),
         )
         full = model(input_ids, **kwargs)
         sliced = model(input_ids, logits_positions=last_rows, **kwargs)

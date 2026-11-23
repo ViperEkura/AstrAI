@@ -8,10 +8,9 @@ from astrai.inference.worker.workspace import InferenceWorkspace
 
 
 def make_cache_workspace(pool: BlockPool) -> InferenceWorkspace:
-    """Workspace sized to the pool (bind_tasks requires it)."""
+    """Workspace sized to the pool."""
     return InferenceWorkspace(
         pool.max_batch_size,
-        pool.max_seq_len,
         max_q_heads=2,
         head_dim=4,
         device=pool.device,
@@ -107,3 +106,20 @@ def appended_slots(cache):
             )
         ]
     )
+
+
+def bind_cache(
+    manager, workspace, requests, *, start_pos=None, seq_ends=None, positions=None
+):
+    """Build the execution snapshot a scheduler would pass to the workspace."""
+    lengths = [manager._states[r.request_id].length for r in requests]
+    if start_pos is None:
+        if positions is None:
+            positions = [length - 1 for length in lengths]
+        entries = [r.execution("decode", pos, 1) for r, pos in zip(requests, positions)]
+    else:
+        entries = [
+            r.execution("prefill", start_pos, end - start_pos)
+            for r, end in zip(requests, lengths if seq_ends is None else seq_ends)
+        ]
+    return workspace.bind(manager.pool, entries)

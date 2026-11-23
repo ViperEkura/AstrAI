@@ -1,26 +1,63 @@
-"""KV cache allocation layer.
-
-Encapsulates the physical slot allocation policy, isolated from GPU buffers
-and request lifecycle management.
-
-- ``RequestCacheState``: data contract between strategy and manager (per-request slot state)
-- ``Allocator``:       bitmask-based page allocator with LRU eviction
-- ``RadixCache``:      page-granular prefix index (exact token match)
-- ``AllocationStrategy``: ABC for physical slot allocation
-- ``ContiguousStrategy``: statically partitioned, no dynamic allocation
-- ``PagedStrategy``:    dynamic paged allocation from a shared pool
-"""
+"""Physical page allocation, request mappings and reusable prefix indexing."""
 
 import threading
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, OrderedDict, Tuple
 
 import torch
 
-from astrai.model.kv_cache import RequestPageTable
+from astrai.inference.contracts import RequestIdentity
 
-# ---- data contract: per-request slot state ----
+
+class RequestPageTable:
+    """Physical page IDs indexed by request slot and logical page."""
+
+    def __init__(self, size: int, max_pages: int, device: torch.device):
+        self.version = 0
+        self.page_table = torch.zeros(
+            (size, max_pages), dtype=torch.int32, device=device
+        )
+        self.free_slots = list(range(size))
+        self._lock = threading.Lock()
+
+    def alloc(self, num_reqs: int) -> Optional[List[int]]:
+        with self._lock:
+            if num_reqs > len(self.free_slots):
+                return None
+            slots = self.free_slots[:num_reqs]
+            self.free_slots = self.free_slots[num_reqs:]
+            return slots
+
+    def free(self, req_indices: List[int]):
+        with self._lock:
+            self.free_slots.extend(req_indices)
+
+    def flush_pages(self, states: List["RequestCacheState"]) -> None:
+        dirty = [s for s in states if s._flushed < len(s.pages)]
+        if not dirty:
+            return
+        if len(dirty) == 1:
+            state = dirty[0]
+            values = torch.tensor(
+                state.pages[state._flushed :],
+                dtype=torch.int32,
+                device=self.page_table.device,
+            )
+            indices = (state.req_idx, slice(state._flushed, len(state.pages)))
+        else:
+            updates = [
+                (s.req_idx, col, s.pages[col])
+                for s in dirty
+                for col in range(s._flushed, len(s.pages))
+            ]
+            rows, columns, values = torch.tensor(
+                updates, device=self.page_table.device, dtype=torch.int32
+            ).unbind(1)
+            indices = (rows, columns)
+        self.page_table[indices] = values
+        self.version += 1
+        for state in dirty:
+            state._flushed = len(state.pages)
 
 
 @dataclass
@@ -28,15 +65,15 @@ class RequestCacheState:
     """Per-request cache allocation state.
 
     Co-locates all request-owned cache metadata so the alloc/free/extend
-    lifecycle is atomic.  Owned by ``KVCacheManager``, consumed by
-    every ``AllocationStrategy`` method.
+    lifecycle is atomic.  Owned by ``KVCacheManager``.
 
     ``pages`` holds logical-to-physical page IDs; extensions flush only new IDs.
     """
 
     req_idx: int
     length: int = 0
-    cached: int = 0
+    owner: Optional[RequestIdentity] = None
+    published: int = 0
     pages: List[int] = field(default_factory=list)
     _flushed: int = 0
 
@@ -127,12 +164,12 @@ class Allocator:
             released += 1
         return released
 
-    def discard_cached(self, idxs: List[int]) -> int:
+    def discard_cached(self, idxs: List[int]) -> None:
         """Forget identities revoked by prefix replacement or relocation."""
         if not idxs:
-            return 0
+            return
         with self._lock:
-            return self._discard_cached(idxs)
+            self._discard_cached(idxs)
 
     def _evict_cached(self, idx: int) -> int:
         """Evict one LRU victim and reclaim its revoked descendants."""
@@ -215,7 +252,6 @@ class Allocator:
         """
         if not idxs:
             return
-        keep = keep_cached_for or (lambda idx: False)
         with self._lock:
             # Set-latch pass first (refs may drop to zero multiple times in
             # one batch; the freed bits are aggregated into ONE big-int
@@ -226,7 +262,7 @@ class Allocator:
             for idx in idxs:
                 self._refs[idx] -= 1
                 if self._refs[idx] == 0:
-                    if keep(idx):
+                    if keep_cached_for and keep_cached_for(idx):
                         self._lru[idx] = None
                     else:
                         freed_bits |= 1 << idx
@@ -249,11 +285,6 @@ class Allocator:
         """
         with self._lock:
             return n_pages <= self._n_pages
-
-    def reclaimable_pages(self) -> int:
-        """Pages currently cached-but-unreferenced (LRU entries)."""
-        with self._lock:
-            return len(self._lru)
 
     def inc_ref(self, idx: int):
         with self._lock:
@@ -381,239 +412,3 @@ class RadixCache:
             if old is not None:
                 revoked.remove(page_idx)
             return revoked
-
-
-class AllocationStrategy(ABC):
-    """Physical slot allocation policy.
-
-    Subclasses implement the actual allocation semantics.  This ABC declares
-    the contract; there are no default implementations.
-    """
-
-    @abstractmethod
-    def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool: ...
-
-    @abstractmethod
-    def free(self, state: RequestCacheState) -> None: ...
-
-    @abstractmethod
-    def extend(self, state: RequestCacheState, pos: int) -> bool: ...
-
-    def extend_batch(
-        self, states: List[RequestCacheState], positions: List[int]
-    ) -> List[bool]:
-        """Extend many requests by one position each; per-item success flags.
-
-        Default: loop ``extend``.  Strategies with a per-extension
-        allocation cost override this with a batched harvest.
-        """
-        return [self.extend(s, p) for s, p in zip(states, positions)]
-
-    @abstractmethod
-    def write_indices(
-        self, state: RequestCacheState, prompt_ids: List[int]
-    ) -> None: ...
-
-    @abstractmethod
-    def record_hashes(
-        self,
-        state: RequestCacheState,
-        prompt_ids: List[int],
-        start: int,
-        *,
-        materialized_end: int,
-    ) -> None: ...
-
-    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
-        """Publish newly assigned physical pages to the request table.
-
-        Only the paged strategy stages slots on the host; the default is a
-        no-op for strategies whose page table rows are already current
-        (contiguous rows are pre-filled and never rewritten).
-        Returns whether this call changed a page mapping.
-        """
-        return False
-
-    def invalidate_cache(self) -> int:
-        """Drop reusable KV entries after an inference weight update."""
-        return 0
-
-    def can_ever_fit(self, n_tokens: int) -> bool:
-        """Whether a request of ``n_tokens`` could ever be admitted."""
-        return True
-
-
-class ContiguousStrategy(AllocationStrategy):
-    """Static contiguous allocation: slots are pre-assigned at pool init.
-
-    No dynamic allocation or prefix caching.  All operations are no-ops
-    because ``RequestPageTable`` is pre-filled with contiguous ranges.
-    """
-
-    def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool:
-        return True
-
-    def free(self, state: RequestCacheState) -> None:
-        pass
-
-    def extend(self, state: RequestCacheState, pos: int) -> bool:
-        return True
-
-    def write_indices(self, state: RequestCacheState, prompt_ids: List[int]) -> None:
-        pass
-
-    def record_hashes(
-        self,
-        state: RequestCacheState,
-        prompt_ids: List[int],
-        start: int,
-        *,
-        materialized_end: int,
-    ) -> None:
-        pass
-
-
-class PagedStrategy(AllocationStrategy):
-    """Dynamic paged allocation from a shared bitmask pool.
-
-    ``page_size`` is a parameter, not a separate strategy: at ``page_size=1``
-    each allocated page *is* one token slot (``page * 1 + 0``), and prefix
-    caching is simply disabled (``prefix=None``).  The unified page formula
-    ``pages[page_idx] * page_size + offset`` holds for both.
-    """
-
-    def __init__(
-        self,
-        alloc: Allocator,
-        prefix: Optional[RadixCache],
-        page_size: int,
-        req_pool: RequestPageTable,
-        device,
-    ):
-        self._alloc = alloc
-        self._prefix = prefix
-        self._page_size = page_size
-        self._req_pool = req_pool
-        self._device = device
-
-    def alloc(self, state: RequestCacheState, prompt_ids: List[int]) -> bool:
-        if self._prefix is not None:
-            hits = self._prefix.lookup(prompt_ids)
-            state.cached = len(hits) * self._page_size
-            for p in hits:
-                self._alloc.inc_ref(p)
-            state.pages = list(hits)
-
-        remaining = len(prompt_ids) - state.cached
-        if remaining <= 0:
-            return True
-        n_new = (remaining + self._page_size - 1) // self._page_size
-        new_pages = self._alloc.alloc_many(n_new)
-        if new_pages is None:
-            return False
-        state.pages.extend(new_pages)
-        return True
-
-    def free(self, state: RequestCacheState) -> None:
-        if self._prefix is not None:
-            self._alloc.free_many(state.pages, keep_cached_for=self._prefix.has_page)
-        else:
-            self._alloc.free_many(state.pages)
-
-    def extend(self, state: RequestCacheState, pos: int) -> bool:
-        page_idx = pos // self._page_size
-        if page_idx >= len(state.pages):
-            p = self._alloc.alloc()
-            if p < 0:
-                return False
-            state.pages.append(p)
-        return True
-
-    def extend_batch(
-        self, states: List[RequestCacheState], positions: List[int]
-    ) -> List[bool]:
-        """Extend a decode step's requests with ONE word-indexed harvest.
-
-        ``extend`` allocates at most one page per call through the
-        big-int-masked ``Allocator.alloc`` (~13us on serving-scale pools;
-        128 per decode step = ~1.7ms of host time).  In the steady decode
-        loop every state needs exactly one new page, so the batch asks
-        the allocator once and hands the pages out lowest-first — the
-        same order the per-request lsb scans would have produced, making
-        the harvest unobservable in slot numbering.  When the batch
-        harvest cannot satisfy every state (a mixed batch or pool
-        pressure), the call falls back to per-request ``extend`` so the
-        success/failure ORDER matches the historical per-request path.
-        """
-        page_size = self._page_size
-        need: List[int] = []
-        for i, (state, pos) in enumerate(zip(states, positions)):
-            if pos // page_size >= len(state.pages):
-                need.append(i)
-        if need:
-            pages = self._alloc.alloc_many(len(need))
-            if pages is None or len(pages) < len(need):
-                return [self.extend(s, p) for s, p in zip(states, positions)]
-            for i, p in zip(need, pages):
-                states[i].pages.append(p)
-        return [True] * len(states)
-
-    def write_indices(self, state: RequestCacheState, prompt_ids: List[int]) -> None:
-        count = len(state.pages)
-        if count:
-            self._req_pool.page_table[state.req_idx, :count] = torch.tensor(
-                state.pages, dtype=torch.int32, device=self._device
-            )
-        state._flushed = count
-
-    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
-        updates = [
-            (state.req_idx, col, state.pages[col])
-            for state in states
-            for col in range(state._flushed, len(state.pages))
-        ]
-        if updates:
-            rows, columns, pages = torch.tensor(
-                updates, device=device, dtype=torch.int32
-            ).unbind(1)
-            self._req_pool.page_table[rows, columns] = pages
-            for state in states:
-                state._flushed = len(state.pages)
-        return bool(updates)
-
-    def record_hashes(
-        self,
-        state: RequestCacheState,
-        prompt_ids: List[int],
-        start: int,
-        *,
-        materialized_end: int,
-    ) -> None:
-        """Publish complete pages below the exclusive, materialized KV end.
-
-        Reserved pages and the full prompt length are not evidence that a
-        chunk has run. The caller must explicitly report its computed end.
-        """
-        if materialized_end < 0 or start < 0:
-            raise ValueError("materialized_end and start must be nonnegative")
-        if self._prefix is None:
-            return
-        full = min(materialized_end, len(prompt_ids)) // self._page_size
-        for i in range(start, min(full, len(state.pages))):
-            revoked = self._prefix.record(state.pages[i], prompt_ids, i)
-            # Radix mutations finish before taking the allocator lock:
-            # allocator-driven eviction takes these locks in the other order.
-            self._alloc.discard_cached(revoked)
-
-    def invalidate_cache(self) -> int:
-        if self._prefix is None:
-            return 0
-        return self._alloc.clear_cached()
-
-    def can_ever_fit(self, n_tokens: int) -> bool:
-        # Page-align the request the same way ``alloc`` does; prefix hits
-        # can only shrink the need, so the unaligned upper bound is a
-        # safe admission test (a borderline request simply waits for a
-        # hit it might not get, never spins forever).
-        n_pages = (n_tokens + self._page_size - 1) // self._page_size
-        return self._alloc.can_ever_satisfy(n_pages)

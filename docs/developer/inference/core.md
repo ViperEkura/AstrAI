@@ -40,9 +40,9 @@ classDiagram
         execute_score()
     }
     class KVCacheManager {
-        alloc_slots() / extend_slots_batch()
-        record_block_hashes(materialized_end)
-        free_slots() / invalidate_cache()
+        alloc(requests, ends)
+        commit(requests, ends)
+        free(requests)
     }
     class PolicyVersionGuard {
         RLock
@@ -55,7 +55,24 @@ classDiagram
     EngineCore *-- PolicyVersionGuard
     Scheduler *-- StepPlanner
     Scheduler *-- KVCacheManager
-    GPUModelRunner --> KVCacheManager : shared bind dependency
+    KVCacheManager --> BlockPool : owns reservations
+    class Request {
+        cache_slot
+        cached_tokens
+        execution(phase, position, num_tokens)
+    }
+    class ExecutionRequest {
+        cache_slot
+        position
+        num_tokens
+    }
+    class InferenceWorkspace {
+        bind(pool, entries)
+    }
+    Scheduler --> Request : update progress
+    Request ..> ExecutionRequest : snapshot
+    GPUModelRunner --> InferenceWorkspace : bind execution entries
+    InferenceWorkspace --> BlockPool : gather physical page rows
 ```
 
 The scheduler owns one request registry, waiting/running queues and terminal
@@ -104,73 +121,44 @@ Stopping similarly drains or safely retires in-flight work before clearing
 request/KV state. A timed-out join retains the live thread and its state;
 a second loop must not be started over it.
 
-## KV allocation strategy
+## KV page allocation
 
-`KVCacheManager` owns request allocation state. `BlockPool` owns the physical
-storage, token mapping and allocation strategy:
+`BlockPool` owns the KV tensors and the request page table. A contiguous pool
+fills each slot's fixed page IDs at construction. For a paged pool,
+`KVCacheManager` reserves and releases physical pages using the pool's allocator.
+When pages hold multiple tokens, a radix index tracks reusable full prefixes.
 
-- **ContiguousStrategy:** static request partitions, no prefix reuse.
-- **PagedStrategy:** logical pages from a bitmap/LRU allocator; radix prefix
-  indexing is enabled for page sizes greater than one.
+The request page table publishes newly allocated page IDs and increments its
+version. Each workspace gathers the rows for its current batch when the ordered
+slots or the table version change. Across a page crossing, the destination
+address stays stable for CUDA Graph replay.
 
-This is the Strategy pattern with two real implementations. The scheduler
-uses the same allocation operations; `BlockPool` selects the policy at
-construction. Contiguous allocation has simpler fixed partitions; paging adds
-reuse and flexible capacity at the cost of page/index bookkeeping.
+The manager has three batched request lifecycle operations. All ends count tokens
+from the beginning of the request and are exclusive.
 
-```mermaid
-classDiagram
-    class KVCacheManager
-    class BlockPool
-    class AllocationStrategy
-    class ContiguousStrategy
-    class PagedStrategy
-    class Allocator
-    class RadixCache
-    KVCacheManager --> BlockPool
-    BlockPool *-- AllocationStrategy
-    AllocationStrategy <|-- ContiguousStrategy
-    AllocationStrategy <|-- PagedStrategy
-    PagedStrategy --> Allocator : page references
-    PagedStrategy --> RadixCache : optional prefix index
-```
-
-A decode token advances its past length. With a physical page table, the
-mapping only changes when a page is allocated or the request batch changes.
-The strategy reports whether it published new page IDs; steady decode reuses
-the workspace table otherwise. A page crossing refreshes the table in place,
-preserving the addresses captured by CUDA Graphs.
-
-Prefix publication requires
-`record_block_hashes(..., materialized_end=exclusive_token_end)`. The boundary
-must come from completed execution, not from prompt length, allocated page
-count, or a cursor already advanced for a later in-flight step. Only complete
-pages below that boundary can be published. The sampled token is not yet in
-KV until a subsequent model execution consumes it.
+| Call | Contract |
+| --- | --- |
+| `alloc(requests, ends=None)` | Reserve through each end, defaulting to its prompt length. Return one success flag per input, in order. New requests receive their cache slot and cached prompt length. Under pressure, a failed request retains its existing reservation. |
+| `commit(requests, ends)` | After the execution fence, index newly completed whole pages. Repeated or older ends are harmless. The sampled token becomes eligible after a subsequent forward consumes it. |
+| `free(requests)` | After all in-flight work retires, release request slots and page references. Stale request identities cannot release a newer incarnation. |
 
 Radix re-recording must preserve valid descendants, and removal of an
 ancestor must not leave descendants advertised by the reverse index. Physical
 allocator references and prefix-index reachability are separate invariants.
 
-Both cache strategies preallocate a GPU arena. Paged allocation currently
+Both layouts preallocate a GPU arena. Paged allocation currently
 reserves prompt pages at admission; chunking limits computation, not that
 initial reservation. Global token budgets, progressive prompt allocation and
 recompute preemption are not introduced by this ownership refactor.
 
 ### Cache binding boundary
 
-Logical ownership is separate from the current object dependencies.
-`GPUModelRunner` receives the scheduler's `KVCacheManager` and calls `bind()`
-for prefill, decode and scoring. Binding reads request allocation state,
-flushes slot mappings and delegates device-view assembly to
-`BlockPool.bind_tasks()`, which uses `InferenceWorkspace`.
-
-Consequently, `TYPE_CHECKING` imports prevent a reverse runtime import but
-do not make the worker independent of core-owned cache state. The current
-operation lock and drain rules protect this shared access. A cleaner future
-boundary would pass the allocated request slots, lengths and mapping data to
-worker-side binding, without moving admission/free decisions out of core or
-copying full page tables every decode step.
+`Request.execution` snapshots the slot, position and token count in an immutable
+`ExecutionRequest`. The runner passes the ordered entries and pool to
+`InferenceWorkspace.bind`. The workspace gathers page rows when the slot order or
+the table version changes. Decode uses one tensor for RoPE positions and attention
+past lengths. Prefill builds query offsets from the per-request token counts.
+The same cache view is reused across model layers.
 
 ## Policy versioning
 

@@ -4,6 +4,7 @@ import torch
 from astrai.inference.core.cache import (
     BlockPool,
     KVCacheManager,
+    RequestCacheState,
     RequestPageTable,
 )
 from tests.support.cache import (
@@ -33,10 +34,13 @@ def test_request_page_table_alloc_when_full():
     assert pool.alloc(1) is None
 
 
-def test_request_page_table_write():
+def test_request_page_table_publishes_dirty_pages_once():
     pool = RequestPageTable(4, 128, torch.device("cpu"))
     slots = pool.alloc(1)
-    pool.write((slots[0], slice(0, 3)), torch.tensor([10, 20, 30]))
+    state = RequestCacheState(req_idx=slots[0], pages=[10, 20, 30])
+    pool.flush_pages([state])
+    pool.flush_pages([state])
+    assert pool.version == 1
     assert pool.page_table[slots[0], 0].item() == 10
     assert pool.page_table[slots[0], 2].item() == 30
 
@@ -44,26 +48,26 @@ def test_request_page_table_write():
 def test_page_pool_contiguous_task_alloc_free():
     pool = make_contiguous_pool()
     task_cache = KVCacheManager(pool)
-    assert task_cache.alloc_slots("t1", [1, 2, 3])
+    assert task_cache.admit("t1", [1, 2, 3])
     assert "t1" in task_cache._states
-    task_cache.free_slots("t1")
+    task_cache.release("t1")
     assert "t1" not in task_cache._states
 
 
 def test_page_pool_contiguous_task_extend():
     pool = make_contiguous_pool()
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", [1, 2, 3])
-    assert task_cache.extend_slots("t1", 3)
-    assert task_cache.extend_slots("t1", 63)
-    assert not task_cache.extend_slots("t1", 64)
+    task_cache.admit("t1", [1, 2, 3])
+    assert task_cache.reserve_decode(["t1"], [3])[0]
+    assert task_cache.reserve_decode(["t1"], [63])[0]
+    assert not task_cache.reserve_decode(["t1"], [64])[0]
 
 
-def test_page_pool_contiguous_bind_tasks_prefill():
+def test_page_pool_contiguous_bind_prefill():
     pool = make_contiguous_pool()
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", list(range(10)))
-    task_cache.alloc_slots("t2", list(range(10)))
+    task_cache.admit("t1", list(range(10)))
+    task_cache.admit("t2", list(range(10)))
     kv = task_cache.bind(["t1", "t2"], make_cache_workspace(pool), start_pos=0)
     assert appended_slots(kv).shape == (20,)
     assert appended_slots(kv).dtype == torch.int32
@@ -72,36 +76,36 @@ def test_page_pool_contiguous_bind_tasks_prefill():
     assert kv.page_table.dtype == torch.int32
 
 
-def test_page_pool_bind_tasks_binds_packed_query_offsets():
+def test_page_pool_bind_binds_packed_query_offsets():
     pool = make_contiguous_pool(max_batch_size=3, max_seq_len=256)
 
     manager = KVCacheManager(pool)
     ids = ["a", "b", "c"]
     for request_id, length in zip(ids, [70, 10, 130]):
-        assert manager.alloc_slots(request_id, list(range(length)))
+        assert manager.admit(request_id, list(range(length)))
     kv = manager.bind(ids, make_cache_workspace(pool), start_pos=0)
 
     assert kv.cu_seqlens_q.tolist() == [0, 70, 80, 210]
 
 
-def test_page_pool_contiguous_bind_tasks_decode():
+def test_page_pool_contiguous_bind_decode():
     pool = make_contiguous_pool()
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", list(range(10)))
-    task_cache.alloc_slots("t2", list(range(8)))
+    task_cache.admit("t1", list(range(10)))
+    task_cache.admit("t2", list(range(8)))
     # Simulate one decode extension so seq_lens advance to 11 and 9.
-    assert task_cache.extend_slots("t1", 10)
-    assert task_cache.extend_slots("t2", 8)
+    assert task_cache.reserve_decode(["t1"], [10])[0]
+    assert task_cache.reserve_decode(["t2"], [8])[0]
     kv = task_cache.bind(["t1", "t2"], make_cache_workspace(pool))
     assert appended_slots(kv).shape == (2,)
     assert kv.cache_seqlens.tolist() == [10, 8]
 
 
 def test_page_pool_contiguous_bind_roundtrip():
-    """Write KV via bind_tasks, then gather via req_to_token indexing."""
+    """Write and gather KV through the request page table."""
     pool = make_contiguous_pool(n_layers=1, n_kv_heads=2, head_dim=4)
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", list(range(4)))
+    task_cache.admit("t1", list(range(4)))
 
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
@@ -119,7 +123,7 @@ def test_page_pool_contiguous_bind_roundtrip():
 def test_page_pool_paged_task_alloc():
     pool = make_paged_pool()
     task_cache = KVCacheManager(pool)
-    assert task_cache.alloc_slots("t1", list(range(10)))
+    assert task_cache.admit("t1", list(range(10)))
     state = task_cache._states["t1"]
     assert len(state.pages) == 10
     assert pool.req_pool.page_table[state.req_idx, 0].item() == state.pages[0]
@@ -128,8 +132,8 @@ def test_page_pool_paged_task_alloc():
 def test_page_pool_paged_task_extend():
     pool = make_paged_pool()
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", list(range(4)))
-    assert task_cache.extend_slots("t1", 4)
+    task_cache.admit("t1", list(range(4)))
+    assert task_cache.reserve_decode(["t1"], [4])[0]
     req_idx = task_cache._states["t1"].req_idx
     task_cache.bind(["t1"], make_cache_workspace(pool))
     assert (
@@ -140,8 +144,8 @@ def test_page_pool_paged_task_extend():
 def test_page_pool_paged_task_free_releases_slots():
     pool = make_paged_pool(n_tokens=16)
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", list(range(8)))
-    task_cache.free_slots("t1")
+    task_cache.admit("t1", list(range(8)))
+    task_cache.release("t1")
     assert "t1" not in task_cache._states
     assert len(pool.req_pool.free_slots) == 4
 
@@ -149,7 +153,7 @@ def test_page_pool_paged_task_free_releases_slots():
 def test_page_pool_paged_bind_roundtrip():
     pool = make_paged_pool(n_layers=1, n_kv_heads=2, head_dim=4)
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", list(range(4)))
+    task_cache.admit("t1", list(range(4)))
 
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
     k = torch.randn(1, 4, 2, 4)
@@ -166,7 +170,7 @@ def test_page_pool_paged_ps64_task_alloc():
     pool = make_paged_pool_ps64()
     task_cache = KVCacheManager(pool)
     prompt = list(range(200))
-    assert task_cache.alloc_slots("t1", prompt)
+    assert task_cache.admit("t1", prompt)
     assert task_cache.cached_tokens("t1") == 0
     n_pages = (200 + 63) // 64
     assert len(task_cache._states["t1"].pages) == n_pages
@@ -175,8 +179,8 @@ def test_page_pool_paged_ps64_task_alloc():
 def test_page_pool_paged_ps64_task_extend_crosses_page():
     pool = make_paged_pool_ps64()
     task_cache = KVCacheManager(pool)
-    task_cache.alloc_slots("t1", list(range(64)))
-    assert task_cache.extend_slots("t1", 64)
+    task_cache.admit("t1", list(range(64)))
+    assert task_cache.reserve_decode(["t1"], [64])[0]
     assert len(task_cache._states["t1"].pages) >= 2
 
 
@@ -184,7 +188,7 @@ def test_page_pool_paged_ps64_bind_roundtrip():
     pool = make_paged_pool_ps64(n_layers=1, n_kv_heads=2, head_dim=4)
     task_cache = KVCacheManager(pool)
     prompt = list(range(128))
-    task_cache.alloc_slots("t1", prompt)
+    task_cache.admit("t1", prompt)
 
     kv = task_cache.bind(["t1"], make_cache_workspace(pool), start_pos=0)
     k = torch.randn(1, 128, 2, 4)
@@ -205,7 +209,7 @@ def test_page_pool_paged_steady_decode_slots_reach_device():
     task_cache = KVCacheManager(pool)
     ws = make_cache_workspace(pool)
     prompt = list(range(4))
-    assert task_cache.alloc_slots("t1", prompt)
+    assert task_cache.admit("t1", prompt)
 
     # Prefill bind flushes the whole staged prefix.
     task_cache.bind(["t1"], ws, start_pos=0)
@@ -214,7 +218,7 @@ def test_page_pool_paged_steady_decode_slots_reach_device():
     # Decode steps: extend stages one slot per token, bind (incremental or
     # not) must push it to the device row.
     for pos in range(4, 10):
-        assert task_cache.extend_slots("t1", pos)
+        assert task_cache.reserve_decode(["t1"], [pos])[0]
         task_cache.bind(["t1"], ws)
         device_row = pool.req_pool.page_table[state.req_idx, : pos + 1].tolist()
         expected = [p * pool.page_size for p in state.pages[: pos + 1]]
@@ -250,14 +254,14 @@ def test_extend_batch_matches_per_task_extend():
 
     ids = [f"t{i}" for i in range(4)]
     for tid in ids:
-        assert mgr_a.alloc_slots(tid, [10, 20, 30])
-        assert mgr_b.alloc_slots(tid, [10, 20, 30])
+        assert mgr_a.admit(tid, [10, 20, 30])
+        assert mgr_b.admit(tid, [10, 20, 30])
 
     # Per-request reference: four extends at position 3.
     for tid in ids:
-        assert mgr_a.extend_slots(tid, 3)
+        assert mgr_a.reserve_decode([tid], [3])[0]
     # Batched: same positions through one strategy call.
-    assert mgr_b.extend_slots_batch(list(ids), [3] * 4) == [True] * 4
+    assert mgr_b.reserve_decode(list(ids), [3] * 4) == [True] * 4
 
     for tid in ids:
         sa = mgr_a._states[tid]
@@ -266,9 +270,9 @@ def test_extend_batch_matches_per_task_extend():
         assert sa.length == sb.length == 4
 
     # Next positions stay in lockstep, and bind flushes both equally.
-    assert mgr_b.extend_slots_batch(list(ids), [4] * 4) == [True] * 4
+    assert mgr_b.reserve_decode(list(ids), [4] * 4) == [True] * 4
     for tid in ids:
-        assert mgr_a.extend_slots(tid, 4)
+        assert mgr_a.reserve_decode([tid], [4])[0]
     mgr_a.bind(ids, ws)
     mgr_b.bind(ids, make_cache_workspace(pool_b))
     for tid in ids:
@@ -277,7 +281,7 @@ def test_extend_batch_matches_per_task_extend():
         assert sa.length == sb.length == 5
 
     # A missing request fails alone; the rest still extend.
-    assert mgr_b.extend_slots_batch(["ghost"] + ids[1:], [5] * 4) == [
+    assert mgr_b.reserve_decode(["ghost"] + ids[1:], [5] * 4) == [
         False,
         True,
         True,
@@ -294,7 +298,7 @@ def test_paged_extend_batch_preserves_real_kv_across_mixed_positions(
     ws = make_cache_workspace(pool)
     ids = [f"request{i}" for i in range(len(prompt_lens))]
     for request_id, length in zip(ids, prompt_lens):
-        assert task_cache.alloc_slots(request_id, list(range(length)))
+        assert task_cache.admit(request_id, list(range(length)))
         state = task_cache._states[request_id]
         # Unmapped positions must never be mistaken for physical slot zero.
         pool.req_pool.page_table[state.req_idx, len(state.pages) :].fill_(-1)
@@ -313,7 +317,7 @@ def test_paged_extend_batch_preserves_real_kv_across_mixed_positions(
     # requests. Single prompt=5 must map position 5 to slot 5, not slot 0.
     for step in range(5):
         positions = [length + step for length in prompt_lens]
-        assert task_cache.extend_slots_batch(ids, positions) == [True] * len(ids)
+        assert task_cache.reserve_decode(ids, positions) == [True] * len(ids)
         kv = task_cache.bind(ids, ws)
         expected_slots = [
             task_cache._states[request_id].pages[pos // pool.page_size] * pool.page_size
@@ -346,13 +350,13 @@ def test_paged_extend_batch_fallback_still_maps_in_page_positions():
     lengths = [5, 4, 4, 4]
     ids = [f"request{i}" for i in range(len(lengths))]
     for request_id, length in zip(ids, lengths):
-        assert task_cache.alloc_slots(request_id, list(range(length)))
+        assert task_cache.admit(request_id, list(range(length)))
         state = task_cache._states[request_id]
         pool.req_pool.page_table[state.req_idx, len(state.pages) :].fill_(-1)
 
     # Three page crossings but only two pages remain; the first request
     # needs no new page and must still have its intra-page write mapped.
-    assert task_cache.extend_slots_batch(ids, lengths) == [True, True, True, False]
+    assert task_cache.reserve_decode(ids, lengths) == [True, True, True, False]
     kv = task_cache.bind(ids[:3], make_cache_workspace(pool))
     assert appended_slots(kv).tolist() == [5, 20, 24]
     assert [task_cache._states[rid].length for rid in ids] == [6, 5, 5, 4]
@@ -383,8 +387,8 @@ def test_extend_batch_falls_back_when_pool_runs_dry():
     ids = [f"dry{i}" for i in range(4)]
     for tid in ids:
         # One page each leaves 2 free for decode extension.
-        assert mgr.alloc_slots(tid, [7])
-    results = mgr.extend_slots_batch(list(ids), [1] * 4)
+        assert mgr.admit(tid, [7])
+    results = mgr.reserve_decode(list(ids), [1] * 4)
     assert results == [True, True, False, False]
     for tid, ok in zip(ids, results):
         assert (mgr._states[tid].length == 2) == ok
@@ -401,8 +405,8 @@ def test_decode_reuses_pages_and_layer_views_until_mapping_changes(device, monke
     )
     manager = KVCacheManager(pool)
     workspace = make_cache_workspace(pool)
-    assert manager.alloc_slots("a", [1, 2])
-    assert manager.alloc_slots("b", [8, 9])
+    assert manager.admit("a", [1, 2])
+    assert manager.admit("b", [8, 9])
     gathers = []
     index_select = torch.index_select
 
@@ -414,7 +418,7 @@ def test_decode_reuses_pages_and_layer_views_until_mapping_changes(device, monke
     first = manager.bind(["a", "b"], workspace)
     address = first.page_table.data_ptr()
     for pos in (2, 3):
-        assert all(manager.extend_slots_batch(["a", "b"], [pos, pos]))
+        assert all(manager.reserve_decode(["a", "b"], [pos, pos]))
         bound = manager.bind(["a", "b"], workspace)
         assert bound is first
         assert bound.cache_seqlens.tolist() == [pos, pos]
@@ -427,7 +431,7 @@ def test_decode_reuses_pages_and_layer_views_until_mapping_changes(device, monke
         pool._storage.k_buffer[1], torch.full_like(pool._storage.k_buffer[1], 3)
     )
     # Crossing a physical page boundary refreshes mappings, preserving addresses.
-    assert all(manager.extend_slots_batch(["a", "b"], [4, 4]))
+    assert all(manager.reserve_decode(["a", "b"], [4, 4]))
     crossed = manager.bind(["a", "b"], workspace)
     assert len(gathers) == 2
     assert crossed.page_table.data_ptr() == address
@@ -443,12 +447,24 @@ def test_decode_uses_planned_position_across_two_workspaces():
     pool = make_paged_pool()
     manager = KVCacheManager(pool)
     a, b = make_cache_workspace(pool), make_cache_workspace(pool)
-    assert manager.alloc_slots("old", [1, 2, 3])
+    assert manager.admit("old", [1, 2, 3])
     original = manager.bind(["old"], a, positions=[1])
     assert original.cache_seqlens.tolist() == [1]
-    assert manager.extend_slots("old", 3)
+    assert manager.reserve_decode(["old"], [3])[0]
     manager.bind(["old"], b, positions=[3])
     assert (
         manager.bind(["old"], a, positions=[2]).page_table[0, 3]
         == manager._states["old"].pages[3]
     )
+
+
+def test_reserve_decode_across_multiple_pages_is_atomic_under_pressure():
+    pool = make_paged_pool(page_size=2, max_seq_len=16, n_tokens=8)
+    manager = KVCacheManager(pool)
+    assert manager.admit("a", [1]) and manager.admit("b", [2])
+    assert manager.reserve_decode(["a", "b"], [7, 5]) == [False, True]
+    assert len(manager._states["a"].pages) == 1
+    assert len(manager._states["b"].pages) == 3
+    with pytest.raises(ValueError, match="duplicate"):
+        manager.admit("b", [3])
+    assert manager.request_count == 2

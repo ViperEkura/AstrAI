@@ -12,7 +12,7 @@ import torch
 
 from astrai.extension.runtime.context import use_op_selection
 from astrai.inference.contracts import LogprobRequest
-from astrai.inference.core.cache.pool import BlockPool
+from astrai.inference.core.cache import BlockPool
 from astrai.inference.core.events import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
@@ -103,7 +103,6 @@ class EngineCore:
         with use_op_selection(self.op_selection):
             self.model_runner = GPUModelRunner(
                 model=model,
-                kv_cache=cache,
                 cache_mgr=self.scheduler.kv_manager,
                 device=self.device,
                 dtype=self.dtype,
@@ -112,7 +111,7 @@ class EngineCore:
         self._policy_guard = PolicyVersionGuard(
             policy_version,
             ensure_ready=self.ensure_weight_update_ready,
-            on_commit=self.scheduler.kv_manager.invalidate_cache,
+            on_commit=self.scheduler.kv_manager.clear_prefix_cache,
         )
         self.lock = self._policy_guard.lock
         self.stop_event = threading.Event()

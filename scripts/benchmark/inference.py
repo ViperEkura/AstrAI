@@ -145,7 +145,7 @@ class GenerationBenchmark:
 
         request_ids = [f"bench_{i}" for i in range(batch_size)]
         for tid in request_ids:
-            task_cache.alloc_slots(tid, list(range(prompt_len)))
+            task_cache.admit(tid, list(range(prompt_len)))
 
         with torch.inference_mode(), op_backend(attention=self.backend):
             for start_pos in range(0, prompt_len, chunk_size):
@@ -179,8 +179,7 @@ class GenerationBenchmark:
         input_ids = torch.randint(
             0, self.config.vocab_size, (batch_size,), device=self.device
         )
-        for tid in request_ids:
-            task_cache.extend_slots(tid, seq_len)
+        assert all(task_cache.reserve_decode(request_ids, [seq_len] * len(request_ids)))
         kv_cache = task_cache.bind(request_ids, workspace)
         with torch.inference_mode(), op_backend(attention=self.backend):
             self.model(
@@ -200,7 +199,7 @@ class GenerationBenchmark:
         task_cache = self._make_task_cache(pool)
         request_ids = [f"bench_prefill_{i}" for i in range(batch_size)]
         for tid in request_ids:
-            task_cache.alloc_slots(tid, list(range(prompt_length)))
+            task_cache.admit(tid, list(range(prompt_length)))
 
         input_ids = torch.randint(
             0,
@@ -372,7 +371,7 @@ class GenerationBenchmark:
             input_ids_buf.copy_(
                 torch.randint(0, self.config.vocab_size, (b,), device=self.device)
             )
-            if not all(task_cache.extend_slots_batch(request_ids, [seq_len] * b)):
+            if not all(task_cache.reserve_decode(request_ids, [seq_len] * b)):
                 raise RuntimeError("failed to extend KV slots for fixed-KV benchmark")
             kv_cache = task_cache.bind(request_ids, workspace)
             with torch.inference_mode(), op_backend(attention=self.backend):
@@ -446,8 +445,9 @@ class GenerationBenchmark:
             input_ids_buf.copy_(
                 torch.randint(0, self.config.vocab_size, (b,), device=self.device)
             )
-            for tid in request_ids:
-                task_cache.extend_slots(tid, seq_len)
+            assert all(
+                task_cache.reserve_decode(request_ids, [seq_len] * len(request_ids))
+            )
             kv_cache = task_cache.bind(request_ids, workspace)
 
             with torch.inference_mode(), op_backend(attention=self.backend):

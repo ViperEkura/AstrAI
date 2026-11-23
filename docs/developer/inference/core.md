@@ -40,9 +40,9 @@ classDiagram
         execute_score()
     }
     class KVCacheManager {
-        alloc_slots() / extend_slots_batch()
-        record_block_hashes(materialized_end)
-        free_slots() / invalidate_cache()
+        admit() / reserve_decode()
+        publish_prefix(materialized_end)
+        release() / clear_prefix_cache()
     }
     class PolicyVersionGuard {
         RLock
@@ -116,8 +116,14 @@ version. Each workspace gathers the rows for its current batch when the ordered
 slots or the table version change. Across a page crossing, the destination
 address stays stable for CUDA Graph replay.
 
+The scheduler admits and releases requests by ID. The planner reserves positions
+with `reserve_decode(request_ids, positions)`, which returns one success flag per
+request. Under pressure, a failed reservation leaves that request's pages intact.
+The runner passes the positions in its execution plan to `bind` and receives a
+model cache view. RoPE and attention read the same past-length tensor for decode.
+
 Prefix publication requires
-`record_block_hashes(..., materialized_end=exclusive_token_end)`. The boundary
+`publish_prefix(..., materialized_end=exclusive_token_end)`. The boundary
 must come from completed execution, not from prompt length, allocated page
 count, or a cursor already advanced for a later in-flight step. Only complete
 pages below that boundary can be published. The sampled token is not yet in

@@ -13,7 +13,7 @@ from astrai.config.inference_config import (
     resolve_generation_parameters,
 )
 from astrai.inference.contracts import ModelRunnerOutput, SchedulerOutput
-from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
+from astrai.inference.core.cache import BlockPool, KVCacheManager
 from astrai.inference.core.events import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
@@ -381,12 +381,12 @@ class Scheduler:
                 request.status == RequestStatus.FINISHED
                 and request.num_materialized_tokens
             ):
-                self._kv_manager.record_block_hashes(
+                self._kv_manager.publish_prefix(
                     rid,
                     request.prompt_ids + request.output_ids,
                     materialized_end=request.num_materialized_tokens,
                 )
-            self._kv_manager.free_slots(rid)
+            self._kv_manager.release(rid)
             self._metrics.mark_finished(
                 rid, request.input_tokens, request.output_tokens
             )
@@ -413,7 +413,7 @@ class Scheduler:
                     FINISH_REJECTED,
                     error_reason="kv_cache_allocation_failed",
                 )
-            elif self._kv_manager.alloc_slots(request.request_id, request.prompt_ids):
+            elif self._kv_manager.admit(request.request_id, request.prompt_ids):
                 if not request.terminal_emitted:
                     request.status = RequestStatus.RUNNING
                     self.running.append(request)
@@ -511,10 +511,10 @@ class Scheduler:
                 if request.terminal_emitted:
                     continue
                 if entry.phase == "prefill":
-                    self._kv_manager.record_block_hashes(
+                    self._kv_manager.publish_prefix(
                         request.request_id,
                         request.prompt_ids,
-                        entry.position // self._cache.page_size,
+                        start=entry.position,
                         materialized_end=result.materialized_end,
                     )
                 if result.token_id is not None:
@@ -573,7 +573,7 @@ class Scheduler:
     def reserve_tokenized_request(self, request, register_metrics=False):
         if request.request_id in self._states:
             raise ValueError(f"duplicate live request id: {request.request_id}")
-        if not self._kv_manager.alloc_slots(request.request_id, request.prompt_ids):
+        if not self._kv_manager.admit(request.request_id, request.prompt_ids):
             return False
         request.emit_events = False
         self.remember(request)
@@ -582,5 +582,5 @@ class Scheduler:
         return True
 
     def release_tokenized_request(self, request):
-        self._kv_manager.free_slots(request.request_id)
+        self._kv_manager.release(request.request_id)
         self._states.pop(request.request_id, None)

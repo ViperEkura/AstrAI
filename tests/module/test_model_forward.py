@@ -75,7 +75,7 @@ def test_model_forward_contract_uses_dense_training_and_packed_inference():
         torch.device("cpu"),
         torch.float32,
     )
-    assert cache.alloc_slots("t", [1, 2, 3])
+    assert cache.admit("t", [1, 2, 3])
     packed = model(
         torch.tensor([1, 2, 3]),
         position_ids=torch.arange(3),
@@ -117,7 +117,7 @@ def test_cached_prefill_key_mask_matches_dense_attention():
         torch.device("cpu"),
         torch.float32,
     )
-    assert cache.alloc_slots("t", [1, 2, 3, 4])
+    assert cache.admit("t", [1, 2, 3, 4])
 
     with torch.inference_mode():
         dense = model(ids, input_mask=key_mask)["logits"][:, 2:]
@@ -162,7 +162,7 @@ def test_forward_logits_positions_projects_only_requested_rows():
         torch.float32,
     )
     for tid, ids in zip(("t1", "t2"), prompts):
-        assert cache.alloc_slots(tid, ids)
+        assert cache.admit(tid, ids)
     input_ids = torch.tensor(sum(prompts, []), dtype=torch.long)
     position_ids = torch.cat([torch.arange(len(p)) for p in prompts])
     with torch.inference_mode():

@@ -91,16 +91,16 @@ def test_prefill_with_kv_cache_matches_torch(cuda_model):
 
     task_cache = _mk_task_cache(cache)
     ws = _ws(cache)
-    task_cache.alloc_slots("t1", prompt_ids[0])
-    task_cache.alloc_slots("t2", prompt_ids[1])
+    task_cache.admit("t1", prompt_ids[0])
+    task_cache.admit("t2", prompt_ids[1])
     kv1 = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
         out_torch = model(input_ids, kv_cache=kv1, position_ids=position_ids)
 
-    task_cache.free_slots("t1")
-    task_cache.free_slots("t2")
-    task_cache.alloc_slots("t1", prompt_ids[0])
-    task_cache.alloc_slots("t2", prompt_ids[1])
+    task_cache.release("t1")
+    task_cache.release("t2")
+    task_cache.admit("t1", prompt_ids[0])
+    task_cache.admit("t2", prompt_ids[1])
     kv2 = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with op_backend(attention="cuda"):
         with torch.inference_mode():
@@ -152,7 +152,7 @@ def test_masked_cached_chunk_prefill_matches_torch(cuda_model, mask_len):
         )
         task_cache = _mk_task_cache(pool)
         workspace = _ws(pool)
-        assert task_cache.alloc_slots("t", prompt_ids)
+        assert task_cache.admit("t", prompt_ids)
         with op_backend(attention=backend), torch.inference_mode():
             model(
                 ids[:3],
@@ -200,8 +200,8 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
 
     task_cache = _mk_task_cache(cache)
     ws = _ws(cache)
-    task_cache.alloc_slots("t1", prompt_ids[0])
-    task_cache.alloc_slots("t2", prompt_ids[1])
+    task_cache.admit("t1", prompt_ids[0])
+    task_cache.admit("t2", prompt_ids[1])
     kv = task_cache.bind(["t1", "t2"], ws, start_pos=0)
     with torch.inference_mode():
         model(input_ids, kv_cache=kv, position_ids=position_ids)
@@ -210,8 +210,8 @@ def test_decode_mixed_seq_lens_matches_torch(cuda_model):
     dec_ids = torch.tensor([99, 98], dtype=torch.long, device=device)
     dec_pos = torch.tensor([8, 6], dtype=torch.long, device=device)
 
-    task_cache.extend_slots("t1", 8)
-    task_cache.extend_slots("t2", 6)
+    task_cache.reserve_decode(["t1"], [8])[0]
+    task_cache.reserve_decode(["t2"], [6])[0]
     kv_t = task_cache.bind(["t1", "t2"], ws)
     with torch.inference_mode():
         out_torch = model(dec_ids, kv_cache=kv_t, position_ids=dec_pos)
@@ -245,10 +245,10 @@ def test_paged_decode_appends_new_kv_in_kernel():
     )
     task_cache = _mk_task_cache(pool)
     ws = _ws(pool)
-    task_cache.alloc_slots("t1", list(range(8)))
-    task_cache.alloc_slots("t2", list(range(6)))
-    task_cache.extend_slots("t1", 8)
-    task_cache.extend_slots("t2", 6)
+    task_cache.admit("t1", list(range(8)))
+    task_cache.admit("t2", list(range(6)))
+    task_cache.reserve_decode(["t1"], [8])[0]
+    task_cache.reserve_decode(["t2"], [6])[0]
     kv_cache = task_cache.bind(["t1", "t2"], ws)
 
     q = torch.randn(2, 2, D, device="cuda", dtype=torch.bfloat16)
@@ -304,7 +304,7 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
     )
     task_cache = _mk_task_cache(cache)
     ws = _ws(cache)
-    task_cache.alloc_slots("t1", prompt_ids)
+    task_cache.admit("t1", prompt_ids)
 
     input_ids = torch.tensor(prompt_ids, dtype=torch.long, device=device)
     position_ids = torch.arange(len(prompt_ids), device=device)
@@ -316,7 +316,7 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
             kv_cache=task_cache.bind(["t1"], ws, start_pos=0),
         )
 
-        task_cache.extend_slots("t1", len(prompt_ids))
+        task_cache.reserve_decode(["t1"], [len(prompt_ids)])[0]
         kv_cache = task_cache.bind(["t1"], ws)
         assert kv_cache.page_table.dtype == torch.int32
         assert kv_cache.cache_seqlens.dtype == torch.int32
@@ -350,14 +350,14 @@ def test_decode_cuda_graph_replay_is_exact(cuda_model):
     # Replay the same capture with a different request, then cross a page boundary.
     with op_backend(attention="cuda"), torch.inference_mode():
         prompt = [32, 31, 30]
-        assert task_cache.alloc_slots("other", prompt)
+        assert task_cache.admit("other", prompt)
         model(
             torch.tensor(prompt, device=device),
             position_ids=torch.arange(3, device=device),
             kv_cache=task_cache.bind(["other"], ws, start_pos=0),
         )
         for pos in (3, 4):
-            assert task_cache.extend_slots("other", pos)
+            assert task_cache.reserve_decode(["other"], [pos])[0]
             bound = task_cache.bind(["other"], ws)
             assert bound.page_table.data_ptr() == kv_cache.page_table.data_ptr()
             assert bound.cache_seqlens.data_ptr() == kv_cache.cache_seqlens.data_ptr()
@@ -442,7 +442,7 @@ def test_mla_chunk_and_decode_match_dense():
     manager, workspace = KVCacheManager(pool), _ws(pool)
     ids = torch.arange(1, 7, device=device)
     pos = torch.arange(6, device=device)
-    assert manager.alloc_slots("request", ids[:5].tolist())
+    assert manager.admit("request", ids[:5].tolist())
     with torch.inference_mode(), op_backend(attention="torch"):
         dense = model(ids[None])["logits"][0]
     with torch.inference_mode(), op_backend(attention="cuda"):
@@ -456,7 +456,7 @@ def test_mla_chunk_and_decode_match_dense():
                     "logits"
                 ]
             )
-        assert manager.extend_slots("request", 5)
+        assert manager.reserve_decode(["request"], [5])[0]
         chunks.append(
             model(
                 ids[5:],

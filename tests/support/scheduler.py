@@ -14,7 +14,7 @@ def make_contract_scheduler():
     scheduler.scheduler._kv_manager = kv
     scheduler.scheduler._planner.kv_manager = kv
     kv.cached_tokens.return_value = 0
-    kv.extend_slots_batch.side_effect = lambda ids, positions: [True] * len(ids)
+    kv.reserve_decode.side_effect = lambda ids, positions: [True] * len(ids)
     return scheduler
 
 

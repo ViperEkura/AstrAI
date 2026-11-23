@@ -3,7 +3,7 @@
 from typing import List, Optional, Tuple
 
 from astrai.inference.contracts import ExecutionRequest
-from astrai.inference.core.cache.pool import KVCacheManager
+from astrai.inference.core.cache import KVCacheManager
 from astrai.inference.core.request import Request
 
 
@@ -48,7 +48,7 @@ class StepPlanner:
 
         failed = []
         if decode:
-            extended = self.kv_manager.extend_slots_batch(
+            extended = self.kv_manager.reserve_decode(
                 [r.request_id for r in decode], [r.next_pos for r in decode]
             )
             for request, ok in zip(decode, extended):

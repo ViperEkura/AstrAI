@@ -76,7 +76,7 @@ class KVCacheManager:
     """Own request slots, page reservations and prefix publication."""
 
     def __init__(self, pool: BlockPool):
-        self._pool = pool
+        self.pool = pool
         self._alloc = pool.allocator
         self._prefix = pool.prefix
         self._page_size = pool.page_size
@@ -86,7 +86,12 @@ class KVCacheManager:
 
     # -- public request lifecycle --
 
-    def alloc_slots(self, request_id: str, prompt_ids: List[int]) -> bool:
+    def admit(self, request_id: str, prompt_ids: List[int]) -> bool:
+        """Reserve this prompt and acquire any reusable prefix pages."""
+        if request_id in self._states:
+            raise ValueError(f"duplicate cache request: {request_id}")
+        if not self.can_ever_fit(len(prompt_ids)):
+            return False
         req_slots = self._req_pool.alloc(1)
         if req_slots is None:
             return False
@@ -111,7 +116,7 @@ class KVCacheManager:
         state.length = len(prompt_ids)
         return True
 
-    def free_slots(self, request_id: str):
+    def release(self, request_id: str):
         state = self._states.pop(request_id, None)
         if state is None:
             return
@@ -121,45 +126,45 @@ class KVCacheManager:
             )
         self._req_pool.free([state.req_idx])
 
-    def extend_slots(self, request_id: str, pos: int) -> bool:
-        state = self._states.get(request_id)
-        if state is None or pos >= self._max_seq_len:
-            return False
-        if self._alloc is not None and pos // self._page_size >= len(state.pages):
-            page = self._alloc.alloc()
-            if page < 0:
-                return False
-            state.pages.append(page)
-        state.length = pos + 1
-        return True
-
-    def extend_slots_batch(
+    def reserve_decode(
         self, request_ids: List[str], positions: List[int]
     ) -> List[bool]:
-        """Reserve new pages in batch, preserving request order under pool pressure."""
-        states = [self._states.get(key) for key in request_ids]
-        ok = [
-            s is not None and pos < self._max_seq_len
-            for s, pos in zip(states, positions)
-        ]
-        if self._alloc is not None:
-            need = [
-                s
-                for s, pos, valid in zip(states, positions, ok)
-                if valid and pos // self._page_size >= len(s.pages)
-            ]
-            if need:
-                pages = self._alloc.alloc_many(len(need))
-                if pages is None:
-                    return [
-                        self.extend_slots(key, pos)
-                        for key, pos in zip(request_ids, positions)
-                    ]
-                for state, page in zip(need, pages):
-                    state.pages.append(page)
-        for state, pos, valid in zip(states, positions, ok):
+        """Reserve through each token position. Results follow input order."""
+        if len(request_ids) != len(positions) or len(set(request_ids)) != len(
+            request_ids
+        ):
+            raise ValueError("decode positions must match distinct request IDs")
+        ok = []
+        pending = []
+        for i, (key, pos) in enumerate(zip(request_ids, positions)):
+            state = self._states.get(key)
+            valid = state is not None and 0 <= pos < self._max_seq_len
+            ok.append(valid)
             if valid:
-                state.length = pos + 1
+                count = (
+                    pos // self._page_size + 1 - len(state.pages)
+                    if self._alloc is not None
+                    else 0
+                )
+                if count > 0:
+                    pending.append((i, state, count))
+                elif pos >= state.length:
+                    state.length = pos + 1
+        if pending:
+            pages = self._alloc.alloc_many(sum(count for _, _, count in pending))
+            offset = 0
+            for i, state, count in pending:
+                if pages is None:
+                    # Under pressure earlier requests get the available pages first.
+                    new_pages = self._alloc.alloc_many(count)
+                    if new_pages is None:
+                        ok[i] = False
+                        continue
+                else:
+                    new_pages = pages[offset : offset + count]
+                    offset += count
+                state.pages.extend(new_pages)
+                state.length = positions[i] + 1
         return ok
 
     @property
@@ -171,12 +176,12 @@ class KVCacheManager:
         state = self._states.get(request_id)
         return state.cached if state is not None else 0
 
-    def record_block_hashes(
+    def publish_prefix(
         self,
         request_id: str,
         prompt_ids: List[int],
-        start_logical_page: int = 0,
         *,
+        start: int = 0,
         materialized_end: int,
     ):
         """Publish full pages whose KV is materialized below an exclusive end.
@@ -189,15 +194,15 @@ class KVCacheManager:
         state = self._states.get(request_id)
         if state is None or self._alloc is None:
             return
-        if materialized_end < 0 or start_logical_page < 0:
+        if materialized_end < 0 or start < 0:
             raise ValueError("materialized_end and start must be nonnegative")
         if self._prefix is not None:
             full = min(materialized_end, len(prompt_ids)) // self._page_size
-            for i in range(start_logical_page, min(full, len(state.pages))):
+            for i in range(start // self._page_size, min(full, len(state.pages))):
                 revoked = self._prefix.record(state.pages[i], prompt_ids, i)
                 self._alloc.discard_cached(revoked)
 
-    def invalidate_cache(self) -> int:
+    def clear_prefix_cache(self) -> int:
         """Drop reusable KV entries once all request-owned entries are released."""
         if self._states:
             raise RuntimeError("Cannot invalidate KV cache while requests are active")
@@ -209,8 +214,11 @@ class KVCacheManager:
         The admission-time livelock guard: requests that can never fit are
         rejected outright by the scheduler instead of retrying forever.
         """
-        return self._alloc is None or self._alloc.can_ever_satisfy(
-            (n_tokens + self._page_size - 1) // self._page_size
+        return n_tokens <= self._max_seq_len and (
+            self._alloc is None
+            or self._alloc.can_ever_satisfy(
+                (n_tokens + self._page_size - 1) // self._page_size
+            )
         )
 
     # -- bind (assemble KVCache for the model forward) --
@@ -257,7 +265,7 @@ class KVCacheManager:
         if self._alloc is not None:
             self._req_pool.flush_pages(states)
         return workspace.bind(
-            self._pool._storage,
+            self.pool._storage,
             self._req_pool.page_table,
             self._req_pool.version,
             tuple(s.req_idx for s in states),

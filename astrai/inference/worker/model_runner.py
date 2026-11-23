@@ -16,7 +16,7 @@ from astrai.extension.runtime.loader import is_available
 if TYPE_CHECKING:
     # Type-only dependency: the worker consumes the KV manager's ``bind``
     # interface; importing it at runtime would create a core↔worker cycle.
-    from astrai.inference.core.cache.pool import BlockPool, KVCacheManager
+    from astrai.inference.core.cache import KVCacheManager
 from astrai.inference.contracts import ExecutionRequest, LogprobRequest, SchedulerOutput
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.pending import (
@@ -175,7 +175,6 @@ def _build_sampling_batch_info(
 
 def _warmup_cuda_graphs(
     model: AutoModel,
-    pool: "BlockPool",
     cache_mgr: "KVCacheManager",
     ws: InferenceWorkspace,
     gctx: CUDAGraphRunner,
@@ -191,7 +190,7 @@ def _warmup_cuda_graphs(
     # that follows.  Custom .so kernels do NOT need this — they are pre-built.
     warmup_len = _config.prefill_warmup_len
     tid = "_warmup_prefill"
-    if cache_mgr.alloc_slots(tid, list(range(warmup_len))):
+    if cache_mgr.admit(tid, list(range(warmup_len))):
         with (
             torch.inference_mode(),
             timed("warmup prefill", logger),
@@ -207,7 +206,7 @@ def _warmup_cuda_graphs(
                     [warmup_len - 1], dtype=torch.long, device=dev
                 ),
             )
-        cache_mgr.free_slots(tid)
+        cache_mgr.release(tid)
 
     batch_sizes = [1]
     n = 2
@@ -222,12 +221,12 @@ def _warmup_cuda_graphs(
         prompt_tokens = [list(range(prompt_len)) for _ in range(b)]
         alloc_ok = True
         for tid, pt in zip(request_ids, prompt_tokens):
-            if not cache_mgr.alloc_slots(tid, pt):
+            if not cache_mgr.admit(tid, pt):
                 alloc_ok = False
                 break
         if not alloc_ok:
             for tid in request_ids:
-                cache_mgr.free_slots(tid)
+                cache_mgr.release(tid)
             continue
 
         with (
@@ -235,10 +234,10 @@ def _warmup_cuda_graphs(
             timed(f"warmup decode b={b}", logger),
         ):
             for step in range(2):
-                seq_pos = step
-                for tid in request_ids:
-                    cache_mgr.extend_slots(tid, seq_pos)
-                kv = cache_mgr.bind(request_ids, ws)
+                positions = [step] * b
+                if not all(cache_mgr.reserve_decode(request_ids, positions)):
+                    break
+                kv = cache_mgr.bind(request_ids, ws, positions=positions)
                 ids_buf = ws.fill_input_ids([step] * b)
                 gctx.forward(
                     model,
@@ -249,7 +248,7 @@ def _warmup_cuda_graphs(
                 )
 
         for tid in request_ids:
-            cache_mgr.free_slots(tid)
+            cache_mgr.release(tid)
         torch.cuda.synchronize()
 
 
@@ -259,14 +258,12 @@ class GPUModelRunner:
     def __init__(
         self,
         model: AutoModel,
-        kv_cache: "BlockPool",
         cache_mgr: "KVCacheManager",
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
         enable_cuda_graph: bool = True,
     ):
         self.model = model
-        self.kv_cache = kv_cache
         self.kv_manager = cache_mgr
         self.device = device or next(model.parameters()).device
         self.dtype = dtype or next(model.parameters()).dtype
@@ -286,7 +283,7 @@ class GPUModelRunner:
         # Async result relay: pinned depth-2 slots on a dedicated copy
         # stream.  A submitted step's tokens land here without a blocking
         # tolist; commit waits on the posted event instead.  Inert on CPU.
-        self._result_ring = ResultRing(kv_cache.max_batch_size, self.device)
+        self._result_ring = ResultRing(cache_mgr.pool.max_batch_size, self.device)
 
         # Pre-allocated fixed-shape buffers for the decode hot path
         # (input_ids, decode mask, KV bind metadata).  Eagerly sized at init
@@ -300,8 +297,8 @@ class GPUModelRunner:
             head_dim, self.dtype
         )
         self._workspace = InferenceWorkspace(
-            max_batch_size=kv_cache.max_batch_size,
-            max_seq_len=kv_cache.max_seq_len,
+            max_batch_size=cache_mgr.pool.max_batch_size,
+            max_seq_len=cache_mgr.pool.max_seq_len,
             max_q_heads=max_q_heads,
             head_dim=head_dim,
             device=self.device,
@@ -322,11 +319,10 @@ class GPUModelRunner:
         self._graph_ctx.set_enabled(True)
         _warmup_cuda_graphs(
             self.model,
-            self.kv_cache,
             self.kv_manager,
             self._workspace,
             self._graph_ctx,
-            max_batch_size=self.kv_cache.max_batch_size,
+            max_batch_size=self._workspace.max_batch_size,
             device=self.device,
         )
 

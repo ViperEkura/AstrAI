@@ -1,5 +1,8 @@
 #pragma once
 /* Congruous and 16-bit transposed operand staging through cp.async. */
+#include <type_traits>
+
+#include <datatype/element.cuh>
 #include <memory/pipeline.cuh>
 #include <utils/define.cuh>
 #include <utils/tensor.cuh>
@@ -96,7 +99,10 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
          * ACROSS lines, when ld is not 16B — see the scalar fallback).
          */
         const auto* src = operand + line * ld + run0 + c0;
-        const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
+        constexpr bool kFp8 = std::is_same_v<ElemT, fp8_e4m3> || std::is_same_v<ElemT, fp8_e5m2>;
+        constexpr int kCopyAlignment = kFp8 ? 8 : 16;
+        const uintptr_t src_addr = reinterpret_cast<uintptr_t>(src);
+        const bool chunk_aligned = (src_addr & (kCopyAlignment - 1)) == 0;
         const uintptr_t dst = reinterpret_cast<uintptr_t>(tile(r, c0));
 #pragma unroll
         for (int j = 0; j < Map::kPerThread; ++j) {
@@ -105,7 +111,7 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
             ElemT* dstj = reinterpret_cast<ElemT*>(dst ^ (unsigned)(j << 4));
             if (chunk_aligned) {
                 /*
-                 * CUTLASS-style zero-fill predication: one cp.async whose
+                 * CUTLASS-style zero-fill predication: the copy's
                  * runtime src-size loads the valid prefix (whole chunk,
                  * the extent tail cut or nothing for an OOB line) and the
                  * hardware zero-fills the remainder.
@@ -114,6 +120,14 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
                 const int bytes = room >= kChunkElems ? 16
                                   : room > 0          ? (int)(room * (int64_t)sizeof(ElemT))
                                                       : 0;
+                if constexpr (kFp8) {
+                    if ((src_addr & 15) != 0) {
+                        // Keep both 8-byte copies within the same swizzled chunk.
+                        astrai::cp_async_8(dstj, src + c, min(bytes, 8));
+                        astrai::cp_async_8(dstj + 8, src + c + 8, max(bytes - 8, 0));
+                        continue;
+                    }
+                }
                 astrai::cp_async_16(dstj, src + c, bytes);
             } else {
                 // Misaligned base only: element-granular fallback.

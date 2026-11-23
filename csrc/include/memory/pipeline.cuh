@@ -40,6 +40,12 @@ DEVICE_FORCEINLINE void cp_async_16_raw(unsigned smem_addr, const void* gmem_ptr
     }
 }
 
+// Copy a prefix of an 8-byte vector and zero-fill the rest. This width uses .ca.
+DEVICE_FORCEINLINE void cp_async_8(void* smem_ptr, const void* gmem_ptr, int bytes) {
+    const unsigned dst = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(dst), "l"(gmem_ptr), "r"(bytes));
+}
+
 /*
  * Unconditional 16-byte copy to a generic shared pointer.
  * `T` is the smem element type; only the destination pointer's type matters.

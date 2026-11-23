@@ -26,10 +26,13 @@ from typing import Any, Callable, List, Optional, Protocol, TypeVar
 import torch
 from torch import nn
 
-from astrai.inference.contracts import LogprobRequest
+from astrai.inference.contracts import (
+    FINISH_STOP_TOKEN,
+    GenerationResult,
+    LogprobRequest,
+)
 from astrai.inference.core.engine import EngineCore
-from astrai.inference.core.events import FINISH_STOP_TOKEN
-from astrai.inference.core.request import GenerationResult, Request
+from astrai.inference.core.request import Request
 from astrai.parallel.executor import strip_compile_prefix
 
 T = TypeVar("T")

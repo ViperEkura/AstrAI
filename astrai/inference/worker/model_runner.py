@@ -229,6 +229,19 @@ class GPUModelRunner:
     def cuda_graph_enabled(self) -> bool:
         return self._graph_ctx.enabled and self._graph_supported
 
+    def warmup_decode(self, requests: List[ExecutionRequest]) -> None:
+        """Warm or capture the graph for an already reserved decode batch."""
+        kv = self._workspace.bind(self.pool, requests)
+        self._graph_ctx.forward(
+            self.model,
+            key=(len(requests),),
+            input_ids=self._workspace.fill_input_ids(
+                [r.input_token_id for r in requests]
+            ),
+            kv_cache=kv,
+            position_ids=kv.cache_seqlens,
+        )
+
     def execute_prefill(
         self,
         requests: List[ExecutionRequest],

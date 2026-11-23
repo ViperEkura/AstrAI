@@ -1,8 +1,8 @@
 # Event Flow and Request Lifecycle
 
-`core/events.py` is the progress/termination contract between the core and
-frontend. `contracts.py` is the separate plan/result contract between the
-core and worker. Neither contract carries a mutable core `Request`.
+`astrai/inference/contracts.py` defines the events that core emits to the frontend
+and the execution plans and results exchanged with the worker. These messages
+carry request identifiers and snapshots. The scheduler owns mutable requests.
 
 ## One online generation
 

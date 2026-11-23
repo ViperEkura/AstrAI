@@ -1,6 +1,6 @@
 """Frontend-side output processing (vLLM: output_processor.py).
 
-Consumes :mod:`astrai.inference.core.events` output events for one request and
+Consumes :mod:`astrai.inference.contracts` output events for one request and
 produces the user-visible stream: incremental detokenization, text-level
 stop-sequence matching with truncation, and token usage accounting.
 
@@ -11,14 +11,13 @@ The scheduler loop never runs this code — it runs in the consumer's thread
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_STOP_TOKEN,
     RequestError,
     RequestFinished,
     TokenDelta,
 )
-from astrai.inference.core.request import StreamDecoder
-from astrai.tokenize.tokenizer import AutoTokenizer
+from astrai.tokenize.tokenizer import AutoTokenizer, StreamDecoder
 
 
 class StopSequenceChecker:

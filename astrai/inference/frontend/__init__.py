@@ -6,7 +6,7 @@ direct engine-core calls.  Frontend code never touches KV state or
 model tensors directly.
 """
 
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
     FINISH_LENGTH,

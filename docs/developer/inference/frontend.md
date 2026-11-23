@@ -122,3 +122,5 @@ subsequent duplicate/late events. Single-character stop strings retain no
 ambiguous suffix, while a natural terminal flushes the unmatched suffix.
 Prompt usage is initialized from the already-tokenized input so an early
 text stop still reports the correct prompt length.
+
+The frontend submits the prepared token IDs and request IDs as one batch. Direct core callers may also submit text for encoding. The output processor uses the tokenizer's incremental decoder.

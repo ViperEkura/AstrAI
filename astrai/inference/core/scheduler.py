@@ -5,38 +5,34 @@ import threading
 import time
 import uuid
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from astrai.config.inference_config import (
     InferenceConfig,
     normalize_eos_token_ids,
     resolve_generation_parameters,
 )
-from astrai.inference.contracts import ModelRunnerOutput, SchedulerOutput
-from astrai.inference.core.cache import BlockPool, KVCacheManager
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
     FINISH_LENGTH,
     FINISH_REJECTED,
     FINISH_STOP_TOKEN,
+    ModelRunnerOutput,
+    OutputEvent,
+    OutputEventSink,
     RequestError,
     RequestFinished,
+    SchedulerOutput,
     TokenDelta,
 )
+from astrai.inference.core.cache import BlockPool, KVCacheManager
 from astrai.inference.core.metrics import MetricsCollector
 from astrai.inference.core.planner import StepPlanner
 from astrai.inference.core.request import Request, RequestStatus
 
 logger = logging.getLogger(__name__)
 _config = InferenceConfig()
-
-
-class OutputEventSink:
-    """Fast, exception-safe outlet for token and terminal events."""
-
-    def __call__(self, events: List[Any]) -> None:
-        raise NotImplementedError
 
 
 class Scheduler:
@@ -121,7 +117,7 @@ class Scheduler:
     def set_event_sink(self, sink):
         self._event_sink = sink
 
-    def _emit_events(self, events):
+    def _emit_events(self, events: List[OutputEvent]):
         if not events or self._event_sink is None:
             return
         try:
@@ -187,7 +183,7 @@ class Scheduler:
 
     def add_requests(
         self,
-        prompts: List[str],
+        prompts: Optional[List[str]] = None,
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
@@ -219,18 +215,22 @@ class Scheduler:
         }
         if unknown:
             raise TypeError(f"Unexpected generation parameters: {sorted(unknown)}")
-        if not prompts:
+        if prompts is not None and not prompts:
             return []
-        if prompts_ids is not None:
-            if len(prompts_ids) != len(prompts):
-                raise ValueError("prompts_ids must match prompts in length")
-            encoded = prompts_ids
-        else:
+        if prompts_ids is None:
+            if prompts is None:
+                raise TypeError("prompts or prompts_ids is required")
             encoded = self.tokenizer.encode(list(prompts))
             if not isinstance(encoded, list) or len(encoded) != len(prompts):
                 raise ValueError("batch tokenizer returned unexpected shape")
-        if request_ids is not None and len(request_ids) != len(prompts):
+        else:
+            if prompts is not None and len(prompts_ids) != len(prompts):
+                raise ValueError("prompts_ids must match prompts in length")
+            encoded = prompts_ids
+        if request_ids is not None and len(request_ids) != len(encoded):
             raise ValueError("request_ids must match prompts in length")
+        if not encoded:
+            return []
 
         overrides = (
             generation_config.to_dict()

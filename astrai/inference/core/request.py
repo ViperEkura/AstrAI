@@ -1,66 +1,20 @@
 import uuid
-from dataclasses import dataclass
 from enum import Enum
 from typing import (
     List,
-    Literal,
     Optional,
     Sequence,
 )
-
-from tokenizers.decoders import DecodeStream
 
 from astrai.config.inference_config import (
     InferenceConfig,
     normalize_eos_token_ids,
 )
 from astrai.inference.contracts import ExecutionRequest, RequestIdentity, SamplingParams
-from astrai.tokenize.tokenizer import AutoTokenizer
+from astrai.inference.contracts import GenerationResult as GenerationResult
+from astrai.tokenize.tokenizer import StreamDecoder as StreamDecoder
 
 _config = InferenceConfig()
-
-
-@dataclass(frozen=True)
-class GenerationResult:
-    """Structured terminal result for one synchronous generation request."""
-
-    token_ids: List[int]
-    logprobs: List[float]
-    finish_reason: Literal["stop", "length", "cancelled", "rejected"]
-    error_reason: Optional[str] = None
-
-
-class StreamDecoder:
-    """Incremental decoder backed by the tokenizers library's DecodeStream.
-
-    Delegates to the Rust-native streaming decoder which maintains an
-    O(1) bounded token buffer internally (via prefix drain), avoiding
-    the O(n²) cost of re-decoding the full history on each step.
-
-    Multi-byte UTF-8 sequences split across token boundaries are
-    buffered until complete; ``push`` returns "" while the trailing
-    sequence is still incomplete.
-    """
-
-    __slots__ = ("_stream", "_tok")
-
-    def __init__(self, tokenizer: AutoTokenizer):
-        # Test doubles and lightweight tokenizers may lack the Rust handle;
-        # ``push`` degrades to id-as-string so streams still terminate.
-        self._tok = getattr(tokenizer, "_tokenizer", None)
-        self._stream = (
-            DecodeStream(skip_special_tokens=True) if self._tok is not None else None
-        )
-
-    def push(self, token_id: int) -> str:
-        """Append a token ID and return newly completed text.
-
-        Returns "" while a multi-byte character is still incomplete.
-        """
-        if self._stream is None:
-            return str(token_id)
-        chunk = self._stream.step(self._tok, token_id)
-        return chunk or ""
 
 
 class RequestStatus(Enum):

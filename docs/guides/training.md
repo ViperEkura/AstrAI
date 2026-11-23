@@ -528,13 +528,15 @@ class MathRolloutMetrics:
     def __init__(self, prefix):
         self.prefix = prefix
 
-    def on_rollout(self, context, batch):
+    def on_rollout(self, context):
+        batch = context.kwargs["batch"]
         all_wrong = batch.rewards.eq(0).all(dim=1)
         return {
             f"{self.prefix}/all_wrong_rate": (all_wrong.sum().item(), all_wrong.numel())
         }
 
-    def on_log(self, context, record):
+    def on_log(self, context):
+        record = context.kwargs["record"]
         key = f"{self.prefix}/all_wrong_rate"
         if key in record:
             print(f"step={record['step']} {key}={record[key]:.3f}", flush=True)

@@ -43,6 +43,21 @@ def seed_everything(seed: int, rank: int = 0) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _invoke_callback(hook, context: TrainContext, key: str, value: Any):
+    """Expose one event value for the duration of the callback."""
+    missing = object()
+    kwargs = context.kwargs
+    previous = kwargs.get(key, missing)
+    kwargs[key] = value
+    try:
+        return hook(context)
+    finally:
+        if previous is missing:
+            kwargs.pop(key, None)
+        else:
+            kwargs[key] = previous
+
+
 class Trainer:
     def __init__(
         self, train_config: TrainConfig, callbacks: Optional[List[TrainCallback]] = None
@@ -92,7 +107,7 @@ class Trainer:
             ),
         )
         for hook in hooks:
-            values = hook(context, batch)
+            values = _invoke_callback(hook, context, "batch", batch)
             if values:
                 add_rollout_metric_totals(totals, values)
 
@@ -113,7 +128,7 @@ class Trainer:
         if context.rank == 0 and records:
             for hook in self._callback_methods("on_log"):
                 for record in records:
-                    hook(context, dict(record))
+                    _invoke_callback(hook, context, "record", dict(record))
 
     @staticmethod
     def _step_policy(context: TrainContext) -> None:

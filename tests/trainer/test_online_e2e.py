@@ -147,18 +147,29 @@ class ExperimentMetrics:
     def __init__(self, log_path):
         self.log_path = Path(log_path)
 
-    def on_rollout(self, context, batch):
+    def on_rollout(self, context):
+        assert "record" not in context.kwargs
+        batch = context.kwargs["batch"]
         assert batch.rewards.shape[0] == len(batch.prompt_texts)
         all_wrong = batch.rewards.eq(0).all(dim=1)
         return {
             "experiment/all_wrong_rate": (all_wrong.sum().item(), all_wrong.numel())
         }
 
-    def on_log(self, context, record):
+    def after_optimizer_step(self, context):
+        assert "batch" not in context.kwargs
+        assert "record" not in context.kwargs
+
+    def on_log(self, context):
         assert context.rank == 0
+        assert "batch" not in context.kwargs
+        record = context.kwargs["record"]
         if record["type"] == "rollout":
             with self.log_path.open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
+
+    def on_epoch_end(self, context):
+        assert "record" not in context.kwargs
 
 
 @pytest.mark.distributed

@@ -82,8 +82,8 @@ before shutdown callbacks attempt an emergency save.
 
 ## Experiment metrics
 
-`on_rollout(context, batch)` receives a CPU snapshot of a freshly scored
-training rollout. The snapshot contains the sampled policy version, prompt
+`on_rollout(context)` reads `context.kwargs["batch"]`, a CPU snapshot of a
+freshly scored training rollout. The snapshot contains the sampled policy version, prompt
 texts, rewards, response lengths and finish reasons in prompt-group order.
 Synchronous padding rows and cached rollouts are excluded. Each callback can
 return a mapping from metric names to `(numerator, denominator)` pairs. All
@@ -95,11 +95,14 @@ The rollout record is committed with the first successful optimizer update
 for that window. Replaying the same rollouts for more learner updates produces
 no additional records. A resume inherits records from the selected checkpoint.
 
-`on_log(context, record)` receives a copy of each newly committed record on
-global rank zero, after the optimizer hooks. The record includes its step and
-sample cursor. Use this hook for output and avoid distributed collectives
-inside it. Historical records from a resume are available in the checkpoint's
-`metric.jsonl`.
+`on_log(context)` reads `context.kwargs["record"]`, a copy of a newly committed
+record. It runs on global rank zero after the optimizer hooks. The record
+includes its step and sample cursor. Use this hook for output and avoid
+distributed collectives inside it. Historical records from a resume are
+available in the checkpoint's `metric.jsonl`.
+
+The event's entry in `context.kwargs` is scoped to the callback invocation.
+Trainer restores the prior entry when the callback returns or raises.
 
 ## Persistence and resume
 

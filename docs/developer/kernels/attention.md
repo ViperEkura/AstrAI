@@ -117,7 +117,8 @@ tags, recursive visitors or error-formatting callbacks.
 Dense and varlen use `launch_attention_split_q` with different addressing.
 Ordinary paged attention assigns a Q tile, a contiguous KV interval and a
 (request, head) pair to each CTA. For a single decode token, grouped Q heads
-share KV loads and the kernel appends K/V in place. Regular multi-token queries
+share KV loads and the kernel appends K/V in place. The decode mainloop processes
+16 KV tokens per tile, independently of the cache page size. Regular multi-token queries
 append the chunk first and tile 64 query positions per Q head. Ragged queries,
 explicit rollout splits, and long prefills with sufficient Q parallelism use the
 existing prefill schedule.

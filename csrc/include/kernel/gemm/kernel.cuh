@@ -71,7 +71,7 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     using Traits = typename Policy::Traits;
     using Mainloop = GemmCollectiveMainloop<Policy>;
     using Epilogue = GemmCollectiveEpilogue<Policy>;
-    static_assert(!Mainloop::kDirectA && !Mainloop::kDirectB,
+    static_assert(!Policy::Smem::kDirectA && !Policy::Smem::kDirectB,
                   "TMA staging requires dual-congruous operands");
     extern __shared__ __align__(16) char gemm_smem[];
     /*
@@ -89,12 +89,12 @@ __global__ void __launch_bounds__(Policy::kCtaThreads, Policy::kMinCtas)
     GemmTmaContext<kRank3A, kRank3B> tma;
     tma.map_a = &tma_a;
     tma.map_b = &tma_b;
-    tma.bars = reinterpret_cast<uint64_t*>(smem + Mainloop::RingA::Layout::kTotalBytes +
-                                           Mainloop::RingB::Layout::kTotalBytes);
-    tma.depth = Mainloop::kARing;
+    tma.bars = reinterpret_cast<uint64_t*>(smem + Mainloop::A::kBytes +
+                                           Mainloop::B::kBytes);
+    tma.depth = Mainloop::A::kDepth;
     tma.z = blockIdx.z;
     if (threadIdx.x == 0) {
-        for (int s = 0; s < Mainloop::kARing; ++s) {
+        for (int s = 0; s < Mainloop::A::kDepth; ++s) {
             astrai::mbarrier_init(tma.full(s), 1); // producer expect_tx
             astrai::mbarrier_init(tma.empty(s), Policy::kCtaThreads);
         }

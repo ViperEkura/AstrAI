@@ -67,7 +67,7 @@ DEVICE_FORCEINLINE void crosswise_gather_span(TileT tile,
  * rows x 4 contract positions); the PRMT gathers one 32-bit word per row
  * across the four runs. The GENERAL grid-stride form: any geometry stages
  * correctly however few threads; the instantiated path's two-phase sibling
- * (CrosswiseCarry) is selected by load_crosswise_direct, this one covers
+ * (CrosswiseCarry) uses this fallback for
  * the under-subscribed bus.
  */
 template <typename SmemLayout, typename ElemT, int kThreads>
@@ -225,29 +225,6 @@ template <typename SmemLayout, typename ElemT, int kThreads, bool kOn> struct Cr
                               block_row + rg * kRowsChunk, rg, span);
     }
 };
-
-/*
- * The 1-byte route the ladders instantiate: the two-phase carry when the bus
- * fits it, the general grid-stride loader otherwise.
- */
-template <typename SmemLayout, typename ElemT, int kThreads>
-DEVICE_FORCEINLINE void load_crosswise_direct(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
-                                              const ElemT* __restrict__ operand,
-                                              int64_t rows,
-                                              int64_t contract,
-                                              int64_t ld,
-                                              int tid,
-                                              int64_t k_base,
-                                              int64_t block_row) {
-    if constexpr (sizeof(ElemT) == 1 && CrosswiseCarry<SmemLayout, ElemT, kThreads, true>::kFits) {
-        CrosswiseCarry<SmemLayout, ElemT, kThreads, true> carry;
-        carry.issue(operand, rows, contract, ld, tid, k_base, block_row);
-        carry.commit(tile, operand, rows, contract, ld, tid, k_base, block_row);
-    } else {
-        load_crosswise_direct_general<SmemLayout, ElemT, kThreads>(tile, operand, rows, contract,
-                                                                   ld, tid, k_base, block_row);
-    }
-}
 
 } // namespace gemm
 } // namespace astrai

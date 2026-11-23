@@ -7,6 +7,30 @@
 namespace astrai {
 namespace gemm {
 
+// A lane owns an aligned power-of-two run of 16-byte copies in one shared row.
+// Stage initialization and loop-carried prefetch must use the same assignment.
+template <typename Layout, typename Elem, int Threads> struct AsyncCopyMap {
+    static constexpr int kChunkElems = 16 / sizeof(Elem);
+    static constexpr int kTotal = Layout::kRows * Layout::kChunks;
+    static constexpr int kPerThread = kTotal < Threads ? 1 : kTotal / Threads;
+    static_assert(kTotal < Threads || kTotal % Threads == 0);
+    static_assert(kPerThread > 0 && (kPerThread & (kPerThread - 1)) == 0);
+    static_assert(kPerThread <= Layout::kChunks, "a thread's copies must fit one shared row");
+
+    static constexpr int kThreadsPerRow = Layout::kChunks / kPerThread;
+    struct ThreadSlice {
+        int tid;
+
+        DEVICE_FORCEINLINE int row() const { return tid / kThreadsPerRow; }
+        DEVICE_FORCEINLINE int column() const {
+            return (tid % kThreadsPerRow) * kPerThread * kChunkElems;
+        }
+        DEVICE_FORCEINLINE bool active() const { return row() < Layout::kRows; }
+    };
+
+    static DEVICE_FORCEINLINE ThreadSlice get_slice(int tid) { return {tid}; }
+};
+
 /*
  * Stage-load one operand tile into its swizzled ring slot; the two
  * geometries are role-swapped mirrors of the SAME loop, so one template
@@ -39,36 +63,12 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
                                           int64_t k_base,
                                           int64_t block_row) {
     static_assert(!kTransposed || sizeof(ElemT) == 2, "trans staging is 16-bit only");
-    constexpr int kChunkElems = 16 / sizeof(ElemT);
-    constexpr int kTileLines = SmemLayout::kRows; // lines staged per tile
-    constexpr int kChunks = SmemLayout::kChunks;  // chunks per line
-    constexpr int kTotalChunks = kTileLines * kChunks;
-    /*
-     * The bus may be under-subscribed (a 1-byte operand halves the chunks
-     * per line; a 16-warp small CTA against a 1-byte B, or any kK=32
-     * 1-byte side): threads take one chunk each, the rest stage nothing.
-     * What cannot relax is the aligned run: the XOR chunk stepping
-     * (dst ^ (j << 4)) is the swizzle of c0c + j only because a thread's
-     * chunks are one aligned power-of-two run inside the line.
-     */
-    static_assert(kTotalChunks % kThreads == 0 || kTotalChunks < kThreads,
-                  "tile chunks must divide the threads or under-subscribe the bus");
-    constexpr int kCpt = // chunks per thread
-        kTotalChunks < kThreads ? 1 : kTotalChunks / kThreads;
-    static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
-                  "XOR chunk stepping needs a power-of-two chunks-per-thread");
-    /*
-     * A thread's run must stay inside ONE line: a run wider than the line
-     * sends kCpr to zero — tid/0 garbage and a wedged cp.async. Fully
-     * subscribed this says the staged extent must not exceed the thread
-     * count; the under-subscribed arm keeps kCpt 1 and cannot violate it.
-     */
-    static_assert(kCpt <= kChunks, "a thread's 16B run must fit one staged line: the staged "
-                                   "extent cannot exceed the thread count");
-    constexpr int kCpr = kChunks / kCpt; // chunks per line slice
-    const int r = tid / kCpr;            // line within the tile
-    const int c0 = (tid % kCpr) * kCpt * kChunkElems;
-    if (r >= kTileLines)
+    using Map = AsyncCopyMap<SmemLayout, ElemT, kThreads>;
+    constexpr int kChunkElems = Map::kChunkElems;
+    const auto slice = Map::get_slice(tid);
+    const int r = slice.row();
+    const int c0 = slice.column();
+    if (!slice.active())
         return; // no chunks for this thread on this bus
     /*
      * The mirror is three axes: the tile line sources from block_row
@@ -85,7 +85,7 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
         const char* src = reinterpret_cast<const char*>(operand + (line0 + r) * ld + run0 + c0);
         const uintptr_t dst = reinterpret_cast<uintptr_t>(tile(r, c0));
 #pragma unroll
-        for (int j = 0; j < kCpt; ++j)
+        for (int j = 0; j < Map::kPerThread; ++j)
             astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)), src + j * 16);
     } else {
         const int64_t line = line0 + r;
@@ -99,7 +99,7 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
         const bool chunk_aligned = (reinterpret_cast<uintptr_t>(src) & 15) == 0;
         const uintptr_t dst = reinterpret_cast<uintptr_t>(tile(r, c0));
 #pragma unroll
-        for (int j = 0; j < kCpt; ++j) {
+        for (int j = 0; j < Map::kPerThread; ++j) {
             const int c = j * kChunkElems;
             const int64_t col = run0 + c0 + c;
             ElemT* dstj = reinterpret_cast<ElemT*>(dst ^ (unsigned)(j << 4));
@@ -136,20 +136,9 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
 template <bool kAsync, typename RingT, int kThreads, bool kTrans = false> struct PrefetchCarry {
     using ElemT = typename RingT::Elem;               // Ring = Tensor<PtrEngine, RingLayout>
     using SmemLayout = typename RingT::Layout::Stage; // per-stage layout
-    static constexpr int kChunkElems = 16 / sizeof(ElemT);
-    /*
-     * Same bus rule as load_operand_tile: an under-subscribed bus leaves
-     * the surplus threads inactive rather than illegal.
-     */
-    static constexpr int kTotalChunks = SmemLayout::kRows * SmemLayout::kChunks;
-    static_assert(kTotalChunks % kThreads == 0 || kTotalChunks < kThreads,
-                  "tile chunks must divide the threads or under-subscribe the bus");
-    static constexpr int kCpt = kTotalChunks < kThreads ? 1 : kTotalChunks / kThreads;
-    static_assert(kCpt > 0 && (kCpt & (kCpt - 1)) == 0,
-                  "XOR chunk stepping needs a power-of-two chunks-per-thread");
-    static constexpr int kCpr = SmemLayout::kChunks / kCpt;
+    using Map = AsyncCopyMap<SmemLayout, ElemT, kThreads>;
     // Carried state is in BYTES: both pointers advance by the stage stride.
-    static constexpr int kK = kTrans ? SmemLayout::kRows : SmemLayout::kChunks * kChunkElems;
+    static constexpr int kK = kTrans ? SmemLayout::kRows : SmemLayout::kChunks * Map::kChunkElems;
     static constexpr unsigned kKBytes = (unsigned)kK * sizeof(ElemT);
     unsigned wr = 0;           // current stage's swizzled destination offset
     unsigned wr0 = 0;          // slot-0 wrap base
@@ -165,17 +154,17 @@ template <bool kAsync, typename RingT, int kThreads, bool kTrans = false> struct
                                      int tid,
                                      int firstTile) {
         if constexpr (kAsync) {
-            const int rRaw = tid / kCpr;
-            active = rRaw < SmemLayout::kRows;
+            const auto slice = Map::get_slice(tid);
+            active = slice.active();
             /*
              * An inactive thread's (r, c0) maps to no staged chunk; the carried
              * offsets are computed at a clamped r and never dereferenced.
              */
-            const int r = active ? rRaw : 0;
-            const int c0 = (tid % kCpr) * kCpt * kChunkElems;
-            const ElemT* slot0 = astrai::stage_of(ring, firstTile).engine.ptr;
+            const int r = active ? slice.row() : 0;
+            const int c0 = slice.column();
+            const auto stage = astrai::stage_of(ring, firstTile);
             const unsigned laneOff = static_cast<unsigned>(
-                (const char*)astrai::stage_of(ring, firstTile)(r, c0) - (const char*)slot0);
+                (const char*)stage(r, c0) - (const char*)stage.engine.ptr);
             const unsigned base = __cvta_generic_to_shared(ring.engine.ptr) + laneOff;
             wr = base + (unsigned)((int64_t)(firstTile % RingT::Layout::kSlots) *
                                    RingT::Layout::kStageBytes);
@@ -203,7 +192,7 @@ template <bool kAsync, typename RingT, int kThreads, bool kTrans = false> struct
             if (!active)
                 return;
 #pragma unroll
-            for (int j = 0; j < kCpt; ++j)
+            for (int j = 0; j < Map::kPerThread; ++j)
                 astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
         }
     }

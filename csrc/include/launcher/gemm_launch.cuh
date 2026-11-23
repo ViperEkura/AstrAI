@@ -96,16 +96,16 @@ constexpr bool reclaim_fits() {
  */
 template <typename Policy>
 bool tma_maps_for(const GemmParams& p, CUtensorMap* ma, CUtensorMap* mb) {
-    using Mainloop = GemmCollectiveMainloop<Policy>;
+    using Operands = GemmOperands<Policy>;
     const auto a = astrai::tma_map_cache().lookup(
-        astrai::tma_spec<typename Mainloop::ElemA, typename Mainloop::SmemLayoutA,
-                         Mainloop::kBlockM>(p.a_ptr, p.m, p.k, p.a_ld, p.batch, p.a_batch_stride));
+        astrai::tma_spec<typename Operands::A::Elem, typename Operands::A::Canonical,
+                         Operands::A::kRows>(p.a_ptr, p.m, p.k, p.a_ld, p.batch, p.a_batch_stride));
     if (!a)
         return false;
     *ma = *a;
     const auto b = astrai::tma_map_cache().lookup(
-        astrai::tma_spec<typename Mainloop::ElemB, typename Mainloop::SmemLayoutB,
-                         Mainloop::kBlockN>(p.b_ptr, p.n, p.k, p.b_ld, p.batch, p.b_batch_stride));
+        astrai::tma_spec<typename Operands::B::Elem, typename Operands::B::Canonical,
+                         Operands::B::kRows>(p.b_ptr, p.n, p.k, p.b_ld, p.batch, p.b_batch_stride));
     if (!b)
         return false;
     *mb = *b;

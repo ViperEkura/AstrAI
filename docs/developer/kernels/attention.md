@@ -151,6 +151,21 @@ in each warp. Output dimensions read the weights through warp shuffles for FP32
 accumulation, avoiding shared memory and block synchronization. Empty splits
 contribute zero, including fully masked rows.
 
+### Paged decode performance
+
+The BF16 2B model on RTX 5090 used 16-token cache pages, a 16-token decode tile,
+and up to 128 adaptive splits. Each cell is the median end-to-end CUDA Graph
+decode latency over six 64-step windows after warmup. The 128K timing used
+extended RoPE buffers for the 32K checkpoint.
+
+| History | Batch | Main `914be12c` (ms/step) | `ee0478c7` (ms/step) | Candidate / main |
+|---:|---:|---:|---:|---:|
+| 2K | 1 | 3.751 | 3.907 | 1.041× |
+| 16K | 1 | 4.910 | 4.296 | 0.875× |
+| 16K | 4 | 7.152 | 7.505 | 1.049× |
+| 16K | 8 | 9.596 | 9.811 | 1.022× |
+| 128K | 1 | 14.138 | 9.044 | 0.640× |
+
 ## Gated DeltaNet reference path
 
 Set `attention.default_type` to `"gdn"` for a model whose layers all use

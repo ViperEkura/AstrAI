@@ -32,14 +32,19 @@ inline void log_gemm_plan(const GemmParams& p,
                           int k_stages,
                           int smem,
                           bool tma,
-                          bool mx = false) {
+                          bool mx,
+                          int warp_m,
+                          int warp_n,
+                          int tile_k,
+                          const char* fallback) {
     if (!gemm_plan_log_enabled())
         return;
     std::fprintf(stderr,
                  "[gemm-plan] %lldx%lldx%lld b=%d -> tile %dx%d s%d%s%s "
-                 "grid %dx%dx%d raster %d smem %d\n",
+                 "grid %dx%dx%d raster %d smem %d warp %dx%d tile_k %d staging %s fallback %s\n",
                  (long long)p.m, (long long)p.n, (long long)p.k, p.batch, bm, bn, k_stages,
-                 tma ? " tma" : "", mx ? " mx" : "", grid.x, grid.y, grid.z, p.raster, smem);
+                 tma ? " tma" : "", mx ? " mx" : "", grid.x, grid.y, grid.z, p.raster, smem, warp_m,
+                 warp_n, tile_k, tma ? "tma" : "cp.async", fallback);
 }
 
 /*
@@ -57,11 +62,13 @@ void launch_with_smem(int smem_bytes, dim3 grid, dim3 block, cudaStream_t stream
     ASTRAI_LAUNCH_CHECK();
 }
 
-template <typename Policy> void launch_policy(GemmParams p, cudaStream_t stream) {
+template <typename Policy>
+void launch_policy(GemmParams p, cudaStream_t stream, const char* fallback = "none") {
     using Traits = typename Policy::Traits;
     dim3 grid = gemm_grid<Traits>(p);
     log_gemm_plan(p, grid, Traits::kBlockM, Traits::kBlockN, Traits::kStages, Policy::kSmemBytes,
-                  /*tma=*/false, Traits::kMxCell);
+                  /*tma=*/false, Traits::kMxCell, Traits::kWarpM, Traits::kWarpN, Traits::kTile,
+                  fallback);
     launch_with_smem<gemm_kernel<Policy>>(Policy::kSmemBytes, grid, dim3(Traits::kCtaThreads),
                                           stream, p);
 }
@@ -140,7 +147,8 @@ bool launch_policy_tma(const GemmParams& p, cudaStream_t stream, int smem_max = 
         return false;
     dim3 grid = gemm_grid<Traits>(p);
     log_gemm_plan(p, grid, Traits::kBlockM, Traits::kBlockN, Traits::kStages, Policy::kSmemBytes,
-                  /*tma=*/true, Traits::kMxCell);
+                  /*tma=*/true, Traits::kMxCell, Traits::kWarpM, Traits::kWarpN, Traits::kTile,
+                  "none");
     /*
      * Rank bits pick the instantiation: strided batch rides the 3D
      * emitters, broadcast keeps the shared 2D map; the per-stage pick

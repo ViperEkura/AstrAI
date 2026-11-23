@@ -1,5 +1,6 @@
 #pragma once
 /* Manifest tile selection and TMA/cp.async policy resolution. */
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 
@@ -54,9 +55,8 @@ using reclaim_fallback_t = std::conditional_t<
                        Tile_64x64x64_W16x32_S2>>;
 
 template <typename Schedule, typename ElemA, typename ElemB, typename LayoutA, typename LayoutB>
-inline constexpr bool tma_eligible_v =
-    Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 && sizeof(ElemA) <= 2 &&
-    sizeof(ElemB) <= 2;
+inline constexpr bool tma_eligible_v = Schedule::kTma && crosswise_of<LayoutA, LayoutB>() == 0 &&
+                                       sizeof(ElemA) <= 2 && sizeof(ElemB) <= 2;
 
 /* Bind operand types, layouts, and schedule once; a recipe selects the concrete policy. */
 template <typename ElemA,
@@ -67,39 +67,40 @@ template <typename ElemA,
           typename OutT,
           typename Schedule>
 struct GemmTileDispatch {
-    template <bool UseTma>
-    using StagingA = std::conditional_t<UseTma, RowMajor, LayoutA>;
-    template <bool UseTma>
-    using StagingB = std::conditional_t<UseTma, ColMajor, LayoutB>;
+    template <bool UseTma> using StagingA = std::conditional_t<UseTma, RowMajor, LayoutA>;
+    template <bool UseTma> using StagingB = std::conditional_t<UseTma, ColMajor, LayoutB>;
     template <bool UseTma>
     using Manifest = manifest_for<ElemA, ElemB, StagingA<UseTma>, StagingB<UseTma>>;
     template <typename Tile>
-    using ResolvedTile =
-        reclaim_fallback_t<warp_widened_t<ElemA, ElemB, Tile>, ElemA, ElemB, OutT>;
+    using ResolvedTile = reclaim_fallback_t<warp_widened_t<ElemA, ElemB, Tile>, ElemA, ElemB, OutT>;
     template <bool UseTma, typename Tile>
-    using Policy = GemmPolicy<ElemA, ElemB, StagingA<UseTma>, StagingB<UseTma>,
-                              ResolvedTile<Tile>, LayoutOut, OutT,
+    using Policy = GemmPolicy<ElemA,
+                              ElemB,
+                              StagingA<UseTma>,
+                              StagingB<UseTma>,
+                              ResolvedTile<Tile>,
+                              LayoutOut,
+                              OutT,
                               PlannedGemmOptions<Schedule, UseTma>>;
 
-    template <bool UseTma>
-    struct Launcher {
+    template <bool UseTma> struct Launcher {
         const GemmParams& p;
         cudaStream_t stream;
         int smem_max;
+        const char* fallback = "none";
 
         template <typename Tile> bool run() const {
             using P = Policy<UseTma, Tile>;
             if constexpr (UseTma) {
                 return launch_policy_tma<P>(p, stream, smem_max);
             } else {
-                launch_policy<P>(p, stream);
+                launch_policy<P>(p, stream, fallback);
                 return true;
             }
         }
     };
 
-    template <bool UseTma>
-    struct ResourceQuery {
+    template <bool UseTma> struct ResourceQuery {
         const PlanQuery& q;
         KernelResources& result;
 
@@ -139,18 +140,20 @@ struct GemmTileDispatch {
         return result;
     }
 
-    static void launch(GemmParams p, const LaunchPlan& selected, cudaStream_t stream,
-                       const DeviceFacts& dev) {
+    static void
+    launch(GemmParams p, const LaunchPlan& selected, cudaStream_t stream, const DeviceFacts& dev) {
         const PlanDecision& decision = selected.decision;
         p.raster = decision.raster;
         // Descriptor rejection falls through to the cp.async policy.
         if constexpr (tma_eligible_v<Schedule, ElemA, ElemB, LayoutA, LayoutB>) {
-            if (selected.tma &&
-                dispatch_tile<Manifest<true>>(
-                    decision.recipe, Launcher<true>{p, stream, dev.smem_max}))
+            if (selected.tma && dispatch_tile<Manifest<true>>(
+                                    decision.recipe, Launcher<true>{p, stream, dev.smem_max}))
                 return;
         }
-        dispatch_tile<Manifest<false>>(decision.recipe, Launcher<false>{p, stream, dev.smem_max});
+        if (!dispatch_tile<Manifest<false>>(
+                decision.recipe, Launcher<false>{p, stream, dev.smem_max,
+                                                 selected.tma ? "tma_setup_rejected" : "none"}))
+            throw std::runtime_error("selected GEMM recipe has no compiled launch");
     }
 };
 

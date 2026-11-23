@@ -131,6 +131,53 @@ def test_invalid_cache_shape_is_rejected_before_write(device, zero_heads):
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_multiquery_cache_matches_token_decode(dtype):
+    if not torch.cuda.is_available() or not is_available("attention"):
+        pytest.skip("native CUDA attention required")
+
+    # 17 tokens x 4 Q heads per KV head spans a full 64-row Q tile and a tail.
+    batch, tokens, page = 2, 17, 16
+    torch.manual_seed(137)
+    q, k, v = [
+        torch.randn(batch, tokens, heads, 128, device="cuda", dtype=dtype)
+        for heads in (16, 4, 4)
+    ]
+    past = torch.tensor([15, 31], device="cuda", dtype=torch.int32)
+    pages = torch.tensor([[4, 0, 2], [3, 5, 1]], device="cuda", dtype=torch.int32)
+    kc = torch.randn(6, page, 4, 128, device="cuda", dtype=dtype)
+    vc = torch.randn_like(kc)
+    step_k, step_v = kc.clone(), vc.clone()
+    with op_backend(attention="cuda"):
+        out = attention(
+            q,
+            k,
+            v,
+            k_cache=kc,
+            v_cache=vc,
+            cache_seqlens=past,
+            page_table=pages,
+            is_causal=True,
+        )
+        steps = [
+            attention(
+                q[:, i],
+                k[:, i],
+                v[:, i],
+                k_cache=step_k,
+                v_cache=step_v,
+                cache_seqlens=past + i,
+                page_table=pages,
+                is_causal=True,
+            )
+            for i in range(tokens)
+        ]
+    torch.testing.assert_close(out, torch.stack(steps, dim=1), rtol=0.03, atol=0.015)
+    torch.testing.assert_close(kc, step_k, rtol=0, atol=0)
+    torch.testing.assert_close(vc, step_v, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_decode_bitwise_across_graphs(dtype):
     if not is_available("attention") or not torch.cuda.is_available():
         pytest.skip("native CUDA attention required")

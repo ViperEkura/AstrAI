@@ -57,8 +57,10 @@ block, offset = divmod(position, page_size)
 physical_page = page_table[b, block]
 ```
 
-The runner binds the batch's page table and past lengths once per step. Chunked
-prefill supplies the first position of the current chunk and packed Q offsets.
+The runner binds the batch's page table and past lengths once per step.
+The workspace derives `q_len` from the scheduled token counts. Regular multi-token
+batches use the common count. Packed batches use the total count and share
+`cu_seqlens_q` across layers. Single-token prefill uses packed boundaries.
 Decode reuses stable metadata, output and split buffers across graph replays.
 The storage prepares each layer's K/V views once. Model inference selects
 those retained views; gradient-enabled reference calls obtain fresh views. The cache type preserves one-token
@@ -113,7 +115,9 @@ its launcher with `bf16` first and `fp16` otherwise. Attention does not use type
 tags, recursive visitors or error-formatting callbacks.
 
 Dense and varlen use `launch_attention_split_q` with different addressing.
-Cache appends K/V before tiled attention for packed queries; single-token
+Regular multi-token cache calls tile query positions and their grouped query heads
+with grid axes (Q tile, KV head, request). Unequal request lengths use packed query
+offsets. Both paths append new K/V before computing attention. Single-token decode
 queries use `launch_attention_split_kv` with fused append. The split-KV
 launcher selects fixed/adaptive splitting and direct/combined output itself.
 Head dimension, causality, mask coverage and aligned loads retain their existing

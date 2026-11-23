@@ -132,23 +132,32 @@ __global__ void attention_kernel(const AttentionParams p) {
 
 template <typename T>
 __global__ void append_kv(AttentionParams p) {
-    const int token = blockIdx.x;
-    int lo = 0, hi = p.batch;
-    while (lo + 1 < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (p.cu_seqlens_q[mid] <= token)
-            lo = mid;
-        else
-            hi = mid;
+    int batch = blockIdx.y;
+    int token = blockIdx.x;
+    int local = token, count = p.q_len;
+    if (p.cu_seqlens_q) {
+        int lo = 0, hi = p.batch;
+        while (lo + 1 < hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (p.cu_seqlens_q[mid] <= token)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        batch = lo;
+        const int begin = p.cu_seqlens_q[batch], end = p.cu_seqlens_q[batch + 1];
+        if (begin < 0 || begin > token || token >= end || end > p.q_len)
+            __trap();
+        local = token - begin;
+        count = end - begin;
+    } else {
+        token += batch * count;
     }
-    int begin = p.cu_seqlens_q[lo], end = p.cu_seqlens_q[lo + 1];
-    if (begin < 0 || begin > token || token >= end || end > p.q_len)
+    const int past = p.cache_seqlens[batch];
+    if (past < 0 || past > p.kv_len - count)
         __trap();
-    int past = p.cache_seqlens[lo];
-    if (past < 0 || past > p.kv_len - (end - begin))
-        __trap();
-    int pos = past + (token - begin);
-    int page = p.page_table[(int64_t)lo * p.table_stride + pos / p.page_size];
+    const int pos = past + local;
+    const int page = p.page_table[(int64_t)batch * p.table_stride + pos / p.page_size];
     if (page < 0 || page >= p.num_pages)
         __trap();
     int64_t slot = (int64_t)page * p.page_size + pos % p.page_size;

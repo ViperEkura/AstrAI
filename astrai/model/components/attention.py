@@ -31,17 +31,21 @@ def scaled_dot_product_attention(
     """Bind the model layer's cache metadata to the tensor-only attention call."""
     if kv_cache is None:
         return attention(q, k, v, mask=mask, is_causal=is_causal)
+    shape = q.shape
     k_cache, v_cache = kv_cache.layer(layer_id)
-    offsets, workspace = None, (None, None, None)
+    cu_seqlens_q, workspace = None, (None, None, None)
     if isinstance(kv_cache, DecodeKVCache):
         workspace = (
-            kv_cache.decode_o_part,
-            kv_cache.decode_ml_part,
-            kv_cache.decode_out,
+            kv_cache.o_part,
+            kv_cache.ml_part,
+            kv_cache.output,
         )
     else:
-        offsets = kv_cache.cu_seqlens_q
-    return attention(
+        cu_seqlens_q = kv_cache.cu_seqlens_q
+        if cu_seqlens_q is None and q.ndim == 3:
+            batch = kv_cache.cache_seqlens.size(0)
+            q, k, v = (t.unflatten(0, (batch, kv_cache.q_len)) for t in (q, k, v))
+    out = attention(
         q,
         k,
         v,
@@ -49,11 +53,12 @@ def scaled_dot_product_attention(
         v_cache=v_cache,
         cache_seqlens=kv_cache.cache_seqlens,
         page_table=kv_cache.page_table,
-        cu_seqlens_q=offsets,
+        cu_seqlens_q=cu_seqlens_q,
         mask=mask,
         is_causal=is_causal,
         workspace=workspace,
     )
+    return out.view(shape) if out.ndim != len(shape) else out
 
 
 class AttnFactory(BaseFactory[nn.Module]):

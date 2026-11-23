@@ -95,8 +95,8 @@ def appended_slots(cache):
     size = cache.k_buffer.size(2)
     lengths = (
         cache.cu_seqlens_q.diff().tolist()
-        if hasattr(cache, "cu_seqlens_q")
-        else [1] * cache.page_table.size(0)
+        if getattr(cache, "cu_seqlens_q", None) is not None
+        else [getattr(cache, "q_len", 1)] * cache.page_table.size(0)
     )
     return torch.cat(
         [

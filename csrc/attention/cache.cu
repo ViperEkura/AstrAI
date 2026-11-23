@@ -79,7 +79,8 @@ torch::Tensor attention_with_kvcache(torch::Tensor q,
                         k.dim() == 4 && v.dim() == 4 && k.sizes() == v.sizes() &&
                         k.sizes().slice(0, 2) == q.sizes().slice(0, 2),
                     "regular cache attention expects matching BSHD inputs");
-        if (q.size(1) > 1)
+        // CUDA grid.z holds the request index for regular multi-query tiles.
+        if (q.size(1) > 1 && q.size(0) > 65535)
             qs = torch::arange(q.size(0) + 1, q.options().dtype(torch::kInt32)) * q.size(1);
         q = q.flatten(0, 1);
         k = k.flatten(0, 1);
@@ -130,16 +131,22 @@ torch::Tensor attention_with_kvcache(torch::Tensor q,
     p.q_h_stride = static_cast<int>(q.stride(1));
     p.new_kv_token_stride = static_cast<int>(k.stride(0));
     p.new_kv_h_stride = static_cast<int>(k.stride(1));
-    p.q_len = qs ? static_cast<int>(q.size(0)) : 1;
+    const int regular_q_len = shape.size() == 4 ? static_cast<int>(shape[1]) : 1;
+    p.q_len = qs || regular_q_len > 1 ? static_cast<int>(q.size(0)) : 1;
     p.is_causal = causal;
     if (qs) {
         TORCH_CHECK(qs->device() == q.device() && qs->scalar_type() == torch::kInt32 &&
                         qs->is_contiguous() && qs->dim() == 1 && qs->numel() == p.batch + 1,
                     "invalid query offsets");
         p.cu_seqlens_q = qs->data_ptr<int>();
-    } else
+    } else if (regular_q_len == 1)
         TORCH_CHECK(q.size(0) == p.batch, "decode requires one token per request");
     pack_mask(mask, p, q.device(), true);
+    if (!qs) {
+        p.q_len = regular_q_len;
+        if (p.batch > 1)
+            p.q_b_stride = static_cast<int>(regular_q_len * q.stride(0));
+    }
     finish_pack(c10::nullopt, p);
     set_kv_split_size(p, split);
     torch::Tensor out;

@@ -43,7 +43,7 @@ struct AttentionParams {
     int q_head;
     int kv_head;
     int head_dim;
-    int q_len;  // Per-request in contiguous mode; total_q in paged mode.
+    int q_len;  // Per request for regular Q, total tokens for packed Q.
     int kv_len; // KV tokens (dense/varlen) or per-request capacity (cache).
 
     // Tensor strides.

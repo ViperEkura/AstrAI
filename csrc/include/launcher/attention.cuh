@@ -145,12 +145,15 @@ inline void launch_attention_varlen(AttentionParams& p, cudaStream_t stream) {
 template <typename T, typename Allocate>
 inline void
 launch_attention_with_kvcache(AttentionParams& p, cudaStream_t stream, Allocate allocate) {
-    if (p.cu_seqlens_q) {
-        append_kv<T><<<p.q_len, 128, 0, stream>>>(p);
-        ASTRAI_LAUNCH_CHECK();
+    if (!p.cu_seqlens_q && p.q_len == 1)
+        return launch_attention_split_kv<PagedKV<T>>(p, stream, allocate);
+
+    const dim3 append_grid(p.q_len, p.cu_seqlens_q ? 1 : p.batch);
+    append_kv<T><<<append_grid, 128, 0, stream>>>(p);
+    ASTRAI_LAUNCH_CHECK();
+    if (p.cu_seqlens_q)
         return launch_attention_split_q<VarlenQSchedule, PagedKV<T>>(p, stream);
-    }
-    launch_attention_split_kv<PagedKV<T>>(p, stream, allocate);
+    launch_attention_split_q<DenseQSchedule, PagedKV<T>>(p, stream);
 }
 
 } // namespace astrai::attention

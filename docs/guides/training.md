@@ -506,6 +506,44 @@ Built-in top-level models accept a validated `config` object. Extra
 from the full model configuration. Custom constructors declaring `**kwargs`
 remain responsible for validating those extra options.
 
-Built-in callbacks are constructed directly.
-Pass custom instances with `Trainer(config, callbacks=[MyCallback()])`.
-See [callback contracts](../developer/trainer/callbacks.md) for lifecycle hooks.
+### Experiment callbacks
+
+Add a top-level `callbacks` list to the experiment's training YAML. Put the
+callback module on the Python import path. Each worker constructs its own
+instances using the existing `module:attribute` component syntax.
+
+```yaml
+callbacks:
+  - type: experiment_metrics:MathRolloutMetrics
+    params:
+      prefix: experiment/math
+```
+
+For a binary reward, this callback measures the fraction of prompt groups
+whose responses all receive zero. Select prompts using the experiment's
+own domain metadata or prompt index when training on a mixed dataset.
+
+```python
+class MathRolloutMetrics:
+    def __init__(self, prefix):
+        self.prefix = prefix
+
+    def on_rollout(self, context):
+        batch = context.kwargs["batch"]
+        all_wrong = batch.rewards.eq(0).all(dim=1)
+        return {
+            f"{self.prefix}/all_wrong_rate": (all_wrong.sum().item(), all_wrong.numel())
+        }
+
+    def on_log(self, context):
+        record = context.kwargs["record"]
+        key = f"{self.prefix}/all_wrong_rate"
+        if key in record:
+            print(f"step={record['step']} {key}={record[key]:.3f}", flush=True)
+```
+
+Python callers can also pass instances with
+`Trainer(config, callbacks=[MathRolloutMetrics("experiment/math")])`.
+The saved history includes rollout metrics alongside step and validation records.
+See [callback contracts](../developer/trainer/callbacks.md) for dispatch and
+resume semantics.

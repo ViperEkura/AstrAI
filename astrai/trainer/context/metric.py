@@ -30,14 +30,15 @@ class MetricHistory:
     def stage(self, record: Dict[str, Any]) -> None:
         self._pending.append(dict(record))
 
-    def commit(self, step: int, consumed_samples: int) -> None:
+    def commit(self, step: int, consumed_samples: int) -> List[Dict[str, Any]]:
         records = [
-            json.dumps({**record, "step": step, "consumed_samples": consumed_samples})
-            + "\n"
+            {**record, "step": step, "consumed_samples": consumed_samples}
             for record in self._pending
         ]
-        self._committed.extend(records)
+        encoded = [json.dumps(record) + "\n" for record in records]
+        self._committed.extend(encoded)
         self.discard_pending()
+        return records
 
     def discard_pending(self) -> None:
         self._pending.clear()

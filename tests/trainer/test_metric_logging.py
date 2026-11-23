@@ -12,7 +12,7 @@ from astrai.trainer.callbacks.checkpoint import _write_metric_snapshot
 from astrai.trainer.callbacks.metric_util import GradSNRTracker
 from astrai.trainer.context import PreloadedState, TrainContext, TrainContextBuilder
 from astrai.trainer.context.metric import MetricHistory
-from astrai.trainer.trainer import Trainer
+from astrai.trainer.trainer import Trainer, _invoke_callback
 from tests.support.rollout import RandomTokenDataset
 from tests.support.trainer import create_train_config
 
@@ -35,6 +35,19 @@ def _context(step=0, samples=0, checkpoint=None, param_path=None, rollout=None):
         rollout=rollout,
         config=SimpleNamespace(rollout_mode="async_round" if rollout else "sync"),
     )
+
+
+@pytest.mark.parametrize("prior", [{}, {"batch": None}], ids=["absent", "existing"])
+def test_callback_context_restores_payload_on_error(prior):
+    context = TrainContext(kwargs=dict(prior, experiment="math"))
+
+    def fail(ctx):
+        assert ctx.kwargs["batch"] == {"rewards": [0, 1]}
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        _invoke_callback(fail, context, "batch", {"rewards": [0, 1]})
+    assert context.kwargs == dict(prior, experiment="math")
 
 
 def _records(path):

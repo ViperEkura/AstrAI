@@ -113,6 +113,7 @@ class TrainConfig(BaseConfig):
         model (ComponentSpec): Serializable model target and parameters.
         strategy (str): Training strategy (seq, sft, dpo, grpo, online_*).
         dataset (ComponentSpec): Serializable data constructor and parameters.
+        callbacks (List[ComponentSpec]): Optional callback factories in execution order.
         optimizer (ComponentSpec): Serializable optimizer target and parameters.
         optimizer_name (Optional[str]): Legacy input alias used only without an explicit optimizer spec.
         optimizer_hyperparameters (Dict[str, Any]): Legacy constructor parameters; runtime settings live in optimizer.params.
@@ -187,6 +188,7 @@ class TrainConfig(BaseConfig):
     optimizer: ComponentSpec
     scheduler: ComponentSpec
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
+    callbacks: List[ComponentSpec] = field(default_factory=list)
 
     reward_model_fn: Optional[Callable] = None
     critic_model_fn: Optional[Callable] = None

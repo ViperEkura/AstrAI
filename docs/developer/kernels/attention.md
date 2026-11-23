@@ -90,7 +90,9 @@ copy pipeline, tile schedules and numerical recurrence.
 
 `kernel/attention/mainloop.cuh` contains both prefill and decode mainloops;
 `epilogue.cuh` contains output handling and split combination.
-`kernel.cuh` defines their shared storage/result contract and the device entry.
+`kernel.cuh` defines their shared storage/result contract, the attention entry
+and the paged KV append kernel. Prefill retains a separate append launch on the
+same stream before attention, so all query blocks observe the new K/V.
 
 For power-of-two page sizes, the KV address context computes the shift once
 per request/head and reuses it in the tile loop. Other page sizes retain

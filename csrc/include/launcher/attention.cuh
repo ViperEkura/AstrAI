@@ -15,8 +15,8 @@
 #include <type_traits>
 
 #include <api/native/attention.h>
-#include <kernel/attention/append.cuh>
 #include <kernel/attention/epilogue.cuh>
+#include <kernel/attention/kernel.cuh>
 #include <kernel/attention/mainloop.cuh>
 #include <memory/layout_policies.cuh>
 #include <utils/launch.cuh>
@@ -136,9 +136,11 @@ template <int HEAD_DIM,
           bool FixedSplits = false>
 struct PrefillKernel {
     using Config = PrefillConfig<HEAD_DIM, IsCausal>;
-    using Traits =
-        KernelTraits<HEAD_DIM, FixedSplits ? 16 : Config::BC, Config::WARPS,
-                     Config::STAGES, typename KV::Elem>;
+    using Traits = KernelTraits<HEAD_DIM,
+                                FixedSplits ? 16 : Config::BC,
+                                Config::WARPS,
+                                Config::STAGES,
+                                typename KV::Elem>;
 
     static dim3 plan(const AttentionParams& p) {
         // Each block owns BLOCK_M packed (head, row) rows; grid.y selects the KV head.
@@ -148,14 +150,18 @@ struct PrefillKernel {
     }
 
     static void launch(const AttentionParams& p, dim3 grid, cudaStream_t stream) {
-        using Mainloop = PrefillMainloop<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape, FixedSplits>;
+        using Mainloop =
+            PrefillMainloop<Traits, QSchedule, KV, IsCausal, HasMask, MaskCoversShape, FixedSplits>;
         attention_kernel<Mainloop, OutputEpilogue<Traits, true>>
             <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
         ASTRAI_LAUNCH_CHECK();
     }
 };
 
-template <int HEAD_DIM, typename KV, bool HasMask, bool SkipEmptySplits = false,
+template <int HEAD_DIM,
+          typename KV,
+          bool HasMask,
+          bool SkipEmptySplits = false,
           bool FixedSplits = false>
 struct DecodeKernel {
     // BC=16 retains the existing shared-memory/register footprint and occupancy.
@@ -164,15 +170,16 @@ struct DecodeKernel {
     static DecodePlanQuery query(const AttentionParams& p) {
         const int kv_len = KV::host_kv_len(p);
         // Keep the partial-output kernel as the occupancy reference for both modes.
-        return {p.batch,
-                p.q_head,
-                p.kv_head,
-                HEAD_DIM,
-                (kv_len + Traits::BC - 1) / Traits::BC,
-                decode_wave_capacity<
-                    attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits, FixedSplits>,
-                                     SplitEpilogue<Traits>>,
-                    Traits::NUM_THREADS>()};
+        return {
+            p.batch,
+            p.q_head,
+            p.kv_head,
+            HEAD_DIM,
+            (kv_len + Traits::BC - 1) / Traits::BC,
+            decode_wave_capacity<
+                attention_kernel<DecodeMainloop<Traits, KV, HasMask, SkipEmptySplits, FixedSplits>,
+                                 SplitEpilogue<Traits>>,
+                Traits::NUM_THREADS>()};
     }
 
     static DecodeLaunchPlan plan(const AttentionParams& p) {
@@ -308,7 +315,8 @@ inline void launch_attention_with_kvcache(AttentionParams& p, cudaStream_t strea
         append_kv<T><<<p.q_len, 128, 0, stream>>>(p);
         detail::launch_prefill<VarlenQSchedule, PagedKV<T>>(p, stream);
     } else {
-        detail::with_decode_kernel<PagedKV<T>>(p, [&](auto kernel) { decode(kernel, kernel.plan(p)); });
+        detail::with_decode_kernel<PagedKV<T>>(
+            p, [&](auto kernel) { decode(kernel, kernel.plan(p)); });
     }
 }
 

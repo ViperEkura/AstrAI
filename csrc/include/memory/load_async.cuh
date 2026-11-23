@@ -18,10 +18,17 @@ template <typename Layout, typename Elem, int Threads> struct AsyncCopyMap {
     static_assert(kPerThread <= Layout::kChunks, "a thread's copies must fit one shared row");
 
     static constexpr int kThreadsPerRow = Layout::kChunks / kPerThread;
-    static DEVICE_FORCEINLINE int row(int tid) { return tid / kThreadsPerRow; }
-    static DEVICE_FORCEINLINE int column(int tid) {
-        return (tid % kThreadsPerRow) * kPerThread * kChunkElems;
-    }
+    struct ThreadSlice {
+        int tid;
+
+        DEVICE_FORCEINLINE int row() const { return tid / kThreadsPerRow; }
+        DEVICE_FORCEINLINE int column() const {
+            return (tid % kThreadsPerRow) * kPerThread * kChunkElems;
+        }
+        DEVICE_FORCEINLINE bool active() const { return row() < Layout::kRows; }
+    };
+
+    static DEVICE_FORCEINLINE ThreadSlice get_slice(int tid) { return {tid}; }
 };
 
 /*
@@ -58,9 +65,10 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
     static_assert(!kTransposed || sizeof(ElemT) == 2, "trans staging is 16-bit only");
     using Map = AsyncCopyMap<SmemLayout, ElemT, kThreads>;
     constexpr int kChunkElems = Map::kChunkElems;
-    const int r = Map::row(tid);
-    const int c0 = Map::column(tid);
-    if (r >= SmemLayout::kRows)
+    const auto slice = Map::get_slice(tid);
+    const int r = slice.row();
+    const int c0 = slice.column();
+    if (!slice.active())
         return; // no chunks for this thread on this bus
     /*
      * The mirror is three axes: the tile line sources from block_row
@@ -146,17 +154,17 @@ template <bool kAsync, typename RingT, int kThreads, bool kTrans = false> struct
                                      int tid,
                                      int firstTile) {
         if constexpr (kAsync) {
-            const int rRaw = Map::row(tid);
-            active = rRaw < SmemLayout::kRows;
+            const auto slice = Map::get_slice(tid);
+            active = slice.active();
             /*
              * An inactive thread's (r, c0) maps to no staged chunk; the carried
              * offsets are computed at a clamped r and never dereferenced.
              */
-            const int r = active ? rRaw : 0;
-            const int c0 = Map::column(tid);
-            const ElemT* slot0 = astrai::stage_of(ring, firstTile).engine.ptr;
+            const int r = active ? slice.row() : 0;
+            const int c0 = slice.column();
+            const auto stage = astrai::stage_of(ring, firstTile);
             const unsigned laneOff = static_cast<unsigned>(
-                (const char*)astrai::stage_of(ring, firstTile)(r, c0) - (const char*)slot0);
+                (const char*)stage(r, c0) - (const char*)stage.engine.ptr);
             const unsigned base = __cvta_generic_to_shared(ring.engine.ptr) + laneOff;
             wr = base + (unsigned)((int64_t)(firstTile % RingT::Layout::kSlots) *
                                    RingT::Layout::kStageBytes);

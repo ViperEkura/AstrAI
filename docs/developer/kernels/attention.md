@@ -1,35 +1,44 @@
 # Attention
 
-AstrAI exports three functions from `astrai.extension`. Backend selection uses
+AstrAI exports one `attention` function from `astrai.extension`. Backend selection uses
 `op_backend(attention=...)` for a strict context choice or `set_op` for a process default.
 
-| Function | Tensor layout | Boundaries and behavior |
+| Call | Tensor layout | Boundaries and behavior |
 |---|---|---|
 | `attention(q, k, v, *, mask=None, is_causal=False, scale=None)` | BSHD | Dense attention supports gradients. Boolean masks select visible keys and floating masks add to scores. |
-| `attention_varlen(q, k, v, *, cu_seqlens_q, cu_seqlens_k=None, is_causal=False, scale=None)` | THD | Forward-only. Contiguous device int32 prefix sums delimit paired segments. Omitted KV offsets reuse Q offsets. |
-| `attention_with_kvcache(q, k_cache, v_cache, *, k_new, v_new, cache_seqlens, page_table, cu_seqlens_q=None, is_causal=False)` | BSHD or packed THD | Append one K/V per Q, update both caches in place, and return the attended Q rows. Packed input requires query offsets. |
+| `attention(q, k, v, cu_seqlens_q=offsets, cu_seqlens_k=None, is_causal=False, scale=None)` | THD | Forward-only. Contiguous device int32 prefix sums delimit paired segments. Omitted KV offsets reuse Q offsets. |
+| `attention(q, k, v, k_cache=kc, v_cache=vc, cache_seqlens=past, page_table=pages, cu_seqlens_q=None, mask=None, is_causal=False)` | BSHD or THD | Append the input K/V, update both caches in place, and return the attended Q rows. Packed queries require offsets; THD without offsets means one new token per request. |
 
-All three support GQA. Rectangular causal attention aligns at the bottom right.
+All three paths support GQA. Rectangular causal attention aligns at the bottom right.
 A fully masked row returns zero. The cache operator scales by `1 / sqrt(head_dim)`.
 Native FP16 and BF16 kernels cover head dimensions 32, 64, 128 and 256.
 
 ## Dispatch and ownership
 
-All three functions build an immutable `AttentionSpec` and use the same
-`AttentionDispatcher` and context key. Its mode distinguishes dense, packed
-and cache calls; backend capability checks and strict/soft selection remain
-in this layer. CUDA, Torch and Flash modules implement the selected calls.
+The public function validates routing arguments, selects a backend with the
+existing `AttentionDispatcher`, and executes it directly. There is no additional
+execution wrapper or public mode parameter. Cache arguments take precedence over
+rank; otherwise BSHD selects dense and THD selects varlen. Partial cache arguments,
+dense offsets, and varlen masks are rejected before execution. Cache calls reject
+independent KV offsets and custom scale. Gradient requirements are derived from
+grad mode and Q/K/V, independently of the operation's layout. Backend capability
+checks and strict/soft selection remain in this layer. CUDA, Torch and Flash
+modules implement the selected calls.
 The three stateless `kernel/attention.py` wrappers alone translate arguments
 to the compiled ABI. They do not select backends or retain cache state.
-CUDA validates tensors while packing native arguments. Torch/Flash use
-`kernel/attention.py` for their contracts and reference metadata;
-the dispatcher does not repeat shape, dtype or offset validation. Backend
-capability checks only decide which implementation can execute a call.
-The public cache layout rule is also defined in that kernel contract module.
+The public entry checks layouts, shapes, dtypes, devices, mask metadata and
+parameter combinations directly before backend selection. Torch/Flash do not
+repeat these checks. Native CUDA entries
+retain ABI safety checks for direct callers. Device offset and page values are
+checked on-device; reference paths check them when materializing host indices.
+The public validation never reads CUDA tensor values or allocates GPU buffers.
+Backend capability checks only decide which implementation can execute a call.
 
-The model-side adapter selects the current layer's buffers and the step's
-query offsets or graph scratch. It passes only tensors and scalar options
-to the private cache dispatcher entry, which preserves request-local masks.
+GQA and MLA select the current layer's buffers and the step's
+query offsets or graph scratch. They pass only tensors and scalar options
+to `attention`, which preserves request-local masks. The `workspace`
+keyword carries caller-owned graph scratch without introducing another entry
+or model-side forwarding helper.
 Extension code does not import model cache classes.
 
 ## Query scheduling and KV addressing
@@ -50,7 +59,7 @@ prefill supplies the first position of the current chunk and packed Q offsets.
 Decode reuses stable metadata, output and split buffers across graph replays.
 The storage prepares each layer's K/V views once. Model inference selects
 those retained views; gradient-enabled reference calls obtain fresh views. The cache type preserves one-token
-prefill and routes request-local masks through an internal entry.
+prefill while all model calls use the same public attention entry.
 
 ## Attention tool responsibilities
 

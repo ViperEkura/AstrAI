@@ -7,7 +7,7 @@ seq_lens with padding mask), and end-to-end rollout run_batch.
 import pytest
 import torch
 
-from astrai.extension import attention_with_kvcache, op_backend
+from astrai.extension import attention, op_backend
 from astrai.extension.runtime.loader import is_available
 from astrai.inference.core.cache import BlockPool, KVCacheManager
 from astrai.inference.core.engine import EngineCore
@@ -254,12 +254,12 @@ def test_paged_decode_appends_new_kv_in_kernel():
     q = torch.randn(2, 2, D, device="cuda", dtype=torch.bfloat16)
     new_k = torch.randn(2, 1, D, device="cuda", dtype=torch.bfloat16)
     new_v = torch.randn(2, 1, D, device="cuda", dtype=torch.bfloat16)
-    out = attention_with_kvcache(
+    out = attention(
         q[:, None],
-        kv_cache.k_buffer[0],
-        kv_cache.v_buffer[0],
-        k_new=new_k[:, None],
-        v_new=new_v[:, None],
+        new_k[:, None],
+        new_v[:, None],
+        k_cache=kv_cache.k_buffer[0],
+        v_cache=kv_cache.v_buffer[0],
         cache_seqlens=kv_cache.cache_seqlens,
         page_table=kv_cache.page_table,
         is_causal=True,

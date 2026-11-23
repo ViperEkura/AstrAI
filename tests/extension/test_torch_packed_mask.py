@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from astrai.model.components.attention import _model_cache_attention
+from astrai.extension import attention
 from astrai.model.kv_cache import DecodeKVCache, PrefillKVCache
 
 
@@ -71,7 +71,18 @@ def test_packed_short_mask_matches_explicit_extent(causal, mask_kind):
         mask = torch.tensor([[[[0.0, -1.0, float("-inf")], [0.0, -0.3, 0.0]]]])
     else:
         mask = torch.tensor([[True, False, True]])
-    out = _model_cache_attention(q, k, v, cache, 0, mask, causal)
+    out = attention(
+        q,
+        k,
+        v,
+        k_cache=cache.k_buffer[0],
+        v_cache=cache.v_buffer[0],
+        cache_seqlens=cache.cache_seqlens,
+        page_table=cache.page_table,
+        cu_seqlens_q=cache.cu_seqlens_q,
+        mask=mask,
+        is_causal=causal,
+    )
     torch.testing.assert_close(out, _expected(q, cache, mask, causal))
     # The third query row is absent from the short non-broadcast mask.
     if mask_kind != "key_only":
@@ -89,7 +100,17 @@ def test_packed_mask_query_axis_is_request_local():
             ]
         ]
     )
-    out = _model_cache_attention(q, k, v, cache, 0, mask, False)
+    out = attention(
+        q,
+        k,
+        v,
+        k_cache=cache.k_buffer[0],
+        v_cache=cache.v_buffer[0],
+        cache_seqlens=cache.cache_seqlens,
+        page_table=cache.page_table,
+        cu_seqlens_q=cache.cu_seqlens_q,
+        mask=mask,
+    )
     torch.testing.assert_close(out, _expected(q, cache, mask, False))
 
 
@@ -101,7 +122,17 @@ def test_oversized_query_mask_rejected_before_cache_write():
     # provide request-local query rows instead of an ambiguous full mask.
     mask = torch.ones(2, 6, 6, dtype=torch.bool)
     with pytest.raises(ValueError, match="request-local"):
-        _model_cache_attention(q, k, v, cache, 0, mask, False)
+        attention(
+            q,
+            k,
+            v,
+            k_cache=cache.k_buffer[0],
+            v_cache=cache.v_buffer[0],
+            cache_seqlens=cache.cache_seqlens,
+            page_table=cache.page_table,
+            cu_seqlens_q=cache.cu_seqlens_q,
+            mask=mask,
+        )
     torch.testing.assert_close(cache.k_buffer, before_k)
     torch.testing.assert_close(cache.v_buffer, before_v)
 
@@ -122,6 +153,15 @@ def test_decode_mask_query_axis_rejected_before_cache_write():
     # Decode has one query row per request even when the batch has two tokens.
     mask = torch.ones(2, 2, 6, dtype=torch.bool)
     with pytest.raises(ValueError, match="request-local"):
-        _model_cache_attention(q[[1, 4]], k[[1, 4]], v[[1, 4]], cache, 0, mask, False)
+        attention(
+            q[[1, 4]],
+            k[[1, 4]],
+            v[[1, 4]],
+            k_cache=cache.k_buffer[0],
+            v_cache=cache.v_buffer[0],
+            cache_seqlens=cache.cache_seqlens,
+            page_table=cache.page_table,
+            mask=mask,
+        )
     torch.testing.assert_close(cache.k_buffer, before_k)
     torch.testing.assert_close(cache.v_buffer, before_v)

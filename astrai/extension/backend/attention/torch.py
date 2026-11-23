@@ -6,9 +6,18 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from astrai.extension.backend.attention.common import repeat_kv
-from astrai.extension.kernel import attention as kernel
-from astrai.extension.kernel.attention import _mask_view
+from astrai.extension.backend.attention.common import _cache_view, repeat_kv
+
+
+def _mask_view(mask):
+    """Attention masks use batch/key, batch/query/key or batch/head/query/key."""
+    if mask is None:
+        return None
+    if mask.ndim == 2:
+        return mask[:, None, None, :]
+    if mask.ndim == 3:
+        return mask[:, None, :, :]
+    return mask
 
 
 def _causal_mask(q_len: int, kv_len: int, device: torch.device) -> Tensor:
@@ -49,7 +58,6 @@ def forward(
     *,
     scale: Optional[float] = None,
 ) -> Tensor:
-    kernel._validate_dense(q, k, v, scale)
     n_rep = q.size(2) // k.size(2)
     k, v = repeat_kv(k, n_rep), repeat_kv(v, n_rep)
     mask = _mask_view(attn_mask)
@@ -73,8 +81,15 @@ def forward(
 
 
 def forward_varlen(q, k, v, qs, ks, is_causal, scale):
-    qs, ks, scale = kernel._prepare_varlen(q, k, v, qs, ks, scale)
-    qoffs, koffs = kernel._segment_offsets(q, k, qs, ks)
+    ks = qs if ks is None else ks
+    qoffs, koffs = qs.tolist(), ks.tolist()
+    for offsets, tokens in ((qoffs, q.size(0)), (koffs, k.size(0))):
+        if (
+            offsets[0] != 0
+            or offsets[-1] != tokens
+            or any(a > b for a, b in zip(offsets, offsets[1:]))
+        ):
+            raise ValueError("invalid segment offsets")
     result = []
     for i in range(len(qoffs) - 1):
         qr = q[qoffs[i] : qoffs[i + 1]]
@@ -110,8 +125,27 @@ def forward_cache(
     *,
     dense=forward,
 ):
-    q, k, v, qs, original = kernel._prepare_cache(q, kc, vc, k, v, past, pages, qs)
-    offsets, lengths, slots, mask = kernel._cache_slots(q, kc, past, pages, qs, mask)
+    q, k, v, qs, original = _cache_view(q, k, v, qs)
+    offsets = list(range(past.numel() + 1)) if qs is None else qs.tolist()
+    lengths = past.tolist()
+    size = kc.size(1)
+    if (
+        offsets[0] != 0
+        or offsets[-1] != q.size(0)
+        or any(a > b for a, b in zip(offsets, offsets[1:]))
+    ):
+        raise ValueError("invalid query offsets")
+    mask = _mask_view(mask)
+    slots = []
+    for i, n in enumerate(lengths):
+        length = n + offsets[i + 1] - offsets[i]
+        if n < 0 or length > pages.size(1) * size:
+            raise ValueError("request exceeds cache capacity")
+        active = pages[i, : (length + size - 1) // size]
+        if any(page < 0 or page >= kc.size(0) for page in active.tolist()):
+            raise ValueError("page index outside cache")
+        pos = torch.arange(length, device=q.device)
+        slots.append(active[pos // size].long() * size + pos % size)
     keys = kc.view(-1, *kc.shape[-2:])
     values = vc.view_as(keys)
     output = []

@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.extension.backend import apply_rotary_emb, attention
-from astrai.extension.backend.attention.dispatcher import _cache_attention
 from astrai.factory import BaseFactory
 from astrai.model.components.conv import Conv1d
 from astrai.model.components.gdn_ops import (
@@ -17,29 +16,6 @@ from astrai.model.components.initialization import should_initialize
 from astrai.model.components.linear import Linear
 from astrai.model.components.norm import RMSNorm
 from astrai.model.kv_cache import DecodeKVCache, KVCache
-
-
-def _model_cache_attention(q, k, v, cache, layer, mask, is_causal):
-    if isinstance(cache, DecodeKVCache):
-        offsets = None
-        workspace = (cache.decode_o_part, cache.decode_ml_part, cache.decode_out)
-    else:
-        offsets = cache.cu_seqlens_q
-        workspace = (None, None, None)
-    k_cache, v_cache = cache.layer(layer)
-    return _cache_attention(
-        q,
-        k_cache,
-        v_cache,
-        k,
-        v,
-        cache.cache_seqlens,
-        cache.page_table,
-        offsets,
-        mask,
-        is_causal,
-        workspace,
-    )
 
 
 class AttnFactory(BaseFactory[nn.Module]):
@@ -124,8 +100,28 @@ class GQA(nn.Module):
         if kv_cache is None:
             sdqa_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
         else:
-            sdqa_out = _model_cache_attention(
-                q, k, v, kv_cache, self.layer_id, attn_mask, is_causal
+            k_cache, v_cache = kv_cache.layer(self.layer_id)
+            offsets, workspace = None, (None, None, None)
+            if isinstance(kv_cache, DecodeKVCache):
+                workspace = (
+                    kv_cache.decode_o_part,
+                    kv_cache.decode_ml_part,
+                    kv_cache.decode_out,
+                )
+            else:
+                offsets = kv_cache.cu_seqlens_q
+            sdqa_out = attention(
+                q,
+                k,
+                v,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_seqlens=kv_cache.cache_seqlens,
+                page_table=kv_cache.page_table,
+                cu_seqlens_q=offsets,
+                mask=attn_mask,
+                is_causal=is_causal,
+                workspace=workspace,
             )
         sdqa_out = sdqa_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
@@ -523,8 +519,28 @@ class MLA(nn.Module):
         if kv_cache is None:
             attn_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
         else:
-            attn_out = _model_cache_attention(
-                q, k, v, kv_cache, self.layer_id, attn_mask, is_causal
+            k_cache, v_cache = kv_cache.layer(self.layer_id)
+            offsets, workspace = None, (None, None, None)
+            if isinstance(kv_cache, DecodeKVCache):
+                workspace = (
+                    kv_cache.decode_o_part,
+                    kv_cache.decode_ml_part,
+                    kv_cache.decode_out,
+                )
+            else:
+                offsets = kv_cache.cu_seqlens_q
+            attn_out = attention(
+                q,
+                k,
+                v,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cache_seqlens=kv_cache.cache_seqlens,
+                page_table=kv_cache.page_table,
+                cu_seqlens_q=offsets,
+                mask=attn_mask,
+                is_causal=is_causal,
+                workspace=workspace,
             )
         attn_out = attn_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 

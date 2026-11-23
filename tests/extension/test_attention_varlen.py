@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from astrai.extension import attention_varlen, op_backend
+from astrai.extension import attention, op_backend
 from astrai.extension.runtime.loader import is_available
 
 
@@ -13,10 +13,10 @@ def compare_segments(device, dtype, dim, causal):
         torch.randn(n, h, dim, device=device, dtype=dtype)
         for n, h in ((24, 4), (11, 2), (11, 2))
     ]
-    out = attention_varlen(q, k, v, cu_seqlens_q=qs, cu_seqlens_k=ks, is_causal=causal)
+    out = attention(q, k, v, cu_seqlens_q=qs, cu_seqlens_k=ks, is_causal=causal)
     ref_inputs = [t.float() for t in (q, k, v)]
     with op_backend(attention="torch"):
-        reference = attention_varlen(
+        reference = attention(
             *ref_inputs, cu_seqlens_q=qs, cu_seqlens_k=ks, is_causal=causal
         )
     torch.testing.assert_close(out.float(), reference, rtol=0.035, atol=0.045)
@@ -25,9 +25,7 @@ def compare_segments(device, dtype, dim, causal):
         assert not out[2:5].count_nonzero()
     k[:5].zero_()
     v[:5].zero_()
-    changed = attention_varlen(
-        q, k, v, cu_seqlens_q=qs, cu_seqlens_k=ks, is_causal=causal
-    )
+    changed = attention(q, k, v, cu_seqlens_q=qs, cu_seqlens_k=ks, is_causal=causal)
     torch.testing.assert_close(out[2:], changed[2:], rtol=0, atol=0)
 
 
@@ -60,10 +58,10 @@ def test_varlen_shared_offsets_across_tiles():
     x = [
         torch.randn(311, h, 64, device="cuda", dtype=torch.bfloat16) for h in (12, 2, 2)
     ]
-    out = attention_varlen(*x, cu_seqlens_q=ptr, is_causal=True, scale=0.17)
+    out = attention(*x, cu_seqlens_q=ptr, is_causal=True, scale=0.17)
     ref = [t.float() for t in x]
     with op_backend(attention="torch"):
-        expected = attention_varlen(*ref, cu_seqlens_q=ptr, is_causal=True, scale=0.17)
+        expected = attention(*ref, cu_seqlens_q=ptr, is_causal=True, scale=0.17)
     torch.testing.assert_close(out.float(), expected, rtol=0.04, atol=0.065)
 
 
@@ -71,12 +69,12 @@ def test_varlen_requires_grad():
     q = torch.ones(3, 1, 8, requires_grad=True)
     offsets = torch.tensor([0, 3], dtype=torch.int32)
     with pytest.raises(RuntimeError, match="forward only"):
-        attention_varlen(q, q, q, cu_seqlens_q=offsets)
+        attention(q, q, q, cu_seqlens_q=offsets)
     with torch.no_grad():
-        assert attention_varlen(q, q, q, cu_seqlens_q=offsets).shape == q.shape
+        assert attention(q, q, q, cu_seqlens_q=offsets).shape == q.shape
 
 
 def test_varlen_invalid_endpoints():
     q = torch.ones(3, 1, 8)
     with pytest.raises(ValueError, match="invalid segment"):
-        attention_varlen(q, q, q, cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32))
+        attention(q, q, q, cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32))

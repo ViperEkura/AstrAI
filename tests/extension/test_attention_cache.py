@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from astrai.extension import attention_with_kvcache, op_backend
+from astrai.extension import attention, op_backend
 from astrai.extension.runtime.loader import is_available
 
 
@@ -34,12 +34,12 @@ def test_paged_append_crosses_physical_blocks(device, regular, page_size):
         else (q, k, v)
     )
     with op_backend(attention="cuda" if device == "cuda" else "torch"):
-        out = attention_with_kvcache(
+        out = attention(
             qin,
-            ks,
-            vs,
-            k_new=kin,
-            v_new=vin,
+            kin,
+            vin,
+            k_cache=ks,
+            v_cache=vs,
             cache_seqlens=pq([3, 5]),
             page_table=table,
             cu_seqlens_q=None if regular else pq(offsets),
@@ -116,12 +116,12 @@ def test_invalid_cache_shape_is_rejected_before_write(device, zero_heads):
         q = q[:, :, :0]
     with op_backend(attention="torch" if device == "cpu" else "cuda"):
         with pytest.raises((ValueError, RuntimeError)):
-            attention_with_kvcache(
+            attention(
                 q,
-                kc,
-                vc,
-                k_new=k_new,
-                v_new=k_new,
+                k_new,
+                k_new,
+                k_cache=kc,
+                v_cache=vc,
                 cache_seqlens=torch.zeros(1, device=device, dtype=torch.int32),
                 page_table=torch.zeros(1, 1, device=device, dtype=torch.int32),
             )

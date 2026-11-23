@@ -7,8 +7,6 @@ import torch
 
 from astrai.extension import (
     ExplicitSelectionError,
-    attention_varlen,
-    attention_with_kvcache,
     op_backend,
     set_op,
     snapshot_op_selection,
@@ -112,16 +110,14 @@ def test_attention_modes_share_selection_policy(mode, monkeypatch):
         if mode == "dense":
             return dense(q, q, q, is_causal=True)
         if mode == "varlen":
-            return attention_varlen(
-                q[0], q[0], q[0], cu_seqlens_q=offsets, is_causal=True
-            )[None]
+            return dense(q[0], q[0], q[0], cu_seqlens_q=offsets, is_causal=True)[None]
         kc, vc = torch.zeros_like(q), torch.zeros_like(q)
-        out = attention_with_kvcache(
+        out = dense(
             q,
-            kc,
-            vc,
-            k_new=q,
-            v_new=q,
+            q,
+            q,
+            k_cache=kc,
+            v_cache=vc,
             cache_seqlens=torch.zeros(1, dtype=torch.int32),
             page_table=torch.zeros(1, 1, dtype=torch.int32),
             is_causal=True,

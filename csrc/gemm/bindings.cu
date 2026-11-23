@@ -235,6 +235,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
      * plan table / planner state must stay single-source.
      */
     astrai::fp8::bind_fp8(m);
+    m.def("small_m_linear", &astrai::gemm::small_m_linear, py::arg("x"), py::arg("weight"));
     m.def("quant_gemm", &astrai::gemm::quant_gemm, py::arg("a"), py::arg("b"),
           py::arg("a_scale") = py::none(), py::arg("b_scale") = py::none(),
           py::arg("trans_a") = false, py::arg("trans_b") = true, py::arg("bias") = py::none(),

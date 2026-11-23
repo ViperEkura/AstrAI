@@ -63,7 +63,7 @@ set(KERNEL_TARGETS
     "gated_deltanet|MODULE|gated_deltanet/gated_deltanet_fwd.cu
         gated_deltanet/gated_deltanet_bwd.cu gated_deltanet/bindings.cu"
     "quantize|MODULE|quantize/bindings.cu $<TARGET_OBJECTS:quantize_entry>"
-    "gemm|MODULE|gemm/entry.cu gemm/bindings.cu gemm/plan/planner.cpp
+    "gemm|MODULE|gemm/entry.cu gemm/small_m.cu gemm/bindings.cu gemm/plan/planner.cpp
         gemm/plan/table.cpp gemm/plan/builtin.cpp
         gemm/fp8/linear.cu gemm/fp8/runtime.cu $<TARGET_OBJECTS:quantize_entry>")
 

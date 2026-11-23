@@ -15,6 +15,8 @@ from typing import Dict, Optional, Set, Tuple
 import torch
 from torch import Tensor
 
+from astrai.extension.kernel.gemm import graph_linear
+
 
 class CUDAGraphRunner:
     """CUDA-graph capture/replay for decode steps.
@@ -104,7 +106,8 @@ class CUDAGraphRunner:
         elif self._captures_frozen:
             return model(**kwargs)
         elif key in self._warmed:
-            cap_output = model(**kwargs)
+            with graph_linear():
+                cap_output = model(**kwargs)
             device = next(
                 value.device for value in kwargs.values() if isinstance(value, Tensor)
             )
@@ -112,14 +115,15 @@ class CUDAGraphRunner:
             if self._capture_stream is None:
                 self._capture_stream = torch.cuda.Stream(device=device)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=self._capture_stream):
+            with graph_linear(), torch.cuda.graph(graph, stream=self._capture_stream):
                 self._outputs[key] = model(**kwargs)
             self._graphs[key] = graph
             self._warmed.discard(key)
             return cap_output
         else:
             self._warmed.add(key)
-            self._outputs[key] = model(**kwargs)
+            with graph_linear():
+                self._outputs[key] = model(**kwargs)
         return self._outputs[key]
 
     def has_graph(self, key: Tuple) -> bool:

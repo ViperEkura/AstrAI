@@ -21,13 +21,60 @@ inner-transposed views fold into the kernel layout at zero copy. ``bias``
 (CUDA bf16 1D of length n) fuses into the epilogue.
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import cache
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from astrai.extension.policy.gemm.plan import PLANNER_MODES, Rows, note_launch
-from astrai.extension.runtime.loader import get_module
+from astrai.extension.runtime.loader import get_module, is_available
+
+_graph_linear = ContextVar("graph_linear", default=False)
+graph_linear_enabled = _graph_linear.get
+
+
+@contextmanager
+def graph_linear():
+    """Use measured projection kernels while warming or capturing a decode graph."""
+    token = _graph_linear.set(True)
+    try:
+        yield
+    finally:
+        _graph_linear.reset(token)
+
+
+@cache
+def _inference_linear_op():
+    if is_available("gemm"):
+        op = getattr(get_module("gemm"), "small_m_linear", None)
+        if op is not None:
+            return op
+    return torch.nn.functional.linear
+
+
+def small_m_token_range(k: int, n: int) -> Tuple[int, int]:
+    """Measured decode projections. Bounds count activation elements for any leading shape."""
+    if k == 2048 and n in (512, 2048):
+        return k, k * (4 if n == 512 else 8)
+    if k == 8192 and n == 2048:
+        return 2 * k, 8 * k
+    return 0, 0
+
+
+def inference_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if (
+        not torch.compiler.is_compiling()
+        and type(x) is torch.Tensor
+        and type(weight) in (torch.Tensor, torch.nn.Parameter)
+        and not torch.is_autocast_enabled()
+        and not torch.jit.is_tracing()
+        and not torch._C._len_torch_dispatch_stack()
+    ):
+        return _inference_linear_op()(x, weight)
+    return torch.nn.functional.linear(x, weight)
 
 
 def quant_gemm(

@@ -193,3 +193,49 @@ def test_operand_device_guard_covers_packing_and_restores_current_device():
     torch.testing.assert_close(
         output, (a.float() @ b.float().T).to(torch.bfloat16), atol=0, rtol=0
     )
+
+
+@pytest.mark.cuda
+@skip_no_kernel
+@pytest.mark.parametrize("rows", [1, 3, 4, 8, 15])
+def test_small_m_linear_matches_fp32(rows):
+    from astrai.extension.runtime.loader import get_module
+
+    x = torch.randn(1, rows, 2056, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(513, 2056, dtype=x.dtype, device=x.device)
+    result = get_module("gemm").small_m_linear(x, w)
+    torch.testing.assert_close(
+        result.float(), x.float() @ w.float().T, rtol=0.005, atol=0.002
+    )
+
+
+@pytest.mark.cuda
+@skip_no_kernel
+def test_small_m_linear_offset_storage_and_grad():
+    from astrai.extension.kernel.gemm import graph_linear
+    from astrai.model.components.linear import Linear
+
+    layer = Linear(2048, 512).to(device="cuda", dtype=torch.bfloat16).eval()
+    x = torch.randn(4097, device="cuda", dtype=torch.bfloat16)[1:].view(2, 2048)
+    with torch.inference_mode(), graph_linear():
+        torch.testing.assert_close(
+            layer(x), torch.nn.functional.linear(x, layer.weight)
+        )
+    layer(x).sum().backward()
+    assert layer.weight.grad is not None
+
+
+@pytest.mark.cuda
+@skip_no_kernel
+@pytest.mark.parametrize("rows", [7, 8, 15, 16])
+def test_down_projection_returns_contiguous_logits(rows):
+    from astrai.extension.kernel.gemm import graph_linear
+    from astrai.model.components.linear import Linear
+
+    layer = Linear(8192, 2048).to(device="cuda", dtype=torch.bfloat16).eval()
+    x = torch.randn(1, rows, 8192, device="cuda", dtype=torch.bfloat16)
+    with torch.inference_mode(), graph_linear():
+        result = layer(x)
+    expected = x.float() @ layer.weight.detach().float().T
+    assert result.is_contiguous()
+    torch.testing.assert_close(result.float(), expected, rtol=0.005, atol=0.002)

@@ -21,6 +21,8 @@ torch::Tensor quant_gemm_impl(torch::Tensor a,
                               bool trans_b,
                               c10::optional<torch::Tensor> bias);
 
+torch::Tensor small_m_linear(const torch::Tensor& x, const torch::Tensor& weight);
+
 PlanProbe plan_probe(int64_t m,
                      int64_t n,
                      int64_t k,

@@ -6,16 +6,24 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.extension.kernel.cross_entropy import is_available, linear_cross_entropy
+from astrai.extension.kernel.gemm import (
+    graph_linear_enabled,
+    inference_linear,
+    small_m_token_range,
+)
 from astrai.model.components.initialization import should_initialize
 
 
 class Linear(nn.Module):
+    _small_m_min = _small_m_max = 0
+
     def __init__(
         self, in_dim: int, out_dim: int, bias: bool = False, init_std: float = 0.02
     ):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((out_dim, in_dim)))
         self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
+        self._small_m_min, self._small_m_max = small_m_token_range(in_dim, out_dim)
         self.init_std = init_std
         # A module must never hand out the bytes torch.empty left behind;
         # models built through AutoRegressiveLM re-init via apply(), but
@@ -32,6 +40,16 @@ class Linear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
+        if (
+            graph_linear_enabled()
+            and self._small_m_max
+            and not self.training
+            and self.bias is None
+            and torch.is_inference_mode_enabled()
+            and x.is_cuda
+            and self._small_m_min <= x.numel() <= self._small_m_max
+        ):
+            return inference_linear(x, self.weight)
         return F.linear(x, self.weight, self.bias)
 
 

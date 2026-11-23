@@ -62,8 +62,8 @@ struct KVTileLoader {
             auto a = addr(kc, d, valid);
             int off = r * Traits::LD + Traits::SharedLayout::column(d, r);
             if (a.vector_aligned) {
-                astrai::cp_async_16(&dK[off], a.k, a.valid);
-                astrai::cp_async_16(&dV[off], a.v, a.valid);
+                astrai::cp_async<16>(&dK[off], a.k, a.valid);
+                astrai::cp_async<16>(&dV[off], a.v, a.valid);
             } else {
                 load_unaligned(&dK[off], &dV[off], static_cast<const typename Traits::Elem*>(a.k),
                                static_cast<const typename Traits::Elem*>(a.v), a.valid);

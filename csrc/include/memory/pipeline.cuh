@@ -19,66 +19,29 @@
 
 namespace astrai {
 
-/*
- * Raw cp.async primitives
- */
-
-/*
- * Raw emitter: read src_size bytes (<= 16) from gmem into the shared
- * offset. src_size = 0 reads nothing, so a predicated-off call zero-fills
- * its destination without touching the (possibly out-of-range) source.
- * BypassL1 selects .cg (L2 only, default) vs .ca (L1 + L2).
- */
-template <bool BypassL1 = true>
-DEVICE_FORCEINLINE void cp_async_16_raw(unsigned smem_addr, const void* gmem_ptr, int src_size) {
-    if constexpr (BypassL1) {
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(smem_addr),
-                     "l"(gmem_ptr), "r"(src_size));
+// Copy the valid prefix into shared memory and zero-fill the rest of the vector.
+// PTX permits .cg only for 16-byte copies. Use .ca for 8-byte copies.
+template <int Bytes>
+DEVICE_FORCEINLINE void cp_async(unsigned smem_addr, const void* src, int valid_bytes = Bytes) {
+    static_assert(Bytes == 8 || Bytes == 16, "expected an 8- or 16-byte copy");
+    if constexpr (Bytes == 16) {
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(smem_addr), "l"(src),
+                     "r"(valid_bytes));
     } else {
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" ::"r"(smem_addr),
-                     "l"(gmem_ptr), "r"(src_size));
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(smem_addr), "l"(src),
+                     "r"(valid_bytes));
     }
 }
 
-// Copy a prefix of an 8-byte vector and zero-fill the rest. This width uses .ca.
-DEVICE_FORCEINLINE void cp_async_8(void* smem_ptr, const void* gmem_ptr, int bytes) {
-    const unsigned dst = __cvta_generic_to_shared(smem_ptr);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(dst), "l"(gmem_ptr), "r"(bytes));
+template <int Bytes, typename T>
+DEVICE_FORCEINLINE void cp_async(T* dst, const void* src, int valid_bytes = Bytes) {
+    cp_async<Bytes>(static_cast<unsigned>(__cvta_generic_to_shared(dst)), src, valid_bytes);
 }
 
-/*
- * Unconditional 16-byte copy to a generic shared pointer.
- * `T` is the smem element type; only the destination pointer's type matters.
- */
-template <typename T, bool BypassL1 = true>
-DEVICE_FORCEINLINE void cp_async_16(T* smem_ptr, const void* gmem_ptr) {
-    cp_async_16_raw<BypassL1>(__cvta_generic_to_shared(smem_ptr), gmem_ptr, 16);
-}
-
-// Predicated: full copy when `pred`, zero-fill otherwise.
-template <typename T, bool BypassL1 = true>
-DEVICE_FORCEINLINE void cp_async_16(T* smem_ptr, const void* gmem_ptr, bool pred) {
-    cp_async_16_raw<BypassL1>(__cvta_generic_to_shared(smem_ptr), gmem_ptr, pred ? 16 : 0);
-}
-
-/*
- * Partial prefix: copy `src_bytes` of the 16B chunk, hardware zero-fill the
- * rest — the k-tail / OOB-row predication form (CUTLASS's zfill iterators):
- * boundary chunks ride the same LDGSTS instead of a scalar fallback loop.
- */
-template <typename T, bool BypassL1 = true>
-DEVICE_FORCEINLINE void cp_async_16(T* smem_ptr, const void* gmem_ptr, int src_bytes) {
-    cp_async_16_raw<BypassL1>(__cvta_generic_to_shared(smem_ptr), gmem_ptr, src_bytes);
-}
-
-/*
- * Predicated raw-offset form: the destination is an already-converted
- * shared-memory offset (e.g. a loop-carried swizzled stage address), so
- * steady-state prefetch sites issue one LDGSTS straight from the register.
- */
-template <bool BypassL1 = true>
-DEVICE_FORCEINLINE void cp_async_16(unsigned smem_addr, const void* gmem_ptr, bool pred) {
-    cp_async_16_raw<BypassL1>(smem_addr, gmem_ptr, pred ? 16 : 0);
+// A false predicate zero-fills the entire vector.
+template <int Bytes, typename T>
+DEVICE_FORCEINLINE void cp_async(T* dst, const void* src, bool valid) {
+    cp_async<Bytes>(static_cast<unsigned>(__cvta_generic_to_shared(dst)), src, valid ? Bytes : 0);
 }
 
 // Commit all outstanding cp.async ops of this thread as one group.

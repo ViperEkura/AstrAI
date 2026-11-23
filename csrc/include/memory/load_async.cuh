@@ -89,7 +89,7 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
         const uintptr_t dst = reinterpret_cast<uintptr_t>(tile(r, c0));
 #pragma unroll
         for (int j = 0; j < Map::kPerThread; ++j)
-            astrai::cp_async_16(reinterpret_cast<ElemT*>(dst ^ (j << 4)), src + j * 16);
+            astrai::cp_async<16>(reinterpret_cast<ElemT*>(dst ^ (j << 4)), src + j * 16);
     } else {
         const int64_t line = line0 + r;
         const bool line_ok = line < line_ext;
@@ -123,12 +123,12 @@ DEVICE_FORCEINLINE void load_operand_tile(Tensor<PtrEngine<ElemT>, SmemLayout> t
                 if constexpr (kFp8) {
                     if ((src_addr & 15) != 0) {
                         // Keep both 8-byte copies within the same swizzled chunk.
-                        astrai::cp_async_8(dstj, src + c, min(bytes, 8));
-                        astrai::cp_async_8(dstj + 8, src + c + 8, max(bytes - 8, 0));
+                        astrai::cp_async<8>(dstj, src + c, min(bytes, 8));
+                        astrai::cp_async<8>(dstj + 8, src + c + 8, max(bytes - 8, 0));
                         continue;
                     }
                 }
-                astrai::cp_async_16(dstj, src + c, bytes);
+                astrai::cp_async<16>(dstj, src + c, bytes);
             } else {
                 // Misaligned base only: element-granular fallback.
 #pragma unroll
@@ -207,7 +207,7 @@ template <bool kAsync, typename RingT, int kThreads, bool kTrans = false> struct
                 return;
 #pragma unroll
             for (int j = 0; j < Map::kPerThread; ++j)
-                astrai::cp_async_16(wr ^ (unsigned)(j << 4), src + j * 16, pf);
+                astrai::cp_async<16>(wr ^ (unsigned)(j << 4), src + j * 16, pf ? 16 : 0);
         }
     }
 

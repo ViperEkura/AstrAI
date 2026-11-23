@@ -193,3 +193,25 @@ def test_operand_device_guard_covers_packing_and_restores_current_device():
     torch.testing.assert_close(
         output, (a.float() @ b.float().T).to(torch.bfloat16), atol=0, rtol=0
     )
+
+
+@pytest.mark.cuda
+@skip_no_kernel
+@pytest.mark.parametrize("trans_b", [True, False])
+@pytest.mark.parametrize("padding,offset", [(8, 0), (8, 1), (7, 0)])
+def test_bf16_stage_copy_alignment(trans_b, padding, offset):
+    # bf16 LDs divisible by eight align successive rows to 16 bytes. A view
+    # can still offset the base, or only some rows can have aligned starts.
+    m, n, k = 128, 256, 512
+    options = {"device": "cuda", "dtype": torch.bfloat16}
+
+    def operand(rows, cols):
+        storage = torch.randint(-3, 4, (rows, cols + padding), **options)
+        return storage[:, offset : offset + cols]
+
+    a = operand(m, k)
+    b = operand(n, k) if trans_b else operand(k, n)
+    with plan.override(tma=False):
+        actual = kernel.gemm.quant_gemm(a, b, trans_b=trans_b)
+    expected = a.float() @ (b.float().T if trans_b else b.float())
+    torch.testing.assert_close(actual, expected.bfloat16(), atol=0, rtol=0)

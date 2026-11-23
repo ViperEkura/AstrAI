@@ -169,23 +169,5 @@ template <typename SmemLayout, typename ElemT, int kThreads, bool kOn> struct Pa
     }
 };
 
-/*
- * The packed-grid route: the two-phase carry when the bus fits it, the
- * elementwise packed grid otherwise.
- */
-template <typename SmemLayout, typename ElemT, int kThreads>
-DEVICE_FORCEINLINE void load_crosswise_paired(Tensor<PtrEngine<ElemT>, SmemLayout> tile,
-                                              const ElemT* __restrict__ operand,
-                                              int64_t rows,
-                                              int64_t contract,
-                                              int64_t ld,
-                                              int tid,
-                                              int64_t k_base,
-                                              int64_t block_row) {
-    PairPackCarry<SmemLayout, ElemT, kThreads, true> carry;
-    carry.issue(operand, rows, contract, ld, tid, k_base, block_row);
-    carry.commit(tile, operand, rows, contract, ld, tid, k_base, block_row);
-}
-
 } // namespace gemm
 } // namespace astrai

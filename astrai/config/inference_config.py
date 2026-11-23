@@ -101,14 +101,12 @@ class InferenceConfig(BaseConfig):
 
     Args:
         max_splits (int): Maximum number of splits for split-KV attention (decode partial results). Defaults to 32.
-        prefill_warmup_len (int): Prompt length for prefill warmup (cuBLAS auto-tuning). Defaults to 64.
         default_rep_window (int): Default repetition penalty window size for frequency penalty. Defaults to 64.
         max_recent_tasks (int): Maximum number of recent tasks tracked for aggregate statistics. Defaults to 128.
         max_num_batched_tokens (int): Token budget per forward for chunked prefill; 0 disables chunking (whole-prompt prefills). Defaults to 0.
     """
 
     max_splits: int = 32
-    prefill_warmup_len: int = 64
     default_rep_window: int = 64
     max_recent_tasks: int = 128
     # Chunked-prefill token budget: one forward's prefill windows plus

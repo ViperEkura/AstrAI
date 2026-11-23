@@ -1,19 +1,6 @@
-"""KV cache orchestration: BlockPool + KVCacheManager.
+"""Physical KV storage and request allocation lifecycle."""
 
-BlockPool owns the physical buffers (``KVStorage`` + ``RequestPageTable``)
-and wires them to an allocation strategy.  It assembles the ``KVCache``
-dataclass passed to the model forward.
-
-KVCacheManager owns the ``request_id`` → ``RequestCacheState`` mapping and
-delegates physical slot allocation to the strategy, and KV bind to the pool.
-
-See ``cache_buffer.py`` for the raw buffer primitives and ``cache_strategy.py``
-for the allocation policies.
-"""
-
-from dataclasses import dataclass
-from itertools import accumulate
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 
@@ -24,67 +11,14 @@ from astrai.inference.core.cache.strategy import (
     PagedStrategy,
     RadixCache,
     RequestCacheState,
-)
-from astrai.inference.worker.workspace import InferenceWorkspace
-from astrai.model.kv_cache import (
-    DecodeKVCache,
-    KVCache,
-    KVStorage,
-    PrefillKVCache,
     RequestPageTable,
 )
-
-# Re-export everything so existing ``from astrai.inference.core.cache import ...``
-# continues to work unchanged after the file split.
-__all__ = [
-    "AllocationStrategy",
-    "Allocator",
-    "BlockPool",
-    "ContiguousStrategy",
-    "DecodeKVCache",
-    "KVCache",
-    "KVCacheManager",
-    "KVStorage",
-    "PagedStrategy",
-    "PrefillKVCache",
-    "RadixCache",
-    "RequestPageTable",
-    "RequestCacheState",
-]
-
-# ---- helpers ----
-
-
-def _is_steady_increment(
-    prev_sig: Optional[Tuple],
-    prev_vals: Optional[List[int]],
-    cur_sig: Tuple,
-    cur_vals: List[int],
-) -> bool:
-    return (
-        prev_sig is not None
-        and prev_vals is not None
-        and prev_sig == cur_sig
-        and len(prev_vals) == len(cur_vals)
-        and all(c == p + 1 for c, p in zip(cur_vals, prev_vals))
-    )
-
-
-# ---- request-scoped bind state ----
-@dataclass
-class _BindState:
-    """Cached bind metadata for steady-state decode increment detection."""
-
-    sig: Tuple
-    seq_lens: List[int]
-    workspace: InferenceWorkspace
-
-
-# ---- pool + manager ----
+from astrai.inference.worker.workspace import InferenceWorkspace
+from astrai.model.kv_cache import KVCache, KVStorage
 
 
 class BlockPool:
-    """Physical KV cache: buffers + request page table + allocation strategy + bind.
+    """Physical KV cache: buffers + request page table + allocation strategy.
 
     Does not know about requests — request lifecycle is managed by
     :class:`KVCacheManager`, which holds a reference to this pool.
@@ -127,13 +61,11 @@ class BlockPool:
         self._req_pool = RequestPageTable(max_batch_size, pages_per_req, device)
 
         if self.contiguous:
-            for i in range(max_batch_size):
-                self._req_pool.page_table[i] = torch.arange(
-                    i * pages_per_req,
-                    (i + 1) * pages_per_req,
-                    dtype=torch.int32,
-                    device=device,
-                )
+            self._req_pool.page_table.copy_(
+                torch.arange(
+                    max_batch_size * pages_per_req, dtype=torch.int32, device=device
+                ).view(max_batch_size, pages_per_req)
+            )
             self._strategy: AllocationStrategy = ContiguousStrategy()
         else:
             n_pages = self.n_tokens // page_size
@@ -153,95 +85,12 @@ class BlockPool:
     def req_pool(self) -> RequestPageTable:
         return self._req_pool
 
-    def bind_tasks(
-        self,
-        req_indices: List[int],
-        seq_lens: List[int],
-        workspace: InferenceWorkspace,
-        device: Optional[torch.device] = None,
-        start_pos: Optional[int] = None,
-        incremental: bool = False,
-        refresh_pages: bool = True,
-    ) -> KVCache:
-        """Assemble the ``KVCache`` metadata for a batch of requests.
-
-        Args:
-            req_indices: request slot indices (from ``RequestPageTable``).
-            seq_lens:    current sequence length per request.
-            workspace:   pre-allocated fixed-shape buffers (CUDA-graph safe).
-            start_pos:   if set, produce **prefill** cache (full q_len range).
-                         If ``None``, produce **decode** cache (last position).
-            incremental: if ``True``, reuse workspace state from previous step
-                         by incrementing counters in-place (decode hot path).
-            refresh_pages: whether the allocation strategy changed a page mapping.
-
-        Returns:
-            ``KVCache`` dataclass with the correct output shapes for the
-            attention backend (prefill: ``[B, q_len]``, decode: ``[B, 1]``).
-        """
-        if device is None:
-            device = workspace.device
-        b = len(req_indices)
-
-        rows = workspace.req_pool_indices[:b]
-        past = workspace.cache_seqlens[:b]
-        table = self._req_pool.page_table
-        shape = (workspace.req_pool_indices.numel(), table.size(1))
-        if workspace.page_table is None or workspace.page_table.shape != shape:
-            with torch.inference_mode(False):
-                workspace.page_table = torch.empty(
-                    shape, dtype=torch.int32, device=device
-                )
-            incremental = False
-        if not incremental:
-            rows.copy_(torch.tensor(req_indices, dtype=torch.int32, device=device))
-        pages = workspace.page_table[:b]
-        if not incremental or refresh_pages:
-            torch.index_select(table, 0, rows, out=pages)
-        if start_pos is None:
-            if incremental:
-                past.add_(1)
-            else:
-                past.copy_(
-                    torch.tensor(
-                        [n - 1 for n in seq_lens], dtype=torch.int32, device=device
-                    )
-                )
-            return DecodeKVCache(
-                self._storage.k_buffer,
-                self._storage.v_buffer,
-                pages,
-                past,
-                workspace.decode_o_part,
-                workspace.decode_ml_part,
-                workspace.decode_out,
-                layer_views=self._storage.layer_views,
-            )
-
-        lengths = [n - start_pos for n in seq_lens]
-        if min(lengths) <= 0:
-            raise ValueError("prefill sequence lengths must exceed start_pos")
-        offsets = workspace.cu_seqlens_q[: b + 1]
-        offsets.copy_(
-            torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device=device)
-        )
-        past.fill_(start_pos)
-        return PrefillKVCache(
-            self._storage.k_buffer,
-            self._storage.v_buffer,
-            pages,
-            past,
-            offsets,
-            layer_views=self._storage.layer_views,
-        )
-
 
 class KVCacheManager:
     """Request ↔ KV slot lifecycle manager.
 
     Sole owner of ``request_id → RequestCacheState``.  Delegates physical slot
-    allocation to the strategy (via ``pool.strategy``) and KV bind to
-    ``pool.bind_tasks()``.
+    allocation to the strategy (via ``pool.strategy``) and binds each batch to its execution workspace.
 
     Usage::
 
@@ -258,13 +107,10 @@ class KVCacheManager:
         self._req_pool = pool.req_pool
         self._max_seq_len = pool.max_seq_len
         self._states: Dict[str, RequestCacheState] = {}
-        self._bind_state: Optional[_BindState] = None
-        self._bind_was_steady = False
 
     # -- public request lifecycle --
 
     def alloc_slots(self, request_id: str, prompt_ids: List[int]) -> bool:
-        self._bind_state = None
         req_slots = self._req_pool.alloc(1)
         if req_slots is None:
             return False
@@ -273,12 +119,11 @@ class KVCacheManager:
         if not self._strategy.alloc(state, prompt_ids):
             self._rollback(state, request_id)
             return False
-        self._strategy.write_indices(state, prompt_ids)
+        self._strategy.flush_pages([state])
         state.length = len(prompt_ids)
         return True
 
     def free_slots(self, request_id: str):
-        self._bind_state = None
         state = self._states.pop(request_id, None)
         if state is None:
             return
@@ -362,8 +207,6 @@ class KVCacheManager:
         """Drop reusable KV entries once all request-owned entries are released."""
         if self._states:
             raise RuntimeError("Cannot invalidate KV cache while requests are active")
-        self._bind_state = None
-        self._bind_was_steady = False
         return self._strategy.invalidate_cache()
 
     def can_ever_fit(self, n_tokens: int) -> bool:
@@ -380,9 +223,10 @@ class KVCacheManager:
         self,
         request_ids: List[str],
         workspace: InferenceWorkspace,
-        device: Optional[torch.device] = None,
+        *,
         start_pos: Optional[int] = None,
         seq_ends: Optional[List[int]] = None,
+        positions: Optional[List[int]] = None,
     ) -> KVCache:
         """Build ``KVCache`` for an ordered list of request IDs.
 
@@ -392,53 +236,38 @@ class KVCacheManager:
         states' full lengths are used, as before.
         """
         states = [self._states[tid] for tid in request_ids]
-        req_indices = [s.req_idx for s in states]
-        seq_lens = [s.length for s in states]
-        if seq_ends is not None:
+        if start_pos is None:
+            if seq_ends is not None:
+                raise ValueError("chunk must fit the reserved request interval")
+            if positions is None:
+                positions = [state.length - 1 for state in states]
+            elif len(positions) != len(states) or any(
+                pos < 0 or pos >= state.length for pos, state in zip(positions, states)
+            ):
+                raise ValueError(
+                    "decode position must fit the reserved request interval"
+                )
+        else:
+            if positions is not None:
+                raise ValueError("positions apply only to decode")
+            if seq_ends is None:
+                seq_ends = [state.length for state in states]
             if len(seq_ends) != len(states):
                 raise ValueError("seq_ends must match request_ids in length")
-            if (
-                start_pos is None
-                or start_pos < 0
-                or any(
-                    not start_pos < end <= state.length
-                    for end, state in zip(seq_ends, states)
-                )
+            if start_pos < 0 or any(
+                not start_pos < end <= s.length for end, s in zip(seq_ends, states)
             ):
                 raise ValueError("chunk must fit the reserved request interval")
-            seq_lens = list(seq_ends)
-        sig = tuple(req_indices)
-
-        prev = self._bind_state
-        incremental = (
-            start_pos is None
-            and prev is not None
-            and prev.workspace is workspace
-            and _is_steady_increment(prev.sig, prev.seq_lens, sig, seq_lens)
+        self._strategy.flush_pages(states)
+        return workspace.bind(
+            self._pool._storage,
+            self._req_pool.page_table,
+            self._req_pool.version,
+            tuple(s.req_idx for s in states),
+            positions,
+            start_pos,
+            seq_ends,
         )
-        # Publish newly allocated pages before gathering this batch’s rows.
-        pages_changed = self._strategy.flush_pages(states, device or workspace.device)
-
-        bound = self._pool.bind_tasks(
-            req_indices,
-            seq_lens,
-            workspace,
-            device=device,
-            start_pos=start_pos,
-            incremental=incremental,
-            refresh_pages=pages_changed,
-        )
-
-        self._bind_state = _BindState(
-            sig if start_pos is None else None, list(seq_lens), workspace
-        )
-        self._bind_was_steady = incremental
-        return bound
-
-    @property
-    def bind_was_steady(self) -> bool:
-        """True if the last bind was a steady-state increment (same requests, +1 seq_lens)."""
-        return self._bind_was_steady
 
     # -- internals --
 

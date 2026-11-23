@@ -161,16 +161,11 @@ recompute preemption are not introduced by this ownership refactor.
 
 Logical ownership is separate from the current object dependencies.
 `GPUModelRunner` receives the scheduler's `KVCacheManager` and calls `bind()`
-for prefill, decode and scoring. Binding reads request allocation state,
-flushes slot mappings and delegates device-view assembly to
-`BlockPool.bind_tasks()`, which uses `InferenceWorkspace`.
-
-Consequently, `TYPE_CHECKING` imports prevent a reverse runtime import but
-do not make the worker independent of core-owned cache state. The current
-operation lock and drain rules protect this shared access. A cleaner future
-boundary would pass the allocated request slots, lengths and mapping data to
-worker-side binding, without moving admission/free decisions out of core or
-copying full page tables every decode step.
+for prefill, decode and scoring. The manager checks the planned positions against each request's reservation
+and publishes pending physical page IDs. The workspace gathers rows when the
+ordered slots or the source page-table version changes. Decode passes the
+bound past lengths to both attention and RoPE. A request can have reserved
+space beyond the position used by the current step.
 
 ## Policy versioning
 

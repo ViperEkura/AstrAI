@@ -140,7 +140,6 @@ def test_decode_does_not_reuse_previous_batch_state():
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
     executor.kv_manager = MagicMock()
-    executor.kv_manager.bind_was_steady = True
     executor.kv_manager.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
@@ -149,7 +148,6 @@ def test_decode_does_not_reuse_previous_batch_state():
 
     workspace = MagicMock()
     workspace.max_batch_size = 16
-    workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids.return_value = torch.tensor([7], dtype=torch.long)
     executor._workspace = workspace
     executor.model = MagicMock(
@@ -178,7 +176,13 @@ def test_decode_does_not_reuse_previous_batch_state():
         assert pending is not None
         assert [r.token_id for r in pending.commit().results] == [3]
 
-    assert workspace.position_ids.tolist() == [8]
+    executor.kv_manager.bind.assert_called_once_with(
+        [request.request_id], workspace, positions=[8]
+    )
+    assert (
+        executor.model.call_args.kwargs["position_ids"]
+        is executor.kv_manager.bind.return_value.cache_seqlens
+    )
     assert executor._decode_cache.task_sig == (request.identity,)
     executor._submit_sample.assert_called_once()
     args, kwargs = executor._submit_sample.call_args
@@ -191,14 +195,12 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
     executor = object.__new__(GPUModelRunner)
     executor.device = torch.device("cpu")
     executor.kv_manager = MagicMock()
-    executor.kv_manager.bind_was_steady = True
     executor.kv_manager.bind.return_value = MagicMock()
     executor._graph_supported = False
     executor._graph_ctx = SimpleNamespace(enabled=False)
 
     workspace = MagicMock()
     workspace.max_batch_size = 16
-    workspace.position_ids = torch.tensor([2], dtype=torch.long)
     workspace.fill_input_ids_from_device.return_value = torch.tensor(
         [9], dtype=torch.long
     )
@@ -234,7 +236,13 @@ def test_decode_fills_input_ids_from_device_on_matching_signature():
 
     workspace.fill_input_ids.assert_not_called()
     workspace.fill_input_ids_from_device.assert_called_once_with(tokens)
-    assert workspace.position_ids.tolist() == [3]
+    executor.kv_manager.bind.assert_called_once_with(
+        [request.request_id], workspace, positions=[3]
+    )
+    assert (
+        executor.model.call_args.kwargs["position_ids"]
+        is executor.kv_manager.bind.return_value.cache_seqlens
+    )
     assert executor._decode_cache.task_sig == (request.identity,)
     assert executor._decode_cache.last_tokens is tokens
 

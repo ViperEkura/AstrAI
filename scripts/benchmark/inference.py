@@ -153,7 +153,6 @@ class GenerationBenchmark:
                 kv_cache = task_cache.bind(
                     request_ids,
                     workspace,
-                    self.device,
                     start_pos=start_pos,
                     seq_ends=[end_pos] * batch_size,
                 )
@@ -180,17 +179,14 @@ class GenerationBenchmark:
         input_ids = torch.randint(
             0, self.config.vocab_size, (batch_size,), device=self.device
         )
-        position_ids = torch.tensor(
-            [seq_len] * batch_size, dtype=torch.long, device=self.device
-        )
         for tid in request_ids:
             task_cache.extend_slots(tid, seq_len)
-        kv_cache = task_cache.bind(request_ids, workspace, self.device)
+        kv_cache = task_cache.bind(request_ids, workspace)
         with torch.inference_mode(), op_backend(attention=self.backend):
             self.model(
                 input_ids,
                 kv_cache=kv_cache,
-                position_ids=position_ids,
+                position_ids=kv_cache.cache_seqlens,
             )
 
     def run_prefill_benchmark(
@@ -215,7 +211,7 @@ class GenerationBenchmark:
         position_ids = torch.arange(
             prompt_length, dtype=torch.long, device=self.device
         ).repeat(batch_size)
-        kv_cache = task_cache.bind(request_ids, workspace, self.device, start_pos=0)
+        kv_cache = task_cache.bind(request_ids, workspace, start_pos=0)
 
         for _ in range(3):
             with torch.inference_mode(), op_backend(attention=self.backend):
@@ -365,7 +361,6 @@ class GenerationBenchmark:
 
         b = batch_size
         input_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
-        position_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
         gctx = CUDAGraphRunner(enabled=True)
         graph_key = (b,)
 
@@ -377,10 +372,9 @@ class GenerationBenchmark:
             input_ids_buf.copy_(
                 torch.randint(0, self.config.vocab_size, (b,), device=self.device)
             )
-            position_ids_buf[:] = seq_len
             if not all(task_cache.extend_slots_batch(request_ids, [seq_len] * b)):
                 raise RuntimeError("failed to extend KV slots for fixed-KV benchmark")
-            kv_cache = task_cache.bind(request_ids, workspace, self.device)
+            kv_cache = task_cache.bind(request_ids, workspace)
             with torch.inference_mode(), op_backend(attention=self.backend):
                 if start_event is not None:
                     start_event.record()
@@ -389,7 +383,7 @@ class GenerationBenchmark:
                     key=graph_key,
                     input_ids=input_ids_buf,
                     kv_cache=kv_cache,
-                    position_ids=position_ids_buf,
+                    position_ids=kv_cache.cache_seqlens,
                 )
                 if end_event is not None:
                     end_event.record()
@@ -444,7 +438,6 @@ class GenerationBenchmark:
 
         b = batch_size
         input_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
-        position_ids_buf = torch.zeros(b, dtype=torch.long, device=self.device)
 
         gctx = CUDAGraphRunner(enabled=True)
         graph_key = (b,)
@@ -453,10 +446,9 @@ class GenerationBenchmark:
             input_ids_buf.copy_(
                 torch.randint(0, self.config.vocab_size, (b,), device=self.device)
             )
-            position_ids_buf[:] = seq_len
             for tid in request_ids:
                 task_cache.extend_slots(tid, seq_len)
-            kv_cache = task_cache.bind(request_ids, workspace, self.device)
+            kv_cache = task_cache.bind(request_ids, workspace)
 
             with torch.inference_mode(), op_backend(attention=self.backend):
                 return gctx.forward(
@@ -464,7 +456,7 @@ class GenerationBenchmark:
                     key=graph_key,
                     input_ids=input_ids_buf,
                     kv_cache=kv_cache,
-                    position_ids=position_ids_buf,
+                    position_ids=kv_cache.cache_seqlens,
                 )
 
         for i in range(5):

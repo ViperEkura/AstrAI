@@ -1,39 +1,10 @@
 """Device KV storage, logical-to-physical page mappings and per-step metadata."""
 
-import threading
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor
-
-
-class RequestPageTable:
-    """Physical page IDs indexed by request slot and logical page."""
-
-    def __init__(self, size: int, max_pages: int, device: torch.device):
-        self.size = size
-        self.max_pages = max_pages
-        self.page_table = torch.zeros(
-            (size, max_pages), dtype=torch.int32, device=device
-        )
-        self.free_slots = list(range(size))
-        self._lock = threading.Lock()
-
-    def alloc(self, num_reqs: int) -> Optional[List[int]]:
-        with self._lock:
-            if num_reqs > len(self.free_slots):
-                return None
-            slots = self.free_slots[:num_reqs]
-            self.free_slots = self.free_slots[num_reqs:]
-            return slots
-
-    def free(self, req_indices: List[int]):
-        with self._lock:
-            self.free_slots.extend(req_indices)
-
-    def write(self, indices, values):
-        self.page_table[indices] = values
 
 
 class KVStorage:

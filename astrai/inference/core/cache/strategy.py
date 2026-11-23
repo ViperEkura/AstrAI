@@ -18,7 +18,36 @@ from typing import Callable, Dict, List, Optional, OrderedDict, Tuple
 
 import torch
 
-from astrai.model.kv_cache import RequestPageTable
+
+class RequestPageTable:
+    """Physical page IDs indexed by request slot and logical page."""
+
+    def __init__(self, size: int, max_pages: int, device: torch.device):
+        self.version = 0
+        self.size = size
+        self.max_pages = max_pages
+        self.page_table = torch.zeros(
+            (size, max_pages), dtype=torch.int32, device=device
+        )
+        self.free_slots = list(range(size))
+        self._lock = threading.Lock()
+
+    def alloc(self, num_reqs: int) -> Optional[List[int]]:
+        with self._lock:
+            if num_reqs > len(self.free_slots):
+                return None
+            slots = self.free_slots[:num_reqs]
+            self.free_slots = self.free_slots[num_reqs:]
+            return slots
+
+    def free(self, req_indices: List[int]):
+        with self._lock:
+            self.free_slots.extend(req_indices)
+
+    def write(self, indices, values):
+        self.page_table[indices] = values
+        self.version += 1
+
 
 # ---- data contract: per-request slot state ----
 
@@ -410,11 +439,6 @@ class AllocationStrategy(ABC):
         return [self.extend(s, p) for s, p in zip(states, positions)]
 
     @abstractmethod
-    def write_indices(
-        self, state: RequestCacheState, prompt_ids: List[int]
-    ) -> None: ...
-
-    @abstractmethod
     def record_hashes(
         self,
         state: RequestCacheState,
@@ -424,15 +448,8 @@ class AllocationStrategy(ABC):
         materialized_end: int,
     ) -> None: ...
 
-    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
-        """Publish newly assigned physical pages to the request table.
-
-        Only the paged strategy stages slots on the host; the default is a
-        no-op for strategies whose page table rows are already current
-        (contiguous rows are pre-filled and never rewritten).
-        Returns whether this call changed a page mapping.
-        """
-        return False
+    def flush_pages(self, states: List[RequestCacheState]) -> None:
+        """Publish pending page IDs. Static partitions are already populated."""
 
     def invalidate_cache(self) -> int:
         """Drop reusable KV entries after an inference weight update."""
@@ -458,9 +475,6 @@ class ContiguousStrategy(AllocationStrategy):
 
     def extend(self, state: RequestCacheState, pos: int) -> bool:
         return True
-
-    def write_indices(self, state: RequestCacheState, prompt_ids: List[int]) -> None:
-        pass
 
     def record_hashes(
         self,
@@ -558,28 +572,29 @@ class PagedStrategy(AllocationStrategy):
                 states[i].pages.append(p)
         return [True] * len(states)
 
-    def write_indices(self, state: RequestCacheState, prompt_ids: List[int]) -> None:
-        count = len(state.pages)
-        if count:
-            self._req_pool.page_table[state.req_idx, :count] = torch.tensor(
-                state.pages, dtype=torch.int32, device=self._device
+    def flush_pages(self, states: List[RequestCacheState]) -> None:
+        dirty = [s for s in states if s._flushed < len(s.pages)]
+        if not dirty:
+            return
+        if len(dirty) == 1:
+            state = dirty[0]
+            values = torch.tensor(
+                state.pages[state._flushed :], dtype=torch.int32, device=self._device
             )
-        state._flushed = count
-
-    def flush_pages(self, states: List[RequestCacheState], device) -> bool:
-        updates = [
-            (state.req_idx, col, state.pages[col])
-            for state in states
-            for col in range(state._flushed, len(state.pages))
-        ]
-        if updates:
-            rows, columns, pages = torch.tensor(
-                updates, device=device, dtype=torch.int32
+            indices = (state.req_idx, slice(state._flushed, len(state.pages)))
+        else:
+            updates = [
+                (s.req_idx, col, s.pages[col])
+                for s in dirty
+                for col in range(s._flushed, len(s.pages))
+            ]
+            rows, columns, values = torch.tensor(
+                updates, device=self._device, dtype=torch.int32
             ).unbind(1)
-            self._req_pool.page_table[rows, columns] = pages
-            for state in states:
-                state._flushed = len(state.pages)
-        return bool(updates)
+            indices = (rows, columns)
+        self._req_pool.write(indices, values)
+        for state in dirty:
+            state._flushed = len(state.pages)
 
     def record_hashes(
         self,

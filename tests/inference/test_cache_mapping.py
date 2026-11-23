@@ -75,9 +75,11 @@ def test_page_pool_contiguous_bind_tasks_prefill():
 def test_page_pool_bind_tasks_binds_packed_query_offsets():
     pool = make_contiguous_pool(max_batch_size=3, max_seq_len=256)
 
-    kv = pool.bind_tasks(
-        [0, 1, 2], [70, 10, 130], make_cache_workspace(pool), start_pos=0
-    )
+    manager = KVCacheManager(pool)
+    ids = ["a", "b", "c"]
+    for request_id, length in zip(ids, [70, 10, 130]):
+        assert manager.alloc_slots(request_id, list(range(length)))
+    kv = manager.bind(ids, make_cache_workspace(pool), start_pos=0)
 
     assert kv.cu_seqlens_q.tolist() == [0, 70, 80, 210]
 
@@ -414,7 +416,7 @@ def test_decode_reuses_pages_and_layer_views_until_mapping_changes(device, monke
     for pos in (2, 3):
         assert all(manager.extend_slots_batch(["a", "b"], [pos, pos]))
         bound = manager.bind(["a", "b"], workspace)
-        assert manager.bind_was_steady
+        assert bound is first
         assert bound.cache_seqlens.tolist() == [pos, pos]
         assert bound.page_table.data_ptr() == address
     assert len(gathers) == 1
@@ -435,3 +437,18 @@ def test_decode_reuses_pages_and_layer_views_until_mapping_changes(device, monke
     reordered = manager.bind(["b", "a"], workspace)
     assert len(gathers) == 3
     assert reordered.page_table[0, :2].tolist() == manager._states["b"].pages
+
+
+def test_decode_uses_planned_position_across_two_workspaces():
+    pool = make_paged_pool()
+    manager = KVCacheManager(pool)
+    a, b = make_cache_workspace(pool), make_cache_workspace(pool)
+    assert manager.alloc_slots("old", [1, 2, 3])
+    original = manager.bind(["old"], a, positions=[1])
+    assert original.cache_seqlens.tolist() == [1]
+    assert manager.extend_slots("old", 3)
+    manager.bind(["old"], b, positions=[3])
+    assert (
+        manager.bind(["old"], a, positions=[2]).page_table[0, 3]
+        == manager._states["old"].pages[3]
+    )

@@ -236,7 +236,6 @@ def _warmup_cuda_graphs(
         ):
             for step in range(2):
                 seq_pos = step
-                ws.position_ids[:b] = seq_pos
                 for tid in request_ids:
                     cache_mgr.extend_slots(tid, seq_pos)
                 kv = cache_mgr.bind(request_ids, ws)
@@ -246,7 +245,7 @@ def _warmup_cuda_graphs(
                     key=(b,),
                     input_ids=ids_buf,
                     kv_cache=kv,
-                    position_ids=ws.position_ids[:b],
+                    position_ids=kv.cache_seqlens,
                 )
 
         for tid in request_ids:
@@ -610,26 +609,18 @@ class GPUModelRunner:
         else:
             input_ids = ws.fill_input_ids([t.input_token_id for t in requests])
 
-        kv_cache = self.kv_manager.bind(request_ids, ws)
-
-        # Reuse sampling state only if all conditions hold:
-        # 1. The cached decode state belongs to THIS request set (task_sig)
-        # 2. KV bind detected steady increment (same req_indices, seq_lens +1)
-        reuse_decode_state = cache_valid and self.kv_manager.bind_was_steady
-        if reuse_decode_state:
-            info = cached.sampling_info
-            ws.position_ids[:b] += 1
-        else:
-            info = _build_sampling_batch_info(requests, self.device)
-            ws.position_ids[:b].copy_(
-                torch.tensor(cur_positions, dtype=torch.long, device=self.device)
-            )
+        info = (
+            cached.sampling_info
+            if cache_valid
+            else _build_sampling_batch_info(requests, self.device)
+        )
         if info.meta.has_freq and pending_same_batch:
             # Frequency penalty subtracts per-token counts computed from the
             # host history (prompt tail + full output). With a pending step
             # in flight the histories are one step behind the device relay,
             # so the penalty would be computed against the wrong prefix.
             return None
+        kv_cache = self.kv_manager.bind(request_ids, ws, positions=cur_positions)
         self._decode_cache = DecodeSteadyState(task_sig, info)
 
         # ---- forward (graph replay or live run + capture) ----
@@ -650,13 +641,13 @@ class GPUModelRunner:
                     key=key,
                     input_ids=input_ids,
                     kv_cache=kv_cache,
-                    position_ids=ws.position_ids[:b],
+                    position_ids=kv_cache.cache_seqlens,
                 )
             else:
                 outputs = self.model(
                     input_ids,
                     kv_cache=kv_cache,
-                    position_ids=ws.position_ids[:b],
+                    position_ids=kv_cache.cache_seqlens,
                 )
             logits = outputs["logits"]
 

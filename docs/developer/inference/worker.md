@@ -17,7 +17,7 @@ live scheduler request. The returned results identify the requests to which
 rows belong; the core must not infer that correspondence from a mutable batch.
 
 Plans isolate request execution data, but not all cache access: the runner
-still calls the shared `KVCacheManager.bind()` and checks `bind_was_steady`.
+still calls the shared `KVCacheManager.bind()` with the positions in the execution plan.
 This [remaining boundary](core.md#cache-binding-boundary) must be visible in
 architecture diagrams even though the corresponding imports are type-only.
 

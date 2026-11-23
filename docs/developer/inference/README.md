@@ -68,8 +68,8 @@ The source import direction is **frontend → core → worker → model/cache AB
 all layers can use `contracts.py`. `tests/inference/test_layering.py` rejects
 reverse runtime imports. This is an import rule, not complete object isolation:
 the runner receives a shared `KVCacheManager` and calls `bind()` to create model
-cache views. That method still combines request lookup with device metadata
-assembly. See [the cache boundary](core.md#cache-binding-boundary).
+cache views. The manager resolves request slots and reservations, then the workspace binds
+fixed-address tensors for the model. See [the cache boundary](core.md#cache-binding-boundary).
 
 ## Design patterns in use
 
@@ -162,11 +162,6 @@ Both allocation policies preallocate GPU storage. `kv_tokens=None` selects
 contiguous allocation; a finite value selects paged allocation, with radix
 prefix reuse when `page_size > 1`. Paged admission currently reserves the
 prompt's pages. Progressive admission and recompute preemption are not present.
-
-The main remaining ownership issue is shared KV binding. A future change can
-make request-slot/length data explicit at that boundary and keep device metadata
-assembly with the worker, while preserving fixed addresses and overlap ordering.
-Adding an abstract manager alone would leave the same dependency in place.
 
 ## Layer details
 

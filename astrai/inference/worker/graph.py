@@ -34,7 +34,7 @@ class CUDAGraphRunner:
                 input_ids=workspace.input_ids[:b].unsqueeze(1),
                 input_mask=input_mask,
                 kv_cache=kv_cache,
-                position_ids=workspace.position_ids[:b].unsqueeze(1),
+                position_ids=kv_cache.cache_seqlens[:b].unsqueeze(1),
             )
 
     The first call at a given key runs *without* capture (warmup).  The

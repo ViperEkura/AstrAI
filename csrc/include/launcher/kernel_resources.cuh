@@ -8,6 +8,20 @@
 namespace astrai {
 namespace gemm {
 
+// Function attributes belong to the CUDA device. Each host thread can safely
+// initialize its device on first use; repeated writes set the same kernel limit.
+template <auto Kernel> inline void configure_kernel_smem(int bytes, int device) {
+    if (bytes <= 48 * 1024)
+        return;
+    static thread_local std::map<int, int> configured;
+    int& limit = configured[device];
+    if (limit < bytes) {
+        ASTRAI_CUDA_CHECK(
+            cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        limit = bytes;
+    }
+}
+
 // Kernel metadata is queried once per typed kernel and device. No launch or
 // timing is involved; CUDA accounts for registers and allocation granularity.
 template <auto Kernel, typename Policy> KernelResources kernel_resources(const PlanQuery& q) {
@@ -19,9 +33,7 @@ template <auto Kernel, typename Policy> KernelResources kernel_resources(const P
     KernelResources result{};
     if (Policy::kSmemBytes > q.dev.smem_max)
         return result;
-    if (Policy::kSmemBytes > 48 * 1024)
-        ASTRAI_CUDA_CHECK(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                               Policy::kSmemBytes));
+    configure_kernel_smem<Kernel>(Policy::kSmemBytes, q.dev.ordinal);
     cudaFuncAttributes attributes{};
     ASTRAI_CUDA_CHECK(cudaFuncGetAttributes(&attributes, Kernel));
     ASTRAI_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(

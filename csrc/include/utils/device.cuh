@@ -18,7 +18,7 @@ namespace astrai {
  * Query these values because resource limits vary by architecture.
  */
 inline DeviceFacts device_facts() {
-    static DeviceFacts cached[64] = {};
+    static thread_local DeviceFacts cached[64] = {};
     int dev = 0;
     cudaGetDevice(&dev);
     const bool cacheable = dev >= 0 && dev < 64;

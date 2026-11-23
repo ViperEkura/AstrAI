@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include <kernel/gemm/kernel.cuh>
+#include <launcher/kernel_resources.cuh>
 #include <policy/gemm/config.h>
 #include <utils/device.cuh>
 #include <utils/launch.cuh>
@@ -50,12 +51,7 @@ inline void log_gemm_plan(const GemmParams& p,
 template <auto Kernel, typename... Args>
 void launch_with_smem(int smem_bytes, dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
     if (smem_bytes > 48 * 1024) {
-        static bool armed = false; // per instantiation
-        if (!armed) {
-            const cudaError_t err = cudaFuncSetAttribute(
-                Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-            armed = (err == cudaSuccess);
-        }
+        configure_kernel_smem<Kernel>(smem_bytes, device_facts().ordinal);
     }
     Kernel<<<grid, block, smem_bytes, stream>>>(args...);
     ASTRAI_LAUNCH_CHECK();

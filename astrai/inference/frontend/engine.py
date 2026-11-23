@@ -94,6 +94,7 @@ class InferenceEngine:
     def _submit_processed(
         self,
         processed: List[ProcessedInput],
+        submit,
         *,
         max_tokens: Optional[int],
         temperature: float,
@@ -102,13 +103,13 @@ class InferenceEngine:
         frequency_penalty: float,
         rep_window: int,
         **generation_kwargs,
-    ) -> None:
+    ):
         """Register every consumer before admitting the prepared requests."""
         request_ids = [item.request_id for item in processed]
         for request_id in request_ids:
             self._tracker.register(request_id, event_capacity=self._max_seq_len + 1)
         try:
-            self._core.add_requests(
+            return submit(
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -322,8 +323,9 @@ class InferenceEngine:
 
         async def _agen():
             processed = self._input_processor.process(prompt)
-            self._submit_processed(
+            admission = self._submit_processed(
                 [processed],
+                self._core.enqueue_requests,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
@@ -337,6 +339,7 @@ class InferenceEngine:
             terminal_chunk = None
             token_offset = 0
             try:
+                await asyncio.wrap_future(admission)
                 processor = OutputProcessor(
                     request_id,
                     self.tokenizer,
@@ -366,7 +369,12 @@ class InferenceEngine:
                                 break
                             yield chunk
             finally:
-                self._release_requests([request_id])
+                if admission.cancel() or (
+                    admission.done() and admission.exception() is not None
+                ):
+                    tracker.unregister(request_id)
+                else:
+                    self._release_requests([request_id])
             # Release before yielding the terminal chunk: callers may pause or
             # stop iteration here without resuming the generator again.
             if terminal_chunk is not None:
@@ -467,6 +475,7 @@ class InferenceEngine:
         submit = partial(
             self._submit_processed,
             processed,
+            self._core.add_requests,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,

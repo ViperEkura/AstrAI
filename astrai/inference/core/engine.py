@@ -4,6 +4,7 @@ import logging
 import threading
 import uuid
 from collections import deque
+from concurrent.futures import Future
 from contextlib import contextmanager
 from functools import wraps
 from typing import Callable, List, Optional, TypeVar
@@ -118,6 +119,7 @@ class EngineCore:
         self.stop_event = threading.Event()
         self.loop_thread = None
         self._lifecycle_lock = threading.Lock()
+        self._admissions = deque()
         self._pending = deque()
         self._closing = False
         self._shutdown_failed = False
@@ -172,6 +174,17 @@ class EngineCore:
         with self.lock:
             self.ensure_accepting()
             return self.scheduler.add_requests(prompts, **kwargs)
+
+    def enqueue_requests(self, **kwargs) -> Future[List[str]]:
+        """Queue a frontend batch for validation and admission by the running loop."""
+        with self._lifecycle_lock:
+            self.ensure_accepting()
+            if self.loop_thread is None or not self.loop_thread.is_alive():
+                raise RuntimeError("scheduler must be running to enqueue requests")
+            reply = Future()
+            self._admissions.append((kwargs, reply))
+            self.scheduler.wake()
+        return reply
 
     def cancel_request(self, request_id: str) -> bool:
         with self.lock:
@@ -229,7 +242,7 @@ class EngineCore:
         with self.lock:
             self.drain()
             self._release_finished()
-            if self.scheduler.has_requests():
+            if self._admissions or self.scheduler.has_requests():
                 raise RuntimeError(
                     "Cannot run synchronous inference with queued requests"
                 )
@@ -404,6 +417,18 @@ class EngineCore:
             with use_op_selection(self.op_selection):
                 while not self.stop_event.is_set():
                     with self.lock:
+                        # A bounded snapshot gives a busy producer and decode a turn each.
+                        for _ in range(len(self._admissions)):
+                            kwargs, reply = self._admissions.popleft()
+                            if reply.set_running_or_notify_cancel():
+                                try:
+                                    ids = self.scheduler.add_requests(**kwargs)
+                                except BaseException as exc:
+                                    reply.set_exception(exc)
+                                    if not isinstance(exc, Exception):
+                                        raise
+                                else:
+                                    reply.set_result(ids)
                         work = self.tick()
                     if not work:
                         if self.scheduler.has_requests():
@@ -413,10 +438,17 @@ class EngineCore:
                             self.scheduler.wait_for_requests(timeout=0.05)
         except BaseException as exc:
             error = exc
-            self._closing = True
             self.stop_event.set()
             logger.exception("EngineCore loop crashed")
         finally:
+            with self._lifecycle_lock:
+                self._closing = True
+                admissions, self._admissions = self._admissions, deque()
+            for _, reply in admissions:
+                if reply.set_running_or_notify_cancel():
+                    reply.set_exception(
+                        error or RuntimeError("engine stopped before admission")
+                    )
             with self.lock:
                 try:
                     self._shutdown(error)

@@ -3,7 +3,7 @@ from collections import Counter
 
 import pytest
 
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_LENGTH,
     FINISH_STOP_TOKEN,
     RequestError,

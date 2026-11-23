@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, Mock, call
 
 import pytest
 
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
     FINISH_LENGTH,

@@ -96,9 +96,9 @@ class Scheduler:
         return bool(self.running or self.waiting)
 
     def wait_for_requests(self, timeout):
-        self._request_event.clear()
         if not self.has_requests():
             self._request_event.wait(timeout)
+        self._request_event.clear()
 
     def wake(self):
         self._request_event.set()

@@ -7,7 +7,7 @@ import torch
 
 from astrai.extension import op_backend, snapshot_op_selection
 from astrai.inference import EngineCore, GenerationResult
-from astrai.inference.core.scheduler import OutputEventSink
+from astrai.inference.contracts import OutputEventSink
 from astrai.model.autoregressive_lm import AutoRegressiveLM
 from astrai.trainer.backend import run_batch
 from tests.support.models import make_rollout_config
@@ -457,3 +457,65 @@ def test_admission_rejects_requests_that_can_never_fit(cpu_device):
         assert not scheduler.scheduler.waiting
     finally:
         scheduler.stop()
+
+
+def test_enqueue_during_a_tick_preserves_batch_validation_and_cancellation():
+    core, _, _ = make_real_scheduler("cpu")
+    entered, resume = threading.Event(), threading.Event()
+    tick = core.tick
+
+    def paused_tick():
+        entered.set()
+        assert resume.wait(5)
+        return tick()
+
+    core.tick = paused_tick
+    core.start()
+    try:
+        assert entered.wait(5)
+        good = core.enqueue_requests(
+            prompts_ids=[[1]], request_ids=["good"], max_tokens=1
+        )
+        duplicate = core.enqueue_requests(
+            prompts_ids=[[2], [3]], request_ids=["other", "good"]
+        )
+        cancelled = core.enqueue_requests(prompts_ids=[[4]], request_ids=["unused"])
+        assert cancelled.cancel()
+        assert not good.done()
+        resume.set()
+        assert good.result(timeout=5) == ["good"]
+        with pytest.raises(ValueError, match="duplicate"):
+            duplicate.result(timeout=5)
+        assert core.get_stats()["total_tasks"] == 1
+    finally:
+        resume.set()
+        core.stop()
+
+
+@pytest.mark.parametrize("crash", [False, True])
+def test_queued_admission_settles_when_the_loop_exits(crash):
+    core, _, _ = make_real_scheduler("cpu")
+    entered, resume = threading.Event(), threading.Event()
+
+    def paused_tick():
+        entered.set()
+        assert resume.wait(5)
+        if crash:
+            raise RuntimeError("failed tick")
+        return False
+
+    core.tick = paused_tick
+    core.start()
+    try:
+        assert entered.wait(5)
+        reply = core.enqueue_requests(prompts_ids=[[1]], request_ids=["pending"])
+        if not crash:
+            assert not core.stop(timeout=0)
+        resume.set()
+        with pytest.raises(RuntimeError, match="failed tick" if crash else "stopped"):
+            reply.result(timeout=5)
+        with pytest.raises(RuntimeError, match="stopping or stopped"):
+            core.enqueue_requests(prompts_ids=[[2]], request_ids=["late"])
+    finally:
+        resume.set()
+        core.stop()

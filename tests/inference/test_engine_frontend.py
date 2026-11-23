@@ -1,9 +1,10 @@
 import asyncio
+from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_CANCELLED,
     RequestError,
     RequestFinished,
@@ -48,6 +49,12 @@ def _emit_on_submission(engine, text="", reason=None, error=False):
             emit(rid, ids)
         return kwargs["request_ids"]
 
+    def enqueue_requests(**kwargs):
+        reply = Future()
+        reply.set_result(engine._core.add_requests(**kwargs))
+        return reply
+
+    engine._core.enqueue_requests.side_effect = enqueue_requests
     engine._core.add_request.side_effect = add_request
     engine._core.add_requests.side_effect = add_requests
 
@@ -63,11 +70,11 @@ import threading
 
 import pytest
 
-from astrai.inference.core.engine import EngineCore
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_LENGTH,
     FINISH_STOP_TOKEN,
 )
+from astrai.inference.core.engine import EngineCore
 from astrai.inference.frontend.engine import build_engine
 from tests.support.models import make_model
 
@@ -534,3 +541,24 @@ class _CharacterDecoder:
 
     def push(self, token_id):
         return chr(token_id) if token_id > 2 else ""
+
+
+def test_async_cancel_before_admission_discards_the_unregistered_request(event_engine):
+    admission = Future()
+    event_engine._core.enqueue_requests.side_effect = None
+    event_engine._core.enqueue_requests.return_value = admission
+
+    async def consume():
+        stream = event_engine.generate_events("hi")
+        task = asyncio.create_task(anext(stream))
+        await asyncio.sleep(0)
+        assert event_engine._tracker._requests
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await stream.aclose()
+
+    asyncio.run(consume())
+    assert admission.cancelled()
+    assert not event_engine._tracker._requests
+    event_engine._core.cancel_request.assert_not_called()

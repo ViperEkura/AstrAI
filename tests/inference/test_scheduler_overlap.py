@@ -9,8 +9,7 @@ import torch
 
 from astrai.extension.runtime.context import use_op_selection
 from astrai.inference import EngineCore
-from astrai.inference.contracts import SchedulerOutput
-from astrai.inference.core.events import RequestFinished, TokenDelta
+from astrai.inference.contracts import RequestFinished, SchedulerOutput, TokenDelta
 from astrai.inference.core.request import Request
 from astrai.inference.worker.pending import (
     PendingExecution,

@@ -9,11 +9,13 @@ import torch
 
 from astrai.inference.contracts import (
     ModelRunnerOutput,
+    RequestError,
+    RequestFinished,
     RequestIdentity,
     RequestOutput,
     SchedulerOutput,
+    TokenDelta,
 )
-from astrai.inference.core.events import RequestError, RequestFinished, TokenDelta
 from astrai.inference.core.request import Request
 from astrai.inference.worker.pending import PendingExecution, ResultRing
 from astrai.trainer.backend import run_batch

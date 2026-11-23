@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from unittest.mock import MagicMock
 
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_CANCELLED,
     FINISH_LENGTH,
     RequestError,

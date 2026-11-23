@@ -82,7 +82,7 @@ before shutdown callbacks attempt an emergency save.
 
 ## Experiment metrics
 
-`on_rollout_end(context, batch)` receives a CPU snapshot of a freshly scored
+`on_rollout(context, batch)` receives a CPU snapshot of a freshly scored
 training rollout. The snapshot contains the sampled policy version, prompt
 texts, rewards, response lengths and finish reasons in prompt-group order.
 Synchronous padding rows and cached rollouts are excluded. Each callback can

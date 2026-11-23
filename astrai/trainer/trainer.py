@@ -201,7 +201,7 @@ class Trainer:
 
     def _train_batch(self, context: TrainContext, batch) -> None:
         context.checkpoint_safe = False
-        hooks = tuple(self._callback_methods("on_rollout_end"))
+        hooks = tuple(self._callback_methods("on_rollout"))
         rollout_metrics = None
         if hooks:
             totals: RolloutMetricTotals = {}
@@ -357,7 +357,7 @@ class Trainer:
         iterator = iter(context.dataloader)
         context.train_iterator = iterator
         context.on_shutdown("train_loader", partial(stop_loader_workers, iterator))
-        rollout_hooks = tuple(self._callback_methods("on_rollout_end"))
+        rollout_hooks = tuple(self._callback_methods("on_rollout"))
         for window_start, window_samples, microbatches in sampler.windows():
             if context.stop_agreed:
                 break

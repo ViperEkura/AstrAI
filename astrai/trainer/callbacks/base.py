@@ -63,7 +63,7 @@ class TrainCallback(Protocol):
     def after_optimizer_step(self, context: TrainContext):
         """Called after the optimizer and scheduler step (sync step only)."""
 
-    def on_rollout_end(
+    def on_rollout(
         self, context: TrainContext, batch: RolloutMetricsBatch
     ) -> Optional[RolloutMetricTotals]:
         """Contribute named (numerator, denominator) pairs for a fresh rollout."""

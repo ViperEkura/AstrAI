@@ -528,7 +528,7 @@ class MathRolloutMetrics:
     def __init__(self, prefix):
         self.prefix = prefix
 
-    def on_rollout_end(self, context, batch):
+    def on_rollout(self, context, batch):
         all_wrong = batch.rewards.eq(0).all(dim=1)
         return {
             f"{self.prefix}/all_wrong_rate": (all_wrong.sum().item(), all_wrong.numel())

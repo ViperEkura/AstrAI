@@ -147,7 +147,7 @@ class ExperimentMetrics:
     def __init__(self, log_path):
         self.log_path = Path(log_path)
 
-    def on_rollout_end(self, context, batch):
+    def on_rollout(self, context, batch):
         assert batch.rewards.shape[0] == len(batch.prompt_texts)
         all_wrong = batch.rewards.eq(0).all(dim=1)
         return {

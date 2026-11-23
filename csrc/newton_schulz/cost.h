@@ -30,8 +30,9 @@ inline CostTerms cost_of(const gemm::GemmRecipe& recipe,
                          double blocks,
                          double epilogue_bytes) {
     CostTerms result;
-    result.geometry =
-        gemm::geometry_cost(recipe, query, resources.resident, blocks, epilogue_bytes);
+    result.geometry = gemm::recipe_cost(gemm::CostModel::kGeometry, recipe, query,
+                                        resources.resident, blocks, epilogue_bytes)
+                          .work;
     if (!std::isfinite(result.geometry))
         return result;
     result.k_steps = std::ceil(static_cast<double>(query.k) / recipe.k_tile);

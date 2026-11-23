@@ -127,6 +127,29 @@ def test_compiled_schedule_switches(dtype, staging, k, capfd):
 
 @pytest.mark.cuda
 @skip_no_kernel
+def test_model_prefetch_depth_for_crosswise_gemm():
+    facts = kernel.gemm.facts()
+    if min(facts["smem_max"], facts["smem_per_sm"]) < 65536:
+        pytest.skip("three-stage BF16 tile needs 64 KiB shared memory")
+    # TT has one crosswise operand. One 64x64 tile per SM is the last
+    # grid where the deeper copy pipeline cannot cost CTA concurrency.
+    n = 64 * facts["sms"]
+
+    def stages(columns, k, batch=1):
+        decision = kernel.gemm.probe(
+            64, columns, k, trans_a=True, trans_b=True, batch=batch
+        )
+        return decision["k_stages"]
+
+    with plan.override(planner="model"):
+        assert stages(n, 2048) == 3
+        assert stages(n + 1, 2048) == 2
+        assert stages(n, 512) == 2
+        assert stages(n, 2048, batch=2) == 2
+
+
+@pytest.mark.cuda
+@skip_no_kernel
 def test_unaligned_base_uses_cpasync_plan(capfd):
     m, n, k = 65, 129, 128
     storage = torch.randint(-2, 3, (m * k + 1,), device="cuda").to(torch.bfloat16)

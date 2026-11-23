@@ -73,10 +73,12 @@ def set_table(rows: Rows) -> int:
 
 
 def set_planner(mode: str) -> Dict:
-    """Pick the planner: ``table`` (rows only, the degraded ladder when no
-    row matches), ``hybrid`` (rows, then the model, then the ladder — the
-    shipped default), or ``model`` (analytical only). ``""`` restores the
-    shipped default instead of pinning a mode."""
+    """Select traffic scoring (``model``) or geometry scoring (``heuristic``).
+
+    ``table`` requires a matching row. ``hybrid`` tries rows first and then
+    geometry scoring. An empty string clears the explicit mode. The
+    unconfigured default is ``model``.
+    """
     if mode and mode not in PLANNER_MODES:
         raise ValueError(f"planner must be one of {PLANNER_MODES}, got {mode!r}")
     return get_module("gemm").configure({"planner": mode})

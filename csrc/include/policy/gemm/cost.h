@@ -1,5 +1,5 @@
 #pragma once
-/* Shared geometry cost for GEMM and symmetric matrix operations. */
+/* Host-side recipe scoring for GEMM and symmetric matrix operations. */
 #include <api/native/gemm_plan.h>
 
 #include <algorithm>
@@ -28,22 +28,61 @@ inline int geometry_raster(const PlanQuery& q, int bm, int bn) {
     return (int)std::max(g, (int64_t)1);
 }
 
-// Five work proxies ranked in log space, not an execution-time estimate.
-// Callers supply the actual grid and epilogue traffic (e.g. triangular SYRK).
-inline double geometry_cost(const GemmRecipe& r,
-                            const PlanQuery& q,
-                            int resident_ctas,
-                            double blocks,
-                            double output_bytes) {
+enum class CostModel { kTraffic, kGeometry };
+
+struct RecipeCost {
+    double work = std::numeric_limits<double>::infinity();
+    int prefetch_stages = 0; // tie-break within one CTA geometry and K tile
+};
+
+// The caller supplies the effective tile, grid and epilogue bytes; SYRK has a triangular grid.
+inline RecipeCost recipe_cost(CostModel model,
+                              const GemmRecipe& r,
+                              const PlanQuery& q,
+                              int resident_ctas,
+                              double blocks,
+                              double output_bytes) {
     if (resident_ctas <= 0 || q.dev.sms <= 0 || q.k <= 0 || blocks <= 0 || output_bytes <= 0)
-        return std::numeric_limits<double>::infinity();
-    // Integer ceil without n+d-1 overflow; cast before multiplying grid axes.
-    auto ceil_div = [](std::int64_t n, int d) { return n / d + (n % d != 0); };
-    const double steps = (double)ceil_div(q.k, r.k_tile);
+        return {};
+    const double steps = static_cast<double>(q.k / r.k_tile + (q.k % r.k_tile != 0));
+    const int operand_row_bytes = r.bm * q.ba + r.bn * q.bb;
+
+    if (model == CostModel::kTraffic) {
+        if (!q.tma) {
+            // cp.async copies complete K tiles. Ring size bounds concurrent CTAs.
+            const int slots_per_sm = q.dev.smem_per_sm / r.smem;
+            const double waves =
+                std::ceil(blocks / (static_cast<double>(q.dev.sms) * slots_per_sm));
+            const double work = (steps * r.k_tile * operand_row_bytes + output_bytes) * waves;
+
+            // Extra prefetch only breaks ties on long, single-wave BF16 crosswise grids.
+            constexpr int kMinPrefetchTiles = 16;
+            constexpr int kBf16VectorElements = 16 / sizeof(uint16_t);
+            const bool full_vectors =
+                q.m % kBf16VectorElements == 0 && q.n % kBf16VectorElements == 0;
+            const bool prefer_prefetch = q.perf_class == (int)GemmPerfClass::kW16A16 &&
+                                         q.batch == 1 && blocks <= q.dev.sms &&
+                                         q.k >= kMinPrefetchTiles * r.k_tile &&
+                                         (q.crosswise == 1 || (q.crosswise == 2 && full_vectors));
+            return {work, prefer_prefetch ? r.k_stages : 0};
+        }
+
+        // TMA overlaps copies and MMA. These fitted weights are in equivalent bytes.
+        const double cells = static_cast<double>(r.bm) * r.bn;
+        const double loop = q.ba == 1 && q.bb == 1 ? 0.0 : 8.0 * cells * steps;
+        const double memory = static_cast<double>(q.k) * operand_row_bytes + output_bytes + loop;
+        const double mma = 64.0 * steps * (r.k_tile / q.mma_k) * (r.bm / 16) * (r.bn / 8);
+        const double waves = std::ceil(blocks / (static_cast<double>(q.dev.sms) * resident_ctas));
+        const double weight =
+            q.ba == 2 && q.bb == 2 ? waves * resident_ctas : std::ceil(blocks / q.dev.sms);
+        return {std::max(memory, mma) * weight};
+    }
+
+    // Geometry mode ranks five work estimates in log space using actual CTA residency.
     const double resident = std::min((double)resident_ctas, std::ceil(blocks / q.dev.sms));
     const double waves = std::ceil(blocks / (q.dev.sms * resident));
     const double warps = r.threads / 32.0;
-    const double copy = (double)r.k_tile * (r.bm * q.ba + r.bn * q.bb) / 512.0;
+    const double copy = (double)r.k_tile * operand_row_bytes / 512.0;
     const double mma = ((double)r.k_tile / q.mma_k) * (r.bm / 16.0) * (r.bn / 8.0) / warps;
     const double fragments = (double)r.k_tile * (r.wm * q.ba + r.wn * q.bb) / 512.0;
     const double conversions =
@@ -69,7 +108,7 @@ inline double geometry_cost(const GemmRecipe& r,
     double score = 0.0;
     for (double arm : arms)
         score += arm;
-    return score;
+    return {score};
 }
 
 } // namespace gemm

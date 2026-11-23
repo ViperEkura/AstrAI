@@ -31,16 +31,15 @@ the current device; `set_staging()` can disable TMA or MX independently.
 The device policy composes element types, tile geometry, shared-memory
 layout, schedule and epilogue. Instruction wrappers own the register
 contract; `static_assert` enforces architecture and layout constraints.
-Host planning is a fixed sequence of ordinary functions: override rows,
-injected rows, measured builtin rows, then heuristic,
-subject to the selected planner mode. No virtual planner hierarchy is needed.
+The default planner scores the compiled recipes. Table and hybrid modes
+consult override, injected and builtin rows in that order.
 
 ## Geometry heuristic (`geom_cta`)
 
 `plan.configure(planner="heuristic")` uses the same `geom_cta` rule as the
-Python replay script. Explicit heuristic mode skips measured rows; default
-`hybrid` checks rows first, then uses geom_cta. Both read compiled kernel
-metadata without timing kernels. The older `model` is explicit-only.
+Python replay script. Explicit heuristic mode scores the compiled kernels directly.
+`hybrid` uses the same score when no measured row matches. Both read compiled
+kernel metadata without timing kernels.
 
 ### Formula
 
@@ -95,11 +94,9 @@ log(L*B + E) = max(x,y) + log1p(exp(-abs(x-y)))
 
 No large cost products or `exp(score)` are formed; the one exponential has
 a nonpositive argument. C++ uses `double`, Python uses double-precision
-`float`. C++ avoids `n+d-1` overflow in heuristic ceil division and casts
-grid axes before multiplication. M/N/K must be positive; nonfinite
-scores are excluded. Rounding and near ties remain possible.
-This protection applies to this score, not the older integer `model` or
-every launch calculation. Logs run on the host; decisions are cached.
+`float`. The planner converts grid factors to double before multiplying them. M/N/K
+must be positive. The planner excludes nonfinite scores and caches decisions
+on the host. Rounding can affect near ties.
 
 **Limits and validation.** These overlapping work proxies can trade one
 advantage against another bottleneck, so their geometric mean is not a
@@ -548,9 +545,8 @@ unchanged.
 ## Planning
 
 `gemm/plan/planner.cpp` ranks recipes; `gemm/plan/table.cpp` owns row parsing,
-configuration and lookup. Ties keep manifest order. Decisions are cached
-per thread/query; row lookup precedes heuristic ranking, so newly installed rows
-take effect immediately. Empty tables avoid their mutex.
+configuration and lookup. The planner caches decisions per thread and query.
+Hybrid mode checks rows before consulting the cached decision.
 
 | Mode | Search order (first match wins) |
 | --- | --- |
@@ -582,21 +578,38 @@ above the device's shared-memory budget fall through. Builtin rows live
 between generated markers in `gemm/plan/builtin.cpp`; changing them
 requires a rebuild.
 
-**Existing fitted model.** Available only through `planner="model"` for
-comparison; the default chain no longer uses it. It prices work as well as
-waves, since a large CTA performs more work than a small one:
+### Candidate selection rules
 
-- cp.async: `(K-padded operand bytes + output bytes) * waves`, using raw
-  shared-memory-floor residency in the wave denominator.
-- TMA: `max(operand + output + mainloop, MMA_arm) * W_eff`. Mainloop cost
-  is `8*BM*BN*ceil(K/KK)` for non-byte pairs, zero for byte pairs; MMA cost
-  is 64 times the warp MMA instruction count. `W_eff` is resident-scaled
-  waves for two-byte pairs, otherwise `ceil(blocks/SMs)`. The coefficients
-  are RTX 5090 fitted equivalent-byte weights, not hardware rates.
+1. Enumerate recipes compiled for the operand widths and layouts. Discard a
+   recipe if its shared-memory allocation exceeds the device limit or no CTA
+   can reside on an SM.
+2. Score the remaining recipes with `recipe_cost` in `policy/gemm/cost.h`.
+   The default `model` mode uses the traffic formulas below. The `heuristic`
+   mode uses the effective kernel tile, its occupancy and the five geometry
+   terms described above. Each mode minimizes its own score.
+3. Keep manifest order on equal scores, with one exception for `model`.
+   Given the same CTA geometry and K tile, favor deeper prefetch for a
+   batch-one BF16 crosswise grid with at most one CTA per SM and
+   `K >= 16 * K_tile`. If both operands are crosswise, M and N must also
+   be multiples of eight BF16 elements. For example, on 170 SMs a
+   `64x64` tile for `8x2048x2048` launches 32 CTAs. The same tile for
+   `512x2048x2048` launches 256 and keeps the original tie order.
+4. In `model` mode, apply the existing short-K correction on the measured RTX 5090
+   configuration (170 SMs, 100 KiB shared memory per SM). For contiguous
+   batch-one BF16 TMA with BF16 output and M/N/K all at least 128, use the
+   best eligible 32-deep tile when K fits within the shallowest eligible
+   64-deep pipeline's stage count times the winning tile's K depth.
+   Then select the raster for the winning geometry.
 
-TMA residency includes ring padding/barriers. Pointer or stride alignment
-failures use cp.async. A smaller KK can improve residency but also adds loop
-iterations; neither occupancy nor wave count alone predicts performance.
+| Default score | Per-CTA work | Wave multiplier |
+| --- | --- | --- |
+| cp.async | Operand bytes rounded up to whole K tiles, plus output bytes | `ceil(blocks / (SMs * floor(smem_per_SM / ring_bytes)))` |
+| TMA | `max(operand_bytes + output_bytes + loop, MMA_weight)` | Two-byte pairs use `ceil(blocks / (SMs * resident_CTAs)) * resident_CTAs`. Other pairs use `ceil(blocks / SMs)`. |
+
+The score is per-CTA work times the wave multiplier. TMA uses the true K
+extent for operand bytes. The fitted loop term is zero for byte pairs and
+`8 * BM * BN * ceil(K/KK)` otherwise. The fitted MMA weight is 64 times
+the warp MMA instruction count. TMA residency includes ring padding and barriers.
 
 **Python API.** `plan.py` owns configuration and probe; `autotune.py` owns
 measurements, cache rows and persistence. FP8 slots and autocast routing are

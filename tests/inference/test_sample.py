@@ -19,16 +19,12 @@ def test_sample_return_logprobs_greedy_path():
 
 
 def test_sample_return_logprobs_matches_manual_computation():
-    """Returned logprob equals log_softmax(raw_logits)[token].
-
-    Logprobs live in the raw (pre-strategy) model distribution so they
-    line up with training-side policy logprobs for RL importance ratios.
-    """
+    """Score the selected token before nucleus truncation."""
     torch.manual_seed(1)
     logits = torch.randn(2, 30)
     tokens, logprobs = sample(logits, temperature=0.7, top_p=0.95, return_logprobs=True)
     expected = torch.gather(
-        torch.log_softmax(logits.float(), dim=-1),
+        torch.log_softmax(logits.float() / 0.7, dim=-1),
         -1,
         tokens.unsqueeze(-1),
     ).squeeze(-1)
@@ -100,7 +96,7 @@ def test_seeded_sampling_matches_the_filtered_distribution():
 
 
 @pytest.mark.parametrize("meta_cached", [False, True])
-def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
+def test_per_row_filters_penalties_and_logprobs(meta_cached):
     logits = torch.tensor([[5.0, 4.0, 3.0, 2.0], [1.0, 2.0, 3.0, 4.0]])
     counts = torch.tensor([[2.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
     captured = []
@@ -118,7 +114,9 @@ def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
             frequency_penalty=torch.tensor([1.0, -1.0]),
             frequency_counts=counts,
             return_logprobs=True,
-            meta=SamplingMeta(False, True, 2, True, True) if meta_cached else None,
+            meta=SamplingMeta(False, True, 2, True, True, False)
+            if meta_cached
+            else None,
         )
     torch.testing.assert_close(
         counts, torch.tensor([[2.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
@@ -134,8 +132,11 @@ def test_per_row_filters_penalties_and_raw_logprobs(meta_cached):
         -1,
     )
     torch.testing.assert_close(captured[0], expected)
+    scores = (logits - counts * torch.tensor([[1.0], [-1.0]])) / torch.tensor(
+        [[0.5], [1.0]]
+    )
     torch.testing.assert_close(
-        logprobs, logits.log_softmax(-1).gather(-1, tokens[:, None]).squeeze(-1)
+        logprobs, scores.log_softmax(-1).gather(-1, tokens[:, None]).squeeze(-1)
     )
 
 
@@ -152,8 +153,31 @@ def test_temperature_logprobs_score_before_truncation(top_k):
         logits.clone(),
         temperature=temperatures,
         top_k=top_k,
-        return_logprobs="temperature",
+        return_logprobs=True,
         seeds=[3, 7],
     )
     expected = (logits.float() / temperatures[:, None]).log_softmax(-1)
     torch.testing.assert_close(actual, expected.gather(1, tokens[:, None]).squeeze(1))
+
+
+def test_zero_temperature_row_reports_raw_score_in_a_mixed_batch():
+    logits = torch.tensor([[5, 4, 4], [1, 2, 3]], dtype=torch.bfloat16)
+    kwargs = dict(
+        temperature=torch.tensor([0.0, 0.5]),
+        top_p=torch.tensor([0.0, 1.0]),
+        frequency_penalty=1.0,
+        frequency_counts=torch.tensor([[3, 0, 0], [0, 0, 2]]),
+        seeds=[3, 7],
+    )
+    tokens, scores = sample(logits.clone(), return_logprobs=True, **kwargs)
+    torch.testing.assert_close(tokens, sample(logits.clone(), **kwargs))
+    assert tokens[0].item() == 1
+    expected = torch.stack(
+        (logits[0].float(), torch.tensor([2.0, 4.0, 2.0]))
+    ).log_softmax(-1)
+    torch.testing.assert_close(scores, expected.gather(1, tokens[:, None]).squeeze(1))
+
+
+def test_return_logprobs_requires_bool():
+    with pytest.raises(TypeError, match="return_logprobs must be a bool"):
+        sample(torch.zeros(1, 3), return_logprobs="temperature")

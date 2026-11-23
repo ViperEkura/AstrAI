@@ -7,8 +7,6 @@ An identity includes an incarnation so a late result cannot hit a reused id.
 from dataclasses import dataclass
 from typing import FrozenSet, List, Literal, Optional, Tuple, Union
 
-LogprobRequest = bool | Literal["temperature"]
-
 
 @dataclass(frozen=True)
 class GenerationResult:
@@ -92,7 +90,7 @@ class SchedulerOutput:
     step_id: int
     policy_version: int
     requests: Tuple[ExecutionRequest, ...]
-    return_logprobs: LogprobRequest = False
+    return_logprobs: bool = False
 
     @property
     def request_ids(self) -> Tuple[str, ...]:

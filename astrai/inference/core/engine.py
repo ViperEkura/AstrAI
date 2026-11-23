@@ -14,7 +14,6 @@ from astrai.extension.runtime.context import use_op_selection
 from astrai.inference.contracts import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
-    LogprobRequest,
 )
 from astrai.inference.core.cache import BlockPool
 from astrai.inference.core.request import Request, RequestStatus
@@ -270,7 +269,7 @@ class EngineCore:
         if latest is not None and latest.committed:
             self.model_runner.clear_pending()
 
-    def execute_synchronously(self, requests, return_logprobs=False):
+    def execute_synchronously(self, requests, return_logprobs: bool = False):
         with self.lock:
             self.drain()
             plan = self.scheduler.schedule(
@@ -461,7 +460,7 @@ class EngineCore:
 
     @_synchronous
     def execute_requests(
-        self, requests: List[Request], return_logprobs: LogprobRequest = False
+        self, requests: List[Request], return_logprobs: bool = False
     ) -> None:
         """Drive tokenized requests through admission and execution to terminal."""
         self.scheduler.refresh_stop_ids()

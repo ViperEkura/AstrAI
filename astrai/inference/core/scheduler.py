@@ -424,7 +424,7 @@ class Scheduler:
         self.release_finished(safe_to_release)
 
     def schedule(
-        self, requests=None, policy_version=None, *, return_logprobs=False
+        self, requests=None, policy_version=None, *, return_logprobs: bool = False
     ) -> SchedulerOutput:
         if policy_version is None:
             policy_version = self._policy_version

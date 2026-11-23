@@ -29,7 +29,6 @@ from torch import nn
 from astrai.inference.contracts import (
     FINISH_STOP_TOKEN,
     GenerationResult,
-    LogprobRequest,
 )
 from astrai.inference.core.engine import EngineCore
 from astrai.inference.core.request import Request
@@ -62,7 +61,7 @@ def run_batch(
     top_k: int = 50,
     frequency_penalty: float = 0.0,
     rep_window: int = 64,
-    return_logprobs: LogprobRequest = False,
+    return_logprobs: bool = False,
     return_details: bool = False,
     seeds: Optional[List[int]] = None,
 ) -> List[Any]:

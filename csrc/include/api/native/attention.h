@@ -6,7 +6,7 @@ namespace astrai {
 namespace attention {
 
 // Standard workspace capacity: decode splits per (batch, q_head).
-constexpr int MAX_SPLITS = 32;
+constexpr int MAX_SPLITS = 64;
 
 /* Converts the softmax scale for exp2: scale_log2 = scale * log2(e). */
 constexpr float LOG2E = 1.44269504088896340736f;

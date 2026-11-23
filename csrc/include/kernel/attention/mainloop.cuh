@@ -122,11 +122,7 @@ struct PrefillMainloop {
 };
 
 // Each decode CTA processes a KV split for up to one MMA tile of query heads.
-template <typename Tile,
-          typename KV,
-          bool HasMask,
-          bool SkipEmptySplits = false,
-          bool FixedSplits = false>
+template <typename Tile, typename KV, bool HasMask, bool FixedSplits = false>
 struct DecodeMainloop {
     using Traits = Tile;
     static DEVICE_FORCEINLINE bool
@@ -138,8 +134,8 @@ struct DecodeMainloop {
         const int lane = threadIdx.x;
         const int pass = blockIdx.x / p.kv_head;
         const int kv_head = blockIdx.x % p.kv_head;
-        const int batch = blockIdx.y;
-        const int split = blockIdx.z;
+        const int batch = blockIdx.z;
+        const int split = blockIdx.y;
 
         constexpr int MAX_G = Traits::BR;
         const int G_total = p.q_head / p.kv_head;
@@ -166,18 +162,15 @@ struct DecodeMainloop {
                                                   lane};
 
         const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
-        const int tiles_per_split = FixedSplits ? p.kv_split_size / Traits::BC
-                                                : (tiles_total + p.num_splits - 1) / p.num_splits;
-        const int ti_begin = split * tiles_per_split;
-        const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
-        if constexpr (FixedSplits) {
-            if (ti_begin >= tiles_total)
-                return false;
-        } else if constexpr (SkipEmptySplits && KV::kPaged) {
-            // Skip empty splits only when a graph reuses much less than its capacity.
-            if (skip_empty_decode_splits(p, seq_len) && split > 0 && ti_begin >= tiles_total)
-                return false;
-        }
+        // A KV tile belongs to the same split across batch shapes and graph capacities.
+        const int chunk = FixedSplits ? p.kv_split_size / Traits::BC : 1;
+        const int first = split * chunk;
+        if (first >= tiles_total)
+            return false;
+        const int stride = FixedSplits ? 1 : MAX_SPLITS;
+        const int ntiles = FixedSplits ? min(chunk, tiles_total - first)
+                                       : 1 + (tiles_total - first - 1) / stride;
+        auto tile_index = [&](int i) { return first + i * stride; };
 
         // Fetch one page per lane ahead of the K/V copies, then share it across columns.
         auto prefetch_tokens = [&](int ti) {
@@ -199,12 +192,11 @@ struct DecodeMainloop {
 
         // Wait for the oldest copy group while newer loads overlap compute.
         constexpr int STAGES = Traits::STAGES;
-        const int ntiles = ti_end - ti_begin;
 
         auto process_tile = [&](int it, int buf) {
             const T* bK = sK + buf * Traits::BC * Traits::LD;
             const T* bV = sV + buf * Traits::BC * Traits::LD;
-            int kv0 = (ti_begin + it) * Traits::BC;
+            int kv0 = tile_index(it) * Traits::BC;
 
             typename Traits::ScoreFragment scores;
             Mma::scores(query, bK, lane, scores);
@@ -217,11 +209,11 @@ struct DecodeMainloop {
         if (ntiles >= STAGES) {
 #pragma unroll
             for (int i = 0; i < STAGES; i++)
-                load_tile(ti_begin + i, i, prefetch_tokens(ti_begin + i));
+                load_tile(tile_index(i), i, prefetch_tokens(tile_index(i)));
 
             for (int it = 0; it < ntiles; it++) {
-                const int next = ti_begin + it + STAGES;
-                const int tokens = next < ti_end ? prefetch_tokens(next) : -1;
+                const int next = it + STAGES;
+                const int tokens = next < ntiles ? prefetch_tokens(tile_index(next)) : -1;
                 if (it + 1 == ntiles)
                     astrai::cp_async_wait_group<0>();
                 else
@@ -230,12 +222,12 @@ struct DecodeMainloop {
                 process_tile(it, it & (STAGES - 1));
                 __syncwarp();
                 if (it + STAGES < ntiles)
-                    load_tile(next, (it + STAGES) & (STAGES - 1), tokens);
+                    load_tile(tile_index(next), (it + STAGES) & (STAGES - 1), tokens);
             }
         } else {
             // Fewer tiles than stages: load all, wait for all, process.
             for (int i = 0; i < ntiles; i++)
-                load_tile(ti_begin + i, i, prefetch_tokens(ti_begin + i));
+                load_tile(tile_index(i), i, prefetch_tokens(tile_index(i)));
             astrai::cp_async_wait_all();
             __syncwarp();
             for (int it = 0; it < ntiles; it++)

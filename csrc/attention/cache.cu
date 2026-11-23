@@ -19,24 +19,29 @@ static SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
     const bool has_ml = ml_part_buf.has_value() && ml_part_buf->defined();
     TORCH_CHECK(has_o == has_ml, "split buffers must be provided together");
     SplitWorkspace workspace;
-    p.split_stride = std::max(MAX_SPLITS, p.num_splits);
+    p.split_stride = p.num_splits;
     const int64_t o_needed = (int64_t)p.batch * p.q_head * p.split_stride * p.head_dim;
     const int64_t ml_needed = (int64_t)p.batch * p.q_head * p.split_stride * 2;
-    // The standard reusable workspace has MAX_SPLITS slots. Longer fixed
-    // contexts use a larger stream-local allocation.
-    if (has_o && p.split_stride == MAX_SPLITS) {
+    if (has_o) {
         for (const auto* buffer_ptr : {&*o_part_buf, &*ml_part_buf}) {
             const auto& buffer = *buffer_ptr;
             TORCH_CHECK(buffer.device() == q.device(), "split buffers must be on Q's device");
             TORCH_CHECK(buffer.scalar_type() == torch::kFloat32 && buffer.is_contiguous(),
                         "split buffers must be contiguous f32 tensors");
         }
-        TORCH_CHECK(o_part_buf->numel() >= o_needed, "o_part_buf too small");
-        TORCH_CHECK(ml_part_buf->numel() >= ml_needed, "ml_part_buf too small");
-        // The optional function arguments already retain these caller buffers.
-        p.o_part = o_part_buf->data_ptr<float>();
-        p.ml_part = ml_part_buf->data_ptr<float>();
-    } else if (!direct_output) {
+        if (o_part_buf->numel() >= o_needed && ml_part_buf->numel() >= ml_needed) {
+            p.o_part = o_part_buf->data_ptr<float>();
+            p.ml_part = ml_part_buf->data_ptr<float>();
+        } else {
+            // Older callers reserve 32 slots per row. Preserve their decode schedule
+            // by allocating the additional scratch when the graph needs more slots.
+            const int64_t rows = (int64_t)p.batch * p.q_head;
+            TORCH_CHECK(p.num_splits > 32 && o_part_buf->numel() >= rows * 32 * p.head_dim &&
+                            ml_part_buf->numel() >= rows * 32 * 2,
+                        "split workspace too small");
+        }
+    }
+    if (!p.o_part && !direct_output) {
         const auto options = q.options().dtype(torch::kFloat32);
         workspace.o_part = torch::empty({p.batch, p.q_head, p.split_stride, p.head_dim}, options);
         workspace.ml_part = torch::empty({p.batch, p.q_head, p.split_stride, 2}, options);

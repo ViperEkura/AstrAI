@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -33,34 +32,9 @@ inline auto with_head_dim(int head_dim, Fn&& fn) {
                              " has no kernel instantiation (instantiated: 32 64 128 256)");
 }
 
-// Fill at most one occupancy wave, with at least two KV tiles per split.
-inline int compute_num_splits(int blocks, int tiles, int wave_capacity) {
-    return std::max(1, std::min({wave_capacity / std::max(blocks, 1), tiles / 2, MAX_SPLITS}));
-}
-
-// Cache occupancy per device and kernel specialization.
-template <auto Kernel, int Threads>
-inline int decode_wave_capacity() {
-    static std::atomic<int> cached[64] = {};
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess)
-        return 1;
-    const bool cacheable = device >= 0 && device < 64;
-    if (cacheable) {
-        const int value = cached[device].load(std::memory_order_relaxed);
-        if (value)
-            return value;
-    }
-    int sms = 0, per_sm = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
-        return 1;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, Kernel, Threads, 0) != cudaSuccess ||
-        per_sm < 1)
-        per_sm = 1;
-    const int capacity = std::max(1, sms * per_sm);
-    if (cacheable)
-        cached[device].store(capacity, std::memory_order_relaxed);
-    return capacity;
+// Graph capture sizes the launch from capacity. Each row uses only its live chunks.
+inline int decode_num_splits(int capacity, int chunk_size) {
+    return capacity > 0 ? std::min(MAX_SPLITS, (capacity - 1) / chunk_size + 1) : 1;
 }
 
 // Resolve runtime flags to compile-time kernel arguments at the launch site.
@@ -125,37 +99,26 @@ inline void launch_attention_split_kv(AttentionParams& p, cudaStream_t stream, A
                 using Traits = KernelTraits<D, 16, 1, 2, typename KV::Elem>;
                 using Output = SplitEpilogue<Traits>;
                 auto kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask>, Output>;
-                auto combine = &split_kv_combine<KV, Traits::BC, false, false>;
+                auto combine = &split_kv_combine<KV, Traits::BC>;
                 const int blocks = p.kv_head * ((p.q_head / p.kv_head + 15) / 16);
                 const int length = KV::host_kv_len(p);
                 const bool fixed = p.kv_split_size != 0;
                 if (fixed) {
                     kernel =
-                        &attention_kernel<DecodeMainloop<Traits, KV, Mask, false, true>, Output>;
-                    combine = &split_kv_combine<KV, Traits::BC, false, true>;
+                        &attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, Output>;
+                    combine = &split_kv_combine<KV, Traits::BC, true>;
                     p.num_splits = length > 0 ? (length - 1) / p.kv_split_size + 1 : 1;
                 } else {
-                    int capacity;
-                    if (KV::kPaged && p.kv_len >= SKIP_EMPTY_SPLITS_MIN_CAPACITY) {
-                        kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, Output>;
-                        combine = &split_kv_combine<KV, Traits::BC, true, false>;
-                        capacity = decode_wave_capacity<
-                            attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, Output>,
-                            Traits::NUM_THREADS>();
-                    } else {
-                        capacity = decode_wave_capacity<
-                            attention_kernel<DecodeMainloop<Traits, KV, Mask>, Output>,
-                            Traits::NUM_THREADS>();
-                    }
-                    p.num_splits =
-                        compute_num_splits(p.batch * blocks, (length + 15) / 16, capacity);
+                    p.num_splits = decode_num_splits(length, Traits::BC);
                 }
                 const bool direct = p.num_splits == 1 && (fixed || D <= 128);
                 auto workspace = allocate(direct);
-                const dim3 grid(blocks, p.batch, p.num_splits);
+                const dim3 grid(blocks, p.num_splits, p.batch);
                 if (direct) {
-                    attention_kernel<DecodeMainloop<Traits, KV, Mask>, OutputEpilogue<Traits>>
-                        <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
+                    auto direct_kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask>, OutputEpilogue<Traits>>;
+                    if (fixed)
+                        direct_kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, OutputEpilogue<Traits>>;
+                    direct_kernel<<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
                 } else {
                     kernel<<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
                     ASTRAI_LAUNCH_CHECK();

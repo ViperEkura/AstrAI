@@ -119,16 +119,15 @@ launcher selects fixed/adaptive splitting and direct/combined output itself.
 Head dimension, causality, mask coverage and aligned loads retain their existing
 specializations.
 
-Decode computes its split count from the current cache capacity and cached
-kernel occupancy. The only allocation callback belongs to the native caller:
-it validates reusable scratch or creates tensors after the split count is
-known, returning owners held through launch. It does not select or launch
-kernels. Caller scratch is validated even for direct output. This keeps Torch
-allocation outside the launcher without reserving unnecessary buffers.
+In ordinary decode, split `s` processes 16-token KV tiles numbered
+`s, s + 64, s + 128, ...` within each request. Page-table capacity bounds the
+launch grid. On replay, the live sequence length determines which splits have
+work. The tile assignment and reduction order are independent of batch size,
+batch slot and graph capacity. Rollout's fixed-size splits remain contiguous.
 
-CUDA Graph replay continues to read device sequence lengths and page tables
-at stable addresses. Tile shapes, split limits and the occupancy reference
-are unchanged; no device synchronization or extra metadata kernel is added.
+The standard workspace reserves 64 partial results per query head and batch
+row. The native caller validates reusable buffers and allocates scratch when
+a legacy 32-slot buffer cannot hold all the partials for the launch.
 
 Paged decode selects aligned or unaligned new-token loads from host pointer
 and stride metadata. The aligned kernel copies new K/V fragments in 16-byte

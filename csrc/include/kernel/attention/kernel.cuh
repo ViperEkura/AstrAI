@@ -8,15 +8,6 @@
 
 namespace astrai::attention {
 
-// Keep the extra split bookkeeping on large graph capacities only. The device
-// skips partials when the replayed request uses under one eighth of the table.
-constexpr int SKIP_EMPTY_SPLITS_MIN_CAPACITY = 8192;
-constexpr int SKIP_EMPTY_SPLITS_CAPACITY_RATIO = 8;
-
-DEVICE_FORCEINLINE bool skip_empty_decode_splits(const AttentionParams& p, int seq_len) {
-    return seq_len < p.kv_len / SKIP_EMPTY_SPLITS_CAPACITY_RATIO;
-}
-
 // Each lane holds two rows of an m16n8 accumulator. Coordinates are local to the request.
 struct QueryRows {
     struct Row {

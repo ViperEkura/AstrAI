@@ -18,18 +18,13 @@ using bf16 = astrai::bf16;
 // Exercise split policy boundaries without launching a kernel.
 static int run_split_tests() {
     struct Case {
-        int blocks, tiles, capacity, splits;
+        int capacity, splits;
     };
-    const Case cases[] = {
-        {1, 0, 128, 1},     {1, 3, 128, 1},    {1, 4, 128, 2},     {1, 65, 1024, MAX_SPLITS},
-        {256, 256, 128, 1}, {8, 256, 128, 16}, {12, 256, 128, 10}, {4, 256, 7, 1},
-        {4, 256, 8, 2},
-    };
+    const Case cases[] = {{1, 1}, {16, 1}, {17, 2}, {1023, 64}, {1024, 64}, {16384, 64}};
     int fail = 0;
     for (const auto& c : cases) {
-        if (compute_num_splits(c.blocks, c.tiles, c.capacity) != c.splits) {
-            printf("FAILED split policy: blocks=%d tiles=%d capacity=%d\n", c.blocks, c.tiles,
-                   c.capacity);
+        if (decode_num_splits(c.capacity, 16) != c.splits) {
+            printf("FAILED split policy: capacity=%d\n", c.capacity);
             ++fail;
         }
     }
@@ -58,7 +53,7 @@ struct DecodeScratch {
 };
 
 static void setup_scratch(AttentionParams& p, DecodeScratch& sc) {
-    int max_splits = 32;
+    int max_splits = MAX_SPLITS;
     cudaMalloc(&sc.o_part, (size_t)p.batch * p.q_head * max_splits * p.head_dim * sizeof(float));
     cudaMalloc(&sc.ml_part, (size_t)p.batch * p.q_head * max_splits * 2 * sizeof(float));
 }

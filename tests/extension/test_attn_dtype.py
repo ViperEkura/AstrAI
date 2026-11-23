@@ -309,12 +309,13 @@ def test_paged_decode_graph_replays_split_append(dtype, dim, width):
 @skip_no_kernel
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
+@pytest.mark.parametrize("scratch_splits", [32, 64])
+def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim, scratch_splits):
     torch.manual_seed(26)
-    batch, heads, kv_heads, width = 2, 6, 2, 8192
+    batch, heads, kv_heads, width = 2, 6, 2, 16384
     # Appending one token requires final length >= 1; length 1 tests an empty
     # history. Fully masked rows below still exercise zero-output split merging.
-    length_cases = ((8191, 1), (17, 33), (1, 513), (1, 2048))
+    length_cases = ((width - 1, 1), (17, 33), (1, 513), (1, 2048))
     q = torch.randn(batch, heads, dim, device="cuda", dtype=dtype)
     k_cache = torch.randn(batch * width, kv_heads, dim, device="cuda", dtype=q.dtype)
     v_cache = torch.randn_like(k_cache)
@@ -328,8 +329,12 @@ def test_paged_decode_large_graph_reuses_shorter_lengths(dtype, dim):
     mask = torch.ones(batch, heads, 1, width, device="cuda", dtype=torch.bool)
     mask[..., 3::7] = False
     mask[0, 0] = False
-    scratch = torch.empty(batch, heads, 32, dim, device="cuda", dtype=torch.float32)
-    ml = torch.empty(batch, heads, 32, 2, device="cuda", dtype=torch.float32)
+    scratch = torch.empty(
+        batch, heads, scratch_splits, dim, device="cuda", dtype=torch.float32
+    )
+    ml = torch.empty(
+        batch, heads, scratch_splits, 2, device="cuda", dtype=torch.float32
+    )
     output = torch.empty_like(q)
 
     def call():

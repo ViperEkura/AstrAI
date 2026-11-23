@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from astrai.extension import attention, op_backend
-from astrai.extension.runtime.loader import is_available
+from astrai.extension.runtime.loader import get_module, is_available
 
 
 @pytest.mark.parametrize("regular", [False, True])
@@ -127,3 +127,48 @@ def test_invalid_cache_shape_is_rejected_before_write(device, zero_heads):
             )
     torch.testing.assert_close(kc, before[0])
     torch.testing.assert_close(vc, before[1])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_decode_bitwise_across_graphs(dtype):
+    if not is_available("attention") or not torch.cuda.is_available():
+        pytest.skip("native CUDA attention required")
+
+    torch.manual_seed(91)
+    device = "cuda"
+    page_size, heads, kv_heads, dim = 16, 16, 4, 128
+    lengths = (1, 64, 65, 2048, 4096, 4097, 8193, 16384)
+    pages = max(lengths) // page_size
+    k_cache = torch.randn(
+        pages + 3, page_size, kv_heads, dim, device=device, dtype=dtype
+    )
+    v_cache = torch.randn_like(k_cache)
+    table = torch.randperm(pages, device=device, dtype=torch.int32)
+    q = torch.randn(1, heads, dim, device=device, dtype=dtype)
+    k_new = torch.randn(1, kv_heads, dim, device=device, dtype=dtype)
+    v_new = torch.randn_like(k_new)
+    native = get_module("attention").attention_with_kvcache
+    expected = {}
+    # A graph per request capacity, followed by a larger graph with the same row
+    # in a different batch slot. Other rows write a separate physical page.
+    for batch, width, replay_lengths in [
+        (1, (length + page_size - 1) // page_size, [length]) for length in lengths
+    ] + [(1, pages, lengths), (4, pages, lengths)]:
+        tables = torch.full((batch, width), pages, device=device, dtype=torch.int32)
+        tables[:-1, 0] += torch.arange(batch - 1, device=device, dtype=torch.int32)
+        tables[-1].copy_(table[:width])
+        past = torch.zeros(batch, device=device, dtype=torch.int32)
+        qs, ks, vs = [t.repeat(batch, 1, 1) for t in (q, k_new, v_new)]
+        args = (qs, k_cache, v_cache, ks, vs, past, tables)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = native(*args)
+        for length in replay_lengths:
+            past[-1] = length - 1
+            graph.replay()
+            value = out[-1].view(torch.int16).clone()
+            if length in expected:
+                assert torch.equal(value, expected[length])
+            else:
+                expected[length] = value

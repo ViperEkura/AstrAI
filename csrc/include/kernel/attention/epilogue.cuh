@@ -47,7 +47,7 @@ struct SplitEpilogue {
                 continue;
             const int head = tile.query.row[row].head;
             const size_t slot =
-                (size_t(tile.query.batch) * p.q_head + head) * p.split_stride + blockIdx.z;
+                (size_t(tile.query.batch) * p.q_head + head) * p.split_stride + blockIdx.y;
             float* output = p.o_part + slot * Traits::HEAD_DIM;
 #pragma unroll
             for (int i = 0; i < Traits::DN8; ++i) {
@@ -66,7 +66,7 @@ struct SplitEpilogue {
  * Split-combine: merges the per-split partials (o_part/ml_part) into the
  * final normalised O (KV selects the O addressing and element type).
  */
-template <typename KV, int TileK, bool SkipEmptySplits = false, bool FixedSplits = false>
+template <typename KV, int TileK, bool FixedSplits = false>
 __global__ void split_kv_combine(const AttentionParams p) {
     using T = typename KV::Elem;
 
@@ -97,16 +97,8 @@ __global__ void split_kv_combine(const AttentionParams p) {
         static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv);
         return;
     }
-    int active_splits = p.num_splits;
-    if constexpr (SkipEmptySplits && KV::kPaged) {
-        const int seq_len = KV::kv_len(p, batch);
-        if (skip_empty_decode_splits(p, seq_len)) {
-            const int tiles_total = (seq_len + TileK - 1) / TileK;
-            const int tiles_per_split = (tiles_total + p.num_splits - 1) / p.num_splits;
-            active_splits =
-                tiles_per_split ? (tiles_total + tiles_per_split - 1) / tiles_per_split : 1;
-        }
-    }
+    const int length = KV::kv_len(p, batch);
+    const int active_splits = min(MAX_SPLITS, (length - 1) / TileK + 1);
 
     // Avoid warp reductions when merging only one or two splits.
     if (active_splits <= 2) {
@@ -134,19 +126,26 @@ __global__ void split_kv_combine(const AttentionParams p) {
     const bool valid = lane < active_splits;
     const float mi = valid ? mlp[lane * 2] : -FLT_MAX;
     const float li = valid ? mlp[lane * 2 + 1] : 0.0f;
-    float max_m = mi;
+    const int upper = lane + 32;
+    const float mj = upper < active_splits ? mlp[upper * 2] : -FLT_MAX;
+    float max_m = fmaxf(mi, mj);
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
         max_m = fmaxf(max_m, __shfl_xor_sync(0xFFFFFFFF, max_m, offset));
     const float weight = mi > -FLT_MAX ? exp2f(mi * scale_log2 - max_m * scale_log2) : 0.0f;
+    const float upper_weight = mj > -FLT_MAX ? exp2f((mj - max_m) * scale_log2) : 0.0f;
     float sum_l = li * weight;
+    if (upper < active_splits)
+        sum_l += mlp[upper * 2 + 1] * upper_weight;
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2)
         sum_l += __shfl_xor_sync(0xFFFFFFFF, sum_l, offset);
     const float inv_sum = sum_l > 1e-20f ? 1.0f / sum_l : 0.0f;
     float acc = 0.0f;
-    for (int s = 0; s < active_splits; s++)
+    for (int s = 0; s < min(active_splits, 32); s++)
         acc = fmaf(op[s * p.head_dim + d], __shfl_sync(0xFFFFFFFF, weight, s), acc);
+    for (int s = 32; s < active_splits; ++s)
+        acc = fmaf(op[s * p.head_dim + d], __shfl_sync(0xFFFFFFFF, upper_weight, s - 32), acc);
     const int o_off = KV::q_base(p, batch, q_head) + d;
     static_cast<T*>(p.o_ptr)[o_off] = ElemTrait<T>::from_float(acc * inv_sum);
 }

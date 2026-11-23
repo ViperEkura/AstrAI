@@ -100,13 +100,13 @@ class InferenceConfig(BaseConfig):
     Centralizes magic constants previously scattered across inference modules.
 
     Args:
-        max_splits (int): Maximum number of splits for split-KV attention (decode partial results). Defaults to 32.
+        max_splits (int): Maximum number of splits for split-KV attention (decode partial results). Defaults to 64.
         default_rep_window (int): Default repetition penalty window size for frequency penalty. Defaults to 64.
         max_recent_tasks (int): Maximum number of recent tasks tracked for aggregate statistics. Defaults to 128.
         max_num_batched_tokens (int): Prefill token budget per scheduler step; 0 disables chunking (whole-prompt prefills). Defaults to 0.
     """
 
-    max_splits: int = 32
+    max_splits: int = 64
     default_rep_window: int = 64
     max_recent_tasks: int = 128
     max_num_batched_tokens: int = 0

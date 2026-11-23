@@ -10,7 +10,7 @@ from torch import Tensor
 from astrai.extension.backend.attention import cuda, flash
 from astrai.extension.backend.attention import torch as native
 from astrai.extension.backend.attention.common import AttentionSpec
-from astrai.extension.kernel.attention_validation import cache_layout
+from astrai.extension.kernel.attention import _validate_cache_layout
 from astrai.extension.runtime.operation import ExplicitSelectionError, OpDispatcher
 
 
@@ -128,7 +128,7 @@ def attention_with_kvcache(
     is_causal: bool = False,
 ) -> Tensor:
     """Append at each request's past length and return the attended queries."""
-    cache_layout(q, cu_seqlens_q)
+    _validate_cache_layout(q, cu_seqlens_q)
     selected = _attention_dispatcher.dispatch(
         q, k_new, v_new, None, is_causal, mode="cache"
     )

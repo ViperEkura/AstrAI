@@ -22,7 +22,7 @@ in this layer. CUDA, Torch and Flash modules implement the selected calls.
 The three stateless `kernel/attention.py` wrappers alone translate arguments
 to the compiled ABI. They do not select backends or retain cache state.
 CUDA validates tensors while packing native arguments. Torch/Flash use
-`kernel/attention_validation.py` for their contracts and reference metadata;
+`kernel/attention.py` for their contracts and reference metadata;
 the dispatcher does not repeat shape, dtype or offset validation. Backend
 capability checks only decide which implementation can execute a call.
 The public cache layout rule is also defined in that kernel contract module.

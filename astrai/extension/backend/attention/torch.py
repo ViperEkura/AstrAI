@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from astrai.extension.backend.attention.common import repeat_kv
-from astrai.extension.kernel import attention_validation as contract
-from astrai.extension.kernel.attention_validation import mask_view as _mask_view
+from astrai.extension.kernel import attention as kernel
+from astrai.extension.kernel.attention import _mask_view
 
 
 def _causal_mask(q_len: int, kv_len: int, device: torch.device) -> Tensor:
@@ -49,7 +49,7 @@ def forward(
     *,
     scale: Optional[float] = None,
 ) -> Tensor:
-    contract.dense(q, k, v, scale)
+    kernel._validate_dense(q, k, v, scale)
     n_rep = q.size(2) // k.size(2)
     k, v = repeat_kv(k, n_rep), repeat_kv(v, n_rep)
     mask = _mask_view(attn_mask)
@@ -73,8 +73,8 @@ def forward(
 
 
 def forward_varlen(q, k, v, qs, ks, is_causal, scale):
-    qs, ks, scale = contract.varlen(q, k, v, qs, ks, scale)
-    qoffs, koffs = contract.segment_offsets(q, k, qs, ks)
+    qs, ks, scale = kernel._prepare_varlen(q, k, v, qs, ks, scale)
+    qoffs, koffs = kernel._segment_offsets(q, k, qs, ks)
     result = []
     for i in range(len(qoffs) - 1):
         qr = q[qoffs[i] : qoffs[i + 1]]
@@ -110,8 +110,8 @@ def forward_cache(
     *,
     dense=forward,
 ):
-    q, k, v, qs, original = contract.cache(q, kc, vc, k, v, past, pages, qs)
-    offsets, lengths, slots, mask = contract.cache_slots(q, kc, past, pages, qs, mask)
+    q, k, v, qs, original = kernel._prepare_cache(q, kc, vc, k, v, past, pages, qs)
+    offsets, lengths, slots, mask = kernel._cache_slots(q, kc, past, pages, qs, mask)
     keys = kc.view(-1, *kc.shape[-2:])
     values = vc.view_as(keys)
     output = []

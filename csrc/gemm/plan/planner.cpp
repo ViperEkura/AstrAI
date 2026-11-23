@@ -131,68 +131,9 @@ row_plan(const PlanQuery& q, std::optional<TableRow> row, const char* source) {
         *recipe, row->raster != 0 ? row->raster : plan_raster(q, recipe->bm, recipe->bn), source};
 }
 
-// RTX 5090 fitted mainloop and MMA costs in equivalent bytes, not TMA instruction counts.
-constexpr std::int64_t kMainloopBytesPerCellTile = 8;
-constexpr std::int64_t kMmaArmBytesPerInstr = 64;
-
-int resident_of(const GemmRecipe& r, const PlanQuery& q) {
-    return plan_resident_ctas(static_cast<TileClass>(r.cta), r.k_stages, r.k_tile, q);
-}
-
-// TMA overlaps copy and compute; cp.async hides copy latency through residency.
-// Resident-scaled waves apply only to two-byte pairs.
-std::int64_t cost_of(const GemmRecipe& r, const PlanQuery& q, int resident) {
-    const std::int64_t blocks = q.batch * ((std::int64_t)((q.m + r.bm - 1) / r.bm) *
-                                           (std::int64_t)((q.n + r.bn - 1) / r.bn));
-    if (!q.tma) {
-        // Price complete K tiles and divide waves by resident CTA capacity.
-        const std::int64_t operand = ((q.k + r.k_tile - 1) / r.k_tile) * (std::int64_t)r.k_tile *
-                                     (r.bm * q.ba + r.bn * q.bb);
-        const std::int64_t mu = q.dev.smem_per_sm / r.smem;
-        const std::int64_t slots = (std::int64_t)q.dev.sms * mu;
-        const std::int64_t waves = slots > 0 ? (blocks + slots - 1) / slots : 1;
-        return (operand + (std::int64_t)q.out_elem_bytes * r.bm * r.bn) * waves;
-    }
-    const bool byte_pair = q.ba == 1 && q.bb == 1;
-    const std::int64_t operand = (std::int64_t)q.k * (r.bm * q.ba + r.bn * q.bb);
-    const std::int64_t output = (std::int64_t)q.out_elem_bytes * r.bm * r.bn;
-    const std::int64_t k_tiles = (q.k + r.k_tile - 1) / r.k_tile;
-    const std::int64_t loop_penalty =
-        byte_pair ? 0 : kMainloopBytesPerCellTile * (std::int64_t)r.bm * r.bn * k_tiles;
-    const std::int64_t mma_instructions = k_tiles * (r.k_tile / q.mma_k) * (r.bm / 16) * (r.bn / 8);
-    const std::int64_t mma_arm = kMmaArmBytesPerInstr * mma_instructions;
-    const std::int64_t per_cta = std::max(operand + output + loop_penalty, mma_arm);
-    const std::int64_t slots = (std::int64_t)q.dev.sms * resident;
-    const std::int64_t waves = slots > 0 ? (blocks + slots - 1) / slots : 1;
-    const std::int64_t w_eff =
-        q.ba == 2 && q.bb == 2 ? waves * resident : (blocks + q.dev.sms - 1) / q.dev.sms;
-    return per_cta * w_eff;
-}
-
-// For otherwise identical crosswise recipes the traffic model ties pipeline
-// depths. With at most one CTA per SM, a deeper ring cannot displace another
-// active CTA. Short reductions do not amortize its prologue.
-bool prefer_deeper_prefetch(const GemmRecipe& candidate,
-                            const GemmRecipe& current,
-                            const PlanQuery& q) {
-    constexpr int kMinPrefetchTiles = 16;
-    if (q.crosswise == 0 || q.perf_class != (int)GemmPerfClass::kW16A16 || q.batch != 1 ||
-        candidate.cta != current.cta || candidate.k_tile != current.k_tile ||
-        candidate.k_stages <= current.k_stages || q.k < kMinPrefetchTiles * candidate.k_tile)
-        return false;
-    // Two crosswise operands with a partial BF16 copy vector on either axis
-    // showed no consistent benefit from the extra stage.
-    constexpr int kVectorElements = 16 / sizeof(uint16_t);
-    if (q.crosswise == 2 && (q.m % kVectorElements || q.n % kVectorElements))
-        return false;
-    const int64_t m_tiles = (q.m + candidate.bm - 1) / candidate.bm;
-    const int64_t n_tiles = (q.n + candidate.bn - 1) / candidate.bn;
-    return m_tiles * n_tiles <= q.dev.sms;
-}
-
-// geom_cta: rank five work proxies in log space. Smaller is better.
-// This is a heuristic ordering, not a prediction of execution time.
-double heuristic_cost(const GemmRecipe& named, const PlanQuery& q, int fallback_resident) {
+// Geometry scoring uses the resolved kernel's tile and occupancy.
+KernelResources
+geometry_resources(const GemmRecipe& named, const PlanQuery& q, int fallback_resident) {
     KernelResources resource{};
     if (q.resources) {
         resource = q.resources(named, q);
@@ -205,13 +146,7 @@ double heuristic_cost(const GemmRecipe& named, const PlanQuery& q, int fallback_
             resource.effective.threads = 512;
         }
     }
-    if (resource.resident <= 0)
-        return std::numeric_limits<double>::infinity();
-    const auto& r = resource.effective;
-    auto ceil_div = [](int64_t n, int d) { return n / d + (n % d != 0); };
-    const double blocks =
-        (double)q.batch * (double)ceil_div(q.m, r.bm) * (double)ceil_div(q.n, r.bn);
-    return geometry_cost(r, q, resource.resident, blocks, (double)q.out_elem_bytes * r.bm * r.bn);
+    return resource;
 }
 
 bool same_model_query(const PlanQuery& a, const PlanQuery& b) {
@@ -247,26 +182,38 @@ std::optional<PlanDecision> model_plan(const PlanQuery& q, bool heuristic = fals
             return entry.decision;
     std::optional<GemmRecipe> best;
     std::optional<GemmRecipe> short_k_best;
-    double best_cost = 0;
+    RecipeCost best_cost;
+    const auto model = heuristic ? CostModel::kGeometry : CostModel::kTraffic;
     double short_k_cost = 0;
     int shallow_k_stages = std::numeric_limits<int>::max();
     with_manifest(q.crosswise > 0, q.ba, q.bb, [&](auto manifest) {
         for_each_recipe<decltype(manifest)>(q.ba, q.bb, [&](GemmRecipe recipe) {
-            const int resident = resident_of(recipe, q);
+            const int resident = plan_resident_ctas(static_cast<TileClass>(recipe.cta),
+                                                    recipe.k_stages, recipe.k_tile, q);
             if (resident <= 0)
                 return;
             if (recipe.k_tile == 64)
                 shallow_k_stages = std::min(shallow_k_stages, recipe.k_stages);
-            const double cost = heuristic ? heuristic_cost(recipe, q, resident)
-                                          : (double)cost_of(recipe, q, resident);
-            if (!std::isfinite(cost))
+            const auto resource = heuristic ? geometry_resources(recipe, q, resident)
+                                            : KernelResources{recipe, resident};
+            if (resource.resident <= 0)
                 return;
-            if (!heuristic && recipe.k_tile == 32 && (!short_k_best || cost < short_k_cost)) {
+            const auto& tile = resource.effective;
+            const double blocks = static_cast<double>(q.batch) * ((q.m + tile.bm - 1) / tile.bm) *
+                                  ((q.n + tile.bn - 1) / tile.bn);
+            const RecipeCost cost =
+                recipe_cost(model, tile, q, resource.resident, blocks,
+                            static_cast<double>(q.out_elem_bytes) * tile.bm * tile.bn);
+            if (!std::isfinite(cost.work))
+                return;
+            if (!heuristic && recipe.k_tile == 32 && (!short_k_best || cost.work < short_k_cost)) {
                 short_k_best = recipe;
-                short_k_cost = cost;
+                short_k_cost = cost.work;
             }
-            if (!best || cost < best_cost ||
-                (!heuristic && cost == best_cost && prefer_deeper_prefetch(recipe, *best, q))) {
+            if (!best || cost.work < best_cost.work ||
+                (cost.work == best_cost.work && recipe.cta == best->cta &&
+                 recipe.k_tile == best->k_tile &&
+                 cost.prefetch_stages > best_cost.prefetch_stages)) {
                 best = recipe;
                 best_cost = cost;
             }

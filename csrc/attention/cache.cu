@@ -19,27 +19,34 @@ static SplitWorkspace resolve_split_buffers(const c10::optional<torch::Tensor>& 
     const bool has_ml = ml_part_buf.has_value() && ml_part_buf->defined();
     TORCH_CHECK(has_o == has_ml, "split buffers must be provided together");
     SplitWorkspace workspace;
-    p.split_stride = std::max(MAX_SPLITS, p.num_splits);
-    const int64_t o_needed = (int64_t)p.batch * p.q_head * p.split_stride * p.head_dim;
-    const int64_t ml_needed = (int64_t)p.batch * p.q_head * p.split_stride * 2;
-    // The standard reusable workspace has MAX_SPLITS slots. Longer fixed
-    // contexts use a larger stream-local allocation.
-    if (has_o && p.split_stride == MAX_SPLITS) {
+    p.split_stride = p.num_splits;
+    const int64_t rows = q.size(0) * p.q_head;
+    const int64_t o_needed = rows * p.split_stride * p.head_dim;
+    const int64_t ml_needed = rows * p.split_stride * 2;
+    if (has_o) {
         for (const auto* buffer_ptr : {&*o_part_buf, &*ml_part_buf}) {
             const auto& buffer = *buffer_ptr;
             TORCH_CHECK(buffer.device() == q.device(), "split buffers must be on Q's device");
             TORCH_CHECK(buffer.scalar_type() == torch::kFloat32 && buffer.is_contiguous(),
                         "split buffers must be contiguous f32 tensors");
         }
-        TORCH_CHECK(o_part_buf->numel() >= o_needed, "o_part_buf too small");
-        TORCH_CHECK(ml_part_buf->numel() >= ml_needed, "ml_part_buf too small");
-        // The optional function arguments already retain these caller buffers.
-        p.o_part = o_part_buf->data_ptr<float>();
-        p.ml_part = ml_part_buf->data_ptr<float>();
-    } else if (!direct_output) {
+        if (o_part_buf->numel() >= o_needed && ml_part_buf->numel() >= ml_needed) {
+            p.o_part = o_part_buf->data_ptr<float>();
+            p.ml_part = ml_part_buf->data_ptr<float>();
+        } else {
+            // Older callers reserve 32 slots per row. Preserve their decode schedule
+            // by allocating the additional scratch when the graph needs more slots.
+            const int64_t decode_rows = int64_t(p.batch) * p.q_head;
+            TORCH_CHECK((p.q_len > 1 || p.num_splits > 32) &&
+                            o_part_buf->numel() >= decode_rows * 32 * p.head_dim &&
+                            ml_part_buf->numel() >= decode_rows * 32 * 2,
+                        "split workspace too small");
+        }
+    }
+    if (!p.o_part && !direct_output) {
         const auto options = q.options().dtype(torch::kFloat32);
-        workspace.o_part = torch::empty({p.batch, p.q_head, p.split_stride, p.head_dim}, options);
-        workspace.ml_part = torch::empty({p.batch, p.q_head, p.split_stride, 2}, options);
+        workspace.o_part = torch::empty({rows, p.split_stride, p.head_dim}, options);
+        workspace.ml_part = torch::empty({rows, p.split_stride, 2}, options);
     }
     if (workspace.o_part.defined()) {
         p.o_part = workspace.o_part.data_ptr<float>();
@@ -74,7 +81,8 @@ torch::Tensor attention_with_kvcache(torch::Tensor q,
                         k.dim() == 4 && v.dim() == 4 && k.sizes() == v.sizes() &&
                         k.sizes().slice(0, 2) == q.sizes().slice(0, 2),
                     "regular cache attention expects matching BSHD inputs");
-        if (q.size(1) > 1)
+        // CUDA grid.z holds the request index for regular multi-query tiles.
+        if (q.size(1) > 1 && q.size(0) > 65535)
             qs = torch::arange(q.size(0) + 1, q.options().dtype(torch::kInt32)) * q.size(1);
         q = q.flatten(0, 1);
         k = k.flatten(0, 1);
@@ -125,16 +133,22 @@ torch::Tensor attention_with_kvcache(torch::Tensor q,
     p.q_h_stride = static_cast<int>(q.stride(1));
     p.new_kv_token_stride = static_cast<int>(k.stride(0));
     p.new_kv_h_stride = static_cast<int>(k.stride(1));
-    p.q_len = qs ? static_cast<int>(q.size(0)) : 1;
+    const int regular_q_len = shape.size() == 4 ? static_cast<int>(shape[1]) : 1;
+    p.q_len = qs || regular_q_len > 1 ? static_cast<int>(q.size(0)) : 1;
     p.is_causal = causal;
     if (qs) {
         TORCH_CHECK(qs->device() == q.device() && qs->scalar_type() == torch::kInt32 &&
                         qs->is_contiguous() && qs->dim() == 1 && qs->numel() == p.batch + 1,
                     "invalid query offsets");
         p.cu_seqlens_q = qs->data_ptr<int>();
-    } else
+    } else if (regular_q_len == 1)
         TORCH_CHECK(q.size(0) == p.batch, "decode requires one token per request");
     pack_mask(mask, p, q.device(), true);
+    if (!qs) {
+        p.q_len = regular_q_len;
+        if (p.batch > 1)
+            p.q_b_stride = static_cast<int>(regular_q_len * q.stride(0));
+    }
     finish_pack(c10::nullopt, p);
     set_kv_split_size(p, split);
     torch::Tensor out;

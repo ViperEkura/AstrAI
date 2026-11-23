@@ -20,7 +20,8 @@ template <typename Tile,
           bool IsCausal,
           bool HasMask,
           bool MaskCoversShape = false,
-          bool FixedSplits = false>
+          bool FixedSplits = false,
+          bool SplitKV = false>
 struct PrefillMainloop {
     using Traits = Tile;
     static DEVICE_FORCEINLINE bool
@@ -33,14 +34,24 @@ struct PrefillMainloop {
         const int lane = threadIdx.x % 32;
         constexpr int BLOCK_M = Traits::BR * Traits::WARPS; // packed rows per block
 
-        const int G = p.q_head / p.kv_head;
-        const int kv_head = blockIdx.y;
+        const int group = p.q_head / p.kv_head;
+        const int G = SplitKV ? 1 : group;
+        const bool flat_z = int64_t(p.batch) * p.q_head <= 65535;
+        const int head =
+            SplitKV ? (flat_z ? blockIdx.z % p.q_head : blockIdx.x % p.q_head) : blockIdx.y;
+        const int kv_head = SplitKV ? head / group : head;
         // Fold scale * log2(e) into the softmax exponent.
         const float scale_log2 = p.scale * LOG2E;
 
         const int q_block = QSchedule::template order_work<IsCausal>(p, blockIdx.x, gridDim.x);
         int batch, packed0;
-        QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
+        if constexpr (SplitKV) {
+            batch = flat_z ? blockIdx.z / p.q_head : blockIdx.z;
+            const int q_tile = flat_z ? blockIdx.x : blockIdx.x / p.q_head;
+            packed0 = q_tile * BLOCK_M;
+        } else {
+            QSchedule::map_packed_block(p, BLOCK_M, q_block, batch, packed0);
+        }
 
         // The storage and query policies supply request-local lengths.
         const int seq_len = KV::kv_len(p, batch);
@@ -52,7 +63,7 @@ struct PrefillMainloop {
         }
         const int warp_begin = packed0 + warp * Traits::BR;
         tile.query =
-            QueryRows::prefill<Layout, QSchedule>(p, batch, warp_begin, kv_head, G, q_len, lane);
+            QueryRows::prefill<Layout, QSchedule>(p, batch, warp_begin, head, G, q_len, lane);
         typename Traits::QueryFragment query;
         Mma::load_query(p, tile.query, lane, query);
 
@@ -114,7 +125,16 @@ struct PrefillMainloop {
                 return true;
             }
         }
-        run_tiles(0, tiles, tile.accum);
+        if constexpr (SplitKV) {
+            const auto part = KVPartition::from(p, seq_len);
+            if (blockIdx.y >= part.count)
+                return false;
+            const int width = part.template tile_width<Traits::BC>(p);
+            const int first = blockIdx.y * width;
+            run_tiles(first, first + min(width, max(0, tiles - first)), tile.accum);
+        } else {
+            run_tiles(0, tiles, tile.accum);
+        }
         if constexpr (!FixedSplits)
             tile.accum.finish_sum();
         return true;
@@ -122,11 +142,7 @@ struct PrefillMainloop {
 };
 
 // Each decode CTA processes a KV split for up to one MMA tile of query heads.
-template <typename Tile,
-          typename KV,
-          bool HasMask,
-          bool SkipEmptySplits = false,
-          bool FixedSplits = false>
+template <typename Tile, typename KV, bool HasMask, bool FixedSplits = false>
 struct DecodeMainloop {
     using Traits = Tile;
     static DEVICE_FORCEINLINE bool
@@ -136,10 +152,12 @@ struct DecodeMainloop {
         using Layout = typename Traits::FragmentLayout;
 
         const int lane = threadIdx.x;
-        const int pass = blockIdx.x / p.kv_head;
-        const int kv_head = blockIdx.x % p.kv_head;
-        const int batch = blockIdx.y;
-        const int split = blockIdx.z;
+        // Large batches use the legacy axis packing to fit the CUDA grid.z limit.
+        const bool flat_z = int64_t(p.batch) * p.kv_head <= 65535;
+        const int pass = flat_z ? blockIdx.x : blockIdx.x / p.kv_head;
+        const int kv_head = flat_z ? blockIdx.z % p.kv_head : blockIdx.x % p.kv_head;
+        const int batch = flat_z ? blockIdx.z / p.kv_head : blockIdx.z;
+        const int split = blockIdx.y;
 
         constexpr int MAX_G = Traits::BR;
         const int G_total = p.q_head / p.kv_head;
@@ -166,18 +184,20 @@ struct DecodeMainloop {
                                                   lane};
 
         const int tiles_total = (seq_len + Traits::BC - 1) / Traits::BC;
-        const int tiles_per_split = FixedSplits ? p.kv_split_size / Traits::BC
-                                                : (tiles_total + p.num_splits - 1) / p.num_splits;
-        const int ti_begin = split * tiles_per_split;
-        const int ti_end = min(tiles_total, ti_begin + tiles_per_split);
+        int chunk;
         if constexpr (FixedSplits) {
-            if (ti_begin >= tiles_total)
+            chunk = p.kv_split_size / Traits::BC;
+        } else {
+            const auto part = KVPartition::from(p, seq_len);
+            if (split >= part.count)
                 return false;
-        } else if constexpr (SkipEmptySplits && KV::kPaged) {
-            // Skip empty splits only when a graph reuses much less than its capacity.
-            if (skip_empty_decode_splits(p, seq_len) && split > 0 && ti_begin >= tiles_total)
-                return false;
+            chunk = part.template tile_width<Traits::BC>(p);
         }
+        const int first = split * chunk;
+        if (first >= tiles_total)
+            return false;
+        const int ntiles = min(chunk, tiles_total - first);
+        auto tile_index = [&](int i) { return first + i; };
 
         // Fetch one page per lane ahead of the K/V copies, then share it across columns.
         auto prefetch_tokens = [&](int ti) {
@@ -199,12 +219,11 @@ struct DecodeMainloop {
 
         // Wait for the oldest copy group while newer loads overlap compute.
         constexpr int STAGES = Traits::STAGES;
-        const int ntiles = ti_end - ti_begin;
 
         auto process_tile = [&](int it, int buf) {
             const T* bK = sK + buf * Traits::BC * Traits::LD;
             const T* bV = sV + buf * Traits::BC * Traits::LD;
-            int kv0 = (ti_begin + it) * Traits::BC;
+            int kv0 = tile_index(it) * Traits::BC;
 
             typename Traits::ScoreFragment scores;
             Mma::scores(query, bK, lane, scores);
@@ -217,11 +236,11 @@ struct DecodeMainloop {
         if (ntiles >= STAGES) {
 #pragma unroll
             for (int i = 0; i < STAGES; i++)
-                load_tile(ti_begin + i, i, prefetch_tokens(ti_begin + i));
+                load_tile(tile_index(i), i, prefetch_tokens(tile_index(i)));
 
             for (int it = 0; it < ntiles; it++) {
-                const int next = ti_begin + it + STAGES;
-                const int tokens = next < ti_end ? prefetch_tokens(next) : -1;
+                const int next = it + STAGES;
+                const int tokens = next < ntiles ? prefetch_tokens(tile_index(next)) : -1;
                 if (it + 1 == ntiles)
                     astrai::cp_async_wait_group<0>();
                 else
@@ -230,12 +249,12 @@ struct DecodeMainloop {
                 process_tile(it, it & (STAGES - 1));
                 __syncwarp();
                 if (it + STAGES < ntiles)
-                    load_tile(next, (it + STAGES) & (STAGES - 1), tokens);
+                    load_tile(tile_index(next), (it + STAGES) & (STAGES - 1), tokens);
             }
         } else {
             // Fewer tiles than stages: load all, wait for all, process.
             for (int i = 0; i < ntiles; i++)
-                load_tile(ti_begin + i, i, prefetch_tokens(ti_begin + i));
+                load_tile(tile_index(i), i, prefetch_tokens(tile_index(i)));
             astrai::cp_async_wait_all();
             __syncwarp();
             for (int it = 0; it < ntiles; it++)

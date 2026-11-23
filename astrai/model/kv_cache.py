@@ -58,14 +58,15 @@ class BaseKVCache:
 
 @dataclass
 class PrefillKVCache(BaseKVCache):
-    cu_seqlens_q: Tensor
+    cu_seqlens_q: Optional[Tensor]
+    q_len: Optional[int] = field(default=None, kw_only=True)
 
 
 @dataclass
 class DecodeKVCache(BaseKVCache):
-    decode_o_part: Tensor
-    decode_ml_part: Tensor
-    decode_out: Tensor
+    o_part: Tensor
+    ml_part: Tensor
+    output: Tensor
 
 
 KVCache = Union[PrefillKVCache, DecodeKVCache]

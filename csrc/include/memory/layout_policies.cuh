@@ -296,7 +296,7 @@ struct PagedKV {
     }
 
     static DEVICE_FORCEINLINE int kv_len(const AttentionParams& p, int batch) {
-        int added = 1;
+        int added = p.q_len;
         if (p.cu_seqlens_q) {
             const int begin = p.cu_seqlens_q[batch], end = p.cu_seqlens_q[batch + 1];
             if (begin < 0 || end < begin || end > p.q_len)

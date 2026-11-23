@@ -1,7 +1,7 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
+#include <climits>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -33,34 +33,16 @@ inline auto with_head_dim(int head_dim, Fn&& fn) {
                              " has no kernel instantiation (instantiated: 32 64 128 256)");
 }
 
-// Fill at most one occupancy wave, with at least two KV tiles per split.
-inline int compute_num_splits(int blocks, int tiles, int wave_capacity) {
-    return std::max(1, std::min({wave_capacity / std::max(blocks, 1), tiles / 2, MAX_SPLITS}));
-}
-
-// Cache occupancy per device and kernel specialization.
-template <auto Kernel, int Threads>
-inline int decode_wave_capacity() {
-    static std::atomic<int> cached[64] = {};
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess)
-        return 1;
-    const bool cacheable = device >= 0 && device < 64;
-    if (cacheable) {
-        const int value = cached[device].load(std::memory_order_relaxed);
-        if (value)
-            return value;
-    }
-    int sms = 0, per_sm = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
-        return 1;
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, Kernel, Threads, 0) != cudaSuccess ||
-        per_sm < 1)
-        per_sm = 1;
-    const int capacity = std::max(1, sms * per_sm);
-    if (cacheable)
-        cached[device].store(capacity, std::memory_order_relaxed);
-    return capacity;
+// Graph capture sizes the launch from capacity. Each row uses only its live chunks.
+inline void configure_kv_splits(AttentionParams& p, int work_per_request) {
+    int device, sms;
+    ASTRAI_CUDA_CHECK(cudaGetDevice(&device));
+    ASTRAI_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    p.waves_per_split = float(work_per_request) / (2 * sms);
+    const int block_n = p.head_dim <= 64 ? 256 : (p.head_dim <= 128 ? 128 : 64);
+    p.num_splits = p.waves_per_split >= 0.8f || p.kv_len == 0
+                       ? 1
+                       : std::min(MAX_SPLITS, 1 + (p.kv_len - 1) / block_n);
 }
 
 // Resolve runtime flags to compile-time kernel arguments at the launch site.
@@ -125,37 +107,28 @@ inline void launch_attention_split_kv(AttentionParams& p, cudaStream_t stream, A
                 using Traits = KernelTraits<D, 16, 1, 2, typename KV::Elem>;
                 using Output = SplitEpilogue<Traits>;
                 auto kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask>, Output>;
-                auto combine = &split_kv_combine<KV, Traits::BC, false, false>;
+                auto combine = &split_kv_combine<KV, D>;
                 const int blocks = p.kv_head * ((p.q_head / p.kv_head + 15) / 16);
                 const int length = KV::host_kv_len(p);
                 const bool fixed = p.kv_split_size != 0;
                 if (fixed) {
                     kernel =
-                        &attention_kernel<DecodeMainloop<Traits, KV, Mask, false, true>, Output>;
-                    combine = &split_kv_combine<KV, Traits::BC, false, true>;
+                        &attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, Output>;
+                    combine = &split_kv_combine<KV, D, true>;
                     p.num_splits = length > 0 ? (length - 1) / p.kv_split_size + 1 : 1;
                 } else {
-                    int capacity;
-                    if (KV::kPaged && p.kv_len >= SKIP_EMPTY_SPLITS_MIN_CAPACITY) {
-                        kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, Output>;
-                        combine = &split_kv_combine<KV, Traits::BC, true, false>;
-                        capacity = decode_wave_capacity<
-                            attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, Output>,
-                            Traits::NUM_THREADS>();
-                    } else {
-                        capacity = decode_wave_capacity<
-                            attention_kernel<DecodeMainloop<Traits, KV, Mask>, Output>,
-                            Traits::NUM_THREADS>();
-                    }
-                    p.num_splits =
-                        compute_num_splits(p.batch * blocks, (length + 15) / 16, capacity);
+                    configure_kv_splits(p, blocks);
                 }
                 const bool direct = p.num_splits == 1 && (fixed || D <= 128);
                 auto workspace = allocate(direct);
-                const dim3 grid(blocks, p.batch, p.num_splits);
+                const bool flat_z = int64_t(p.batch) * p.kv_head <= 65535;
+                const dim3 grid(flat_z ? blocks / p.kv_head : blocks, p.num_splits,
+                                flat_z ? p.batch * p.kv_head : p.batch);
                 if (direct) {
-                    attention_kernel<DecodeMainloop<Traits, KV, Mask>, OutputEpilogue<Traits>>
-                        <<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
+                    auto direct_kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask>, OutputEpilogue<Traits>>;
+                    if (fixed)
+                        direct_kernel = &attention_kernel<DecodeMainloop<Traits, KV, Mask, true>, OutputEpilogue<Traits>>;
+                    direct_kernel<<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
                 } else {
                     kernel<<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
                     ASTRAI_LAUNCH_CHECK();
@@ -164,6 +137,41 @@ inline void launch_attention_split_kv(AttentionParams& p, cudaStream_t stream, A
                 ASTRAI_LAUNCH_CHECK();
             });
         });
+    });
+}
+
+// Each CTA owns one Q tile, one contiguous KV segment and one (request, Q head).
+template <typename T, typename Allocate>
+inline void launch_multiquery_kv(AttentionParams& p, cudaStream_t stream, Allocate& allocate) {
+    constexpr int rows = 64;
+    const int q_tiles = 1 + (p.q_len - 1) / rows;
+    configure_kv_splits(p, q_tiles * p.q_head);
+    if (p.waves_per_split >= 0.8f)
+        return launch_attention_split_q<DenseQSchedule, PagedKV<T>>(p, stream);
+    const bool direct = p.num_splits == 1;
+    auto workspace = allocate(direct);
+    using KV = PagedKV<T>;
+    const bool flat_z = int64_t(p.batch) * p.q_head <= 65535;
+    const dim3 grid(flat_z ? q_tiles : q_tiles * p.q_head, p.num_splits,
+                    flat_z ? p.batch * p.q_head : p.batch);
+    with_head_dim(p.head_dim, [&](auto dim) {
+        constexpr int D = decltype(dim)::value;
+        using Traits = KernelTraits<D, D == 256 ? 16 : 32, 4, 2, T>;
+        static_assert(Traits::BR * Traits::WARPS == rows);
+        ASTRAI_ATTN_BOOL_SWITCH(p.is_causal, Causal, {
+            ASTRAI_ATTN_BOOL_SWITCH(p.mask != nullptr, Mask, {
+                using Loop =
+                    PrefillMainloop<Traits, DenseQSchedule, KV, Causal, Mask, false, false, true>;
+                auto kernel = direct ? &attention_kernel<Loop, OutputEpilogue<Traits, true>>
+                                     : &attention_kernel<Loop, SplitEpilogue<Traits, true>>;
+                kernel<<<grid, Traits::NUM_THREADS, 0, stream>>>(p);
+            });
+        });
+        ASTRAI_LAUNCH_CHECK();
+        if (direct)
+            return;
+        split_kv_combine<KV, D, false, true><<<p.batch * p.q_len * p.q_head, D, 0, stream>>>(p);
+        ASTRAI_LAUNCH_CHECK();
     });
 }
 
@@ -182,12 +190,17 @@ inline void launch_attention_varlen(AttentionParams& p, cudaStream_t stream) {
 template <typename T, typename Allocate>
 inline void
 launch_attention_with_kvcache(AttentionParams& p, cudaStream_t stream, Allocate allocate) {
-    if (p.cu_seqlens_q) {
-        append_kv<T><<<p.q_len, 128, 0, stream>>>(p);
-        ASTRAI_LAUNCH_CHECK();
+    if (!p.cu_seqlens_q && p.q_len == 1)
+        return launch_attention_split_kv<PagedKV<T>>(p, stream, allocate);
+
+    const dim3 append_grid(p.q_len, p.cu_seqlens_q ? 1 : p.batch);
+    append_kv<T><<<append_grid, 128, 0, stream>>>(p);
+    ASTRAI_LAUNCH_CHECK();
+    if (p.cu_seqlens_q)
         return launch_attention_split_q<VarlenQSchedule, PagedKV<T>>(p, stream);
-    }
-    launch_attention_split_kv<PagedKV<T>>(p, stream, allocate);
+    if (p.kv_split_size || int64_t(p.batch) * p.q_len * p.q_head > INT_MAX)
+        return launch_attention_split_q<DenseQSchedule, PagedKV<T>>(p, stream);
+    launch_multiquery_kv<T>(p, stream, allocate);
 }
 
 } // namespace astrai::attention

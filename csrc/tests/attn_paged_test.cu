@@ -307,7 +307,7 @@ struct PagedRig {
         p.q_head = Hq;
         p.kv_head = Hkv;
         p.head_dim = D;
-        p.q_len = total_q;
+        p.q_len = d_qoi ? total_q : 1;
         p.q_l_stride = Hq * D;
         p.q_h_stride = D;
         p.kv_len = max_ctx;

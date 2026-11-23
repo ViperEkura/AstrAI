@@ -32,7 +32,7 @@ class InferenceWorkspace:
       device buffer (fixed address for CUDA-graph capture).
     - KV-cache bind metadata (request rows, page table, past lengths, query offsets), written by
       ``InferenceWorkspace.bind`` when the model runner passes this workspace.
-    - ``decode_o_part`` / ``decode_ml_part``: split-KV partial result buffers
+    - ``o_part`` / ``ml_part``: split-KV partial result buffers
       (mirrors FlashInfer's workspace).  One global alloc, reused by every
       decode step across all layers.  Sliced views are passed to the CUDA
       attention kernel so its internal ``torch.empty`` hot-path alloc goes
@@ -102,12 +102,12 @@ class InferenceWorkspace:
             # pattern).  Shape:
             # [max_batch_size, max_q_heads, MAX_SPLITS, head_dim] (o_part)
             # [max_batch_size, max_q_heads, MAX_SPLITS, 2]     (ml_part)
-            self.decode_o_part = torch.empty(
+            self.o_part = torch.empty(
                 (max_batch_size, max_q_heads, MAX_SPLITS, head_dim),
                 dtype=torch.float32,
                 device=device,
             )
-            self.decode_ml_part = torch.empty(
+            self.ml_part = torch.empty(
                 (max_batch_size, max_q_heads, MAX_SPLITS, 2),
                 dtype=torch.float32,
                 device=device,
@@ -115,7 +115,7 @@ class InferenceWorkspace:
 
             # Decode output buffer (graph-safe pre-alloc).  Shape matches the
             # decode kernel's output: [batch, q_head, head_dim].
-            self.decode_out = torch.empty(
+            self.output = torch.empty(
                 (max_batch_size, max_q_heads, head_dim),
                 dtype=dtype,
                 device=device,
@@ -151,9 +151,9 @@ class InferenceWorkspace:
                     storage.v_buffer,
                     self.page_table[:b],
                     self.cache_seqlens[:b],
-                    self.decode_o_part,
-                    self.decode_ml_part,
-                    self.decode_out,
+                    self.o_part,
+                    self.ml_part,
+                    self.output,
                     layer_views=storage.layer_views,
                 )
             past = self._decode.cache_seqlens
@@ -176,20 +176,24 @@ class InferenceWorkspace:
             past.copy_(
                 torch.as_tensor(positions, dtype=torch.int32, device=self.device)
             )
-        offsets = self.cu_seqlens_q[: b + 1]
-        offsets.copy_(
-            torch.tensor(
-                [0, *accumulate(entry.num_tokens for entry in entries)],
-                device=self.device,
-                dtype=torch.int32,
+        lengths = [entry.num_tokens for entry in entries]
+        q_len = lengths[0]
+        cu_seqlens_q = None
+        # A single-token prefill keeps its prefill schedule even in a uniform batch.
+        if q_len == 1 or lengths.count(q_len) != b:
+            bounds = [0, *accumulate(lengths)]
+            q_len = bounds[-1]
+            cu_seqlens_q = self.cu_seqlens_q[: b + 1]
+            cu_seqlens_q.copy_(
+                torch.tensor(bounds, device=self.device, dtype=torch.int32)
             )
-        )
         return PrefillKVCache(
             storage.k_buffer,
             storage.v_buffer,
             pages,
             past,
-            offsets,
+            cu_seqlens_q,
+            q_len=q_len,
             layer_views=storage.layer_views,
         )
 

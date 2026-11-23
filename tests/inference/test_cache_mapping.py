@@ -67,17 +67,24 @@ def test_page_pool_contiguous_task_extend():
     assert not task_cache.alloc([req_t1], [65])[0]
 
 
-def test_page_pool_contiguous_bind_prefill():
+@pytest.mark.parametrize("length", [1, 10])
+def test_page_pool_contiguous_bind_prefill(length):
     pool = make_contiguous_pool()
     task_cache = KVCacheManager(pool)
-    req_t1 = Request("t1", list(range(10)))
+    req_t1 = Request("t1", list(range(length)))
     task_cache.alloc([req_t1])[0]
-    req_t2 = Request("t2", list(range(10)))
+    req_t2 = Request("t2", list(range(length)))
     task_cache.alloc([req_t2])[0]
     kv = bind_cache(
         task_cache, make_cache_workspace(pool), [req_t1, req_t2], start_pos=0
     )
-    assert appended_slots(kv).shape == (20,)
+    if length == 1:
+        assert kv.q_len == 2
+        assert kv.cu_seqlens_q.tolist() == [0, 1, 2]
+    else:
+        assert kv.q_len == length
+        assert kv.cu_seqlens_q is None
+    assert appended_slots(kv).shape == (2 * length,)
     assert appended_slots(kv).dtype == torch.int32
     assert kv.cache_seqlens.tolist() == [0, 0]
     assert kv.page_table.size(0) == 2
@@ -100,6 +107,7 @@ def test_page_pool_bind_binds_packed_query_offsets():
         start_pos=0,
     )
 
+    assert kv.q_len == 210
     assert kv.cu_seqlens_q.tolist() == [0, 70, 80, 210]
 
 

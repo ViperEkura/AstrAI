@@ -8,14 +8,53 @@
 
 namespace astrai::attention {
 
-// Keep the extra split bookkeeping on large graph capacities only. The device
-// skips partials when the replayed request uses under one eighth of the table.
-constexpr int SKIP_EMPTY_SPLITS_MIN_CAPACITY = 8192;
-constexpr int SKIP_EMPTY_SPLITS_CAPACITY_RATIO = 8;
+// FA2 partitions contiguous logical KV blocks. Use the live request length when
+// choosing boundaries so another graph capacity or batch slot cannot change a row.
+struct KVPartition {
+    int blocks_per_split;
+    int count;
 
-DEVICE_FORCEINLINE bool skip_empty_decode_splits(const AttentionParams& p, int seq_len) {
-    return seq_len < p.kv_len / SKIP_EMPTY_SPLITS_CAPACITY_RATIO;
-}
+    static DEVICE_FORCEINLINE KVPartition from(const AttentionParams& p, int length) {
+        const int block_n = p.head_dim <= 64 ? 256 : (p.head_dim <= 128 ? 128 : 64);
+        const int blocks = 1 + (length - 1) / block_n;
+        const int limit = min(p.num_splits, blocks);
+        if (limit == 1)
+            return {blocks, 1};
+        const int lane = threadIdx.x % 32;
+        constexpr int groups = MAX_SPLITS / 32;
+        float efficiency[groups];
+        float best = 0;
+#pragma unroll
+        for (int i = 0; i < groups; ++i) {
+            const int n = 1 + lane + 32 * i;
+            const bool eligible =
+                n <= limit && (n == 1 || (blocks - 1) / n != (blocks - 1) / (n - 1));
+            const float waves = n * p.waves_per_split;
+            efficiency[i] = eligible ? waves / ceilf(waves) : 0;
+            best = fmaxf(best, efficiency[i]);
+        }
+#pragma unroll
+        for (int step = 16; step; step /= 2)
+            best = fmaxf(best, __shfl_xor_sync(0xffffffff, best, step));
+        int selected = MAX_SPLITS;
+#pragma unroll
+        for (int i = 0; i < groups; ++i) {
+            const unsigned good = __ballot_sync(0xffffffff, efficiency[i] >= 0.85f * best);
+            if (good) {
+                selected = 32 * i + __ffs(good);
+                break;
+            }
+        }
+        const int width = 1 + (blocks - 1) / selected;
+        return {width, 1 + (blocks - 1) / width};
+    }
+
+    template <int TileK>
+    DEVICE_FORCEINLINE int tile_width(const AttentionParams& p) const {
+        const int block_n = p.head_dim <= 64 ? 256 : (p.head_dim <= 128 ? 128 : 64);
+        return blocks_per_split * (block_n / TileK);
+    }
+};
 
 // Each lane holds two rows of an m16n8 accumulator. Coordinates are local to the request.
 struct QueryRows {
@@ -141,23 +180,32 @@ __global__ void attention_kernel(const AttentionParams p) {
 
 template <typename T>
 __global__ void append_kv(AttentionParams p) {
-    const int token = blockIdx.x;
-    int lo = 0, hi = p.batch;
-    while (lo + 1 < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (p.cu_seqlens_q[mid] <= token)
-            lo = mid;
-        else
-            hi = mid;
+    int batch = blockIdx.y;
+    int token = blockIdx.x;
+    int local = token, count = p.q_len;
+    if (p.cu_seqlens_q) {
+        int lo = 0, hi = p.batch;
+        while (lo + 1 < hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (p.cu_seqlens_q[mid] <= token)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        batch = lo;
+        const int begin = p.cu_seqlens_q[batch], end = p.cu_seqlens_q[batch + 1];
+        if (begin < 0 || begin > token || token >= end || end > p.q_len)
+            __trap();
+        local = token - begin;
+        count = end - begin;
+    } else {
+        token += batch * count;
     }
-    int begin = p.cu_seqlens_q[lo], end = p.cu_seqlens_q[lo + 1];
-    if (begin < 0 || begin > token || token >= end || end > p.q_len)
+    const int past = p.cache_seqlens[batch];
+    if (past < 0 || past > p.kv_len - count)
         __trap();
-    int past = p.cache_seqlens[lo];
-    if (past < 0 || past > p.kv_len - (end - begin))
-        __trap();
-    int pos = past + (token - begin);
-    int page = p.page_table[(int64_t)lo * p.table_stride + pos / p.page_size];
+    const int pos = past + local;
+    const int page = p.page_table[(int64_t)batch * p.table_stride + pos / p.page_size];
     if (page < 0 || page >= p.num_pages)
         __trap();
     int64_t slot = (int64_t)page * p.page_size + pos % p.page_size;

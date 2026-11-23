@@ -11,12 +11,11 @@ from typing import Callable, List, Optional, TypeVar
 import torch
 
 from astrai.extension.runtime.context import use_op_selection
-from astrai.inference.contracts import LogprobRequest
-from astrai.inference.core.cache import BlockPool
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
 )
+from astrai.inference.core.cache import BlockPool
 from astrai.inference.core.request import Request, RequestStatus
 from astrai.inference.core.scheduler import Scheduler
 from astrai.inference.core.versioning import PolicyVersionGuard
@@ -127,8 +126,7 @@ class EngineCore:
     def _warmup_cuda_graphs(self):
         runner = self.model_runner
         cache = self.scheduler.kv_manager
-        workspace = runner._workspace
-        maximum = workspace.max_batch_size
+        maximum = cache.pool.max_batch_size
         sizes = {1 << i for i in range(maximum.bit_length())}
         for size in sorted(sizes | {maximum}):
             requests = [Request(f"_warmup_{i}", [0]) for i in range(size)]
@@ -138,18 +136,11 @@ class EngineCore:
                 for step in range(2):
                     if not all(cache.alloc(requests, [step + 1] * size)):
                         break
-                    kv = workspace.bind(
-                        cache.pool, [r.execution("decode", step, 1) for r in requests]
-                    )
-                    runner._graph_ctx.forward(
-                        runner.model,
-                        key=(size,),
-                        input_ids=workspace.fill_input_ids([step] * size),
-                        kv_cache=kv,
-                        position_ids=kv.cache_seqlens,
+                    runner.warmup_decode(
+                        [r.execution("decode", step, 1) for r in requests]
                     )
             finally:
-                torch.cuda.synchronize(self.device)
+                runner.synchronize()
                 cache.free(requests)
 
     @property
@@ -177,7 +168,7 @@ class EngineCore:
             self.ensure_accepting()
             return self.scheduler.add_request(prompt, **kwargs)
 
-    def add_requests(self, prompts: List[str], **kwargs) -> List[str]:
+    def add_requests(self, prompts: Optional[List[str]] = None, **kwargs) -> List[str]:
         with self.lock:
             self.ensure_accepting()
             return self.scheduler.add_requests(prompts, **kwargs)
@@ -278,7 +269,7 @@ class EngineCore:
         if latest is not None and latest.committed:
             self.model_runner.clear_pending()
 
-    def execute_synchronously(self, requests, return_logprobs=False):
+    def execute_synchronously(self, requests, return_logprobs: bool = False):
         with self.lock:
             self.drain()
             plan = self.scheduler.schedule(
@@ -469,7 +460,7 @@ class EngineCore:
 
     @_synchronous
     def execute_requests(
-        self, requests: List[Request], return_logprobs: LogprobRequest = False
+        self, requests: List[Request], return_logprobs: bool = False
     ) -> None:
         """Drive tokenized requests through admission and execution to terminal."""
         self.scheduler.refresh_stop_ids()

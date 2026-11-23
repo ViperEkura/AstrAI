@@ -109,7 +109,7 @@ CUDA decode path, not every fallback and sampling combination.
 addresses owned by `InferenceWorkspace`, and capture must not race outstanding
 work on those buffers. Sampling remains outside the captured forward. An
 in-place weight update does not by itself change parameter addresses.
-Each runner captures on an explicit stream bound to its input device.
+During decode warmup, the core reserves and retires the synthetic requests. The worker binds their execution snapshots, captures the model forward on the input device, and fences it before the core releases the slots.
 `freeze_captures()` makes unseen shapes use eager execution, but currently only
 the graph regression test calls it; production rollout does not automatically
 freeze capture. Do not treat this helper as an installed multi-runner capture

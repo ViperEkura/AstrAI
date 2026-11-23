@@ -9,18 +9,19 @@ import asyncio
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
-from astrai.inference.core.events import (
+from astrai.inference.contracts import (
     FINISH_ABORTED,
     FINISH_CANCELLED,
     FINISH_LENGTH,
     FINISH_REJECTED,
     FINISH_STOP_TOKEN,
+    OutputEvent,
+    OutputEventSink,
     RequestError,
     RequestFinished,
 )
-from astrai.inference.core.scheduler import OutputEventSink
 
 
 def _deliver_async_events(deliveries) -> None:
@@ -30,7 +31,7 @@ def _deliver_async_events(deliveries) -> None:
 
 @dataclass
 class TrackedRequest:
-    events: Deque[Any]
+    events: Deque[OutputEvent]
     finished: threading.Event = field(default_factory=threading.Event)
     subscriber: Optional[Tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = None
 
@@ -63,7 +64,7 @@ class RequestTracker(OutputEventSink):
 
     def subscribe_async(
         self, request_id: str, loop: asyncio.AbstractEventLoop
-    ) -> Tuple[asyncio.Queue, List[Any]]:
+    ) -> Tuple[asyncio.Queue, List[OutputEvent]]:
         queue = asyncio.Queue()
         with self._condition:
             state = self._requests.get(request_id)
@@ -74,9 +75,10 @@ class RequestTracker(OutputEventSink):
             state.subscriber = (loop, queue)
         return queue, pending
 
-    def __call__(self, events: List[Any]) -> None:
+    def __call__(self, events: List[OutputEvent]) -> None:
         by_loop: Dict[
-            asyncio.AbstractEventLoop, List[Tuple[str, asyncio.Queue, List[Any]]]
+            asyncio.AbstractEventLoop,
+            List[Tuple[str, asyncio.Queue, List[OutputEvent]]],
         ] = {}
         with self._condition:
             for event in events:
@@ -122,7 +124,7 @@ class RequestTracker(OutputEventSink):
             state = self._requests.get(request_id)
             return state is not None and state.finished.is_set()
 
-    def drain(self, request_id: str) -> List[Any]:
+    def drain(self, request_id: str) -> List[OutputEvent]:
         """Pop all pending events for one request (non-blocking)."""
         with self._condition:
             state = self._requests.get(request_id)

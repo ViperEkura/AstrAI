@@ -206,7 +206,7 @@ def test_async_submission_preserves_scalar_only_tokenizer(
     event_engine._core.add_request.assert_not_called()
     event_engine._core.add_requests.assert_called_once()
     submitted = event_engine._core.add_requests.call_args.kwargs
-    assert submitted["prompts"] == ["hi"]
+    assert "prompts" not in submitted
     assert submitted["prompts_ids"] == [[10, 11]]
     assert len(submitted["request_ids"]) == 1
     assert submitted["temperature"] == 0.7 and submitted["top_k"] == 3

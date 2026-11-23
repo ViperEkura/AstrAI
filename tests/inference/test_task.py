@@ -1,5 +1,5 @@
 import json
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -315,3 +315,12 @@ def test_hf_default_length_and_explicit_max_length(limit, expected):
     manager = make_scheduler(make_mock_tokenizer(), max_seq_len=50)
     rid = manager.add_request("a", prompt_ids=[1, 2], max_length=limit)
     assert manager._states[rid].max_tokens == expected
+
+
+def test_prepared_batch_keeps_ids_without_encoding_again():
+    scheduler = make_scheduler()
+    with patch.object(scheduler.tokenizer, "encode", side_effect=AssertionError):
+        assert scheduler.add_requests(
+            prompts_ids=[[1, 2], [3]], request_ids=["a", "b"]
+        ) == ["a", "b"]
+    assert [r.prompt_ids for r in scheduler.waiting] == [[1, 2], [3]]

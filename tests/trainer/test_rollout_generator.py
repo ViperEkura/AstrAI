@@ -3,7 +3,7 @@ import threading
 import pytest
 import torch
 
-from astrai.inference.core.request import GenerationResult
+from astrai.inference.contracts import GenerationResult
 from astrai.trainer.backend import run_batch
 from astrai.trainer.rollout import (
     RolloutEvaluator,

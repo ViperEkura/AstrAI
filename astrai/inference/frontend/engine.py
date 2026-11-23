@@ -27,9 +27,9 @@ import torch
 import torch.nn as nn
 
 from astrai.extension.runtime.context import OpSelection
+from astrai.inference.contracts import RequestError, TokenDelta
 from astrai.inference.core.cache import BlockPool
 from astrai.inference.core.engine import EngineCore
-from astrai.inference.core.events import RequestError, TokenDelta
 from astrai.inference.frontend.input_processor import InputProcessor, ProcessedInput
 from astrai.inference.frontend.output_processor import OutputProcessor
 from astrai.inference.frontend.tracking import (
@@ -109,7 +109,6 @@ class InferenceEngine:
             self._tracker.register(request_id, event_capacity=self._max_seq_len + 1)
         try:
             self._core.add_requests(
-                prompts=[item.prompt_text or "" for item in processed],
                 max_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,

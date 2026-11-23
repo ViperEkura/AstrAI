@@ -15,7 +15,7 @@ from astrai.extension.runtime.loader import is_available
 
 if TYPE_CHECKING:
     from astrai.inference.core.cache import BlockPool
-from astrai.inference.contracts import ExecutionRequest, LogprobRequest, SchedulerOutput
+from astrai.inference.contracts import ExecutionRequest, SchedulerOutput
 from astrai.inference.worker.graph import CUDAGraphRunner
 from astrai.inference.worker.pending import (
     PendingExecution,
@@ -147,6 +147,7 @@ def _build_sampling_batch_info(
     # (measured 0.6 s stall at batch 128).
     meta = SamplingMeta(
         greedy=all(t == 0.0 for t in temps),
+        has_greedy=0.0 in temps,
         any_temp_not_one=any(t != 1.0 for t in temps),
         max_top_k=max(top_ks, default=0),
         any_topp_lt1=any(tp < 1.0 for tp in top_ps),
@@ -229,10 +230,23 @@ class GPUModelRunner:
     def cuda_graph_enabled(self) -> bool:
         return self._graph_ctx.enabled and self._graph_supported
 
+    def warmup_decode(self, requests: List[ExecutionRequest]) -> None:
+        """Warm or capture the graph for an already reserved decode batch."""
+        kv = self._workspace.bind(self.pool, requests)
+        self._graph_ctx.forward(
+            self.model,
+            key=(len(requests),),
+            input_ids=self._workspace.fill_input_ids(
+                [r.input_token_id for r in requests]
+            ),
+            kv_cache=kv,
+            position_ids=kv.cache_seqlens,
+        )
+
     def execute_prefill(
         self,
         requests: List[ExecutionRequest],
-        return_logprobs: LogprobRequest = False,
+        return_logprobs: bool = False,
         *,
         plan: SchedulerOutput,
     ) -> PendingExecution:
@@ -404,7 +418,7 @@ class GPUModelRunner:
     def submit_decode(
         self,
         requests: List[ExecutionRequest],
-        return_logprobs: LogprobRequest = False,
+        return_logprobs: bool = False,
         *,
         plan: SchedulerOutput,
     ) -> Optional[PendingExecution]:
@@ -519,7 +533,7 @@ class GPUModelRunner:
         self,
         logits: Tensor,
         requests: List[ExecutionRequest],
-        return_logprobs: LogprobRequest = False,
+        return_logprobs: bool = False,
         info: Optional[SamplingBatchInfo] = None,
         *,
         plan: SchedulerOutput,

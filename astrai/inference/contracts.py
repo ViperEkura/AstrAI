@@ -1,13 +1,21 @@
-"""Immutable, in-process scheduling/execution messages.
+"""In-process scheduling, execution and output contracts.
 
 No request lifecycle objects or core/worker imports belong in this module.
 An identity includes an incarnation so a late result cannot hit a reused id.
 """
 
 from dataclasses import dataclass
-from typing import FrozenSet, Literal, Optional, Tuple
+from typing import FrozenSet, List, Literal, Optional, Tuple, Union
 
-LogprobRequest = bool | Literal["temperature"]
+
+@dataclass(frozen=True)
+class GenerationResult:
+    """Structured terminal result for one synchronous generation request."""
+
+    token_ids: List[int]
+    logprobs: List[float]
+    finish_reason: Literal["stop", "length", "cancelled", "rejected"]
+    error_reason: Optional[str] = None
 
 
 @dataclass(frozen=True, eq=False)
@@ -82,7 +90,7 @@ class SchedulerOutput:
     step_id: int
     policy_version: int
     requests: Tuple[ExecutionRequest, ...]
-    return_logprobs: LogprobRequest = False
+    return_logprobs: bool = False
 
     @property
     def request_ids(self) -> Tuple[str, ...]:
@@ -125,3 +133,62 @@ class ModelRunnerOutput:
     step_id: int
     policy_version: int
     results: Tuple[RequestOutput, ...]
+
+
+# Finish reasons shared by every entry point.  Protocol adapters map these
+# onto their own vocabularies (OpenAI ``finish_reason``, Anthropic
+# ``stop_reason``); the core never invents protocol-specific reasons.
+FINISH_STOP_TOKEN = "stop_token"  # a tokenizer stop id was sampled
+FINISH_LENGTH = "length"  # max_tokens / sequence cap reached
+FINISH_CANCELLED = "cancelled"  # user cancelled before completion
+FINISH_ABORTED = "aborted"  # engine-side termination (KV cap…)
+FINISH_REJECTED = "rejected"  # request refused before running
+
+
+@dataclass(frozen=True)
+class TokenDelta:
+    """One committed output token for a request.
+
+    ``text`` is the incremental detokenized fragment (may be empty while a
+    multi-byte character is still incomplete); it is filled by the
+    frontend's OutputProcessor, not by the core.
+    """
+
+    request_id: str
+    token_id: int
+    sequence_no: int  # 1-based output position of this token
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class RequestFinished:
+    """Terminal success event for a request."""
+
+    request_id: str
+    finish_reason: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    # Sampled token ids, filled when the consumer asked to keep them
+    # (such as rollout); streaming consumers leave it empty.
+    token_ids: Tuple = ()
+
+
+@dataclass(frozen=True)
+class RequestError:
+    """Terminal failure event for a request."""
+
+    request_id: str
+    error_code: str
+    message: str
+    retryable: bool = False
+    finish_reason: str = FINISH_ABORTED
+
+
+OutputEvent = Union[TokenDelta, RequestFinished, RequestError]
+
+
+class OutputEventSink:
+    """Receive committed token events in order, followed by one terminal event per request."""
+
+    def __call__(self, events: List[OutputEvent]) -> None:
+        raise NotImplementedError

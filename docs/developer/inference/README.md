@@ -147,10 +147,9 @@ The useful vLLM-style separation is scheduling versus execution, with explicit
 plan/result messages. AstrAI keeps direct in-process calls for shared-model
 training; it has no EngineCore/worker RPC or process executor.
 
-Chunked prefill uses a budget **per start-offset group**, reset for each group.
-Decode is planned separately, and the runner submits separate forwards by phase
-and prefill start offset. This is not a global token budget or a single mixed
-prefill/decode forward. Chunking remains off by default.
+All prefill start-offset groups share one token budget per scheduler step.
+Decode tokens are scheduled separately. The runner submits separate forwards
+by phase and prefill start offset. Chunking remains off by default.
 
 Both allocation policies preallocate GPU storage. `kv_tokens=None` selects
 contiguous allocation; a finite value selects paged allocation, with radix

@@ -60,8 +60,8 @@ finally:
 ```
 
 A finite `kv_tokens` selects paged allocation; `page_size > 1` enables prefix
-reuse. `token_budget` limits each prefill start-offset group, not all work in
-one scheduler step. The frontend uses the injected core's sequence limit.
+reuse. `token_budget` caps the total prefill tokens in each scheduler step.
+Decode tokens are scheduled separately. The frontend uses the injected core's sequence limit.
 
 Automatic attention dispatch tries compatible CUDA, FlashAttention and Torch
 implementations. Use `set_op("attention", "cuda")` for a soft default or

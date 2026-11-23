@@ -272,6 +272,35 @@ def test_failed_fence_retains_kv_until_successful_retry(scheduler):
     assert sched.scheduler.kv_manager.request_count == 0
 
 
+@pytest.mark.parametrize(("budget", "fresh_window"), [(2, 0), (4, 2), (None, 5)])
+def test_prefill_step_budget_across_offsets(scheduler, budget, fresh_window):
+    engine, _ = scheduler
+    core = engine.scheduler
+    resident = _admit(engine, "resident")
+    resumed = _admit(engine, "resumed", prompt=(20, 21, 22, 23, 24))
+    core._planner._token_budget = 3
+    for request in (resident, resumed):
+        plan = core.schedule([request])
+        core.update_from_output(_output(plan))
+
+    fresh = _admit(engine, "fresh", prompt=(30, 31, 32, 33, 34))
+    core._planner._token_budget = budget
+    plan = core.schedule([resident, resumed, fresh])
+    windows = [(r.request_id, r.position, r.num_tokens) for r in plan.requests]
+    expected = [("resumed", 3, 2)]
+    if fresh_window:
+        expected.append(("fresh", 0, fresh_window))
+    assert windows == [*expected, ("resident", 2, 1)]
+    core.update_from_output(_output(plan))
+    if fresh_window < len(fresh.prompt_ids):
+        next_plan = core.schedule([fresh])
+        (entry,) = next_plan.requests
+        assert (entry.position, entry.num_tokens) == (
+            fresh_window,
+            min(budget, len(fresh.prompt_ids) - fresh_window),
+        )
+
+
 def test_chunk_cache_publication_uses_confirmed_not_optimistic_watermark(scheduler):
     sched, events = scheduler
     sched.scheduler._planner._token_budget = 1

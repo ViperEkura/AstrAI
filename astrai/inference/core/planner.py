@@ -8,7 +8,7 @@ from astrai.inference.core.request import Request
 
 
 class StepPlanner:
-    """Apply the existing per-prefill-group budget and reserve decode KV."""
+    """Share the step budget across prefill windows and reserve decode KV."""
 
     def __init__(self, kv_manager: KVCacheManager, token_budget: Optional[int] = None):
         if token_budget is not None and token_budget <= 0:
@@ -35,8 +35,8 @@ class StepPlanner:
             else:
                 decode.append(request)
 
+        remaining = self._token_budget
         for start, group in groups.items():
-            remaining = self._token_budget
             for request in group:
                 need = len(request.prompt_ids) - start
                 count = need if remaining is None else min(need, remaining)

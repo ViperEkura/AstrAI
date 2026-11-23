@@ -148,7 +148,7 @@ allocator references and prefix-index reachability are separate invariants.
 
 Both layouts preallocate a GPU arena. Paged allocation currently
 reserves prompt pages at admission; chunking limits computation, not that
-initial reservation. Global token budgets, progressive prompt allocation and
+initial reservation. Combined prefill/decode budgets, progressive prompt allocation and
 recompute preemption are not introduced by this ownership refactor.
 
 ### Cache binding boundary

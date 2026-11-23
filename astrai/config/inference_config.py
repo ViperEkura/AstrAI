@@ -103,12 +103,10 @@ class InferenceConfig(BaseConfig):
         max_splits (int): Maximum number of splits for split-KV attention (decode partial results). Defaults to 32.
         default_rep_window (int): Default repetition penalty window size for frequency penalty. Defaults to 64.
         max_recent_tasks (int): Maximum number of recent tasks tracked for aggregate statistics. Defaults to 128.
-        max_num_batched_tokens (int): Token budget per forward for chunked prefill; 0 disables chunking (whole-prompt prefills). Defaults to 0.
+        max_num_batched_tokens (int): Prefill token budget per scheduler step; 0 disables chunking (whole-prompt prefills). Defaults to 0.
     """
 
     max_splits: int = 32
     default_rep_window: int = 64
     max_recent_tasks: int = 128
-    # Chunked-prefill token budget: one forward's prefill windows plus
-    # decode steps never exceed this.  None (0) disables chunking.
     max_num_batched_tokens: int = 0

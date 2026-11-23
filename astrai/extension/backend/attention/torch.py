@@ -1,5 +1,6 @@
 """Torch reference attention backend."""
 
+import math
 from typing import Optional
 
 import torch
@@ -13,6 +14,10 @@ def _mask_view(mask):
     """Attention masks use batch/key, batch/query/key or batch/head/query/key."""
     if mask is None:
         return None
+    if mask.dtype != torch.bool and not mask.is_floating_point():
+        raise ValueError("attention mask must be boolean or floating point")
+    if mask.ndim not in (2, 3, 4):
+        raise ValueError("attention mask must be 2D, 3D or 4D")
     if mask.ndim == 2:
         return mask[:, None, None, :]
     if mask.ndim == 3:
@@ -58,6 +63,20 @@ def forward(
     *,
     scale: Optional[float] = None,
 ) -> Tensor:
+    # Reference execution can run without the CUDA extension.
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("dense attention requires 4D Q/K/V")
+    if (
+        k.shape != v.shape
+        or q.size(0) != k.size(0)
+        or q.size(-1) != k.size(-1)
+        or k.size(2) == 0
+        or q.size(2) == 0
+        or q.size(2) % k.size(2)
+    ):
+        raise ValueError("incompatible dense Q/K/V shapes or heads")
+    if scale is not None and not math.isfinite(scale):
+        raise ValueError("attention scale must be finite")
     n_rep = q.size(2) // k.size(2)
     k, v = repeat_kv(k, n_rep), repeat_kv(v, n_rep)
     mask = _mask_view(attn_mask)
@@ -81,7 +100,24 @@ def forward(
 
 
 def forward_varlen(q, k, v, qs, ks, is_causal, scale):
+    if torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)):
+        raise RuntimeError("varlen attention supports forward only")
+    if q.ndim != 3 or k.ndim != 3 or k.shape != v.shape:
+        raise ValueError("expected matching THD Q/K/V layouts")
+    if ks is None and q.size(0) != k.size(0):
+        raise ValueError("shared offsets require equal Q and KV token counts")
     ks = qs if ks is None else ks
+    for ptr in (qs, ks):
+        if (
+            ptr.ndim != 1
+            or ptr.numel() < 2
+            or ptr.dtype != torch.int32
+            or ptr.device != q.device
+            or not ptr.is_contiguous()
+        ):
+            raise ValueError("expected contiguous int32 segment offsets on Q's device")
+    if qs.numel() != ks.numel():
+        raise ValueError("Q and KV segment counts must match")
     qoffs, koffs = qs.tolist(), ks.tolist()
     for offsets, tokens in ((qoffs, q.size(0)), (koffs, k.size(0))):
         if (
@@ -125,6 +161,43 @@ def forward_cache(
     *,
     dense=forward,
 ):
+    if (
+        q.ndim not in (3, 4)
+        or k.ndim != q.ndim
+        or k.shape != v.shape
+        or q.shape[:-2] != k.shape[:-2]
+        or kc.ndim != 4
+        or kc.shape != vc.shape
+        or kc.size(1) <= 0
+        or k.shape[-2:] != kc.shape[-2:]
+        or q.size(-1) != k.size(-1)
+        or k.size(-2) == 0
+        or q.size(-2) == 0
+        or q.size(-2) % k.size(-2)
+        or not kc.is_contiguous()
+        or not vc.is_contiguous()
+        or any(t.device != q.device or t.dtype != q.dtype for t in (k, v, kc, vc))
+    ):
+        raise ValueError("incompatible cache and appended Q/K/V tensors")
+    if (
+        past.ndim != 1
+        or past.numel() == 0
+        or pages.ndim != 2
+        or pages.size(0) != past.numel()
+    ):
+        raise ValueError("expected past lengths [B] and page table [B, blocks]")
+    if qs is not None:
+        if q.ndim != 3 or qs.ndim != 1 or qs.numel() != past.numel() + 1:
+            raise ValueError("expected THD queries and [B+1] offsets")
+    elif q.size(0) != past.numel():
+        raise ValueError("expected BSHD queries or one THD row per request")
+    for tensor in (past, pages, qs):
+        if tensor is not None and (
+            tensor.dtype != torch.int32
+            or tensor.device != q.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("expected contiguous int32 metadata on Q's device")
     q, k, v, qs, original = _cache_view(q, k, v, qs)
     offsets = list(range(past.numel() + 1)) if qs is None else qs.tolist()
     lengths = past.tolist()
@@ -136,6 +209,14 @@ def forward_cache(
     ):
         raise ValueError("invalid query offsets")
     mask = _mask_view(mask)
+    if mask is not None and (
+        mask.device != q.device
+        or mask.size(0) not in (1, past.numel())
+        or mask.size(1) not in (1, q.size(1))
+        or not 0 < mask.size(-1) <= pages.size(1) * size
+        or not 0 < mask.size(-2) <= (q.size(0) if qs is not None else 1)
+    ):
+        raise ValueError("invalid request-local paged mask")
     slots = []
     for i, n in enumerate(lengths):
         length = n + offsets[i + 1] - offsets[i]

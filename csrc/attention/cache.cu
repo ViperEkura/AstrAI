@@ -11,6 +11,11 @@ torch::Tensor attention_with_kvcache(torch::Tensor q, torch::Tensor kc, torch::T
                                      c10::optional<torch::Tensor> ml,
                                      c10::optional<torch::Tensor> output) {
     const at::cuda::OptionalCUDAGuard guard(device_of(q));
+    TORCH_CHECK(!at::GradMode::is_enabled() ||
+                    !(q.requires_grad() || k.requires_grad() || v.requires_grad() ||
+                      kc.requires_grad() || vc.requires_grad()),
+                "cache attention supports forward only");
+    TORCH_CHECK(q.dim() == 3 || q.dim() == 4, "cache queries must be THD or BSHD");
     const auto shape = q.sizes().vec();
     if (q.dim() == 4) {
         TORCH_CHECK(!qs && past.dim() == 1 && q.size(0) == past.numel() && q.size(1) > 0 &&

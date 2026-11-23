@@ -60,7 +60,8 @@ torch::Tensor attention_varlen(torch::Tensor q, torch::Tensor k, torch::Tensor v
     TORCH_CHECK(!at::GradMode::is_enabled() ||
                     !(q.requires_grad() || k.requires_grad() || v.requires_grad()),
                 "attention_varlen supports forward only");
-    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && (ks || q.size(0) == k.size(0)),
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 &&
+                    k.sizes() == v.sizes() && (ks || q.size(0) == k.size(0)),
                 "shared offsets require equal token counts");
     q = q.contiguous();
     k = k.contiguous();

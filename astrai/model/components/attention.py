@@ -18,6 +18,44 @@ from astrai.model.components.norm import RMSNorm
 from astrai.model.kv_cache import DecodeKVCache, KVCache
 
 
+def scaled_dot_product_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    *,
+    kv_cache: Optional[KVCache],
+    layer_id: int,
+    mask: Optional[Tensor],
+    is_causal: bool,
+) -> Tensor:
+    """Bind the model layer's cache metadata to the tensor-only attention call."""
+    if kv_cache is None:
+        return attention(q, k, v, mask=mask, is_causal=is_causal)
+    k_cache, v_cache = kv_cache.layer(layer_id)
+    offsets, workspace = None, (None, None, None)
+    if isinstance(kv_cache, DecodeKVCache):
+        workspace = (
+            kv_cache.decode_o_part,
+            kv_cache.decode_ml_part,
+            kv_cache.decode_out,
+        )
+    else:
+        offsets = kv_cache.cu_seqlens_q
+    return attention(
+        q,
+        k,
+        v,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=kv_cache.cache_seqlens,
+        page_table=kv_cache.page_table,
+        cu_seqlens_q=offsets,
+        mask=mask,
+        is_causal=is_causal,
+        workspace=workspace,
+    )
+
+
 class AttnFactory(BaseFactory[nn.Module]):
     pass
 
@@ -97,38 +135,123 @@ class GQA(nn.Module):
             q = apply_rotary_emb(q, rotary_emb)
             k = apply_rotary_emb(k, rotary_emb)
 
-        if kv_cache is None:
-            sdqa_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
-        else:
-            k_cache, v_cache = kv_cache.layer(self.layer_id)
-            offsets, workspace = None, (None, None, None)
-            if isinstance(kv_cache, DecodeKVCache):
-                workspace = (
-                    kv_cache.decode_o_part,
-                    kv_cache.decode_ml_part,
-                    kv_cache.decode_out,
-                )
-            else:
-                offsets = kv_cache.cu_seqlens_q
-            sdqa_out = attention(
-                q,
-                k,
-                v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_seqlens=kv_cache.cache_seqlens,
-                page_table=kv_cache.page_table,
-                cu_seqlens_q=offsets,
-                mask=attn_mask,
-                is_causal=is_causal,
-                workspace=workspace,
-            )
+        sdqa_out = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            kv_cache=kv_cache,
+            layer_id=self.layer_id,
+            mask=attn_mask,
+            is_causal=is_causal,
+        )
         sdqa_out = sdqa_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
 
         if self.use_gated_attention:
             sdqa_out = sdqa_out * F.sigmoid(self.gate(x))
 
         out = self.o_proj(sdqa_out)
+        return out
+
+
+@AttnFactory.register("mla")
+class MLA(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        norm_eps: float,
+        use_qk_norm: bool,
+        use_gated_attention: bool,
+        layer_id: int,
+        n_layers: int = 1,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.layer_id = layer_id
+        self.n_rep = n_heads // n_kv_heads
+        self.use_qk_norm = use_qk_norm
+        self.use_gated_attention = use_gated_attention
+
+        self.q_proj = Linear(dim, n_heads * self.head_dim, bias=False)
+
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, norm_eps)
+        self.kv_a_proj = Linear(dim, kv_lora_rank, bias=False)
+        self.kv_norm = RMSNorm(kv_lora_rank, norm_eps)
+
+        self.kv_b_proj = Linear(
+            kv_lora_rank,
+            n_kv_heads * (2 * self.head_dim),
+        )
+
+        self.o_proj = Linear(
+            dim, dim, bias=False, init_std=0.02 / (2 * n_layers) ** 0.5
+        )
+
+        if use_gated_attention:
+            self.gate = Linear(dim, dim, bias=False)
+
+    def forward(
+        self,
+        x: Tensor,
+        rotary_emb: Tensor,
+        attn_mask: Tensor = None,
+        kv_cache: Optional[KVCache] = None,
+        is_causal: bool = False,
+    ) -> Tensor:
+        q = self.q_proj(x)
+        q = q.reshape(*x.shape[:-1], self.n_heads, self.head_dim)
+
+        kv_compressed = self.kv_a_proj(x)
+        kv_compressed = self.kv_norm(kv_compressed)
+
+        kv = self.kv_b_proj(kv_compressed)
+        kv = kv.reshape(*x.shape[:-1], self.n_kv_heads, -1)
+
+        k_nope, k_rope, v = torch.split(
+            kv, [self.qk_nope_head_dim, self.qk_rope_head_dim, self.head_dim], dim=-1
+        )
+
+        q_nope, q_rope = (
+            q[..., : self.qk_nope_head_dim],
+            q[..., self.qk_nope_head_dim :],
+        )
+        q_rope = apply_rotary_emb(q_rope, rotary_emb)
+        k_rope = apply_rotary_emb(k_rope, rotary_emb)
+
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope], dim=-1)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        attn_out = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            kv_cache=kv_cache,
+            layer_id=self.layer_id,
+            mask=attn_mask,
+            is_causal=is_causal,
+        )
+        attn_out = attn_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
+
+        if self.use_gated_attention:
+            attn_out = attn_out * F.sigmoid(self.gate(x))
+
+        out = self.o_proj(attn_out)
         return out
 
 
@@ -430,122 +553,3 @@ class GDN(nn.Module):
                 conv=self._next_conv_window(mixed, state.conv), recurrent=recurrent
             ),
         )
-
-
-@AttnFactory.register("mla")
-class MLA(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        n_heads: int,
-        n_kv_heads: int,
-        kv_lora_rank: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        norm_eps: float,
-        use_qk_norm: bool,
-        use_gated_attention: bool,
-        layer_id: int,
-        n_layers: int = 1,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.head_dim = qk_nope_head_dim + qk_rope_head_dim
-        self.layer_id = layer_id
-        self.n_rep = n_heads // n_kv_heads
-        self.use_qk_norm = use_qk_norm
-        self.use_gated_attention = use_gated_attention
-
-        self.q_proj = Linear(dim, n_heads * self.head_dim, bias=False)
-
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, norm_eps)
-        self.kv_a_proj = Linear(dim, kv_lora_rank, bias=False)
-        self.kv_norm = RMSNorm(kv_lora_rank, norm_eps)
-
-        self.kv_b_proj = Linear(
-            kv_lora_rank,
-            n_kv_heads * (2 * self.head_dim),
-        )
-
-        self.o_proj = Linear(
-            dim, dim, bias=False, init_std=0.02 / (2 * n_layers) ** 0.5
-        )
-
-        if use_gated_attention:
-            self.gate = Linear(dim, dim, bias=False)
-
-    def forward(
-        self,
-        x: Tensor,
-        rotary_emb: Tensor,
-        attn_mask: Tensor = None,
-        kv_cache: Optional[KVCache] = None,
-        is_causal: bool = False,
-    ) -> Tensor:
-        q = self.q_proj(x)
-        q = q.reshape(*x.shape[:-1], self.n_heads, self.head_dim)
-
-        kv_compressed = self.kv_a_proj(x)
-        kv_compressed = self.kv_norm(kv_compressed)
-
-        kv = self.kv_b_proj(kv_compressed)
-        kv = kv.reshape(*x.shape[:-1], self.n_kv_heads, -1)
-
-        k_nope, k_rope, v = torch.split(
-            kv, [self.qk_nope_head_dim, self.qk_rope_head_dim, self.head_dim], dim=-1
-        )
-
-        q_nope, q_rope = (
-            q[..., : self.qk_nope_head_dim],
-            q[..., self.qk_nope_head_dim :],
-        )
-        q_rope = apply_rotary_emb(q_rope, rotary_emb)
-        k_rope = apply_rotary_emb(k_rope, rotary_emb)
-
-        q = torch.cat([q_nope, q_rope], dim=-1)
-        k = torch.cat([k_nope, k_rope], dim=-1)
-
-        if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-
-        if kv_cache is None:
-            attn_out = attention(q, k, v, mask=attn_mask, is_causal=is_causal)
-        else:
-            k_cache, v_cache = kv_cache.layer(self.layer_id)
-            offsets, workspace = None, (None, None, None)
-            if isinstance(kv_cache, DecodeKVCache):
-                workspace = (
-                    kv_cache.decode_o_part,
-                    kv_cache.decode_ml_part,
-                    kv_cache.decode_out,
-                )
-            else:
-                offsets = kv_cache.cu_seqlens_q
-            attn_out = attention(
-                q,
-                k,
-                v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_seqlens=kv_cache.cache_seqlens,
-                page_table=kv_cache.page_table,
-                cu_seqlens_q=offsets,
-                mask=attn_mask,
-                is_causal=is_causal,
-                workspace=workspace,
-            )
-        attn_out = attn_out.reshape(*x.shape[:-1], self.n_heads * self.head_dim)
-
-        if self.use_gated_attention:
-            attn_out = attn_out * F.sigmoid(self.gate(x))
-
-        out = self.o_proj(attn_out)
-        return out

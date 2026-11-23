@@ -15,7 +15,7 @@ Native FP16 and BF16 kernels cover head dimensions 32, 64, 128 and 256.
 
 ## Dispatch and ownership
 
-The public function validates routing arguments, selects a backend with the
+The public function resolves routing arguments, selects a backend with the
 existing `AttentionDispatcher`, and executes it directly. There is no additional
 execution wrapper or public mode parameter. Cache arguments take precedence over
 rank; otherwise BSHD selects dense and THD selects varlen. Partial cache arguments,
@@ -26,20 +26,17 @@ checks and strict/soft selection remain in this layer. CUDA, Torch and Flash
 modules implement the selected calls.
 The three stateless `kernel/attention.py` wrappers alone translate arguments
 to the compiled ABI. They do not select backends or retain cache state.
-The public entry checks layouts, shapes, dtypes, devices, mask metadata and
-parameter combinations directly before backend selection. Torch/Flash do not
-repeat these checks. Native CUDA entries
-retain ABI safety checks for direct callers. Device offset and page values are
-checked on-device; reference paths check them when materializing host indices.
-The public validation never reads CUDA tensor values or allocates GPU buffers.
-Backend capability checks only decide which implementation can execute a call.
+The three native C++ entries own tensor validation before launching work:
+dense checks and packing live in attention.cu, varlen in varlen.cu, and cache
+in cache.cu. Shared native checks cover dtype, masks, integer bounds and scratch.
+Python only rejects ambiguous routing options; it does not repeat native tensor
+metadata checks. Torch reference entries retain the checks needed to run without
+a compiled extension. GPU offset and page values are checked on-device.
 
-GQA and MLA select the current layer's buffers and the step's
-query offsets or graph scratch. They pass only tensors and scalar options
-to `attention`, which preserves request-local masks. The `workspace`
-keyword carries caller-owned graph scratch without introducing another entry
-or model-side forwarding helper.
-Extension code does not import model cache classes.
+GQA and MLA share the model-side scaled_dot_product_attention function, which binds the
+current layer's K/V views, query offsets and workspace before calling attention.
+They are adjacent in the model module; GDN and its state follow them. Extension
+code does not import model cache classes.
 
 ## Query scheduling and KV addressing
 

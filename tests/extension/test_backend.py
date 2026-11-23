@@ -179,35 +179,3 @@ def test_spec_separates_layout_from_gradient_requirement(rank):
         inference = dispatcher.build_spec(q, k, q, None, False)
     assert inference.mode == spec.mode
     assert not inference.needs_backward and inference.phase == "infer"
-
-
-@pytest.mark.parametrize(
-    "case", ["dtype", "heads", "scale", "mask", "offsets", "cache"]
-)
-def test_input_validation_precedes_backend_selection(case):
-    q = torch.randn(1, 2, 2, 8)
-    k, v = torch.randn_like(q), torch.randn_like(q)
-    args = {}
-    if case == "dtype":
-        k = k.double()
-    elif case == "heads":
-        k, v = k[:, :, :0], v[:, :, :0]
-    elif case == "scale":
-        args["scale"] = float("nan")
-    elif case == "mask":
-        args["mask"] = torch.ones(1, 2, dtype=torch.int64)
-    elif case == "offsets":
-        q, k, v = q[0], k[0], v[0]
-        args["cu_seqlens_q"] = torch.tensor([0, 2], dtype=torch.int64)
-    else:
-        args.update(
-            k_cache=torch.zeros(1, 4, 1, 8),
-            v_cache=torch.zeros(1, 4, 1, 8),
-            cache_seqlens=torch.zeros(1, dtype=torch.int32),
-            page_table=torch.zeros(1, 1, dtype=torch.int32),
-        )
-    # An unknown backend would fail differently if dispatch ran before validation.
-    with op_backend(attention="unknown"):
-        with pytest.raises(ValueError) as error:
-            attention(q, k, v, **args)
-    assert "Unknown attention implementation" not in str(error.value)

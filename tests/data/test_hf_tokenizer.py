@@ -7,6 +7,7 @@ from tokenizers import Tokenizer, models
 
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.callbacks.checkpoint import _copy_tokenizer_files
+from tests.support.tokenizers import build_test_tokenizer
 
 
 def _write_tokenizer(root, *, eos="<eos>", generation=None):
@@ -223,3 +224,44 @@ def test_tool_template_json_preserves_unicode_and_html(tmp_path):
         '"description": "<a>&天气"}}]查天气'
     )
     assert actual.apply_chat_template(messages, tokenize=False, tools=tools) == expected
+
+
+def test_thinking_switch_respects_template_and_native_chatml():
+    tok = build_test_tokenizer(special_tokens=("<unk>", "<pad>", "<think>", "</think>"))
+    messages = [{"role": "user", "content": "hello"}]
+    tok.set_chat_template(
+        "{% if enable_thinking is defined %}{{ enable_thinking }}{% else %}default{% endif %}"
+    )
+    for mode, expected in [(None, "default"), (False, "False"), (True, "True")]:
+        assert (
+            tok.apply_chat_template(messages, tokenize=False, enable_thinking=mode)
+            == expected
+        )
+
+    tok.set_chat_template(
+        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+    )
+    for mode, suffix in [
+        (None, ""),
+        (True, "<think>\n"),
+        (False, "<think>\n\n</think>\n\n"),
+    ]:
+        text = "<|im_start|>assistant\n" + suffix
+        assert tok.apply_chat_template(
+            [messages], tokenize=False, enable_thinking=mode
+        ) == [text]
+        assert tok.apply_chat_template(messages, enable_thinking=mode) == tok.encode(
+            text, add_special_tokens=False
+        )
+        assert (
+            tok.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=mode,
+            )
+            == ""
+        )
+    tok.set_chat_template("fixed prompt")
+    with pytest.raises(ValueError, match="does not support"):
+        tok.apply_chat_template(messages, enable_thinking=True)

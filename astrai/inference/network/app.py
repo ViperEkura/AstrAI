@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import uvicorn
 from fastapi import APIRouter, FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from astrai.inference.frontend.engine import InferenceEngine, build_engine
 from astrai.inference.network.anthropic import AnthropicResponseBuilder
@@ -46,11 +46,16 @@ class ToolDef(BaseModel):
     function: FunctionDef
 
 
+class ChatTemplateKwargs(BaseModel, extra="forbid"):
+    enable_thinking: Optional[StrictBool] = None
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI Chat Completion API request body."""
 
     model: str = "astrai"
     messages: List[ChatMessage]
+    chat_template_kwargs: Optional[ChatTemplateKwargs] = None
     temperature: Optional[float] = Field(default=1.0, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
     top_k: Optional[int] = Field(default=50, ge=1)

@@ -29,6 +29,21 @@ for EOS and length precedence.
 The HTTP adapter and demo scripts select sampling when temperature is positive
 and greedy decoding when it is zero. Their defaults differ from direct engine calls.
 
+## Thinking in chat requests
+
+Pass `"chat_template_kwargs": {"enable_thinking": true}` in the JSON body of
+`/v1/chat/completions`, or run `scripts/demo/stream_chat.py --think`.
+Use `false` or `--no-think` for direct answers. Omit the option to use the
+checkpoint default. Python callers can pass `enable_thinking=True` or
+`False` to `tokenizer.apply_chat_template` before generation.
+
+The checkpoint template controls the prompt when it consumes this variable.
+For native ChatML generation prompts ending in the assistant header, a tokenizer
+with both thinking markers can prefill an opening thinking tag or a completed
+empty thinking block. Prefilled text belongs to the input. The API returns
+subsequently generated text in the usual content field. Allow enough output
+tokens for both the reasoning and the final answer.
+
 ## Cache and backend selection
 
 The default contiguous cache reserves `max_batch_size × max_seq_len` slots.

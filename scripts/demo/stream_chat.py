@@ -1,4 +1,4 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from contextlib import closing
 from pathlib import Path
 
@@ -68,7 +68,15 @@ def parse_args():
     parser.add_argument(
         "--raw", action="store_true", help="Continue text without a chat template"
     )
+    parser.add_argument(
+        "--think",
+        action=BooleanOptionalAction,
+        default=None,
+        help="Enable or disable thinking for chat (default: checkpoint behavior)",
+    )
     args = parser.parse_args()
+    if args.raw and args.think is not None:
+        parser.error("--think/--no-think requires chat mode")
     if args.raw and args.system_prompt:
         parser.error("--system_prompt requires chat mode")
     if args.frequency_penalty is None:
@@ -97,6 +105,7 @@ def chat():
                         msgs + [{"role": "user", "content": query}],
                         tokenize=False,
                         add_generation_prompt=True,
+                        enable_thinking=args.think,
                     )
 
                 with closing(

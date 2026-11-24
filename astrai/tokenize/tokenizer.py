@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.decoders import DecodeStream
 
-from astrai.tokenize.chat_template import ChatTemplate
+from astrai.tokenize.chat_template import ChatTemplate, ChatTemplateInputError
 
 Message = Dict[str, Any]
 """Single chat message with ``role`` and ``content`` keys."""
@@ -275,6 +275,7 @@ class AutoTokenizer:
         tokenize: bool = True,
         add_generation_prompt: bool = True,
         return_assistant_tokens_mask: bool = False,
+        enable_thinking: Optional[bool] = None,
         **kwargs,
     ) -> Union[str, List[int], List[str], List[List[int]], Dict[str, Any]]:
         """Apply the chat template and optionally tokenize.
@@ -296,6 +297,7 @@ class AutoTokenizer:
             add_generation_prompt: Whether to add the generation prompt.
             return_assistant_tokens_mask: Return input_ids and assistant_masks
                 from template generation blocks, using full-text token offsets.
+            enable_thinking: Optional per-request thinking mode. Omit to use the template default.
             **kwargs: Additional template variables.
 
         Returns:
@@ -306,6 +308,29 @@ class AutoTokenizer:
             raise RuntimeError(
                 "Chat template not set. Use set_chat_template() to set a template first."
             )
+
+        suffix = ""
+        if enable_thinking is not None:
+            if not isinstance(enable_thinking, bool):
+                raise ChatTemplateInputError("enable_thinking must be a boolean")
+            if "enable_thinking" in self._chat_template.template_variables:
+                kwargs["enable_thinking"] = enable_thinking
+            elif add_generation_prompt:
+                if self._tokenizer is None or any(
+                    self._tokenizer.token_to_id(tag) is None
+                    for tag in ("<think>", "</think>")
+                ):
+                    raise ChatTemplateInputError(
+                        "Thinking requires a supporting chat template or thinking tokens"
+                    )
+                suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+
+        def generation_text(text):
+            if suffix and not text.endswith("<|im_start|>assistant\n"):
+                raise ChatTemplateInputError(
+                    "This generation prompt does not support switching thinking mode"
+                )
+            return text + suffix if suffix else text
 
         is_batch = bool(messages) and isinstance(messages[0], list)
         if return_assistant_tokens_mask:
@@ -329,7 +354,9 @@ class AutoTokenizer:
                         merged_spans[-1] = (merged_spans[-1][0], end)
                     elif end > start:
                         merged_spans.append((start, end))
-                encoded = self._tokenizer.encode(text, add_special_tokens=False)
+                encoded = self._tokenizer.encode(
+                    generation_text(text), add_special_tokens=False
+                )
                 mask = []
                 for start, end in encoded.offsets:
                     overlaps = [
@@ -354,10 +381,12 @@ class AutoTokenizer:
 
         if is_batch:
             rendered = [
-                self._chat_template.render(
-                    messages=msgs,
-                    add_generation_prompt=add_generation_prompt,
-                    **kwargs,
+                generation_text(
+                    self._chat_template.render(
+                        messages=msgs,
+                        add_generation_prompt=add_generation_prompt,
+                        **kwargs,
+                    )
                 )
                 for msgs in messages
             ]
@@ -373,6 +402,7 @@ class AutoTokenizer:
             add_generation_prompt=add_generation_prompt,
             **kwargs,
         )
+        rendered = generation_text(rendered)
         if tokenize:
             return self.encode(rendered, add_special_tokens=False)
         return rendered

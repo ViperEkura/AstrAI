@@ -58,7 +58,10 @@ class OpenAIResponseBuilder(ResponseBuilder):
         tools = _resolve_tools(request)
         try:
             prompt = engine.tokenizer.apply_chat_template(
-                messages, tokenize=False, tools=tools or []
+                messages,
+                tokenize=False,
+                tools=tools or [],
+                **(request.chat_template_kwargs or {}),
             )
         except ToolCallValidationError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error

@@ -328,87 +328,65 @@ class AutoTokenizer:
                         "Thinking requires a supporting chat template or thinking tokens"
                     )
 
-        def generation_text(text):
-            if suffix and not text.endswith("<|im_start|>assistant\n"):
-                raise ChatTemplateInputError(
-                    "This generation prompt does not support switching thinking mode"
-                )
-            return text + suffix if suffix else text
-
         is_batch = bool(messages) and isinstance(messages[0], list)
         if return_assistant_tokens_mask:
             if not tokenize:
                 raise ValueError("Assistant token masks require tokenize=True")
             if self._tokenizer is None:
                 raise RuntimeError("Tokenizer not initialized")
-            conversations = messages if is_batch else [messages]
-            outputs = []
-            for conversation in conversations:
-                if system_prompt and not is_batch:
-                    conversation = [
-                        {"role": "system", "content": system_prompt}
-                    ] + list(conversation)
+
+        if system_prompt and not is_batch:
+            messages = [{"role": "system", "content": system_prompt}] + list(messages)
+        conversations = messages if is_batch else [messages]
+        kwargs["add_generation_prompt"] = add_generation_prompt
+        rendered = []
+        outputs = []
+        for conversation in conversations:
+            if return_assistant_tokens_mask:
                 text, spans = self._chat_template.render_with_spans(
-                    conversation, add_generation_prompt=add_generation_prompt, **kwargs
+                    conversation, **kwargs
                 )
-                merged_spans = []
-                for start, end in spans:
-                    if merged_spans and start == merged_spans[-1][1]:
-                        merged_spans[-1] = (merged_spans[-1][0], end)
-                    elif end > start:
-                        merged_spans.append((start, end))
-                encoded = self._tokenizer.encode(
-                    generation_text(text), add_special_tokens=False
-                )
-                mask = []
-                for start, end in encoded.offsets:
-                    overlaps = [
-                        (a, b)
-                        for a, b in merged_spans
-                        if start < b and end > a and end > start
-                    ]
-                    if overlaps and not any(
-                        a <= start and end <= b for a, b in overlaps
-                    ):
-                        raise ValueError(
-                            "A token crosses a generation boundary; use token-aligned delimiters"
-                        )
-                    mask.append(int(bool(overlaps)))
-                outputs.append({"input_ids": encoded.ids, "assistant_masks": mask})
+            else:
+                text = self._chat_template.render(conversation, **kwargs)
+            if suffix:
+                if not text.endswith("<|im_start|>assistant\n"):
+                    raise ChatTemplateInputError(
+                        "This generation prompt does not support switching thinking mode"
+                    )
+                text += suffix
+            if not return_assistant_tokens_mask:
+                rendered.append(text)
+                continue
+
+            merged_spans = []
+            for start, end in spans:
+                if merged_spans and start == merged_spans[-1][1]:
+                    merged_spans[-1] = (merged_spans[-1][0], end)
+                elif end > start:
+                    merged_spans.append((start, end))
+            encoded = self._tokenizer.encode(text, add_special_tokens=False)
+            mask = []
+            for start, end in encoded.offsets:
+                overlaps = [
+                    (a, b)
+                    for a, b in merged_spans
+                    if start < b and end > a and end > start
+                ]
+                if overlaps and not any(a <= start and end <= b for a, b in overlaps):
+                    raise ValueError(
+                        "A token crosses a generation boundary; use token-aligned delimiters"
+                    )
+                mask.append(int(bool(overlaps)))
+            outputs.append({"input_ids": encoded.ids, "assistant_masks": mask})
+        if return_assistant_tokens_mask:
             if is_batch:
                 return {
                     key: [output[key] for output in outputs]
                     for key in ("input_ids", "assistant_masks")
                 }
             return outputs[0]
-
-        if is_batch:
-            rendered = [
-                generation_text(
-                    self._chat_template.render(
-                        messages=msgs,
-                        add_generation_prompt=add_generation_prompt,
-                        **kwargs,
-                    )
-                )
-                for msgs in messages
-            ]
-            if tokenize:
-                return self.encode(rendered, add_special_tokens=False)
-            return rendered
-
-        # Single conversation
-        if system_prompt:
-            messages = [{"role": "system", "content": system_prompt}] + list(messages)
-        rendered = self._chat_template.render(
-            messages=messages,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
-        rendered = generation_text(rendered)
-        if tokenize:
-            return self.encode(rendered, add_special_tokens=False)
-        return rendered
+        result = rendered if is_batch else rendered[0]
+        return self.encode(result, add_special_tokens=False) if tokenize else result
 
 
 class StreamDecoder:

@@ -31,10 +31,10 @@ and greedy decoding when it is zero. Their defaults differ from direct engine ca
 
 ## Thinking in chat requests
 
-Pass `"chat_template_kwargs": {"enable_thinking": true}` in the JSON body of
-`/v1/chat/completions`, or run `scripts/demo/stream_chat.py --think`.
-Use `false` or `--no-think` for direct answers. Omit the option to use the
-checkpoint default. Python callers can pass `enable_thinking=True` or
+The streaming chat CLI defaults to direct answers. Pass `--enable-thinking`
+to request thinking. HTTP clients can send `"chat_template_kwargs": {"enable_thinking": true}`
+or `false` to `/v1/chat/completions`; omitting the field uses the checkpoint
+default. Python callers can pass `enable_thinking=True` or
 `False` to `tokenizer.apply_chat_template` before generation.
 
 The checkpoint template controls the prompt when it consumes this variable.

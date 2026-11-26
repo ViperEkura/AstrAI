@@ -265,3 +265,14 @@ def test_thinking_switch_respects_template_and_native_chatml():
     tok.set_chat_template("fixed prompt")
     with pytest.raises(ValueError, match="does not support"):
         tok.apply_chat_template(messages, enable_thinking=True)
+
+
+def test_direct_chat_without_thinking_tokens():
+    tok = build_test_tokenizer(chat_template="{{ messages[0].content }}")
+    messages = [{"role": "user", "content": "hello"}]
+    assert (
+        tok.apply_chat_template(messages, tokenize=False, enable_thinking=False)
+        == "hello"
+    )
+    with pytest.raises(ValueError, match="Thinking requires"):
+        tok.apply_chat_template(messages, enable_thinking=True)

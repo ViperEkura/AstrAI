@@ -316,14 +316,17 @@ class AutoTokenizer:
             if "enable_thinking" in self._chat_template.template_variables:
                 kwargs["enable_thinking"] = enable_thinking
             elif add_generation_prompt:
-                if self._tokenizer is None or any(
-                    self._tokenizer.token_to_id(tag) is None
+                if self._tokenizer is not None and all(
+                    self._tokenizer.token_to_id(tag) is not None
                     for tag in ("<think>", "</think>")
                 ):
+                    suffix = (
+                        "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+                    )
+                elif enable_thinking:
                     raise ChatTemplateInputError(
                         "Thinking requires a supporting chat template or thinking tokens"
                     )
-                suffix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
 
         def generation_text(text):
             if suffix and not text.endswith("<|im_start|>assistant\n"):

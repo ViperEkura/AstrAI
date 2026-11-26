@@ -31,18 +31,14 @@ and greedy decoding when it is zero. Their defaults differ from direct engine ca
 
 ## Thinking in chat requests
 
-The streaming chat CLI defaults to direct answers. Pass `--enable-thinking`
+The streaming chat CLI passes `enable_thinking=False` by default. Pass `--enable-thinking`
 to request thinking. HTTP clients can send `"chat_template_kwargs": {"enable_thinking": true}`
 or `false` to `/v1/chat/completions`; omitting the field uses the checkpoint
 default. Python callers can pass `enable_thinking=True` or
 `False` to `tokenizer.apply_chat_template` before generation.
 
-The checkpoint template controls the prompt when it consumes this variable.
-For native ChatML generation prompts ending in the assistant header, a tokenizer
-with both thinking markers can prefill an opening thinking tag or a completed
-empty thinking block. Prefilled text belongs to the input. The API returns
-subsequently generated text in the usual content field. Allow enough output
-tokens for both the reasoning and the final answer.
+The checkpoint chat template decides how to render this option. A template
+that ignores the variable renders its usual prompt for either setting.
 
 ## Cache and backend selection
 

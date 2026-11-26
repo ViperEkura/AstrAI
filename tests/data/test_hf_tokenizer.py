@@ -226,53 +226,25 @@ def test_tool_template_json_preserves_unicode_and_html(tmp_path):
     assert actual.apply_chat_template(messages, tokenize=False, tools=tools) == expected
 
 
-def test_thinking_switch_respects_template_and_native_chatml():
+def test_template_owns_thinking_prompt():
     tok = build_test_tokenizer(special_tokens=("<unk>", "<pad>", "<think>", "</think>"))
     messages = [{"role": "user", "content": "hello"}]
     tok.set_chat_template(
-        "{% if enable_thinking is defined %}{{ enable_thinking }}{% else %}default{% endif %}"
+        "reply{% if enable_thinking is defined %}/{{ enable_thinking }}{% endif %}"
     )
-    for mode, expected in [(None, "default"), (False, "False"), (True, "True")]:
+    for mode, expected in [
+        (None, "reply"),
+        (False, "reply/False"),
+        (True, "reply/True"),
+    ]:
         assert (
             tok.apply_chat_template(messages, tokenize=False, enable_thinking=mode)
             == expected
         )
 
-    tok.set_chat_template(
-        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
-    )
-    for mode, suffix in [
-        (None, ""),
-        (True, "<think>\n"),
-        (False, "<think>\n\n</think>\n\n"),
-    ]:
-        text = "<|im_start|>assistant\n" + suffix
-        assert tok.apply_chat_template(
-            [messages], tokenize=False, enable_thinking=mode
-        ) == [text]
-        assert tok.apply_chat_template(messages, enable_thinking=mode) == tok.encode(
-            text, add_special_tokens=False
-        )
+    tok.set_chat_template("reply")
+    for mode in (True, False):
         assert (
-            tok.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-                enable_thinking=mode,
-            )
-            == ""
+            tok.apply_chat_template(messages, tokenize=False, enable_thinking=mode)
+            == "reply"
         )
-    tok.set_chat_template("fixed prompt")
-    with pytest.raises(ValueError, match="does not support"):
-        tok.apply_chat_template(messages, enable_thinking=True)
-
-
-def test_direct_chat_without_thinking_tokens():
-    tok = build_test_tokenizer(chat_template="{{ messages[0].content }}")
-    messages = [{"role": "user", "content": "hello"}]
-    assert (
-        tok.apply_chat_template(messages, tokenize=False, enable_thinking=False)
-        == "hello"
-    )
-    with pytest.raises(ValueError, match="Thinking requires"):
-        tok.apply_chat_template(messages, enable_thinking=True)

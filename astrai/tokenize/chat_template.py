@@ -5,7 +5,7 @@ from datetime import datetime
 from functools import cached_property
 from typing import Any, Dict, List, Optional
 
-from jinja2 import Template, TemplateError, meta, nodes
+from jinja2 import Template, TemplateError, nodes
 from jinja2.ext import Extension
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
@@ -81,11 +81,7 @@ def _validate_generation_blocks(node, parents=()):
         _validate_generation_blocks(child, parents + (node,))
 
 
-class ChatTemplateInputError(ValueError):
-    """Invalid input to the chat template."""
-
-
-class ToolCallValidationError(ChatTemplateInputError):
+class ToolCallValidationError(ValueError):
     """Invalid tool-call history supplied by the caller."""
 
 
@@ -170,11 +166,6 @@ class ChatTemplate:
         parsed = environment.parse(self.template_str)
         _validate_generation_blocks(parsed)
         return environment.from_string(parsed)
-
-    @cached_property
-    def template_variables(self):
-        environment = self._compiled.environment
-        return meta.find_undeclared_variables(environment.parse(self.template_str))
 
     def __getstate__(self) -> Dict[str, Any]:
         """Exclude the cached Jinja2 template from pickling.

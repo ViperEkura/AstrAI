@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 from tokenizers import AddedToken, Tokenizer
 from tokenizers.decoders import DecodeStream
 
-from astrai.tokenize.chat_template import ChatTemplate, ChatTemplateInputError
+from astrai.tokenize.chat_template import ChatTemplate
 
 Message = Dict[str, Any]
 """Single chat message with ``role`` and ``content`` keys."""
@@ -309,24 +309,10 @@ class AutoTokenizer:
                 "Chat template not set. Use set_chat_template() to set a template first."
             )
 
-        suffix = ""
         if enable_thinking is not None:
             if not isinstance(enable_thinking, bool):
-                raise ChatTemplateInputError("enable_thinking must be a boolean")
-            if "enable_thinking" in self._chat_template.template_variables:
-                kwargs["enable_thinking"] = enable_thinking
-            elif add_generation_prompt:
-                if self._tokenizer is not None and all(
-                    self._tokenizer.token_to_id(tag) is not None
-                    for tag in ("<think>", "</think>")
-                ):
-                    suffix = (
-                        "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
-                    )
-                elif enable_thinking:
-                    raise ChatTemplateInputError(
-                        "Thinking requires a supporting chat template or thinking tokens"
-                    )
+                raise ValueError("enable_thinking must be a boolean")
+            kwargs["enable_thinking"] = enable_thinking
 
         is_batch = bool(messages) and isinstance(messages[0], list)
         if return_assistant_tokens_mask:
@@ -348,12 +334,6 @@ class AutoTokenizer:
                 )
             else:
                 text = self._chat_template.render(conversation, **kwargs)
-            if suffix:
-                if not text.endswith("<|im_start|>assistant\n"):
-                    raise ChatTemplateInputError(
-                        "This generation prompt does not support switching thinking mode"
-                    )
-                text += suffix
             if not return_assistant_tokens_mask:
                 rendered.append(text)
                 continue

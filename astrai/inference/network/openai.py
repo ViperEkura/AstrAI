@@ -16,7 +16,7 @@ from astrai.inference.network.protocol import (
     sse_event,
 )
 from astrai.inference.network.tool_parser import BaseToolParser, SimpleJsonToolParser
-from astrai.tokenize.chat_template import ChatTemplateInputError
+from astrai.tokenize.chat_template import ToolCallValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ class OpenAIResponseBuilder(ResponseBuilder):
                 tools=tools or [],
                 **(request.chat_template_kwargs or {}),
             )
-        except ChatTemplateInputError as error:
+        except ToolCallValidationError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
         self._resp_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

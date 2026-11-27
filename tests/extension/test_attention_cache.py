@@ -65,6 +65,124 @@ def test_paged_append_crosses_physical_blocks(device, regular, page_size):
     torch.testing.assert_close(vs, oldv, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("regular", [False, True])
+@pytest.mark.parametrize(
+    "device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)]
+)
+@torch.inference_mode()
+def test_torch_decode_with_spaced_cache_rows(device, regular):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    torch.manual_seed(12)
+    dtype = torch.bfloat16 if device == "cuda" else torch.float64
+    pages = torch.tensor(
+        [[1, 2, -1], [5, 6, -1], [9, 10, -1]], device=device, dtype=torch.int32
+    )
+    past = torch.full((3,), 4, device=device, dtype=torch.int32)
+    # Keep a storage offset, gaps between rows and an invalid unused page.
+    kc, vc = [
+        torch.randn(13, 3, 2, 16, device=device, dtype=dtype)[1:] for _ in range(2)
+    ]
+    q, k, v = [torch.randn(3, h, 16, device=device, dtype=dtype) for h in (6, 2, 2)]
+    expected_k, expected_v = kc.clone(), vc.clone()
+    expected_k[[2, 6, 10], 1] = k
+    expected_v[[2, 6, 10], 1] = v
+    histories = [
+        torch.stack([t[i : i + 2].flatten(0, 1)[:5] for i in (1, 5, 9)])
+        .repeat_interleave(3, dim=2)
+        .transpose(1, 2)
+        .double()
+        for t in (expected_k, expected_v)
+    ]
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.double().unsqueeze(2), *histories
+    ).squeeze(2)
+    if regular:
+        q, k, v = (t.unsqueeze(1) for t in (q, k, v))
+    with op_backend(attention="torch"):
+        out = attention(
+            q,
+            k,
+            v,
+            k_cache=kc,
+            v_cache=vc,
+            cache_seqlens=past,
+            page_table=pages,
+            is_causal=True,
+        )
+    assert out.shape == q.shape
+    tol = 0.015 if device == "cuda" else 1e-10
+    torch.testing.assert_close(
+        out.reshape_as(expected).double(), expected, atol=tol, rtol=tol
+    )
+    torch.testing.assert_close(kc, expected_k, atol=0, rtol=0)
+    torch.testing.assert_close(vc, expected_v, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+def test_torch_decode_preserves_writes_visible_in_request_order():
+    # Row 1 overwrites row 0's history after row 0 has consumed it.
+    kc = torch.zeros(3, 1, 1, 1)
+    vc = torch.tensor([2.0, 0.0, 6.0]).view_as(kc)
+    q = k = torch.zeros(2, 1, 1)
+    v = torch.tensor([4.0, 10.0]).view_as(q)
+    with op_backend(attention="torch"):
+        out = attention(
+            q,
+            k,
+            v,
+            k_cache=kc,
+            v_cache=vc,
+            cache_seqlens=torch.tensor([1, 1], dtype=torch.int32),
+            page_table=torch.tensor([[0, 1], [2, 0]], dtype=torch.int32),
+        )
+    torch.testing.assert_close(out.flatten(), torch.tensor([3.0, 8.0]))
+    torch.testing.assert_close(vc.flatten(), torch.tensor([10.0, 4.0, 6.0]))
+
+
+@pytest.mark.parametrize("external", [False, True])
+@torch.inference_mode()
+def test_torch_decode_preserves_query_aliasing_a_later_cache_write(external):
+    kc = torch.zeros(4, 1, 1, 1)
+    vc = torch.tensor([2.0, 0.0, 6.0, 0.0]).view_as(kc)
+    # Both queries read slot 3. It is still zero when row 0 attends.
+    last_slot = torch.from_numpy(vc.numpy()[3:]).view(1, 1, 1) if external else vc[3]
+    q = last_slot.expand(2, 1, 1)
+    k, v = torch.ones_like(q), torch.tensor([4.0, 8.0]).view_as(q)
+    with op_backend(attention="torch"):
+        out = attention(
+            q,
+            k,
+            v,
+            k_cache=kc,
+            v_cache=vc,
+            cache_seqlens=torch.tensor([1, 1], dtype=torch.int32),
+            page_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        )
+    torch.testing.assert_close(out[0], torch.full_like(out[0], 3.0))
+    torch.testing.assert_close(vc.flatten(), torch.tensor([2.0, 4.0, 6.0, 8.0]))
+
+
+@torch.inference_mode()
+def test_torch_decode_validates_last_active_page_before_any_write():
+    kc, vc = [torch.zeros(4, 1, 1, 4) for _ in range(2)]
+    q = torch.ones(2, 1, 4)
+    with (
+        op_backend(attention="torch"),
+        pytest.raises(ValueError, match="page index outside cache"),
+    ):
+        attention(
+            q,
+            q,
+            q,
+            k_cache=kc,
+            v_cache=vc,
+            cache_seqlens=torch.tensor([1, 1], dtype=torch.int32),
+            page_table=torch.tensor([[0, 1], [2, 4]], dtype=torch.int32),
+        )
+    assert not kc.any() and not vc.any()
+
+
 @pytest.mark.cuda
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not is_available("attention"),

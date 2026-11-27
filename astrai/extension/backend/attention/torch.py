@@ -78,6 +78,15 @@ def forward(
     if scale is not None and not math.isfinite(scale):
         raise ValueError("attention scale must be finite")
     n_rep = q.size(2) // k.size(2)
+    if q.size(1) == 1 and k.size(1) > 1 and attn_mask is None:
+        # A rectangular last query sees every key. Keep square causal calls
+        # intact: a single local token may be part of a context-parallel shard.
+        # Use the queries sharing a KV head as SDPA rows instead of copying KV.
+        grouped_q = q.reshape(q.size(0), k.size(2), n_rep, q.size(-1))
+        out = F.scaled_dot_product_attention(
+            grouped_q, k.transpose(1, 2), v.transpose(1, 2), scale=scale
+        )
+        return out.reshape_as(q).contiguous()
     k, v = repeat_kv(k, n_rep), repeat_kv(v, n_rep)
     mask = _mask_view(attn_mask)
     sdpa_causal = is_causal
@@ -144,6 +153,46 @@ def forward_varlen(q, k, v, qs, ks, is_causal, scale):
                 )[0]
             )
     return torch.cat(result)
+
+
+def _linear_decode(q, kc, vc, k, v, page_rows, length):
+    """Use zero-copy KV views when the live rows form disjoint, strided spans."""
+    batch, blocks = page_rows.shape
+    starts = page_rows[:2, 0].tolist()
+    first = starts[0]
+    stride = starts[1] - first if batch > 1 else blocks
+    last = first + (batch - 1) * stride
+    if first < 0 or stride < blocks or last + blocks > kc.size(0):
+        return None
+    expected = torch.arange(first, first + blocks, device="cpu", dtype=torch.int64)
+    for row in page_rows.unbind():
+        if not torch.equal(row, expected):
+            return None
+        expected.add_(stride)
+
+    # Distinct storage wrappers can still refer to overlapping external memory.
+    # In that case each request must see the cache writes in their original order.
+    def byte_range(tensor):
+        storage = tensor.untyped_storage()
+        start = storage.data_ptr()
+        return start, start + storage.nbytes()
+
+    spans = [byte_range(t) for t in (q, k, v)]
+    for cache in (kc, vc):
+        begin, end = byte_range(cache)
+        if any(begin < hi and lo < end for lo, hi in spans):
+            return None
+        spans.append((begin, end))
+    size = kc.size(1)
+    keys, values = (
+        cache.flatten(0, 1)[first * size : last * size + length]
+        .unfold(0, length, stride * size)
+        .movedim(-1, 1)
+        for cache in (kc, vc)
+    )
+    keys[:, -1].copy_(k)
+    values[:, -1].copy_(v)
+    return forward(q[:, None], keys, values)
 
 
 def forward_cache(
@@ -217,13 +266,33 @@ def forward_cache(
         or not 0 < mask.size(-2) <= (q.size(0) if qs is not None else 1)
     ):
         raise ValueError("invalid request-local paged mask")
+    page_rows = None
+    if (
+        qs is None
+        and mask is None
+        and dense is forward
+        and not torch.is_grad_enabled()
+        and q.device.type in ("cpu", "cuda")
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+        and lengths[0] > 0
+        and lengths.count(lengths[0]) == len(lengths)
+    ):
+        length = lengths[0] + 1
+        if length > pages.size(1) * size:
+            raise ValueError("request exceeds cache capacity")
+        page_rows = pages[:, : (length + size - 1) // size].cpu()
+        out = _linear_decode(q, kc, vc, k, v, page_rows, length)
+        if out is not None:
+            return out.reshape(original)
+
     slots = []
     for i, n in enumerate(lengths):
         length = n + offsets[i + 1] - offsets[i]
         if n < 0 or length > pages.size(1) * size:
             raise ValueError("request exceeds cache capacity")
         active = pages[i, : (length + size - 1) // size]
-        if any(page < 0 or page >= kc.size(0) for page in active.tolist()):
+        row = page_rows[i] if page_rows is not None else active
+        if any(page < 0 or page >= kc.size(0) for page in row.tolist()):
             raise ValueError("page index outside cache")
         pos = torch.arange(length, device=q.device)
         slots.append(active[pos // size].long() * size + pos % size)

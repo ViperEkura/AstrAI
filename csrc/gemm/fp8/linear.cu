@@ -15,7 +15,7 @@
  *
  * Not here by design: the autocast region and recipe/format policy
  * (astrai/extension/policy/quantization/autocast.py), the module slot table
- * (astrai/extension/policy/quantization/autocast.py), and the rings / cast caches / snapshot
+ * (astrai/extension/policy/quantization/autocast.py), and the rings / activation cache / snapshot
  * (ring.h, cache.h, state.h). The state owner and checkpoint
  * interface live in runtime.cu in this module.
  */
@@ -50,12 +50,6 @@ namespace {
 
 struct Fp8FwdOut {
     Tensor out;
-    /*
-     * The GEMMs' dequant scales. ``sx`` is a ring *view* (no clone) that dies at
-     * that ring's next fold, so it is read only within this call and the backward
-     * after it; ``sw`` is a ring view or, on a cast-cache hit, the cache's
-     * immutable copy — either way it must describe ``w8``'s bytes.
-     */
     Tensor sx, sw;
     Tensor x8T, w8T; // K-contiguous transposed casts (undefined when absent)
 };
@@ -113,39 +107,32 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
     }
     if (!meta->x->initialized)
         meta->x->seed(x, fmt_a, margin);
-    /*
-     * Ring view of the current scale pair: the fold publishes into the other
-     * pair, so this slot still holds the multiplier the cast used when the GEMM
-     * reads it. It dies at this ring's next fold — consumed well before that in
-     * training order (the backward precedes the same linear's next forward).
-     */
-    res.sx = meta->x->scale();
-    Tensor w8;
-    const auto generation = st.generation.load(std::memory_order_relaxed);
-    if (meta->cast.valid(w, fmt_a, fmt_b, generation)) {
-        w8 = meta->cast.out;
-        res.sw = meta->cast.scale;
-        res.w8T = meta->cast.out_t;
-    } else {
-        res.sw = meta->w.scale();
-        if (update_rings) {
-            const auto qw = quant::quantize_scaled(
-                w, meta->w.scale_recip(), meta->w.state, history_len, meta->w.idx, fmt_a, fmt_b,
-                margin, quant_max_of(fmt_a), meta->w.pub_scale(), meta->w.pub_recip());
-            w8 = qw.out;
-            res.w8T = qw.out_t;
-            meta->w.advance();
-            // The entry must outlive the ring pair it came from: immutable copy.
-            meta->cast = {w8, res.w8T, res.sw.clone(), version_of(w), generation};
-        } else {
-            /*
-             * Ring-free cast (no-grad): folding here would advance the window a
-             * second time per step and desynchronize the recompute.
-             */
-            w8 = quant::quantize(w, meta->w.scale_recip(), fmt_a, c10::nullopt).out;
-        }
+    // The weight history advances once per version; the bytes always come from w.
+    auto& ring = meta->w;
+    const auto version = w.is_inference() ? -1 : version_of(w);
+    const bool same_scale =
+        version >= 0 && version == meta->weight_version && fmt_a == meta->weight_format;
+    res.sw = same_scale ? ring.pub_scale() : ring.scale();
+    if (update_rings)
+        res.sw = res.sw.clone();
+    const auto qw =
+        update_rings && !same_scale
+            ? quant::quantize_scaled(w, ring.scale_recip(), ring.state, history_len, ring.idx,
+                                     fmt_a, fmt_b, margin, quant_max_of(fmt_a), ring.pub_scale(),
+                                     ring.pub_recip())
+            : quant::quantize(w, same_scale ? ring.pub_recip() : ring.scale_recip(), fmt_a,
+                              update_rings ? c10::make_optional(fmt_b) : c10::nullopt);
+    if (update_rings && !same_scale) {
+        ring.advance();
+        meta->weight_version = version;
+        meta->weight_format = fmt_a;
     }
+    res.w8T = qw.out_t;
 
+    // A later microbatch can advance the ring before this backward runs.
+    res.sx = cached_activation ? cached_activation->scale : meta->x->scale();
+    if (update_rings && !cached_activation)
+        res.sx = res.sx.clone();
     Tensor x8;
     if (update_rings) {
         if (cached_activation.has_value()) {
@@ -159,15 +146,15 @@ Fp8FwdOut fp8_forward_impl(const Tensor& x,
             res.x8T = qx.out_t;
             meta->x->advance();
             if (cache_activation) {
-                st.act_cache.insert(x, qx.out, qx.out_t, meta->x, margin);
+                st.act_cache.insert(x, qx.out, qx.out_t, res.sx, meta->x, margin);
             }
         }
     } else {
         x8 = quant::quantize(x, meta->x->scale_recip(), fmt_a, c10::nullopt).out;
     }
-    res.out =
-        gemm::quant_gemm_impl(x8.reshape({-1, x8.size(-1)}), w8, res.sx, res.sw, false, true, bias)
-            .reshape(out_shape);
+    res.out = gemm::quant_gemm_impl(x8.reshape({-1, x8.size(-1)}), qw.out, res.sx, res.sw, false,
+                                    true, bias)
+                  .reshape(out_shape);
     return res;
 }
 
@@ -199,7 +186,7 @@ tensor_list fp8_backward_impl(const Tensor& g, const Fp8BwdIn& in) {
     /*
      * NT fast path via transposed quantize outputs: g8 + w8T gives grad_x, g8T +
      * x8T gives grad_w. g is consumed in both orientations (one dual pass feeds
-     * both); x8T/w8T came from the forward or the weight cast cache, so the
+     * both); x8T/w8T came from the forward, so the
      * backward re-reads neither x nor w.
      */
     const auto qg = in.dynamic ? quant::quantize(g2, sg.reciprocal(), in.fmt_b, in.fmt_b)

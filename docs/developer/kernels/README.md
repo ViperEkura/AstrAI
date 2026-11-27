@@ -45,7 +45,7 @@ Additionally, optimized `.cuh` variants with tensor-core MMA (Matrix Multiply-Ac
 One entry the table does not spell out: `gemm/` also carries the **fp8
 training** linear — `gemm/fp8/linear.cu` (the composed forward *and* backward in
 one C++ `autograd::Function`) with scale rings in `gemm/fp8/ring.h`,
-cast caches in `gemm/fp8/cache.h`, and registry definitions in
+the activation cache in `gemm/fp8/cache.h`, and registry definitions in
 `gemm/fp8/state.h`. `gemm/fp8/runtime.cu` owns the single process state,
 checkpoint interface, and Python registration. Its Python entry is the strategy
 layer `astrai/extension/policy/quantization/autocast.py` (`fp8_autocast`, recipe/format policy),

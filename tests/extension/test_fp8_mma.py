@@ -769,67 +769,55 @@ def test_ring_publishes_reciprocal_bitwise(fmt, margin):
 
 @pytest.mark.cuda
 @skip_no_fp8
-def test_weight_cast_cache_reuses_and_invalidates():
-    """The weight cast is reused while the weight's version counter is
-    unchanged (one cast per optimizer step, not per micro-batch), and
-    invalidated by an in-place update and a checkpoint restore. Reuse must
-    be numerically inert: identical inputs under an unchanged weight give
-    bit-identical outputs."""
-    torch.manual_seed(23)
-    dev = torch.device("cuda")
+def test_weight_recast_reads_storage_and_preserves_history_cadence():
     gemm = _gemm()
     gemm.fp8_reset()
-    gemm.fp8_set_act_cache(False)
-    x = torch.randn(8, 64, device=dev, dtype=torch.bfloat16)
-    w = torch.randn(32, 64, device=dev, dtype=torch.bfloat16)
-    bias = torch.zeros(32, device=dev, dtype=torch.bfloat16)
+    x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
     try:
+        first = gemm.fp8_linear(x, w)
+        index = gemm.fp8_debug_meta(w)["w"]["idx"]
+        # Model publication through a collective can change bytes without a version bump.
+        version = w._version
+        w.data.neg_()
+        assert w._version == version
+        for training in (False, True):
+            output = gemm.fp8_linear(x, w, update_rings=training)
+            torch.testing.assert_close(output, -first, rtol=0, atol=0)
+            assert gemm.fp8_debug_meta(w)["w"]["idx"] == index
 
-        def run():
-            return gemm.fp8_linear(
-                x,
-                w,
-                bias,
-                True,
-                False,
-                False,
-                16,
-                0,
-                torch.float8_e4m3fn,
-                torch.float8_e5m2,
-            )
-
-        o1 = run()
-        first = gemm.fp8_debug_meta(w)
-        first_idx = first["w"]["idx"]
-        first_hist = first["w"]["hist"].clone()
-        o2 = run()
-        reused = gemm.fp8_debug_meta(w)
-        assert reused["w"]["idx"] == first_idx
-        assert torch.equal(reused["w"]["hist"], first_hist)
-        assert torch.equal(o1, o2)
-
-        with torch.no_grad():
-            w.add_(0.01)  # the optimizer-step shape: in-place => version bump
-        o3 = run()
-        assert not torch.equal(o2, o3)
-        updated = gemm.fp8_debug_meta(w)
-        assert updated["w"]["idx"] == (first_idx + 1) % 16
-        assert updated["cast_version"] == w._version
-
-        # The ring's history also folds on a miss only: a hit leaves both the
-        # window and the write index untouched.
-        meta = gemm.fp8_debug_meta(w)
-        idx, hist = meta["w"]["idx"], meta["w"]["hist"].clone()
-        run()
-        meta = gemm.fp8_debug_meta(w)
-        assert meta["w"]["idx"] == idx and torch.equal(meta["w"]["hist"], hist)
-        assert meta["cast_version"] == w._version
-
+        w.neg_()
+        gemm.fp8_linear(x, w)
+        assert gemm.fp8_debug_meta(w)["w"]["idx"] == (index + 1) % 16
         fp8_load_state_dict(fp8_state_dict())
-        restored_idx = gemm.fp8_debug_meta(w)["w"]["idx"]
-        run()
-        assert gemm.fp8_debug_meta(w)["w"]["idx"] == (restored_idx + 1) % 16
+        gemm.fp8_linear(x, w)
+        assert gemm.fp8_debug_meta(w)["w"]["idx"] == (index + 2) % 16
     finally:
         gemm.fp8_reset()
-        gemm.fp8_set_act_cache(True)
+
+
+@pytest.mark.cuda
+@skip_no_fp8
+def test_delayed_backward_uses_forward_scales():
+    gemm = _gemm()
+    x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(16, 32, device="cuda", dtype=torch.bfloat16)
+
+    def gradients(overlap):
+        gemm.fp8_reset()
+        first = gemm.fp8_linear(x, w)
+        if overlap:
+            gemm.fp8_linear(x * 16, w)
+            # Reuse the first activation after another forward advanced its ring.
+            replay = gemm.fp8_linear(x, w)
+            torch.testing.assert_close(replay, first, rtol=0, atol=0)
+        return torch.autograd.grad(first, (x, w), g)
+
+    try:
+        serial = gradients(False)
+        overlapped = gradients(True)
+        for reference, actual in zip(serial, overlapped):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    finally:
+        gemm.fp8_reset()

@@ -1,5 +1,5 @@
 #pragma once
-/* Versioned weight casts and a bounded activation LRU. */
+/* Bounded cache for activations shared by multiple projections. */
 #include <c10/util/Optional.h>
 
 #include <cstdint>
@@ -15,26 +15,13 @@ namespace fp8 {
 
 using torch::Tensor;
 
-/* In-place updates, including optimizer steps, invalidate cached casts. */
 inline int64_t version_of(const Tensor& t) {
     return t.unsafeGetTensorImpl()->version_counter().current_version();
 }
 
-/* Keep the immutable scale that produced these bytes across ring advances. */
-struct WeightCast {
-    Tensor out, out_t, scale;
-    int64_t version = -1;
-    int64_t generation = -1;
-
-    bool valid(const Tensor& w, at::ScalarType dtype, at::ScalarType tdtype, int64_t gen) const {
-        return out.defined() && out_t.defined() && version == version_of(w) && generation == gen &&
-               out.scalar_type() == dtype && out_t.scalar_type() == tdtype;
-    }
-};
-
 /* A strong input identity prevents a recycled TensorImpl from becoming a hit. */
 struct ActivationCast {
-    Tensor input, out, out_t;
+    Tensor input, out, out_t, scale;
     std::shared_ptr<ScaleRing> ring;
     int64_t version;
     int64_t margin;
@@ -80,6 +67,7 @@ class ActivationCache {
     void insert(const Tensor& input,
                 Tensor out,
                 Tensor out_t,
+                Tensor scale,
                 std::shared_ptr<ScaleRing> ring,
                 int64_t margin) {
         const int64_t entry_bytes = input.numel() * input.element_size() +
@@ -102,8 +90,8 @@ class ActivationCache {
             bytes -= entries.front().bytes;
             entries.pop_front();
         }
-        entries.push_back({input, std::move(out), std::move(out_t), std::move(ring),
-                           version_of(input), margin, entry_bytes});
+        entries.push_back({input, std::move(out), std::move(out_t), std::move(scale),
+                           std::move(ring), version_of(input), margin, entry_bytes});
         bytes += entry_bytes;
     }
 

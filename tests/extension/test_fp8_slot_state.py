@@ -59,7 +59,7 @@ def _meta(weight, slot):
 
 @pytest.mark.cuda
 @skip_no_fp8
-def test_slot_rebind_keeps_the_rings_and_drops_the_stale_weight_cast():
+def test_slot_rebind_keeps_rings_and_uses_replacement_weight():
     gemm = _gemm()
     gemm.fp8_set_slots([(0, "layers.0.q_proj", "layers.*.q_proj")])
     x = _bf16(8, 16)
@@ -86,9 +86,6 @@ def test_slot_rebind_keeps_the_rings_and_drops_the_stale_weight_cast():
     second = _meta(w_new, 0)
     assert second["w"]["initialized"], "the ring survived the replacement"
     assert second["w"]["idx"] == (idx_before + 1) % HIST, "history kept advancing"
-    # The cast cache validates on the version counter, which a fresh parameter
-    # shares with its predecessor: it must have been dropped, so the GEMM ran
-    # on the NEW weight's bytes.
     ref = F.linear(x, w_new, None)
     assert (out - ref).norm() / ref.norm() < 0.1
 

@@ -212,7 +212,7 @@ module). `astrai/extension/policy/quantization/autocast.py` owns the FP8
 strategy: recipes, history / dynamic scaling and `fp8_autocast`. The same quantize
 adapter executes FP8 and int8 casts with caller-provided multipliers.
 The composed fp8 linear —
-quantize, ring fold/advance, the weight-cast cache and all three GEMMs — lives in C++
+quantize, ring fold/advance, the activation cache and all three GEMMs — lives in C++
 (`csrc/gemm/fp8/linear.cu`, compiled into the `gemm` module
 where the GEMM dispatch state lives) behind a single Python->C++ crossing;
 the strategy layer routes `aten::linear` to it on CUDA. The aten override
@@ -251,11 +251,10 @@ Dynamic scaling measures the current input before calling `quantize`.
 History scaling calls `quantize_scaled` with the current reciprocal and
 the other publication pair. `ScaleRing` owns seeding, the history cursor
 and double buffering; linear controls their forward/backward timing.
-Versioned weight casts retain a scale snapshot and become invalid after an
-in-place weight update. Shared activation casts retain their associated
-ring. Cache hits skip both quantization and ring advancement, and no-grad
-calls do not update history. These caches and registry snapshots are not
-dependencies of either quantization entry.
+Each forward casts the current weight. The weight history advances once per
+weight version. A training forward saves its transposed operands and scales
+until backward finishes. Projections that share an activation can reuse its
+cast and scale. No-grad calls read the rings without advancing them.
 
 The runtime owns registration, reset and restoration. Python checkpoint
 dictionaries are converted to typed snapshots at its boundary; checkpoint
@@ -271,7 +270,7 @@ in `api/native/gemm.h`. Private packing types never enter the native API.
 | `gemm/bindings.cu` | Python arguments and planner dictionaries |
 | `gemm/entry.cu` | Device guard, metadata validation, operand/output ownership, dtype/schedule selection and probe |
 | `gemm/plan/` | Ordinary C++ planner, row table and generated builtin rows |
-| `gemm/fp8/` | Training autograd, scale rings, cast caches and runtime state |
+| `gemm/fp8/` | Training autograd, scale rings, activation cache and runtime state |
 | `gemm/instantiations/` | One heavy CUDA compilation unit per dtype pair; CMake compiles each schedule |
 | `policy/gemm/` | Tile manifest, traits, geometry, cost model and shared runtime switches |
 | `launcher/gemm_*.cuh` | Native layout lowering, recipe selection and CUDA launch |

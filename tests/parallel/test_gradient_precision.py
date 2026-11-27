@@ -485,7 +485,13 @@ def _owner_state_check(rank, rendezvous, directory, backend, cpu_offload):
                         target.main_grad = (
                             None if gradient is None else gradient.clone()
                         )
+                versions = {
+                    p: p._version
+                    for p in model.parameters()
+                    if parameter_gradient(p) is not None
+                }
                 actual.step()
+                assert all(p._version > version for p, version in versions.items())
                 expected.step()
                 for param, target in zip(model.parameters(), reference.parameters()):
                     torch.testing.assert_close(param, target, rtol=0, atol=0)

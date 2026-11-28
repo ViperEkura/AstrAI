@@ -39,6 +39,14 @@ and end at the corresponding token total. Native varlen checks metadata without
 launching a separate value-validation kernel. Torch reference execution checks
 values while materializing segment indices; paged kernels retain their addressing guards.
 
+For an unmasked single query against multiple keys, the Torch backend groups
+query heads that share a KV head into independent SDPA rows. Bottom-right
+causality exposes the entire live history, so this needs neither repeated K/V
+heads nor a causal mask. Square calls retain their causal flag for context parallelism.
+In inference, equal-length decode requests with disjoint, evenly spaced runs
+of consecutive physical pages can append and attend in one batch using cache
+views. Other layouts retain request-ordered appends and reads.
+
 GQA and MLA share the model-side scaled_dot_product_attention function, which binds the
 current layer's K/V views, query offsets and workspace before calling attention.
 They are adjacent in the model module; GDN and its state follow them. Extension

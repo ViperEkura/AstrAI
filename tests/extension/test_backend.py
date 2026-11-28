@@ -1,6 +1,7 @@
 """Attention Dispatcher capability and execution tests."""
 
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -69,6 +70,73 @@ def test_attention_causal_scale_and_mask_share_one_contract(q_len, kv_len, scale
     ).transpose(1, 2)
     with op_backend(attention="torch"):
         actual = attention(q, k, v, mask=padding, is_causal=True, scale=scale)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "batch,stride,scale,backward", [(1, 1, None, False), (3, 2, -0.25, True)]
+)
+def test_torch_single_query_gqa_matches_dense(batch, stride, scale, backward):
+    torch.manual_seed(23)
+    q, k, v = (
+        torch.randn(batch, length, heads * stride, 8)[:, :, ::stride].requires_grad_(
+            backward
+        )
+        for length, heads in ((1, 6), (7, 2), (7, 2))
+    )
+    with op_backend(attention="torch"), torch.set_grad_enabled(backward):
+        actual = attention(q, k, v, is_causal=True, scale=scale)
+
+    # The single bottom-right causal query sees every key.
+    group_size = q.size(2) // k.size(2)
+    q64 = q.double().transpose(1, 2)
+    k64, v64 = (
+        x.double().transpose(1, 2).repeat_interleave(group_size, dim=1) for x in (k, v)
+    )
+    scores = q64 @ k64.transpose(-1, -2)
+    factor = q.size(-1) ** -0.5 if scale is None else scale
+    expected = ((scores * factor).softmax(dim=-1) @ v64).transpose(1, 2).float()
+    sdpa = torch.nn.functional.scaled_dot_product_attention(
+        q64.float(), k64.float(), v64.float(), scale=scale
+    ).transpose(1, 2)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, sdpa)
+    if backward:
+        upstream = torch.randn_like(actual)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual, (q, k, v), upstream),
+            torch.autograd.grad(expected, (q, k, v), upstream),
+        )
+
+
+def test_single_token_causal_shard_preserves_sdpa_contract():
+    # Ring attention uses the original sequence axis and causal flag to decide
+    # which remote ranks are visible, even when each shard has only one token.
+    q = torch.zeros(1, 1, 4, 8)
+    k = torch.zeros(1, 1, 2, 8)
+    with (
+        op_backend(attention="torch"),
+        patch.object(
+            torch.nn.functional,
+            "scaled_dot_product_attention",
+            wraps=torch.nn.functional.scaled_dot_product_attention,
+        ) as ring_entry,
+    ):
+        attention(q, k, k, is_causal=True)
+    ring_entry.assert_called_once()
+    assert ring_entry.call_args.args[0].size(-2) == 1
+    assert ring_entry.call_args.kwargs["is_causal"]
+
+
+def test_torch_single_query_gqa_respects_head_mask():
+    q = torch.zeros(1, 1, 4, 1)
+    k = torch.zeros(1, 4, 2, 1)
+    v = torch.arange(8, dtype=q.dtype).view_as(k)
+    # Each query head selects its own key, even within a shared KV head.
+    mask = torch.eye(4, dtype=torch.bool)[None, :, None, :]
+    with op_backend(attention="torch"):
+        actual = attention(q, k, v, mask=mask, is_causal=True)
+    expected = torch.tensor([0.0, 2.0, 5.0, 7.0]).view_as(q)
     torch.testing.assert_close(actual, expected)
 
 

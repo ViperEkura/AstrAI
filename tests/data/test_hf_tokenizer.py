@@ -7,6 +7,7 @@ from tokenizers import Tokenizer, models
 
 from astrai.tokenize import AutoTokenizer
 from astrai.trainer.callbacks.checkpoint import _copy_tokenizer_files
+from tests.support.tokenizers import build_test_tokenizer
 
 
 def _write_tokenizer(root, *, eos="<eos>", generation=None):
@@ -223,3 +224,27 @@ def test_tool_template_json_preserves_unicode_and_html(tmp_path):
         '"description": "<a>&天气"}}]查天气'
     )
     assert actual.apply_chat_template(messages, tokenize=False, tools=tools) == expected
+
+
+def test_template_owns_thinking_prompt():
+    tok = build_test_tokenizer(special_tokens=("<unk>", "<pad>", "<think>", "</think>"))
+    messages = [{"role": "user", "content": "hello"}]
+    tok.set_chat_template(
+        "reply{% if enable_thinking is defined %}/{{ enable_thinking }}{% endif %}"
+    )
+    for mode, expected in [
+        (None, "reply"),
+        (False, "reply/False"),
+        (True, "reply/True"),
+    ]:
+        assert (
+            tok.apply_chat_template(messages, tokenize=False, enable_thinking=mode)
+            == expected
+        )
+
+    tok.set_chat_template("reply")
+    for mode in (True, False):
+        assert (
+            tok.apply_chat_template(messages, tokenize=False, enable_thinking=mode)
+            == "reply"
+        )

@@ -29,6 +29,17 @@ for EOS and length precedence.
 The HTTP adapter and demo scripts select sampling when temperature is positive
 and greedy decoding when it is zero. Their defaults differ from direct engine calls.
 
+## Thinking in chat requests
+
+The streaming chat CLI passes `enable_thinking=False` by default. Pass `--enable-thinking`
+to request thinking. HTTP clients can send `"chat_template_kwargs": {"enable_thinking": true}`
+or `false` to `/v1/chat/completions`; omitting the field uses the checkpoint
+default. Python callers can pass `enable_thinking=True` or
+`False` to `tokenizer.apply_chat_template` before generation.
+
+The checkpoint chat template decides how to render this option. A template
+that ignores the variable renders its usual prompt for either setting.
+
 ## Cache and backend selection
 
 The default contiguous cache reserves `max_batch_size × max_seq_len` slots.

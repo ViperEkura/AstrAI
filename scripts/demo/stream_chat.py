@@ -68,7 +68,14 @@ def parse_args():
     parser.add_argument(
         "--raw", action="store_true", help="Continue text without a chat template"
     )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking for chat (default: disabled)",
+    )
     args = parser.parse_args()
+    if args.raw and args.enable_thinking:
+        parser.error("--enable-thinking requires chat mode")
     if args.raw and args.system_prompt:
         parser.error("--system_prompt requires chat mode")
     if args.frequency_penalty is None:
@@ -97,6 +104,7 @@ def chat():
                         msgs + [{"role": "user", "content": query}],
                         tokenize=False,
                         add_generation_prompt=True,
+                        enable_thinking=args.enable_thinking,
                     )
 
                 with closing(

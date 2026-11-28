@@ -189,3 +189,25 @@ def test_chat_completions_real_engine(tmp_path, client):
     finally:
         engine.shutdown()
         get_app().state.engine = None
+
+
+def test_chat_thinking_option_reaches_template(client, loaded_model):
+    loaded_model.tokenizer = build_test_tokenizer(
+        chat_template="{{ 'on' if enable_thinking else 'off' }}"
+    )
+
+    async def events():
+        yield StreamChunk("ok", [1], True)
+
+    for value, expected in [(True, "on"), (False, "off")]:
+        loaded_model.generate_events.return_value = events()
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": value},
+            },
+        )
+        assert response.status_code == 200
+        args, kwargs = loaded_model.generate_events.call_args
+        assert (args[0] if args else kwargs["prompt"]) == expected

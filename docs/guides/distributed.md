@@ -197,6 +197,12 @@ backward. The second stage owns the remaining blocks, final norm and language
 model head. Each update uses 64 sequences across the four data replicas.
 CP and TP are both one for this layout.
 
+The stage module owns its decoder layer range and original checkpoint names.
+The 1F1B schedule handles microbatch execution and same-stage DP gradient
+synchronization. The executor adapts fixed-shape windows, validation and
+checkpoint collection to the existing Trainer lifecycle. Training and validation
+share the same token-summed loss; validation does not require a prior training step.
+
 The normal checkpoint directory contains a complete model. Use the same
 layer partition and `--resume` to restore stage optimizer states, the
 learning-rate schedule and the committed data cursor. To start from weights
@@ -210,8 +216,8 @@ Gradient accumulation lets you simulate a larger effective batch size by accumul
 Effective batch = dp_size × batch_per_device × grad_accum_steps
 ```
 
-CP and TP ranks share each batch, so neither degree scales the effective batch.
-The launcher starts `dp_size × cp_size × tp_size` processes.
+CP, TP and PP ranks share each batch, so none of these degrees scales the effective batch.
+The launcher starts `dp_size × cp_size × tp_size × pp_size` processes.
 
 Example: dp_size 4 × batch 4 × accum 8 = effective batch 256.
 

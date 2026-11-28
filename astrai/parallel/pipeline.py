@@ -2,6 +2,7 @@
 
 from collections import OrderedDict
 from contextlib import contextmanager
+from functools import partial
 from typing import List
 
 import torch
@@ -71,6 +72,20 @@ class DecoderStage(nn.Module):
         return self.model(inputs)["hidden_states"]
 
 
+def _sequence_loss_sum(
+    module, hidden, targets, *, loss_backend, loss_chunk_size, label_smoothing
+):
+    """Compute the same token-summed objective for training and validation."""
+    if loss_backend == "torch":
+        logits = module.lm_head(hidden).flatten(0, 1).float()
+        return F.cross_entropy(
+            logits, targets.flatten(), label_smoothing=label_smoothing, reduction="sum"
+        )
+    return module.lm_head(
+        hidden, targets, chunk_size=loss_chunk_size, label_smoothing=label_smoothing
+    )
+
+
 class PipelineUpdate:
     """Run 1F1B for one DP replica, then synchronize same-stage gradients."""
 
@@ -96,9 +111,13 @@ class PipelineUpdate:
         self.local_batch = microbatch_size * microbatches
         self.seq_len = seq_len
         self.normalizer = self.local_batch * seq_len
-        self.loss_chunk_size = loss_chunk_size
-        self.loss_backend = loss_backend
-        self.label_smoothing = label_smoothing
+        self.loss_sum = partial(
+            _sequence_loss_sum,
+            module,
+            loss_backend=loss_backend,
+            loss_chunk_size=loss_chunk_size,
+            label_smoothing=label_smoothing,
+        )
         param = next(module.parameters())
         self.device = param.device
         hidden = torch.empty(
@@ -128,24 +147,6 @@ class PipelineUpdate:
         self.gradients = gradients or MainGradientAccumulator(
             module, synchronize=lambda: False
         )
-
-    def loss_sum(self, hidden: Tensor, targets: Tensor) -> Tensor:
-        if self.loss_backend == "torch":
-            logits = self.module.lm_head(hidden).flatten(0, 1).float()
-            loss = F.cross_entropy(
-                logits,
-                targets.flatten(),
-                label_smoothing=self.label_smoothing,
-                reduction="sum",
-            )
-        else:
-            loss = self.module.lm_head(
-                hidden,
-                targets,
-                chunk_size=self.loss_chunk_size,
-                label_smoothing=self.label_smoothing,
-            )
-        return loss
 
     def backward(self, inputs: Tensor, targets: Tensor) -> Tensor:
         expected = (self.local_batch, self.seq_len)
@@ -203,6 +204,12 @@ class PipelineExecutor(BaseExecutor):
         self.cfg = cfg
         self.topology = topology
         self.pipeline = None
+        opts = cfg.strategy_kwargs
+        self.loss_options = {
+            "loss_backend": opts.get("loss_backend", "torch"),
+            "loss_chunk_size": opts.get("loss_chunk_size", 512),
+            "label_smoothing": opts.get("label_smoothing", 0.0),
+        }
         # Stage leaders exchange CPU checkpoint tensors without staging an entire model on CUDA.
         self.writers = (
             dist.new_group(
@@ -243,7 +250,8 @@ class PipelineExecutor(BaseExecutor):
         )
         return stage
 
-    def backward_window(self, model, chunks, window_samples):
+    def _prepare_window(self, model, chunks):
+        """Pad only dummy rows so every 1F1B stage keeps fixed message shapes."""
         device = next(model.parameters()).device
         inputs = torch.cat([batch["input_ids"][:count] for batch, count in chunks])
         targets = torch.cat([batch["target_ids"][:count] for batch, count in chunks])
@@ -253,19 +261,19 @@ class PipelineExecutor(BaseExecutor):
             missing = local_batch - len(inputs)
             inputs = F.pad(inputs, (0, 0, 0, missing))
             targets = F.pad(targets, (0, 0, 0, missing), value=-100)
-        inputs, targets = inputs.to(device), targets.to(device)
+        return inputs.to(device), targets.to(device)
+
+    def backward_window(self, model, chunks, window_samples):
+        inputs, targets = self._prepare_window(model, chunks)
         if self.pipeline is None:
-            opts = self.cfg.strategy_kwargs
             self.pipeline = PipelineUpdate(
                 model,
                 self.topology.mesh,
                 self.cfg.batch_per_device,
                 inputs.shape[1],
                 self.cfg.grad_accum_steps,
-                opts.get("loss_chunk_size", 512),
-                loss_backend=opts.get("loss_backend", "torch"),
-                label_smoothing=opts.get("label_smoothing", 0.0),
                 gradients=self._grad_accumulator,
+                **self.loss_options,
             )
         self.pipeline.normalizer = (
             window_samples * inputs.shape[1] / self.topology.dp_size
@@ -288,7 +296,9 @@ class PipelineExecutor(BaseExecutor):
         hidden = model(inputs)
         last = self.cfg.pp_size - 1
         if rank == last:
-            loss = self.pipeline.loss_sum(hidden, targets) / targets.numel()
+            # Validation is valid before the first training schedule is built.
+            loss = _sequence_loss_sum(model, hidden, targets, **self.loss_options)
+            loss = loss / targets.numel()
         else:
             dist.send(hidden.contiguous(), group=pp, group_dst=rank + 1)
             loss = torch.empty((), device=param.device)

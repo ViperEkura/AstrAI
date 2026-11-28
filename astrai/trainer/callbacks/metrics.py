@@ -136,8 +136,11 @@ class MetricCallback(TrainCallback):
 
         with torch.no_grad():
             for batch in context.val_dataloader:
-                loss_output = context.strategy(batch)
-                total_loss += loss_output["loss"].item()
+                if context.config.pp_size > 1:
+                    loss = context.executor.validation_loss(context.model, batch)
+                else:
+                    loss = context.strategy(batch)["loss"]
+                total_loss += loss.item()
                 num_batches += 1
 
         # Sum (loss, batches) across dp replicas and take the ratio; the

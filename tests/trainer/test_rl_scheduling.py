@@ -123,6 +123,7 @@ def _run_replay(strategy, result, epochs=1, minibatch=None):
         rl_minibatch_prompts=minibatch,
         epoch_tail_policy="flush",
         cp_size=1,
+        pp_size=1,
     )
     dataset = list(range(total))
     runner = FakeRunner(result)

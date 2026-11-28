@@ -51,6 +51,17 @@ def _optimizer_restore(context: Any, state: Dict) -> None:
     full_resume = (
         context.checkpoint is not None and "scheduler" in context.checkpoint.extra
     )
+    if "pipeline_stages" in state:
+        bounds = getattr(context.executor, "boundaries", None)
+        if bounds != state["boundaries"]:
+            raise ValueError(
+                "Loading pipeline optimizer state requires the saved layer partition"
+            )
+        state = state["pipeline_stages"][context.topology.pp_rank]
+    elif getattr(context.config, "pp_size", 1) > 1:
+        raise ValueError(
+            "Loading an unpartitioned optimizer into PP requires load_state_dict.optimizer=false"
+        )
     if full_resume:
         context.optimizer.load_state_dict(state)
     else:

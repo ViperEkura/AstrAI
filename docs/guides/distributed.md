@@ -8,6 +8,7 @@ The `--dp_mode` setting selects the data-parallel gradient-sync strategy: **sing
 - [DP Modes](#dp-modes)
 - [Context Parallelism](#context-parallelism)
 - [Tensor Parallelism](#tensor-parallelism)
+- [Pipeline Parallelism](#pipeline-parallelism)
 - [Gradient Accumulation](#gradient-accumulation)
 - [Process Launching](#process-launching)
 - [NCCL Troubleshooting](#nccl-troubleshooting)
@@ -168,6 +169,45 @@ Constraints (enforced with explicit errors at launch):
 - `--tp_size > 1` cannot be combined with `--cp_size > 1` — the ring-attention patch and head-sharded projections interact on the SDPA inputs and the combination is unverified.
 - MoE is refused (expert dispatch and the per-token aux loss assume full-feature router inputs), and so is LoRA (the `LoRALinear` wrapper bypasses the sharded `Linear` forward).
 
+## Pipeline Parallelism
+
+Run dense, untied SEQ pretraining with the same training command:
+
+```bash
+python -m scripts.tools.train --config pretrain.yaml
+```
+
+For the 24-layer 2B model on eight GPUs, set these fields in the training YAML:
+
+```yaml
+parallel:
+  dp_mode: ddp
+  dp_size: 4
+  pp_size: 2
+  pp_split_points: [12]
+  pp_checkpoint_counts: [6, 0]
+training:
+  batch_per_device: 1
+  grad_accum_steps: 16
+```
+
+Each pair of adjacent ranks runs one 1F1B pipeline. Layers 0 through 11 run
+on its first stage, where the first six blocks recompute activations during
+backward. The second stage owns the remaining blocks, final norm and language
+model head. Each update uses 64 sequences across the four data replicas.
+CP and TP are both one for this layout.
+
+The stage module owns its decoder layer range and original checkpoint names.
+The 1F1B schedule handles microbatch execution and same-stage DP gradient
+synchronization. The executor adapts fixed-shape windows, validation and
+checkpoint collection to the existing Trainer lifecycle. Training and validation
+share the same token-summed loss; validation does not require a prior training step.
+
+The normal checkpoint directory contains a complete model. Use the same
+layer partition and `--resume` to restore stage optimizer states, the
+learning-rate schedule and the committed data cursor. To start from weights
+trained with another layout, set `training.load_state_dict.optimizer: false`.
+
 ## Gradient Accumulation
 
 Gradient accumulation lets you simulate a larger effective batch size by accumulating gradients over multiple micro-batches before calling `optimizer.step()`.
@@ -176,8 +216,8 @@ Gradient accumulation lets you simulate a larger effective batch size by accumul
 Effective batch = dp_size × batch_per_device × grad_accum_steps
 ```
 
-CP and TP ranks share each batch, so neither degree scales the effective batch.
-The launcher starts `dp_size × cp_size × tp_size` processes.
+CP, TP and PP ranks share each batch, so none of these degrees scales the effective batch.
+The launcher starts `dp_size × cp_size × tp_size × pp_size` processes.
 
 Example: dp_size 4 × batch 4 × accum 8 = effective batch 256.
 

@@ -1,21 +1,8 @@
-"""Parallel topology: decomposition of the global world into (dp, cp, tp).
+"""Trainer rank layout and per-dimension communication groups.
 
-This module is the universal rank-layout layer shared by every parallel
-consumer (trainer, sampler, future inference runtime).  It knows nothing
-about executors, strategies, or checkpoints.
-
-Rank mapping is row-major over ``mesh = (dp, cp, tp)``::
-
-    global_rank = dp_idx * (cp * tp) + cp_idx * tp + tp_idx
-
-so the tp dimension is innermost (contiguous ranks — fastest interconnect)
-and each cp group is a contiguous block when ``tp_size == 1``.
-
-``tp_size > 1`` activates the tp dimension for
-:class:`astrai.parallel.tp.TPState`; combined cp+tp layouts are refused at
-the trainer level until their interaction is verified.  ``cp_size ==
-tp_size == 1`` builds a trivial topology with no new process groups —
-byte-identical to the pre-topology single-dimension behavior.
+The mesh is (dp, cp, tp), with an additional innermost pp dimension for
+pipeline training. Each pipeline consists of contiguous ranks. Peers at
+the same stage in different replicas share a data-parallel group.
 """
 
 import logging
@@ -27,13 +14,13 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 logger = logging.getLogger(__name__)
 
-# Meshes cached per (world, dp, cp, tp, device) so repeated topology builds
+# Meshes cached per (world, dp, cp, tp, pp, device) so repeated topology builds
 # in one process never duplicate process-group creation.
-_MESH_CACHE: Dict[Tuple[int, int, int, int, str], DeviceMesh] = {}
+_MESH_CACHE: Dict[Tuple[int, int, int, int, int, str], DeviceMesh] = {}
 
 
 class ParallelTopology:
-    """Rank layout for ``world_size = dp_size * cp_size * tp_size``.
+    """Rank layout for ``world_size = dp_size * cp_size * tp_size * pp_size``.
 
     Attributes:
         dp_size / cp_size / tp_size: decomposition of the world.
@@ -55,26 +42,29 @@ class ParallelTopology:
         cp_size: int = 1,
         tp_size: int = 1,
         device_type: str = "cuda",
+        pp_size: int = 1,
     ):
         if tp_size < 1 or cp_size < 1:
             raise ValueError(
                 f"cp_size and tp_size must be >= 1, got cp={cp_size} tp={tp_size}"
             )
-        if world_size % (cp_size * tp_size) != 0:
+        if pp_size < 1 or world_size % (cp_size * tp_size * pp_size) != 0:
             raise ValueError(
                 f"world_size ({world_size}) must be divisible by "
-                f"cp_size * tp_size ({cp_size * tp_size})"
+                f"cp_size * tp_size * pp_size ({cp_size * tp_size * pp_size})"
             )
         self.world_size = world_size
         self.cp_size = cp_size
         self.tp_size = tp_size
-        self.dp_size = world_size // (cp_size * tp_size)
+        self.pp_size = pp_size
+        self.dp_size = world_size // (cp_size * tp_size * pp_size)
         self.device_type = device_type
 
         self.global_rank = dist.get_rank() if dist.is_initialized() else 0
-        self.tp_rank = self.global_rank % tp_size
-        self.cp_rank = (self.global_rank // tp_size) % cp_size
-        self.dp_rank = self.global_rank // (cp_size * tp_size)
+        self.tp_rank = (self.global_rank // pp_size) % tp_size
+        self.cp_rank = (self.global_rank // (pp_size * tp_size)) % cp_size
+        self.pp_rank = self.global_rank % pp_size
+        self.dp_rank = self.global_rank // (cp_size * tp_size * pp_size)
 
         self.mesh: Optional[DeviceMesh] = None
         self.dp_group = None
@@ -83,14 +73,16 @@ class ParallelTopology:
 
         # Only materialize a mesh when a parallel dimension is active — the
         # trivial path creates no groups and stays byte-identical to legacy.
-        if world_size > 1 and (cp_size > 1 or tp_size > 1):
-            key = (world_size, self.dp_size, cp_size, tp_size, device_type)
+        if world_size > 1 and (cp_size > 1 or tp_size > 1 or pp_size > 1):
+            key = (world_size, self.dp_size, cp_size, tp_size, pp_size, device_type)
             mesh = _MESH_CACHE.get(key)
             if mesh is None:
                 mesh = init_device_mesh(
                     device_type,
-                    (self.dp_size, cp_size, tp_size),
-                    mesh_dim_names=("dp", "cp", "tp"),
+                    (self.dp_size, cp_size, tp_size)
+                    + ((pp_size,) if pp_size > 1 else ()),
+                    mesh_dim_names=("dp", "cp", "tp")
+                    + (("pp",) if pp_size > 1 else ()),
                 )
                 _MESH_CACHE[key] = mesh
             self.mesh = mesh
@@ -104,16 +96,18 @@ class ParallelTopology:
             self.tp_group = mesh.get_group(2)
 
             logger.info(
-                "parallel topology: world=%d dp=%d cp=%d tp=%d "
-                "(rank %d -> dp=%d cp=%d tp=%d)",
+                "parallel topology: world=%d dp=%d cp=%d tp=%d pp=%d "
+                "(rank %d -> dp=%d cp=%d tp=%d pp=%d)",
                 world_size,
                 self.dp_size,
                 cp_size,
                 tp_size,
+                pp_size,
                 self.global_rank,
                 self.dp_rank,
                 self.cp_rank,
                 self.tp_rank,
+                self.pp_rank,
             )
 
     @property
@@ -126,7 +120,7 @@ class ParallelTopology:
 
     @property
     def is_trivial(self) -> bool:
-        return self.cp_size == 1 and self.tp_size == 1
+        return self.cp_size == 1 and self.tp_size == 1 and self.pp_size == 1
 
     def is_dp_leader(self) -> bool:
         """Whether this rank leads its dp group (cp_rank == tp_rank == 0).
@@ -134,7 +128,7 @@ class ParallelTopology:
         Ranks with the same dp_rank consume the same batch: cp peers hold
         different sequence slices of it, tp peers identical copies.
         """
-        return self.cp_rank == 0 and self.tp_rank == 0
+        return self.cp_rank == 0 and self.tp_rank == 0 and self.pp_rank == 0
 
     def samples_per_replica(self, dataset_len: int) -> int:
         """Dataset length as one dp replica sees it (ceil over ``dp_size``).
@@ -165,16 +159,16 @@ class ParallelTopology:
 
 
 def build_topology(
-    cp_size: int = 1, tp_size: int = 1, device_type: str = "cuda"
+    cp_size: int = 1, tp_size: int = 1, device_type: str = "cuda", pp_size: int = 1
 ) -> ParallelTopology:
     """Build the topology for the current process group.
 
     Requires the WORLD group to be initialized when any dimension is active.
     """
     world = dist.get_world_size() if dist.is_initialized() else 1
-    if (cp_size > 1 or tp_size > 1) and not dist.is_initialized():
+    if (cp_size > 1 or tp_size > 1 or pp_size > 1) and not dist.is_initialized():
         raise RuntimeError(
             "context/tensor parallelism requires an initialized process "
             "group; run inside setup_parallel/spawn_parallel_fn"
         )
-    return ParallelTopology(world, cp_size, tp_size, device_type)
+    return ParallelTopology(world, cp_size, tp_size, device_type, pp_size)

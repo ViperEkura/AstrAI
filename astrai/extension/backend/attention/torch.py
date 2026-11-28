@@ -155,41 +155,61 @@ def forward_varlen(q, k, v, qs, ks, is_causal, scale):
     return torch.cat(result)
 
 
-def _linear_decode(q, kc, vc, k, v, page_rows, length):
-    """Use zero-copy KV views when the live rows form disjoint, strided spans."""
-    batch, blocks = page_rows.shape
+def _storage_byte_range(tensor: Tensor):
+    """Compare addresses: distinct storage wrappers may share external memory."""
+    storage = tensor.untyped_storage()
+    start = storage.data_ptr()
+    return start, start + storage.nbytes()
+
+
+def _try_batched_decode(q, kc, vc, k, v, page_rows, length) -> Optional[Tensor]:
+    """Append and attend through cache views for disjoint, evenly spaced rows.
+
+    The caller supplies equal-length single-token requests and live page rows
+    on CPU. Each row must contain consecutive physical pages. Return None
+    without writing either cache when layout or aliasing requires fallback.
+    """
+    batch, pages_per_row = page_rows.shape
     starts = page_rows[:2, 0].tolist()
-    first = starts[0]
-    stride = starts[1] - first if batch > 1 else blocks
-    last = first + (batch - 1) * stride
-    if first < 0 or stride < blocks or last + blocks > kc.size(0):
+    first_page = starts[0]
+    page_stride = starts[1] - first_page if batch > 1 else pages_per_row
+    last_page = first_page + (batch - 1) * page_stride
+    if (
+        first_page < 0
+        or page_stride < pages_per_row
+        or last_page + pages_per_row > kc.size(0)
+    ):
         return None
-    expected = torch.arange(first, first + blocks, device="cpu", dtype=torch.int64)
+    expected = torch.arange(
+        first_page, first_page + pages_per_row, device="cpu", dtype=torch.int64
+    )
     for row in page_rows.unbind():
         if not torch.equal(row, expected):
             return None
-        expected.add_(stride)
+        expected.add_(page_stride)
 
-    # Distinct storage wrappers can still refer to overlapping external memory.
-    # In that case each request must see the cache writes in their original order.
-    def byte_range(tensor):
-        storage = tensor.untyped_storage()
-        start = storage.data_ptr()
-        return start, start + storage.nbytes()
-
-    spans = [byte_range(t) for t in (q, k, v)]
+    # Batched appends must not change inputs or another cache before it is read.
+    # Keep request-ordered execution for Q/K/V-cache and K-cache/V-cache aliases.
+    spans = [_storage_byte_range(t) for t in (q, k, v)]
     for cache in (kc, vc):
-        begin, end = byte_range(cache)
+        begin, end = _storage_byte_range(cache)
         if any(begin < hi and lo < end for lo, hi in spans):
             return None
         spans.append((begin, end))
-    size = kc.size(1)
+
+    page_size = kc.size(1)
+    first_token = first_page * page_size
+    end_token = last_page * page_size + length
+    token_stride = page_stride * page_size
+    # [pages, page_size, Hkv, D] -> [B, live_length, Hkv, D].
+    # unfold selects each request's live history without copying cache data.
     keys, values = (
-        cache.flatten(0, 1)[first * size : last * size + length]
-        .unfold(0, length, stride * size)
+        cache.flatten(0, 1)[first_token:end_token]
+        .unfold(0, length, token_stride)
         .movedim(-1, 1)
         for cache in (kc, vc)
     )
+    # All eligibility checks precede mutation. Each query sees its full history.
     keys[:, -1].copy_(k)
     values[:, -1].copy_(v)
     return forward(q[:, None], keys, values)
@@ -267,7 +287,7 @@ def forward_cache(
     ):
         raise ValueError("invalid request-local paged mask")
     page_rows = None
-    if (
+    can_try_batched_decode = (
         qs is None
         and mask is None
         and dense is forward
@@ -276,12 +296,13 @@ def forward_cache(
         and q.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
         and lengths[0] > 0
         and lengths.count(lengths[0]) == len(lengths)
-    ):
+    )
+    if can_try_batched_decode:
         length = lengths[0] + 1
         if length > pages.size(1) * size:
             raise ValueError("request exceeds cache capacity")
         page_rows = pages[:, : (length + size - 1) // size].cpu()
-        out = _linear_decode(q, kc, vc, k, v, page_rows, length)
+        out = _try_batched_decode(q, kc, vc, k, v, page_rows, length)
         if out is not None:
             return out.reshape(original)
 
